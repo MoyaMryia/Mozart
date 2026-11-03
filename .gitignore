@@ -18,7 +18,7 @@ compile_commands.json
 *.exe
 *.dSYM/
 
-# ---- Python ----
+# ---- Python（仅离线导出工具，非运行时） ----
 __pycache__/
 *.py[cod]
 .venv/

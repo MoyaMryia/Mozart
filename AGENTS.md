@@ -11,6 +11,7 @@ Mozart 是面向 NVIDIA Jetson Orin Nano Super 8 GB 的本地语音处理系统�
 
 本仓库处于重写阶段。新代码按 `README.md` 的目录约定落地，旧实现只在
 `~/Projects/Project-Mozart` 中作为归档参考，不作为依赖。
+运行时只使用 C++20，不启动 Python 进程。离线模型导出可以使用 Python，但不进入构建与部署路径。
 
 ## 语言与写作
 
@@ -52,7 +53,7 @@ Mozart 是面向 NVIDIA Jetson Orin Nano Super 8 GB 的本地语音处理系统�
 - 守卫必须在它声称要拦住的错误出现时失败。
 - 校验失败时返回明确错误并停止，不要捕获内部错误后继续运行。
 - 降级时记录原因，并让状态接口可以查询该原因。
-- `except` 只捕获当前能够处理的异常类型。
+- 只捕获当前能够处理的异常类型，其余向上抛出。
 
 ## 仓库卫生
 
@@ -88,6 +89,7 @@ Mozart 是面向 NVIDIA Jetson Orin Nano Super 8 GB 的本地语音处理系统�
 ## 平台约束
 
 - 目标设备为 Jetson Orin Nano Super 8 GB，ARM64，JetPack 6。
+- 构建使用 CMake ≥ 3.22 + Ninja + CTest；构建目录只使用 `CMakePresets.json` 中的预设名。
 - 音频路径使用 ALSA；实时线程不得分配内存或阻塞。
 - 推理后端为 ONNX Runtime 或 TensorRT；所选部署链路不依赖 PyTorch。
 - 主机（x86_64）用于构建与单元测试，声学与延迟验收在目标设备上完成。
@@ -98,4 +100,5 @@ Mozart 是面向 NVIDIA Jetson Orin Nano Super 8 GB 的本地语音处理系统�
 
 - 组件是否保留 `daemon` 与 `api` 的合并形态。
 - 控制面协议（Unix 数据报、HTTP、WebSocket）的最终范围。
+- 文档长度与限制句检查尚未实现（旧实现依赖 Python 脚本），当前只检查行尾空白与报告的“适用范围”一节。
 - 仓外资产的目录约定与环境变量名。

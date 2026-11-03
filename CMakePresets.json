@@ -1,0 +1,69 @@
+{
+  "version": 3,
+  "cmakeMinimumRequired": { "major": 3, "minor": 22, "patch": 0 },
+  "configurePresets": [
+    {
+      "name": "host-debug",
+      "displayName": "主机 x86_64 Debug",
+      "generator": "Ninja",
+      "binaryDir": "${sourceDir}/build/host-debug",
+      "cacheVariables": {
+        "CMAKE_BUILD_TYPE": "Debug",
+        "MOZART_WITH_ORT": "OFF",
+        "MOZART_WITH_TRT": "OFF"
+      }
+    },
+    {
+      "name": "host-asan",
+      "displayName": "主机 Debug + ASan/UBSan",
+      "inherits": "host-debug",
+      "binaryDir": "${sourceDir}/build/host-asan",
+      "cacheVariables": { "MOZART_SANITIZE": "address,undefined" }
+    },
+    {
+      "name": "host-tsan",
+      "displayName": "主机 Debug + TSan",
+      "inherits": "host-debug",
+      "binaryDir": "${sourceDir}/build/host-tsan",
+      "cacheVariables": { "MOZART_SANITIZE": "thread" }
+    },
+    {
+      "name": "jetson-release",
+      "displayName": "Jetson aarch64 Release",
+      "generator": "Ninja",
+      "binaryDir": "${sourceDir}/build/jetson-release",
+      "cacheVariables": {
+        "CMAKE_BUILD_TYPE": "Release",
+        "MOZART_WITH_ORT": "ON",
+        "MOZART_WITH_TRT": "ON",
+        "CMAKE_CXX_FLAGS": "-march=armv8.2-a+fp16+dotprod"
+      }
+    }
+  ],
+  "buildPresets": [
+    { "name": "host-debug", "configurePreset": "host-debug" },
+    { "name": "host-asan", "configurePreset": "host-asan" },
+    { "name": "host-tsan", "configurePreset": "host-tsan" },
+    { "name": "jetson-release", "configurePreset": "jetson-release" }
+  ],
+  "testPresets": [
+    {
+      "name": "host-debug",
+      "configurePreset": "host-debug",
+      "output": { "outputOnFailure": true },
+      "execution": { "jobs": 4 }
+    },
+    {
+      "name": "host-asan",
+      "configurePreset": "host-asan",
+      "output": { "outputOnFailure": true },
+      "execution": { "jobs": 2 }
+    },
+    {
+      "name": "host-tsan",
+      "configurePreset": "host-tsan",
+      "output": { "outputOnFailure": true },
+      "execution": { "jobs": 2 }
+    }
+  ]
+}

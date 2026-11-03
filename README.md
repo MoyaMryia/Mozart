@@ -6,14 +6,17 @@
 
 ## 当前状态
 
-本仓库处于**重写阶段**，只有骨架、约定和 CI。
+本仓库处于**重写阶段**，已有构建契约、约定与 CI，尚无业务组件。
 旧实现归档在 `~/Projects/Project-Mozart`，仅作参考，不作为依赖。
 
 | 能力 | 状态 |
 | --- | --- |
 | 仓库骨架、AGENTS.md、CI | 已就绪 |
-| 组件代码 | 未开始 |
+| 构建契约（C++20、Presets、CTest） | 已就绪 |
+| 业务组件 | 未开始 |
 | 目标设备验收 | 未开始 |
+
+运行时只使用 C++20，不依赖 Python。离线模型导出可以使用 Python，但不在构建与部署路径上。
 
 ## 目录约定
 
@@ -24,16 +27,33 @@
 | `rvc/` | 语音转换推理，ONNX Runtime 或 TensorRT |
 | `daemon/` | 进程生命周期、模式切换、HTTP 与控制面 |
 | `web/` | 控制台前端 |
-| `tools/` | Python 服务与脚本：识别、翻译、合成、USB 桥 |
 | `tests/` | 跨组件用例与小型夹具 |
+| `cmake/` | 编译配置模块 |
+| `tools/` | 构建、检查与离线导出脚本 |
 | `docs/` | 长期维护的说明与手册 |
 | `reports/` | 带日期的实测记录，只跟踪 Markdown |
 
 依赖方向：`core` 不依赖其他组件；`pre`、`rvc`、`daemon` 依赖 `core`；
-`daemon` 是唯一对外提供接口的进程；`tools` 通过 `daemon` 的接口协作；
-`web` 只调用 `daemon` 的 HTTP 接口。
+`daemon` 是唯一对外提供接口的进程；`web` 只调用 `daemon` 的 HTTP 接口。
 
 模型、音频和引擎等大资产不进仓库，路径由配置文件或环境变量给出。
+
+## 工具链
+
+| 项 | 要求 |
+| --- | --- |
+| 编译标准 | C++20，关闭编译器扩展 |
+| 构建系统 | CMake ≥ 3.22 + Ninja + CTest |
+| 编译器缓存 | ccache，检测到即自动启用 |
+| 预设 | `host-debug`、`host-asan`、`host-tsan`、`jetson-release` |
+
+构建目录只使用预设名，不再手写构建参数：
+
+```bash
+cmake --preset host-debug
+cmake --build --preset host-debug --parallel 4
+ctest --preset host-debug
+```
 
 ## 检查
 
@@ -47,9 +67,8 @@ tools/install-hooks.sh
 
 ```bash
 tools/ci-local.sh repo      # 仓库卫生：体积上限、索引与忽略规则一致
-tools/ci-local.sh lint      # 文档与代码风格
-tools/ci-local.sh native    # C/C++ 构建与单元测试
-tools/ci-local.sh python    # Python 单元测试
+tools/ci-local.sh lint      # 新增行的行尾空白、报告“适用范围”一节
+tools/ci-local.sh native    # 配置、构建与 CTest
 tools/ci-local.sh web       # 前端测试与构建
 ```
 

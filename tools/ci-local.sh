@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # 本地与 CI 共用的检查命令。依赖安装留在 workflow 中。
-#   tools/ci-local.sh <repo|lint|native|python|web>   运行一个阶段
+#   tools/ci-local.sh <repo|lint|native|web>          运行一个阶段
 #   tools/ci-local.sh --staged                        提交前检查，pre-commit hook 调用
 #   tools/ci-local.sh all                             依次运行全部阶段
 set -euo pipefail
@@ -9,8 +9,7 @@ cd "$(git rev-parse --show-toplevel)"
 MAX_TRACKED_BYTES=$((5 * 1024 * 1024))
 
 # 阶段名与触发路径（扩展正则，匹配暂存文件路径）。
-NATIVE_PATHS='^(core|pre|rvc|daemon|api|tests)/|^CMakeLists\.txt$|^cmake/'
-PYTHON_PATHS='^(tools|tests)/|\.py$'
+NATIVE_PATHS='^(core|pre|rvc|daemon|api|tests)/|^CMakeLists\.txt$|^CMakePresets\.json$|^cmake/'
 WEB_PATHS='^web/'
 
 skip() { echo "跳过 $1：$2" >&2; }
@@ -43,33 +42,21 @@ stage_repo() {
 }
 
 stage_lint() {
-    if [ -f tools/writing_lint.py ]; then
-        python3 tools/writing_lint.py "$@"
-    else
-        skip lint "tools/writing_lint.py 不存在"
-    fi
+    bash tools/lint.sh "$@"
 }
 
 stage_native() {
-    if [ ! -f CMakeLists.txt ] && ! compgen -G '*/CMakeLists.txt' >/dev/null; then
+    if [ ! -f CMakeLists.txt ]; then
         skip native "没有 CMakeLists.txt"
         return 0
     fi
-    cmake -S . -B build/host -G Ninja -DCMAKE_BUILD_TYPE=Debug -DMOZART_BUILD_TESTS=ON
-    cmake --build build/host -j2
-    if ctest --test-dir build/host -N 2>/dev/null | grep -q 'Test #'; then
-        ctest --test-dir build/host --output-on-failure
+    cmake --preset host-debug
+    cmake --build --preset host-debug --parallel 2
+    if ctest --preset host-debug -N 2>/dev/null | grep -q 'Test #'; then
+        ctest --preset host-debug
     else
         skip native "没有注册的 ctest 用例"
     fi
-}
-
-stage_python() {
-    if [ ! -d tools/tests ]; then
-        skip python "tools/tests 不存在"
-        return 0
-    fi
-    python3 -m unittest discover -s tools/tests -v
 }
 
 stage_web() {
@@ -97,7 +84,6 @@ run_stage() {
         repo) stage_repo ;;
         lint) stage_lint ;;
         native) stage_native ;;
-        python) stage_python ;;
         web) stage_web ;;
         *) echo "未知阶段：$1" >&2; exit 2 ;;
     esac
@@ -113,10 +99,9 @@ staged() {
     stage_lint --staged ${base:+--base-ref "$base"}
 
     local name paths
-    for name in native python web; do
+    for name in native web; do
         case $name in
             native) paths=$NATIVE_PATHS ;;
-            python) paths=$PYTHON_PATHS ;;
             web) paths=$WEB_PATHS ;;
         esac
         if grep -qE "$paths" <<<"$changed"; then
@@ -130,6 +115,6 @@ staged() {
 
 case "${1:---staged}" in
     --staged) staged ;;
-    all) for s in repo lint native python web; do echo "== $s ==" >&2; run_stage "$s"; done ;;
+    all) for s in repo lint native web; do echo "== $s ==" >&2; run_stage "$s"; done ;;
     *) run_stage "$1" ;;
 esac

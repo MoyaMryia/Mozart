@@ -22,13 +22,10 @@ jobs:
         with:
           persist-credentials: false
           fetch-depth: 0
-      - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
-        with:
-          python-version: '3.12'
       # 检查命令只在 tools/ci-local.sh 中定义，本地 pre-commit hook 调用同一脚本。
       - name: 仓库卫生
         run: bash tools/ci-local.sh repo
-      - name: 文档与代码风格
+      - name: 文档检查
         env:
           BASE_SHA: ${{ github.event.pull_request.base.sha || github.event.before }}
         run: |
@@ -37,22 +34,15 @@ jobs:
           else
             bash tools/ci-local.sh lint
           fi
-      - name: 安装原生构建依赖
+      - name: 安装构建依赖
         run: |
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends \
-            cmake ninja-build g++ pkg-config \
+            cmake ninja-build g++ pkg-config ccache \
             libasound2-dev libspdlog-dev libyaml-cpp-dev nlohmann-json3-dev \
             ffmpeg libavfilter-dev libavutil-dev
-      - name: 安装 Python 测试依赖
-        run: |
-          if [ -f requirements-test.txt ]; then
-            python3 -m pip install -r requirements-test.txt
-          fi
-      - name: C/C++ 构建与单元测试
+      - name: 构建与单元测试
         run: bash tools/ci-local.sh native
-      - name: Python 单元测试
-        run: bash tools/ci-local.sh python
 
   web:
     runs-on: ubuntu-24.04

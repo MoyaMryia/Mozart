@@ -36,6 +36,7 @@ Mozart 是面向 NVIDIA Jetson Orin Nano Super 8 GB 的本地语音处理系统�
 | 计算板 | Jetson Orin Nano Super 8 GB，JetPack 6，ARM64 |
 | 音频 | ALSA；主机侧可用 `snd-aloop` 联调 |
 | 推理 | ONNX Runtime 或 TensorRT；部署链路不使用 PyTorch |
+| 运行时语言 | C++20；不使用 Python 进程，模型导出属于离线工具 |
 | 主机 | x86_64 Linux，用于构建与单元测试 |
 
 模型、音频和引擎属于仓外资产，不在版本库中。
