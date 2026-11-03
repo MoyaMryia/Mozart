@@ -55,6 +55,9 @@ cmake --build --preset host-debug --parallel 4
 ctest --preset host-debug
 ```
 
+`host-tsan` 在 Linux 6.x 上需要先降低 ASLR 熵，否则 ThreadSanitizer 报
+`unexpected memory mapping`：`sudo sysctl vm.mmap_rnd_bits=28`。
+
 ## 检查
 
 本地安装 hook：
