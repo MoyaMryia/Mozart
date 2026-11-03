@@ -55,17 +55,22 @@ jobs:
         run: bash tools/ci-local.sh python
 
   web:
-    if: hashFiles('web/package.json') != ''
     runs-on: ubuntu-24.04
     timeout-minutes: 15
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
           persist-credentials: false
+      # hashFiles 只在步骤级 if 中可用，因此逐步骤跳过。
       - uses: actions/setup-node@v4
+        if: hashFiles('web/package.json') != ''
         with:
           node-version: '24'
           cache: npm
           cache-dependency-path: web/package-lock.json
-      - run: npm --prefix web ci
-      - run: bash tools/ci-local.sh web
+      - if: hashFiles('web/package.json') != ''
+        run: npm --prefix web ci
+      - if: hashFiles('web/package.json') != ''
+        run: bash tools/ci-local.sh web
+      - if: hashFiles('web/package.json') == ''
+        run: echo "跳过 web：web/package.json 不存在"
