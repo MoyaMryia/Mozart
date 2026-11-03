@@ -1,0 +1,4 @@
+#!/usr/bin/env sh
+# 提交前检查。命令定义在 tools/ci-local.sh，CI 调用同一脚本。
+repo_root=$(git rev-parse --show-toplevel)
+exec "$repo_root/tools/ci-local.sh" --staged

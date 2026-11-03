@@ -1,0 +1,71 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  checks:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+          fetch-depth: 0
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      # 检查命令只在 tools/ci-local.sh 中定义，本地 pre-commit hook 调用同一脚本。
+      - name: 仓库卫生
+        run: bash tools/ci-local.sh repo
+      - name: 文档与代码风格
+        env:
+          BASE_SHA: ${{ github.event.pull_request.base.sha || github.event.before }}
+        run: |
+          if [ -n "$BASE_SHA" ] && [ "$BASE_SHA" != 0000000000000000000000000000000000000000 ]; then
+            bash tools/ci-local.sh lint --base-ref "$BASE_SHA"
+          else
+            bash tools/ci-local.sh lint
+          fi
+      - name: 安装原生构建依赖
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            cmake ninja-build g++ pkg-config \
+            libasound2-dev libspdlog-dev libyaml-cpp-dev nlohmann-json3-dev \
+            ffmpeg libavfilter-dev libavutil-dev
+      - name: 安装 Python 测试依赖
+        run: |
+          if [ -f requirements-test.txt ]; then
+            python3 -m pip install -r requirements-test.txt
+          fi
+      - name: C/C++ 构建与单元测试
+        run: bash tools/ci-local.sh native
+      - name: Python 单元测试
+        run: bash tools/ci-local.sh python
+
+  web:
+    if: hashFiles('web/package.json') != ''
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '24'
+          cache: npm
+          cache-dependency-path: web/package-lock.json
+      - run: npm --prefix web ci
+      - run: bash tools/ci-local.sh web

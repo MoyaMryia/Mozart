@@ -1,0 +1,95 @@
+# 只跟踪源码、文档、配置和小型测试夹具。
+# 大型资产（模型、音频、引擎、演示物）走仓外归档，路径由配置或环境变量给出。
+# 例外必须在下方白名单中逐条写明，并说明用途。
+
+# ---- 构建产物 ----
+/build/
+/build-*/
+/cmake-build-*/
+CMakeCache.txt
+CMakeFiles/
+cmake_install.cmake
+compile_commands.json
+*.o
+*.a
+*.so
+*.so.*
+*.dylib
+*.exe
+*.dSYM/
+
+# ---- Python ----
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+*.egg-info/
+.coverage
+.coverage.*
+htmlcov/
+
+# ---- Node / 前端 ----
+node_modules/
+/web/dist/
+/dist/
+*.tsbuildinfo
+.npm/
+
+# ---- 模型与运行时资产（仓外归档） ----
+/assets/
+/models/
+*.onnx
+*.engine
+*.plan
+*.pth
+*.pt
+*.safetensors
+*.ckpt
+*.rnnb
+*.bin
+# 小型对拍夹具可以入库，必须显式列出。
+!tests/fixtures/**/*.onnx
+!tests/fixtures/**/*.bin
+
+# ---- 音频、视频与交付物 ----
+*.wav
+*.flac
+*.mp3
+*.m4a
+*.mp4
+*.mkv
+*.pdf
+*.pptx
+*.docx
+*.xlsx
+# 小型回归输入可以入库，必须显式列出。
+!tests/fixtures/**/*.wav
+
+# ---- 日志与本地数据 ----
+*.log
+logs/
+*.pid
+*.sock
+/state/glossary.json
+local/
+
+# ---- 编辑器与系统 ----
+.DS_Store
+Thumbs.db
+*.swp
+*~
+.idea/
+.vscode/*
+!.vscode/settings.json
+!.vscode/extensions.json
+
+# ---- 报告 ----
+# reports/ 只跟踪 Markdown。证据文件默认留在本地，仅白名单例外入库。
+reports/**/*.wav
+reports/**/*.png
+reports/**/*.json
+reports/**/*.html
+reports/**/__pycache__/
