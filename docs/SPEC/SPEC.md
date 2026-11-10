@@ -28,6 +28,7 @@
 | 6 | [SPEC-06-web.md](SPEC-06-web.md) | frontend | 后续 |
 | 7 | [SPEC-07-device.md](SPEC-07-device.md) | usb-audio、usb-gadget | 待定 |
 | 8 | [SPEC-08-verification.md](SPEC-08-verification.md) | rvc-golden、reports | 讨论中 |
+| 9 | [SPEC-09-pipeline.md](SPEC-09-pipeline.md) | 开发与部署流水线 | 讨论中 |
 
 阅读顺序按数据流：core → pre → rvc → daemon。语言、前端、设备、验证按需插入。
 
@@ -48,3 +49,4 @@
 - 2026-11-10：赛题评分标准迁入 `docs/REQUIREMENTS.md`，验收规格引用该文件。
 - 2026-11-10：功能验收写入 `SPEC-08-verification.md`；翻译播报替代参考音色播报。
 - 2026-11-10：一致性核对：术语统一、门槛来源标注、待讨论项归位。
+- 2026-11-10：新增开发与部署流水线规格，建立一键本地入口的讨论框架。
