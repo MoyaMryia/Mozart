@@ -94,6 +94,7 @@ pub struct ProcessInfo {
     pub pid: Option<u32>,
     pub restarts: u32,
     pub last_exit: Option<ExitInfo>,
+    pub last_error: Option<String>,
 }
 
 impl ProcessInfo {
@@ -103,6 +104,7 @@ impl ProcessInfo {
             pid: None,
             restarts: 0,
             last_exit: None,
+            last_error: None,
         }
     }
 }

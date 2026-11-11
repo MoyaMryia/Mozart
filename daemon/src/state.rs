@@ -1,8 +1,22 @@
 use mozart_core::ctl::schema::{
-    ArbiterState, DaemonInfo, GpuState, ProcessInfo, Processes, Route, RouteState, Status,
+    Activity, ArbiterState, DaemonInfo, ExitInfo, GpuState, ProcessInfo, ProcessState, Processes,
+    Route, RouteState, Status,
 };
 use mozart_core::ctl::{self, CODE_NOT_READY};
+use std::sync::{Mutex, MutexGuard};
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum Role {
+    Pre,
+    Rvc,
+}
+
+pub fn lock_state(state: &Mutex<State>) -> MutexGuard<'_, State> {
+    state
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+}
 
 pub struct State {
     started: Instant,
@@ -10,7 +24,8 @@ pub struct State {
     route_active: Route,
     route_since_unix_ms: u64,
     mute: bool,
-    gpu_owner: Option<ctl::schema::Activity>,
+    gpu_owner: Option<Activity>,
+    processes: Processes,
     degraded: Vec<String>,
 }
 
@@ -23,6 +38,10 @@ impl State {
             route_since_unix_ms: now_unix_ms(),
             mute: false,
             gpu_owner: None,
+            processes: Processes {
+                pre: ProcessInfo::stopped(),
+                rvc: ProcessInfo::stopped(),
+            },
             degraded: Vec::new(),
         }
     }
@@ -45,10 +64,7 @@ impl State {
                     owner: self.gpu_owner,
                 },
             },
-            processes: Processes {
-                pre: ProcessInfo::stopped(),
-                rvc: ProcessInfo::stopped(),
-            },
+            processes: self.processes.clone(),
             pre: None,
             rvc: None,
             hw: None,
@@ -74,16 +90,57 @@ impl State {
         }
     }
 
-    pub fn set_mute(&mut self, mute: bool) -> Result<bool, (String, String)> {
-        let _ = mute;
+    pub fn set_mute(&mut self, _mute: bool) -> Result<bool, (String, String)> {
         Err((
             CODE_NOT_READY.to_string(),
             "pre process not started".to_string(),
         ))
     }
+
+    pub fn process_starting(&mut self, role: Role) {
+        let info = self.process_mut(role);
+        info.state = ProcessState::Starting;
+        info.pid = None;
+    }
+
+    pub fn process_running(&mut self, role: Role, pid: u32) {
+        let info = self.process_mut(role);
+        info.state = ProcessState::Running;
+        info.pid = Some(pid);
+        info.last_error = None;
+    }
+
+    pub fn process_exited(&mut self, role: Role, exit: ExitInfo) {
+        let info = self.process_mut(role);
+        info.state = ProcessState::Restarting;
+        info.pid = None;
+        info.restarts += 1;
+        info.last_exit = Some(exit);
+    }
+
+    pub fn process_failed(&mut self, role: Role, error: String) {
+        let info = self.process_mut(role);
+        info.state = ProcessState::Restarting;
+        info.pid = None;
+        info.restarts += 1;
+        info.last_error = Some(error);
+    }
+
+    pub fn process_stopped(&mut self, role: Role) {
+        let info = self.process_mut(role);
+        info.state = ProcessState::Stopped;
+        info.pid = None;
+    }
+
+    fn process_mut(&mut self, role: Role) -> &mut ProcessInfo {
+        match role {
+            Role::Pre => &mut self.processes.pre,
+            Role::Rvc => &mut self.processes.rvc,
+        }
+    }
 }
 
-fn now_unix_ms() -> u64 {
+pub fn now_unix_ms() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map(|duration| duration.as_millis() as u64)

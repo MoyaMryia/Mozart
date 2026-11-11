@@ -1,4 +1,5 @@
-use crate::state::State;
+use crate::state::{lock_state, Role, State};
+use crate::supervisor::Supervisor;
 use mozart_core::config::Config;
 use mozart_core::ctl::schema::{self, MuteSetRequest, RouteSetRequest};
 use mozart_core::ctl::{self, Message, Seqpacket};
@@ -6,12 +7,15 @@ use serde_json::json;
 use std::fs::{File, OpenOptions};
 use std::io;
 use std::os::unix::fs::PermissionsExt;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 const IDLE_TIMEOUT: Duration = Duration::from_secs(30);
 
 pub fn serve(config: &Config) -> io::Result<()> {
     prepare_run_dir(config)?;
+    std::fs::create_dir_all(config.log_dir())?;
     let _lock = lock_instance(config)?;
 
     let socket_path = config.daemon_socket();
@@ -20,8 +24,19 @@ pub fn serve(config: &Config) -> io::Result<()> {
     listener.listen(8)?;
     eprintln!("mozart-daemon: listening on {}", socket_path.display());
 
-    let mut state = State::new();
-    let outcome = accept_loop(&listener, &mut state);
+    let config = Arc::new(config.clone());
+    let state = Arc::new(Mutex::new(State::new()));
+    let running = Arc::new(AtomicBool::new(true));
+    let supervisors = [
+        Supervisor::spawn(Role::Pre, config.clone(), state.clone(), running.clone())?,
+        Supervisor::spawn(Role::Rvc, config.clone(), state.clone(), running.clone())?,
+    ];
+
+    let outcome = accept_loop(&listener, &state);
+    running.store(false, Ordering::Release);
+    for supervisor in supervisors {
+        supervisor.join();
+    }
     drop(listener);
     let _ = std::fs::remove_file(&socket_path);
     outcome
@@ -54,7 +69,7 @@ enum Flow {
     Shutdown,
 }
 
-fn accept_loop(listener: &Seqpacket, state: &mut State) -> io::Result<()> {
+fn accept_loop(listener: &Seqpacket, state: &Mutex<State>) -> io::Result<()> {
     loop {
         let conn = listener.accept()?;
         match serve_connection(&conn, state) {
@@ -65,7 +80,7 @@ fn accept_loop(listener: &Seqpacket, state: &mut State) -> io::Result<()> {
     }
 }
 
-fn serve_connection(conn: &Seqpacket, state: &mut State) -> io::Result<Flow> {
+fn serve_connection(conn: &Seqpacket, state: &Mutex<State>) -> io::Result<Flow> {
     loop {
         let msg = match conn.recv(Some(IDLE_TIMEOUT)) {
             Ok(msg) => msg,
@@ -87,7 +102,8 @@ fn serve_connection(conn: &Seqpacket, state: &mut State) -> io::Result<Flow> {
     }
 }
 
-fn handle_request(state: &mut State, msg: &Message) -> (Vec<u8>, bool) {
+fn handle_request(state: &Mutex<State>, msg: &Message) -> (Vec<u8>, bool) {
+    let mut state = lock_state(state);
     let type_ = msg.header.type_;
     match type_ {
         ctl::DAEMON_HELLO => (

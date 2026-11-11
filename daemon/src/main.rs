@@ -1,5 +1,6 @@
 mod server;
 mod state;
+mod supervisor;
 
 use mozart_core::config::Config;
 use std::path::PathBuf;
