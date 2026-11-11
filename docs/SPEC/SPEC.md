@@ -85,3 +85,4 @@
 - 2026-11-12：确认 `[pre]` 配置段设备与环容量键，以及路由/静音淡变时长与切换次序（SPEC-02）。
 - 2026-11-12：确认 `[pre.dsp]` 配置键（denoise，默认沿用旧代码默认 true；禁用整级跳过）与 WOLA 流式合同（首块 896、稳态 960、发射滞后 64、缺口补零保持 20 ms 节拍），对拍夹具入 `tests/fixtures/dsp/`（SPEC-02）。
 - 2026-11-12：pre AI 支路定稿：整形级配置键（gate/AGC/limiter 默认关）、16 kHz 打包 meta 语义（pts 取采集时间戳、frame_idx 为打包序号）、恒定发送与惰性建链、接收环 8 帧、direct 排空计数与 consumer_drops 口径（rvc / rvc.skipped）（SPEC-02）。
+- 2026-11-12：rvc C++ 实现定稿：六命令按 SPEC-03 落地（StartStream 参数此时固定、StopStream 等当前块返回、GetStatus 14 字段）；`[rvc]` 进程启动键（models_dir、device、half、cache_limit、HuBERT/RMVPE/实时资产路径）与 socket 键入部署 TOML；退出用 SIGTERM，第一版无 UnloadModel/Shutdown。
