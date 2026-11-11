@@ -9,7 +9,8 @@ if(NOT nlohmann_json_FOUND)
     include(FetchContent)
     FetchContent_Declare(json
         GIT_REPOSITORY https://github.com/nlohmann/json.git
-        GIT_TAG v3.11.3)
+        GIT_TAG v3.11.3
+        GIT_SHALLOW TRUE)
     FetchContent_MakeAvailable(json)
 endif()
 
@@ -19,7 +20,8 @@ if(NOT spdlog_FOUND)
     include(FetchContent)
     FetchContent_Declare(spdlog
         GIT_REPOSITORY https://github.com/gabime/spdlog.git
-        GIT_TAG v1.15.1)
+        GIT_TAG v1.15.1
+        GIT_SHALLOW TRUE)
     FetchContent_MakeAvailable(spdlog)
 endif()
 
@@ -62,7 +64,7 @@ if(MOZART_WITH_ORT)
     endif()
 endif()
 
-# ---- 推理核心运行库（搬运自旧 rvc-backend 的最小集）----
+# ---- 推理核心运行库（搬运自旧 rvc-backend 的最小集）+ 数据面 ----
 add_library(mozart_rvc_runtime STATIC
     src/rvc/audio_worker.cpp
     src/rvc/streaming_pipeline.cpp
@@ -73,6 +75,7 @@ add_library(mozart_rvc_runtime STATIC
     src/rvc/model_loader.cpp
     src/rvc/onnx_engine.cpp
     src/rvc/index_search.cpp
+    transport/unix_dgram_stream.cpp
 )
 # include/：搬运核心的旧布局（rvc/*.hpp）；仓库内新模块按目录相对包含
 # （transport/、control/、config/），因此把组件根也加入搜索路径。

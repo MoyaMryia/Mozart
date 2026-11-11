@@ -54,11 +54,14 @@ void AudioWorker::start() {
     if (stream_mode_) {
         StreamingRvc::Config scfg;
         scfg.skip_silence = config_.skip_silence;
-        if (config_.realtime_kind) {
+        // kind=realtime 选短块 preset（实时能力由 StreamSession 入口校验，
+        // 此处按能力探测置位）；kind=file 不用短块，走 quality 或滑窗。
+        scfg.upstream_realtime =
+            config_.realtime_kind && pipeline_.supports_realtime_streaming();
+        if (scfg.upstream_realtime) {
             // 实时短块 preset（旧 AudioWorker.cpp:62-70）：240 ms 窗、
             // 50 ms 交叉淡化、2.5 s 过去上下文、10 ms SOLA 搜索、
-            // 400 ms 启动缓冲；能力由 StreamSession 入口校验。
-            scfg.upstream_realtime = pipeline_.supports_realtime_streaming();
+            // 400 ms 启动缓冲。
             scfg.window_samples = 3840;
             scfg.crossfade_out = 2400;
             scfg.past_context_samples = 40000;
@@ -67,21 +70,20 @@ void AudioWorker::start() {
             scfg.startup_delay_out =
                 config_.realtime_playout_delay_ms * (MOZART_OUTPUT_SAMPLE_RATE / 1000);
             pipeline_.reset_realtime();
-        } else {
-            // file 种类：动态 Generator 走 quality/full-history，否则 2s 滑窗。
-            scfg.full_history = pipeline_.supports_quality_streaming();
-            if (scfg.full_history) {
-                scfg.right_context_samples = 32000;
-                scfg.guard_samples = 80;
-                scfg.startup_buffer_blocks = 3;
-            }
+        }
+        scfg.full_history = !scfg.upstream_realtime
+            && pipeline_.supports_quality_streaming();
+        if (scfg.full_history) {
+            scfg.right_context_samples = 32000;
+            scfg.guard_samples = 80;
+            scfg.startup_buffer_blocks = 3;
         }
         streaming_ = std::make_unique<StreamingRvc>(scfg);
         inference_thread_ = std::thread([this] {
             streaming_->inference_loop(pipeline_, running_);
         });
         spdlog::info("AudioWorker stream mode: {}",
-            config_.realtime_kind
+            scfg.upstream_realtime
                 ? "upstream realtime (240ms block + 2.5s past + SOLA)"
                 : (scfg.full_history
                     ? "Golden quality profile (full history + 2s lookahead + 2 hop reserve)"
