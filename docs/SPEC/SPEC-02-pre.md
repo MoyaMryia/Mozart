@@ -21,13 +21,12 @@
 - 直出分支取在降采样前，用 48 kHz 主干；AI 支路降采样到 16 kHz。
 - 数据面过载：非阻塞发送，丢弃计数；接收缓冲限制在 4–8 帧。
 - Socket 路径在 `/run/mozart/` 下；锁文件防重复实例；对端重启后重连。
+- 控制面（daemon → pre）：Unix SEQPACKET 定长头 + JSON。命令 `Hello`（版本握手）、`SetRoute{route}`（切 direct/rvc）、`SetMute{mute}`（静音开关）、`GetStatus`。路由与静音由 pre 执行淡变，策略归 daemon。
+- 状态：`GetStatus` 返回运行状态、路由、静音、采集/播放设备名、采集/播放/丢弃帧计数、队列深度、各消费者丢弃计数、最近错误、版本。daemon 每秒轮询，pre 不主动推；旧 `pre-status.json` 废弃。
+- 换设备不做在线命令，由 daemon 重启 pre 代替。
 
 ## 改进点
 
 - 禁用降噪时跳过全部计算。
 - 淡变逻辑加重入保护，参数做边界校验。
 - 拆开旧单体主程序。
-
-## 待讨论
-
-- daemon → 音频进程的控制通道：命令集、传输、状态上报。
