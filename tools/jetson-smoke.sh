@@ -24,7 +24,7 @@ pkill -f "mozart-pre --socket" 2>/dev/null
 pkill -f "mozart-rvc --socket" 2>/dev/null
 sleep 0.3
 mkdir -p "$SMOKE_DIR"
-rm -rf "$RUN" "$SMOKE_DIR"/rec.raw "$SMOKE_DIR"/st-*.json "$SMOKE_DIR"/st-*.txt
+rm -rf "$RUN" "$SMOKE_DIR"/rec.raw "$SMOKE_DIR"/signal.raw "$SMOKE_DIR"/st-*.json "$SMOKE_DIR"/st-*.txt
 
 ts() { printf "[%4ss]" "$SECONDS"; }
 ctl() { "$BIN_DIR/mozart-ctl" --config "$CFG" "$@"; }
@@ -41,8 +41,8 @@ elif key == "rvcproc":
     print(d["processes"]["rvc"][sys.argv[3]])
 ' "$1" "$2" "${3:-}" 2>/dev/null; }
 
-# 正弦测试信号：220 Hz、48 kHz、双声道、16 s。
-if [ ! -f "$SMOKE_DIR/signal.raw" ]; then
+# 正弦测试信号：220 Hz、48 kHz、双声道、16 s。每次重新生成，
+# 不复用产物目录中的同名旧文件。
 python3 - "$SMOKE_DIR/signal.raw" <<'EOF'
 import math, struct, sys
 sr, dur, freq = 48000, 16.0, 220.0
@@ -51,7 +51,6 @@ with open(sys.argv[1], 'wb') as f:
         v = int(24000 * math.sin(2 * math.pi * freq * i / sr))
         f.write(struct.pack('<hh', v, v))
 EOF
-fi
 
 cat > "$CFG" <<EOF
 [daemon]
