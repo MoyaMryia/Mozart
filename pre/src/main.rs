@@ -1,12 +1,14 @@
 //! mozart-pre：音频前端进程（SPEC-02）。
-//! 线程结构：采集（ALSA 攒块→环）→ 处理（本任务恒等直通；DSP 由 Task 3/4 插入）
-//! → 播放（路由/静音状态机→淡变→ALSA 写）；控制线程独立服务 SEQPACKET。
+//! 线程结构：采集（ALSA 攒块→环）→ 处理（DSP：80 Hz 高通 + WOLA 谱降噪；
+//! gate/AGC/limiter 由 Task 4 插入）→ 播放（路由/静音状态机→淡变→ALSA 写）；
+//! 控制线程独立服务 SEQPACKET。
 //! 停止：SIGTERM/SIGINT 置停止标志，各线程在时限内退出；设备打开失败立即退出，
 //! daemon 按退避重启（SPEC-02：换设备不做在线命令，由重启代替）。
 
 mod alsa_stream;
 mod capture;
 mod control;
+mod dsp;
 mod playback;
 mod route;
 mod state;
@@ -85,13 +87,19 @@ fn bind_control_socket(path: &Path) -> Result<Seqpacket, String> {
     Seqpacket::bind(path).map_err(|err| format!("bind {}: {err}", path.display()))
 }
 
-/// 处理线程：采集环 → 主干环。本任务恒等直通，DSP 阶段由 Task 3/4 插入。
+/// 处理线程：采集环 → 主干环。DSP 阶段（本任务：80 Hz 高通 + WOLA 谱降噪）
+/// 在采集环之后、direct 分支之前——direct 取的 48 kHz 主干含 DSP，与旧实现
+/// 一致。置信度返回值由 Task 4 的 VAD/打包消费。
 fn process_thread(
     capture_ring: Arc<Ring<RawFrame>>,
     trunk: Arc<Ring<RawFrame>>,
+    denoise: bool,
 ) -> Result<(), String> {
+    // DSP 状态为定长数组，构造后热路径零分配。
+    let mut dsp = dsp::Dsp::new(denoise);
     while !STOP.load(Ordering::Relaxed) {
-        if let Some(frame) = capture_ring.pop(Some(PROCESS_POLL)) {
+        if let Some(mut frame) = capture_ring.pop(Some(PROCESS_POLL)) {
+            dsp.process_frame(&mut frame);
             trunk.push(frame);
         }
     }
@@ -216,7 +224,8 @@ fn main() -> ExitCode {
     let process_handle = {
         let from = capture_ring.clone();
         let to = trunk.clone();
-        match spawn_thread("mozart-trunk", move || process_thread(from, to)) {
+        let denoise = config.pre.dsp.denoise;
+        match spawn_thread("mozart-trunk", move || process_thread(from, to, denoise)) {
             Ok(handle) => handle,
             Err(err) => return spawn_failure("process", err),
         }

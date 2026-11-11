@@ -45,6 +45,25 @@ pub struct PreConfig {
     pub playback_device: String,
     /// 采集 → DSP 环形队列容量（帧），1..=1024。
     pub capture_queue_frames: u32,
+    /// DSP 阶段开关（[pre.dsp] 段）。
+    pub dsp: PreDspConfig,
+}
+
+/// DSP 阶段配置。开关默认沿用旧 main.c 的代码默认（生产脚本曾用 --no-denoise
+/// 显式关闭）；禁用降噪时整级跳过（SPEC-02 已确认差异）。
+#[derive(Debug, Clone, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct PreDspConfig {
+    /// WOLA 谱降噪开关，默认 true；false 时该级全部计算跳过。
+    pub denoise: bool,
+}
+
+impl Default for PreDspConfig {
+    fn default() -> Self {
+        Self {
+            denoise: true,
+        }
+    }
 }
 
 impl Default for PreConfig {
@@ -54,6 +73,7 @@ impl Default for PreConfig {
             capture_device: "default".to_string(),
             playback_device: "default".to_string(),
             capture_queue_frames: 8,
+            dsp: PreDspConfig::default(),
         }
     }
 }
@@ -362,6 +382,7 @@ mod tests {
         assert_eq!(config.pre.capture_device, "default");
         assert_eq!(config.pre.playback_device, "default");
         assert_eq!(config.pre.capture_queue_frames, 8);
+        assert!(config.pre.dsp.denoise, "denoise 默认沿用旧 main.c 代码默认");
     }
 
     #[test]
@@ -386,6 +407,10 @@ mod tests {
         // 未写的键沿用默认。
         assert_eq!(config.pre.playback_device, "default");
         assert_eq!(config.pre.capture_queue_frames, 8);
+        assert!(config.pre.dsp.denoise);
+
+        let denoise_off: Config = toml::from_str("[pre.dsp]\ndenoise = false\n").unwrap();
+        assert!(!denoise_off.pre.dsp.denoise);
     }
 
     #[test]
@@ -429,6 +454,12 @@ mod tests {
 
         let unknown_pre_key: Result<Config, _> = toml::from_str("[pre]\nunknown_key = 1\n");
         assert!(unknown_pre_key.is_err());
+
+        let unknown_dsp_key: Result<Config, _> = toml::from_str("[pre.dsp]\nunknown_key = 1\n");
+        assert!(unknown_dsp_key.is_err());
+
+        let bad_denoise_type: Result<Config, _> = toml::from_str("[pre.dsp]\ndenoise = \"yes\"\n");
+        assert!(bad_denoise_type.is_err());
     }
 
     #[test]

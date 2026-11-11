@@ -58,6 +58,7 @@ node_modules/
 # ---- 音频、视频与交付物 ----
 *.wav
 *.flac
+*.f32
 *.mp3
 *.m4a
 *.mp4
@@ -68,6 +69,15 @@ node_modules/
 *.xlsx
 # 小型回归输入可以入库，必须显式列出。
 !tests/fixtures/**/*.wav
+# pre DSP 对拍夹具（旧 C 核心离线生成，来源与再生命令见 Task 3 报告）：
+# input.f32 输入信号（合成噪声 + 分段正弦，1 s / 48 kHz 单声道 f32）
+!tests/fixtures/dsp/input.f32
+# hp.f32 旧 C 高通输出参考（Rust 侧逐位一致验收）
+!tests/fixtures/dsp/hp.f32
+# wola.f32 旧 C WOLA 降噪输出参考（Rust 侧容差对拍验收）
+!tests/fixtures/dsp/wola.f32
+# counts.txt 旧 C 每 960 样本块的 WOLA 发射样本数（wrapper 帧对齐验收）
+!tests/fixtures/dsp/counts.txt
 
 # ---- 日志与本地数据 ----
 *.log
