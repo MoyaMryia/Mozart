@@ -99,6 +99,16 @@ fn switch_applies_route_and_mute() {
 }
 
 #[test]
+fn idle_connection_does_not_block_control() {
+    let daemon = DaemonProcess::start("idle", &example("pre_stub"), &example("rvc_stub"));
+    let _idle = daemon.connect();
+    let conn = daemon.connect();
+
+    let reply = call(&conn, ctl::DAEMON_GET_STATUS, b"");
+    assert_eq!(reply.status, "ok");
+}
+
+#[test]
 fn shutdown_stops_daemon() {
     let mut daemon = DaemonProcess::start("shutdown", &example("pre_stub"), &example("rvc_stub"));
     let conn = daemon.connect();

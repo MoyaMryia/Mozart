@@ -10,15 +10,18 @@ struct CtlEnv {
 
 impl CtlEnv {
     fn new(tag: &str) -> Self {
+        Self::with_config(
+            tag,
+            "[daemon]\nrpc_timeout_ms = 300\n\n[rvc]\nmodel_id = \"demo\"\n",
+        )
+    }
+
+    fn with_config(tag: &str, config_body: &str) -> Self {
         let dir = std::env::temp_dir().join(format!("mozart-ctl-{}-{tag}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         let config = dir.join("config.toml");
-        std::fs::write(
-            &config,
-            "[daemon]\nrpc_timeout_ms = 300\n\n[rvc]\nmodel_id = \"demo\"\n",
-        )
-        .unwrap();
+        std::fs::write(&config, config_body).unwrap();
         Self { dir, config }
     }
 
@@ -143,6 +146,32 @@ fn up_status_route_mute_down() {
 
     let down_again = env.run(&["down"]);
     assert_success(&down_again);
+}
+
+#[test]
+fn route_rejection_exits_4() {
+    let env = CtlEnv::with_config("reject", "[daemon]\nrpc_timeout_ms = 300\n");
+    let up = env.run(&["up"]);
+    assert_success(&up);
+
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        let status = status_json(&env);
+        if status.pre.is_some() && status.rvc.is_some() {
+            break;
+        }
+        assert!(Instant::now() < deadline, "children did not become ready");
+        std::thread::sleep(Duration::from_millis(50));
+    }
+
+    let output = env.run(&["route", "set", "rvc"]);
+    assert_eq!(
+        output.status.code(),
+        Some(4),
+        "stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(String::from_utf8_lossy(&output.stderr).contains("NotReady"));
 }
 
 #[test]

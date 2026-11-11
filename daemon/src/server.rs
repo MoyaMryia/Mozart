@@ -11,6 +11,7 @@ use std::io;
 use std::os::unix::fs::PermissionsExt;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
+use std::thread;
 use std::time::Duration;
 
 const IDLE_TIMEOUT: Duration = Duration::from_secs(30);
@@ -41,7 +42,7 @@ pub fn serve(config: &Config) -> io::Result<()> {
         running.clone(),
     )?;
 
-    let outcome = accept_loop(&listener, &state, &services, &config);
+    let outcome = accept_loop(&listener, &state, &services, &config, &running);
     running.store(false, Ordering::Release);
     for supervisor in supervisors {
         supervisor.join();
@@ -74,25 +75,36 @@ fn lock_instance(config: &Config) -> io::Result<File> {
     Ok(file)
 }
 
-enum Flow {
-    Continue,
-    Shutdown,
-}
-
 fn accept_loop(
     listener: &Seqpacket,
-    state: &Mutex<State>,
-    services: &Services,
-    config: &Config,
+    state: &Arc<Mutex<State>>,
+    services: &Arc<Services>,
+    config: &Arc<Config>,
+    running: &Arc<AtomicBool>,
 ) -> io::Result<()> {
-    loop {
-        let conn = listener.accept()?;
-        match serve_connection(&conn, state, services, config) {
-            Ok(Flow::Continue) => {}
-            Ok(Flow::Shutdown) => return Ok(()),
-            Err(err) => eprintln!("mozart-daemon: control connection: {err}"),
+    while running.load(Ordering::Acquire) {
+        match listener.wait_readable(Some(Duration::from_millis(100))) {
+            Ok(()) => match listener.accept() {
+                Ok(conn) => {
+                    let state = state.clone();
+                    let services = services.clone();
+                    let config = config.clone();
+                    let running = running.clone();
+                    thread::spawn(move || {
+                        if let Err(err) =
+                            serve_connection(&conn, &state, &services, &config, &running)
+                        {
+                            eprintln!("mozart-daemon: control connection: {err}");
+                        }
+                    });
+                }
+                Err(err) => eprintln!("mozart-daemon: accept: {err}"),
+            },
+            Err(err) if err.kind() == io::ErrorKind::TimedOut => {}
+            Err(err) => return Err(err),
         }
     }
+    Ok(())
 }
 
 fn serve_connection(
@@ -100,7 +112,8 @@ fn serve_connection(
     state: &Mutex<State>,
     services: &Services,
     config: &Config,
-) -> io::Result<Flow> {
+    running: &AtomicBool,
+) -> io::Result<()> {
     loop {
         let msg = match conn.recv(Some(IDLE_TIMEOUT)) {
             Ok(msg) => msg,
@@ -108,7 +121,7 @@ fn serve_connection(
                 if err.kind() == io::ErrorKind::TimedOut
                     || err.kind() == io::ErrorKind::UnexpectedEof =>
             {
-                return Ok(Flow::Continue);
+                return Ok(());
             }
             Err(err) => return Err(err),
         };
@@ -117,7 +130,8 @@ fn serve_connection(
         let request_id = msg.header.request_id;
         conn.send(type_, request_id, &reply)?;
         if shutdown {
-            return Ok(Flow::Shutdown);
+            running.store(false, Ordering::Release);
+            return Ok(());
         }
     }
 }

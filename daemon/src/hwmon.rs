@@ -39,7 +39,7 @@ impl Monitor {
         let gpu_load = std::fs::read_to_string(GPU_LOAD_PATH)
             .ok()
             .and_then(|text| text.trim().parse::<f64>().ok())
-            .map(|raw| raw / 10.0);
+            .map(|raw| (raw / 10.0).clamp(0.0, 100.0));
         let gpu_available = GPU_DEVICES.iter().any(|path| Path::new(path).exists());
         HardwareStatus {
             cpu_percent,
@@ -50,6 +50,7 @@ impl Monitor {
             gpu: GpuInfo {
                 available: gpu_available,
                 load_percent: gpu_load,
+                // Jetson 统一内存：GPU 与 CPU 共用同一内存池，GPU 内存字段取宿主内存。
                 memory_total_bytes: memory_total,
                 memory_used_bytes: memory_used,
             },

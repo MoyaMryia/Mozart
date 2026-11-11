@@ -8,7 +8,7 @@ use mozart_core::ctl::{self, Seqpacket};
 use serde_json::json;
 use std::io;
 use std::path::PathBuf;
-use std::sync::{Mutex, MutexGuard};
+use std::sync::{Mutex, MutexGuard, TryLockError};
 use std::time::Duration;
 
 pub struct Services {
@@ -107,7 +107,10 @@ impl ServiceLink {
 
     fn call(&mut self, type_: u16, body: &[u8]) -> Result<Response, CallError> {
         if self.conn.is_none() {
-            self.connect_and_hello().map_err(CallError::Transport)?;
+            if let Err(err) = self.connect_and_hello() {
+                self.conn = None;
+                return Err(CallError::Transport(err));
+            }
         }
         match self.roundtrip(type_, body) {
             Ok(response) => Ok(response),
@@ -121,7 +124,13 @@ impl ServiceLink {
     fn connect_and_hello(&mut self) -> io::Result<()> {
         let conn = Seqpacket::connect(&self.socket)?;
         self.conn = Some(conn);
-        let response = self.roundtrip(self.hello, b"{}")?;
+        let response = match self.roundtrip(self.hello, b"{}") {
+            Ok(response) => response,
+            Err(err) => {
+                self.conn = None;
+                return Err(err);
+            }
+        };
         if response.status != "ok" {
             self.conn = None;
             return Err(io::Error::other(format!(
@@ -133,20 +142,26 @@ impl ServiceLink {
     }
 
     fn roundtrip(&mut self, type_: u16, body: &[u8]) -> io::Result<Response> {
-        let Some(conn) = self.conn.as_ref() else {
-            return Err(io::Error::new(
-                io::ErrorKind::NotConnected,
-                "control link is not connected",
-            ));
-        };
+        let conn = self
+            .conn
+            .as_ref()
+            .expect("control link must be connected before roundtrip");
         self.next_request = self.next_request.wrapping_add(1);
-        conn.send(type_, self.next_request, body)?;
+        let request_id = self.next_request;
+        conn.send(type_, request_id, body)?;
         let msg = conn.recv(Some(self.timeout))?;
         let reply_type = msg.header.type_;
+        let reply_id = msg.header.request_id;
         if reply_type != type_ {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
                 "response type mismatch",
+            ));
+        }
+        if reply_id != request_id {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "response request_id mismatch",
             ));
         }
         serde_json::from_slice(&msg.body).map_err(io::Error::other)
@@ -189,7 +204,9 @@ fn switch_direct(state: &Mutex<State>, services: &Services) -> Result<Route, (St
         pre.call_ok(ctl::PRE_SET_ROUTE, br#"{"route":"direct"}"#)
             .map_err(CallError::into_rejection)?;
     }
-    let _ = stop_rvc_stream(services);
+    if let Err(err) = stop_rvc_stream(services) {
+        lock_state(state).push_degraded(format!("rvc stream stop: {}", err.describe()));
+    }
     lock_state(state).commit_route(Route::Direct);
     Ok(Route::Direct)
 }
@@ -199,12 +216,6 @@ fn switch_rvc(
     services: &Services,
     config: &Config,
 ) -> Result<Route, (String, String)> {
-    if config.rvc.model_id.is_empty() {
-        return Err((
-            ctl::CODE_NOT_READY.to_string(),
-            "rvc.model_id is not configured".to_string(),
-        ));
-    }
     let status = {
         let mut rvc = services.rvc();
         let response = rvc
@@ -213,9 +224,10 @@ fn switch_rvc(
         serde_json::from_value::<RvcStatus>(response.data)
             .map_err(|err| (ctl::CODE_INTERNAL.to_string(), err.to_string()))?
     };
-    let model_matches = status.model_id.as_deref() == Some(config.rvc.model_id.as_str());
+    let model_id = resolve_model_id(config, &status)?;
+    let model_matches = status.model_id.as_deref() == Some(model_id.as_str());
     if status.state != "streaming" || !model_matches {
-        start_rvc_stream(services, config).map_err(CallError::into_rejection)?;
+        start_rvc_stream(services, config, &model_id).map_err(CallError::into_rejection)?;
     }
 
     let pre_result = {
@@ -224,7 +236,9 @@ fn switch_rvc(
             .map_err(CallError::into_rejection)
     };
     if let Err(rejection) = pre_result {
-        let _ = stop_rvc_stream(services);
+        if let Err(err) = stop_rvc_stream(services) {
+            lock_state(state).push_degraded(format!("rvc stream rollback: {}", err.describe()));
+        }
         return Err(rejection);
     }
 
@@ -232,10 +246,26 @@ fn switch_rvc(
     Ok(Route::Rvc)
 }
 
-fn start_rvc_stream(services: &Services, config: &Config) -> Result<(), CallError> {
+fn resolve_model_id(config: &Config, status: &RvcStatus) -> Result<String, (String, String)> {
+    if !config.rvc.model_id.is_empty() {
+        return Ok(config.rvc.model_id.clone());
+    }
+    status.model_id.clone().ok_or_else(|| {
+        (
+            ctl::CODE_NOT_READY.to_string(),
+            "no model loaded and rvc.model_id is empty".to_string(),
+        )
+    })
+}
+
+fn start_rvc_stream(
+    services: &Services,
+    config: &Config,
+    model_id: &str,
+) -> Result<(), CallError> {
     let handle = {
         let mut rvc = services.rvc();
-        let body = json!({"model_id": config.rvc.model_id}).to_string();
+        let body = json!({"model_id": model_id}).to_string();
         let response = rvc.call_ok(ctl::RVC_LOAD_MODEL, body.as_bytes())?;
         response
             .data
@@ -291,7 +321,15 @@ pub fn poll(state: &Mutex<State>, services: &Services, config: &Config) {
     let pre_status = poll_pre(services, &mut degraded);
     let rvc_status = poll_rvc(services, &mut degraded);
 
-    if let Ok(_transition) = services.transition.try_lock() {
+    let transition = match services.transition.try_lock() {
+        Ok(guard) => Some(guard),
+        Err(TryLockError::WouldBlock) => None,
+        Err(TryLockError::Poisoned(poisoned)) => {
+            degraded.push("transition lock poisoned; recovered".to_string());
+            Some(poisoned.into_inner())
+        }
+    };
+    if let Some(_transition) = transition {
         reconcile(
             state,
             services,
@@ -370,17 +408,20 @@ fn reconcile(
 
     if let Some(status) = rvc_status {
         match active {
-            Route::Rvc => {
-                let model_matches =
-                    status.model_id.as_deref() == Some(config.rvc.model_id.as_str());
-                if !config.rvc.model_id.is_empty()
-                    && (status.state != "streaming" || !model_matches)
-                {
-                    if let Err(err) = start_rvc_stream(services, config) {
-                        degraded.push(format!("rvc stream apply: {}", err.describe()));
+            Route::Rvc => match resolve_model_id(config, status) {
+                Ok(model_id) => {
+                    let model_matches =
+                        status.model_id.as_deref() == Some(model_id.as_str());
+                    if status.state != "streaming" || !model_matches {
+                        if let Err(err) = start_rvc_stream(services, config, &model_id) {
+                            degraded.push(format!("rvc stream apply: {}", err.describe()));
+                        }
                     }
                 }
-            }
+                Err((code, reason)) => {
+                    degraded.push(format!("rvc stream apply: {code}: {reason}"));
+                }
+            },
             Route::Direct => {
                 if status.state == "streaming" {
                     if let Err(err) = stop_rvc_stream(services) {

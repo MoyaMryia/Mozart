@@ -7,7 +7,7 @@ use std::fs::OpenOptions;
 use std::io;
 use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
-use std::process::{Command, ExitCode, Stdio};
+use std::process::{Child, Command, ExitCode, Stdio};
 use std::time::{Duration, Instant};
 
 const EXIT_ERROR: u8 = 1;
@@ -115,10 +115,19 @@ fn up(config: &Config, config_path: Option<&Path>, json_output: bool) -> Result<
             format!("create {}: {err}", config.log_dir().display()),
         )
     })?;
-    spawn_daemon(config, config_path)?;
+    let mut child = spawn_daemon(config, config_path)?;
 
     let deadline = Instant::now() + Duration::from_millis(config.daemon.start_timeout_ms);
     loop {
+        if let Some(status) = child
+            .try_wait()
+            .map_err(|err| CliError::new(EXIT_ERROR, err.to_string()))?
+        {
+            return Err(CliError::new(
+                EXIT_ERROR,
+                format!("daemon exited during startup: {status}"),
+            ));
+        }
         match probe(config) {
             Ok(_) => {
                 print_state(json_output, "running", "daemon started");
@@ -237,7 +246,7 @@ fn probe(config: &Config) -> io::Result<Response> {
     request(&conn, ctl::DAEMON_HELLO, b"{}", config.daemon.rpc_timeout_ms)
 }
 
-fn spawn_daemon(config: &Config, config_path: Option<&Path>) -> Result<(), CliError> {
+fn spawn_daemon(config: &Config, config_path: Option<&Path>) -> Result<Child, CliError> {
     let bin = daemon_binary();
     let log_path = config.log_dir().join("daemon.log");
     let log = OpenOptions::new()
@@ -271,8 +280,7 @@ fn spawn_daemon(config: &Config, config_path: Option<&Path>) -> Result<(), CliEr
             EXIT_ERROR,
             format!("spawn {}: {err}", bin.display()),
         )
-    })?;
-    Ok(())
+    })
 }
 
 fn daemon_binary() -> PathBuf {
@@ -305,10 +313,15 @@ fn is_unreachable(err: &io::Error) -> bool {
 }
 
 fn classify_io(err: io::Error) -> CliError {
-    if err.kind() == io::ErrorKind::TimedOut {
-        CliError::new(EXIT_TIMEOUT, err.to_string())
-    } else {
-        CliError::new(EXIT_UNREACHABLE, err.to_string())
+    match err.kind() {
+        io::ErrorKind::TimedOut => CliError::new(EXIT_TIMEOUT, err.to_string()),
+        io::ErrorKind::NotFound
+        | io::ErrorKind::ConnectionRefused
+        | io::ErrorKind::ConnectionReset
+        | io::ErrorKind::BrokenPipe
+        | io::ErrorKind::UnexpectedEof
+        | io::ErrorKind::NotConnected => CliError::new(EXIT_UNREACHABLE, err.to_string()),
+        _ => CliError::new(EXIT_ERROR, err.to_string()),
     }
 }
 

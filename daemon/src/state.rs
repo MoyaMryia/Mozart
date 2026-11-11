@@ -121,6 +121,12 @@ impl State {
         self.degraded = reasons;
     }
 
+    pub fn push_degraded(&mut self, reason: String) {
+        if !self.degraded.contains(&reason) {
+            self.degraded.push(reason);
+        }
+    }
+
     pub fn process_starting(&mut self, role: Role) {
         let info = self.process_mut(role);
         info.state = ProcessState::Starting;

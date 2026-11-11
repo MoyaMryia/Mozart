@@ -279,6 +279,13 @@ impl Seqpacket {
             let header = Header::from_bytes(&buf[..n])
                 .and_then(Header::ensure_version)
                 .map_err(protocol_io)?;
+            let body_len = header.body_len as usize;
+            if body_len != n - HEADER_BYTES {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "control body length mismatch",
+                ));
+            }
             return Ok(Message {
                 header,
                 body: buf[HEADER_BYTES..n].to_vec(),
@@ -286,7 +293,7 @@ impl Seqpacket {
         }
     }
 
-    fn wait_readable(&self, timeout: Option<Duration>) -> io::Result<()> {
+    pub fn wait_readable(&self, timeout: Option<Duration>) -> io::Result<()> {
         let mut pollfd = libc::pollfd {
             fd: self.fd.as_raw_fd(),
             events: libc::POLLIN,
@@ -437,6 +444,25 @@ mod tests {
         let body = vec![0u8; MAX_BODY_BYTES + 1];
         let err = a.send(DAEMON_HELLO, 1, &body).unwrap_err();
         assert_eq!(err.kind(), io::ErrorKind::InvalidInput);
+    }
+
+    #[test]
+    fn recv_rejects_body_length_mismatch() {
+        let (a, b) = socketpair();
+        let mut packet = Header::new(PRE_GET_STATUS, 3, 5).to_bytes().to_vec();
+        packet.extend_from_slice(b"{}");
+        // SAFETY: packet 缓冲区有效；a 是测试内创建的 SEQPACKET 套接字。
+        let sent = unsafe {
+            libc::send(
+                a.fd.as_raw_fd(),
+                packet.as_ptr().cast(),
+                packet.len(),
+                libc::MSG_NOSIGNAL,
+            )
+        };
+        assert_eq!(sent as usize, packet.len());
+        let err = b.recv(Some(Duration::from_secs(1))).unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::InvalidData);
     }
 
     #[test]
