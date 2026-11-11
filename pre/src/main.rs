@@ -21,6 +21,7 @@ use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
+use std::thread::JoinHandle;
 use std::time::Duration;
 
 /// 主干环（处理 → 播放）容量：8 帧，与采集环默认同量级；未配置化（YAGNI，Task 3/4 复核）。
@@ -105,6 +106,41 @@ where
     std::thread::Builder::new().name(name.to_string()).spawn(body)
 }
 
+/// 设备线程致命错误传播（审查修正点）：返回 Err 前先置停止标志。
+/// main 按固定顺序 join；只靠 main 在 join 结果里补置时，排在死亡线程
+/// 之前的健康线程（如 playback 先死时的 capture）不会退出，main 永远
+/// 阻塞在它的 join 上。设备线程必须自己传播停止，其余线程才能有序退出。
+fn stop_on_fatal(stop: &AtomicBool, result: Result<(), String>) -> Result<(), String> {
+    if result.is_err() {
+        stop.store(true, Ordering::Relaxed);
+    }
+    result
+}
+
+/// 依序回收线程。线程返回 Err（致命设备错误、无进展降级）或 panic 时
+/// 置停止标志，让其余线程在时限内退出，主线程得以收尾并失败退出；
+/// daemon 按退避重启（SPEC-02：换设备由重启代替）。
+/// 设备线程返回 Err 前已自置标志（stop_on_fatal）；此处幂等补置兜底。
+fn join_threads(handles: Vec<(&'static str, JoinHandle<Result<(), String>>)>) -> Option<String> {
+    let mut failure = None;
+    for (name, handle) in handles {
+        match handle.join() {
+            Ok(Ok(())) => {}
+            Ok(Err(message)) => {
+                // 线程致命错误：同样置停止标志，否则其余线程永不退出，进程挂起。
+                STOP.store(true, Ordering::Relaxed);
+                failure = failure.or(Some(format!("{name}: {message}")));
+            }
+            Err(_) => {
+                // 线程 panic：置停止标志让其余线程退出后一并回收。
+                STOP.store(true, Ordering::Relaxed);
+                failure = failure.or(Some(format!("{name}: panicked")));
+            }
+        }
+    }
+    failure
+}
+
 fn main() -> ExitCode {
     let args = match parse_args() {
         Ok(args) => args,
@@ -170,7 +206,7 @@ fn main() -> ExitCode {
         let ring = capture_ring.clone();
         let shared = shared.clone();
         match spawn_thread("mozart-capture", move || {
-            capture::run(capture_pcm, ring, shared, &STOP)
+            stop_on_fatal(&STOP, capture::run(capture_pcm, ring, shared, &STOP))
         }) {
             Ok(handle) => handle,
             Err(err) => return spawn_failure("capture", err),
@@ -188,7 +224,7 @@ fn main() -> ExitCode {
     let playback_handle = {
         let shared = shared.clone();
         match spawn_thread("mozart-playback", move || {
-            playback::run(playback_pcm, trunk, shared, &STOP)
+            stop_on_fatal(&STOP, playback::run(playback_pcm, trunk, shared, &STOP))
         }) {
             Ok(handle) => handle,
             Err(err) => return spawn_failure("playback", err),
@@ -206,23 +242,12 @@ fn main() -> ExitCode {
         }
     };
 
-    let mut failure: Option<String> = None;
-    for (name, handle) in [
+    let failure = join_threads(vec![
         ("capture", capture_handle),
         ("process", process_handle),
         ("playback", playback_handle),
         ("control", control_handle),
-    ] {
-        match handle.join() {
-            Ok(Ok(())) => {}
-            Ok(Err(message)) => failure = failure.or(Some(format!("{name}: {message}"))),
-            Err(_) => {
-                // 线程 panic：置停止标志让其余线程退出后一并回收。
-                STOP.store(true, Ordering::Relaxed);
-                failure = failure.or(Some(format!("{name}: panicked")));
-            }
-        }
-    }
+    ]);
     match failure {
         Some(message) => {
             eprintln!("mozart-pre: {message}");
@@ -243,5 +268,37 @@ fn log_stream_setup(role: &str, device: &str, pcm: &alsa::pcm::PCM) {
             eprintln!("mozart-pre: {role} device {device} ready (period {period}, buffer {buffer})");
         }
         Err(err) => eprintln!("mozart-pre: {role} device {device} ready (params unknown: {err})"),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// 线程返回 Err（致命设备错误、无进展降级）必须置停止标志，其余线程据此
+    /// 退出、主线程得以收尾（审查修正点）；正常退出不得置。
+    /// 全局 STOP 在本 crate 测试中仅本用例使用，串行操纵不与其他用例竞争。
+    #[test]
+    fn thread_fatal_error_sets_stop_flag() {
+        // 传播点一：设备线程返回 Err 前自置停止标志——playback 先死时 main
+        // 还阻塞在 capture join，靠它让 capture 有序退出。
+        STOP.store(false, Ordering::Relaxed);
+        assert!(stop_on_fatal(&STOP, Err("fatal stream error".to_string())).is_err());
+        assert!(STOP.load(Ordering::Relaxed), "设备线程返回 Err 前必须置停止标志");
+        STOP.store(false, Ordering::Relaxed);
+        assert!(stop_on_fatal(&STOP, Ok(())).is_ok());
+        assert!(!STOP.load(Ordering::Relaxed), "正常退出不得置停止标志");
+
+        // 传播点二：join 循环对 Err 同样补置（幂等兜底）；正常退出不置。
+        let ok = std::thread::spawn(|| Ok::<(), String>(()));
+        assert_eq!(join_threads(vec![("ok", ok)]), None);
+        assert!(!STOP.load(Ordering::Relaxed), "正常退出不得置停止标志");
+        let err = std::thread::spawn(|| Err::<(), String>("fatal device error".to_string()));
+        assert_eq!(
+            join_threads(vec![("err", err)]),
+            Some("err: fatal device error".to_string())
+        );
+        assert!(STOP.load(Ordering::Relaxed), "线程返回 Err 必须置停止标志");
+        STOP.store(false, Ordering::Relaxed);
     }
 }

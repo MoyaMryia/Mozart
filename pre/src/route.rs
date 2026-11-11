@@ -3,6 +3,9 @@
 //! 切换次序沿用旧实现（main.c:704-713,768-770）：
 //! - rvc→direct：立即切源，从零淡入；
 //! - direct→rvc：先淡出完成再切源，随后淡入（统一增益路径下新源必须淡入，否则从零硬起）。
+//!   过零落在帧内时，本帧剩余样本保持零增益（选源发生在帧边界，帧内剩余样本
+//!   仍来自旧源），淡入推迟到下一帧首个新源样本（旧 fade_apply 的零保持语义，
+//!   杜绝旧源回淡入尾巴与新源满增益硬起）。
 //! - 淡出途中重新要求当前源：中止淡出并回淡入（重入保护，SPEC-02 改进点）。
 //! 本模块是纯逻辑，不触碰设备与共享状态，逐分支单测覆盖。
 
@@ -22,8 +25,10 @@ fn fade_step() -> f32 {
 enum Phase {
     /// 增益稳定在 1，route == target。
     Stable,
-    /// 当前源淡出到 0；完成后切到 target 并转淡入。
+    /// 当前源淡出到 0；过零后切到 target 并转零保持。
     FadingOut,
+    /// 已过零并切源：本帧剩余样本保持零增益（仍来自旧源），下一帧起淡入。
+    Switched,
     /// 当前源从 0 淡入到 1，route == target。
     FadingIn,
 }
@@ -75,7 +80,12 @@ impl Router {
     }
 
     /// 对一帧样本应用当前增益并推进状态；先推进后相乘（旧 fade_apply 语义）。
+    /// 过零切源后本帧剩余样本保持零增益（选源发生在帧边界、先于 apply，
+    /// 帧内剩余样本仍来自旧源）；淡入推迟到下一帧首个新源样本。
     pub fn apply(&mut self, samples: &mut [f32]) {
+        if self.phase == Phase::Switched {
+            self.phase = Phase::FadingIn;
+        }
         let step = fade_step();
         for sample in samples {
             match self.phase {
@@ -90,9 +100,10 @@ impl Router {
                     self.gain = (self.gain - step).max(0.0);
                     if self.gain <= 0.0 {
                         self.route = self.target;
-                        self.phase = Phase::FadingIn;
+                        self.phase = Phase::Switched;
                     }
                 }
+                Phase::Switched => {}
             }
             *sample *= self.gain;
         }
@@ -135,6 +146,7 @@ impl Mute {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use mozart_core::RAW_SAMPLES;
 
     /// 逐样本推进，返回每样本实际增益；淡变有 480 步 f32 累积，时序有 ±1 样本舍入。
     fn drive_router(router: &mut Router, samples: usize) -> Vec<f32> {
@@ -145,6 +157,13 @@ mod tests {
             gains.push(probe[0]);
         }
         gains
+    }
+
+    /// 按播放线程粒度驱动一帧（960 样本），返回该帧逐样本实际增益（输入恒 1）。
+    fn drive_frame(router: &mut Router) -> [f32; RAW_SAMPLES] {
+        let mut probe = [1.0f32; RAW_SAMPLES];
+        router.apply(&mut probe);
+        probe
     }
 
     fn drive_mute(mute: &mut Mute, samples: usize) -> Vec<f32> {
@@ -174,27 +193,33 @@ mod tests {
 
     #[test]
     fn switch_to_rvc_fades_out_before_switching() {
+        // 按播放线程粒度驱动：请求在帧边界读入，选源先于 apply（playback.rs 次序）。
         let mut router = Router::new(Route::Direct);
         router.request(Route::Rvc);
         assert_eq!(router.route(), Route::Direct);
 
-        // 前 480 样本：direct 从 1 线性淡出。
-        let gains = drive_router(&mut router, FADE_SAMPLES + 8);
-        for (i, &gain) in gains.iter().take(FADE_SAMPLES - 2).enumerate() {
+        // 第一帧：前 480 样本从 1 线性淡出，帧内过零。
+        let frame = drive_frame(&mut router);
+        for (i, &gain) in frame.iter().take(FADE_SAMPLES - 2).enumerate() {
             assert_close(gain, 1.0 - (i + 1) as f32 / FADE_SAMPLES as f32);
         }
-        // 淡出段单调不增；末对跨越切源点，不计入。
-        for pair in gains.windows(2).take(FADE_SAMPLES - 1) {
-            assert!(pair[0] >= pair[1], "淡出必须单调不增：{pair:?}");
+        // 全帧单调不增；过零样本及帧内剩余样本保持零增益——帧内剩余样本
+        // 仍来自旧源，回淡入会形成 10 ms 旧源尾巴（审查修正点）。
+        for pair in frame.windows(2) {
+            assert!(pair[0] >= pair[1], "淡出帧必须单调不增：{pair:?}");
         }
-        // 淡出末尾近零，随后切源并从零淡入。
-        assert!(gains[FADE_SAMPLES - 1] <= EPS);
+        for (i, &gain) in frame.iter().enumerate().skip(FADE_SAMPLES - 1) {
+            assert!(gain <= EPS, "过零后帧内样本必须保持零：样本 {i} 增益 {gain}");
+        }
+        // 帧内已切源，但淡入尚未开始（增益为零）。
         assert_eq!(router.route(), Route::Rvc);
-        assert!(gains[FADE_SAMPLES + 7] > 0.0);
 
-        // 淡入在 480±1 样本内完成并稳态：增益钳位到精确 1.0。
-        let gains = drive_router(&mut router, FADE_SAMPLES + 8);
-        assert_eq!(gains[FADE_SAMPLES + 7], 1.0);
+        // 第二帧：帧边界请求同目标幂等；样本已真正来自新源，才从零淡入。
+        router.request(Route::Rvc);
+        let frame = drive_frame(&mut router);
+        assert_close(frame[0], 1.0 / FADE_SAMPLES as f32);
+        assert_close(frame[FADE_SAMPLES - 1], 1.0);
+        assert_eq!(frame[RAW_SAMPLES - 1], 1.0);
         assert_eq!(router.route(), Route::Rvc);
 
         // 稳态输出等于输入。
@@ -252,7 +277,8 @@ mod tests {
         router.request(Route::Rvc);
         assert_eq!(router.route(), Route::Direct);
         let gains = drive_router(&mut router, FADE_SAMPLES + 8);
-        // 增益半程起降，240 样本内到零；到零即切源并回淡入。
+        // 增益半程起降，240 样本内到零；过零后切源，淡入推迟到下一帧
+        // （逐样本驱动帧长为 1，即下一样本起淡入）。
         assert!(gains.iter().any(|&gain| gain <= EPS), "必须经过零点再切源");
         assert_eq!(router.route(), Route::Rvc);
         assert!(gains[FADE_SAMPLES + 7] > 0.0, "切源后进入淡入");
