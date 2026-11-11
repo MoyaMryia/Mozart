@@ -31,7 +31,6 @@ fn serves_status_and_validates_commands() {
     assert_eq!(status.processes.pre.state, ProcessState::Running);
     assert_eq!(status.processes.rvc.state, ProcessState::Running);
     assert!(status.processes.pre.pid.is_some());
-    assert!(status.hw.is_none());
     assert_eq!(status.daemon.version, env!("CARGO_PKG_VERSION"));
 
     let direct = call(&conn, ctl::DAEMON_ROUTE_SET, br#"{"route":"direct"}"#);

@@ -1,3 +1,4 @@
+mod hwmon;
 mod poller;
 mod server;
 mod services;

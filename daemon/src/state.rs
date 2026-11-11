@@ -1,6 +1,6 @@
 use mozart_core::ctl::schema::{
-    Activity, ArbiterState, DaemonInfo, ExitInfo, GpuState, PreStatus, ProcessInfo, ProcessState,
-    Processes, Route, RouteState, RvcStatus, Status,
+    Activity, ArbiterState, DaemonInfo, ExitInfo, GpuState, HardwareStatus, PreStatus, ProcessInfo,
+    ProcessState, Processes, Route, RouteState, RvcStatus, Status,
 };
 use std::sync::{Mutex, MutexGuard};
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
@@ -27,6 +27,7 @@ pub struct State {
     processes: Processes,
     pre: Option<PreStatus>,
     rvc: Option<RvcStatus>,
+    hw: Option<HardwareStatus>,
     degraded: Vec<String>,
 }
 
@@ -45,6 +46,7 @@ impl State {
             },
             pre: None,
             rvc: None,
+            hw: None,
             degraded: Vec::new(),
         }
     }
@@ -70,7 +72,7 @@ impl State {
             processes: self.processes.clone(),
             pre: self.pre.clone(),
             rvc: self.rvc.clone(),
-            hw: None,
+            hw: self.hw.clone(),
             degraded: self.degraded.clone(),
         }
     }
@@ -109,6 +111,10 @@ impl State {
 
     pub fn set_rvc_status(&mut self, status: Option<RvcStatus>) {
         self.rvc = status;
+    }
+
+    pub fn set_hw(&mut self, hw: Option<HardwareStatus>) {
+        self.hw = hw;
     }
 
     pub fn set_degraded(&mut self, reasons: Vec<String>) {
