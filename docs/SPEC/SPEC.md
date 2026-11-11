@@ -75,3 +75,9 @@
 - 2026-11-11：播报投递队列定为有界内存、不落盘；在途队列均内存，译文存档仍走 subtitles.jsonl。
 - 2026-11-11：播报 TTS 定为独立 Rust 进程（链 sherpa TTS 库），合成后喂 RVC 链路；接入细节入 FUTURE。
 - 2026-11-11：桥到 TTS 接口定为 Unix socket + 自有协议（区别于 llama-server 的 HTTP）。
+- 2026-11-11：同音字纠错确认保留，Rust 复现并与旧实现逐条对拍。
+- 2026-11-11：提前断句（stable_clauses）与断句模型推迟到 FUTURE，第一版整句翻译。
+- 2026-11-11：确认 RPC 超时覆盖 connect/send/recv、PDEATHSIG 孤儿防护与关停幂等。
+- 2026-11-11：灵活变速推迟到 FUTURE，第一版播报原速；拉伸 C 库 libmozart-tempo 保留备用。
+- 2026-11-11：filter_radius 定为保留 FUTURE 提升项、推迟实现，v1 不暴露死参数。
+- 2026-11-11：播报音频由 TTS 进程内重采样到 16 kHz 契约帧，RVC 输入统一 16 kHz；rvc 待讨论清空。
