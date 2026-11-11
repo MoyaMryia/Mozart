@@ -1,6 +1,8 @@
 //! 控制面信封与 SEQPACKET 传输，对应 core/include/mozart/ctl.h。
 //! 修改 C 头后必须同步本文件；布局由编译期断言保证。
 
+pub mod schema;
+
 use std::fmt;
 use std::io;
 use std::mem;

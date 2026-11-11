@@ -1,6 +1,7 @@
 //! 帧契约镜像与控制面信封，对应 core/include/mozart/frame.h 与 ctl.h。
 //! 修改 C 头后必须同步本文件；布局由编译期断言保证。
 
+pub mod config;
 pub mod ctl;
 
 pub const RAW_SAMPLE_RATE: u32 = 48000;
