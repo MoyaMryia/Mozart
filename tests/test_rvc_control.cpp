@@ -38,22 +38,19 @@ int g_fail = 0;
     else { std::printf("  FAIL %s\n", msg); ++g_fail; } } while (0)
 
 // ---- 桩后端 ----
-struct FakeWorker : StreamWorker {
-    bool stopped = false;
-    int resets = 0;
-    WorkerStats canned{};
+// StopStream 后 StreamSession 会销毁 worker；stop/reset 的观测走后端侧
+// 原子计数器，不回读已销毁的 worker 对象（悬垂指针）。
+struct FakeBackend;
 
-    void stop() override { stopped = true; }
-    void reset() override { ++resets; }
-    WorkerStats stats() override {
-        WorkerStats out = canned;
-        out.frames_in = 10;
-        out.frames_out = 9;
-        out.frames_dropped = 1;
-        out.blocks = 2;
-        out.queue_depth = 3;
-        return out;
-    }
+struct FakeWorker : StreamWorker {
+    explicit FakeWorker(FakeBackend& owner) : owner_(owner) {}
+
+    void stop() override;
+    void reset() override;
+    WorkerStats stats() override;
+
+private:
+    FakeBackend& owner_;
 };
 
 struct FakeBackend : SessionBackend {
@@ -61,7 +58,8 @@ struct FakeBackend : SessionBackend {
     bool allow_realtime = true;
     bool allow_file = true;
     bool fail_start = false;
-    FakeWorker* last_worker = nullptr;
+    std::atomic<int> stop_calls{0};
+    std::atomic<int> reset_calls{0};
 
     LoadResult load_model(const std::string& model_id, std::string& reason) override {
         if (model_id == "missing") {
@@ -93,13 +91,23 @@ struct FakeBackend : SessionBackend {
         }
         last_params = params;
         last_realtime = realtime;
-        auto worker = std::make_unique<FakeWorker>();
-        last_worker = worker.get();
-        return worker;
+        return std::make_unique<FakeWorker>(*this);
     }
     RvcParameters last_params{};
     bool last_realtime = false;
 };
+
+void FakeWorker::stop() { owner_.stop_calls.fetch_add(1); }
+void FakeWorker::reset() { owner_.reset_calls.fetch_add(1); }
+WorkerStats FakeWorker::stats() {
+    WorkerStats out{};
+    out.frames_in = 10;
+    out.frames_out = 9;
+    out.frames_dropped = 1;
+    out.blocks = 2;
+    out.queue_depth = 3;
+    return out;
+}
 
 // ---- 应答解析 ----
 struct Reply {
@@ -365,7 +373,7 @@ int main() {
         // 停流后：状态回到 loaded，计数保留最终快照。
         parse_reply(session->handle(make_message(
             MOZART_CTL_RVC_STOP_STREAM, nlohmann::json::object())));
-        CHECK(backend->last_worker && backend->last_worker->stopped,
+        CHECK(backend->stop_calls.load() >= 1,
               "stop reaches the worker");
         reply = parse_reply(session->handle(make_message(
             MOZART_CTL_RVC_GET_STATUS, nlohmann::json::object())));
@@ -391,7 +399,7 @@ int main() {
             MOZART_CTL_RVC_START_STREAM, start_body(1))));
         parse_reply(session->handle(make_message(
             MOZART_CTL_RVC_RESET_STREAM, nlohmann::json::object())));
-        CHECK(backend->last_worker && backend->last_worker->resets == 1,
+        CHECK(backend->reset_calls.load() == 1,
               "reset reaches the active stream");
         CHECK(parse_reply(session->handle(make_message(
                   MOZART_CTL_DAEMON_HELLO, nlohmann::json::object())))
