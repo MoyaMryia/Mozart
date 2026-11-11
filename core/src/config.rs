@@ -45,6 +45,10 @@ pub struct EndpointConfig {
 #[serde(default, deny_unknown_fields)]
 pub struct RvcConfig {
     pub socket: String,
+    /// 数据面：rvc 绑定收输入帧，pre 连接发送。
+    pub input_socket: String,
+    /// 数据面：pre 绑定收输出帧，rvc 连接发送。
+    pub output_socket: String,
     /// 空表示沿用推理进程内已加载的模型；变更路由时不调用 LoadModel。
     pub model_id: String,
     pub f0_method: String,
@@ -58,6 +62,8 @@ impl Default for RvcConfig {
     fn default() -> Self {
         Self {
             socket: "rvc.sock".to_string(),
+            input_socket: "rvc-in.sock".to_string(),
+            output_socket: "rvc-out.sock".to_string(),
             model_id: String::new(),
             f0_method: "rmvpe".to_string(),
             pitch_shift: 0,
@@ -175,6 +181,14 @@ impl Config {
         self.daemon.run_dir.join(&self.rvc.socket)
     }
 
+    pub fn rvc_input_socket(&self) -> PathBuf {
+        self.daemon.run_dir.join(&self.rvc.input_socket)
+    }
+
+    pub fn rvc_output_socket(&self) -> PathBuf {
+        self.daemon.run_dir.join(&self.rvc.output_socket)
+    }
+
     pub fn log_dir(&self) -> PathBuf {
         self.daemon.run_dir.join("logs")
     }
@@ -232,6 +246,8 @@ impl Config {
         validate_socket_name(&self.daemon.socket, "daemon.socket")?;
         validate_socket_name(&self.pre.socket, "pre.socket")?;
         validate_socket_name(&self.rvc.socket, "rvc.socket")?;
+        validate_socket_name(&self.rvc.input_socket, "rvc.input_socket")?;
+        validate_socket_name(&self.rvc.output_socket, "rvc.output_socket")?;
         if self.rvc.f0_method != "rmvpe" {
             return Err(ConfigError::Invalid(
                 "rvc.f0_method must be \"rmvpe\"".to_string(),
@@ -299,6 +315,14 @@ mod tests {
         assert_eq!(config.daemon_socket(), PathBuf::from("/run/mozart/daemon.sock"));
         assert_eq!(config.pre_socket(), PathBuf::from("/run/mozart/pre.sock"));
         assert_eq!(config.rvc_socket(), PathBuf::from("/run/mozart/rvc.sock"));
+        assert_eq!(
+            config.rvc_input_socket(),
+            PathBuf::from("/run/mozart/rvc-in.sock")
+        );
+        assert_eq!(
+            config.rvc_output_socket(),
+            PathBuf::from("/run/mozart/rvc-out.sock")
+        );
         assert_eq!(config.daemon.poll_interval_ms, 1000);
     }
 
@@ -331,6 +355,10 @@ mod tests {
 
         let bad_method: Config = toml::from_str("[rvc]\nf0_method = \"harvest\"\n").unwrap();
         assert!(bad_method.validate().is_err());
+
+        let data_socket_with_slash: Config =
+            toml::from_str("[rvc]\ninput_socket = \"a/b\"\n").unwrap();
+        assert!(data_socket_with_slash.validate().is_err());
 
         let unknown: Result<Config, _> = toml::from_str("[daemon]\nunknown_key = 1\n");
         assert!(unknown.is_err());

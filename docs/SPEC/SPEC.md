@@ -81,3 +81,4 @@
 - 2026-11-11：灵活变速推迟到 FUTURE，第一版播报原速；拉伸 C 库 libmozart-tempo 保留备用。
 - 2026-11-11：filter_radius 定为保留 FUTURE 提升项、推迟实现，v1 不暴露死参数。
 - 2026-11-11：播报音频由 TTS 进程内重采样到 16 kHz 契约帧，RVC 输入统一 16 kHz；rvc 待讨论清空。
+- 2026-11-11：确认数据面 socket 命名与方向：`rvc-in.sock` 由 rvc 绑定收输入帧，`rvc-out.sock` 由 pre 绑定收输出帧。
