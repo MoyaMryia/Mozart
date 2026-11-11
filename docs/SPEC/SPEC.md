@@ -87,3 +87,4 @@
 - 2026-11-12：pre AI 支路定稿：整形级配置键（gate/AGC/limiter 默认关）、16 kHz 打包 meta 语义（pts 取采集时间戳、frame_idx 为打包序号）、恒定发送与惰性建链、接收环 8 帧、direct 排空计数与 consumer_drops 口径（rvc / rvc.skipped）（SPEC-02）。
 - 2026-11-12：rvc C++ 实现定稿：六命令按 SPEC-03 落地（StartStream 参数此时固定、StopStream 等当前块返回、GetStatus 14 字段）；`[rvc]` 进程启动键（models_dir、device、half、cache_limit、HuBERT/RMVPE/实时资产路径）与 socket 键入部署 TOML；退出用 SIGTERM，第一版无 UnloadModel/Shutdown。
 - 2026-11-12：daemon 接线定稿：daemon 把自己解析出的 TOML 路径随 spawn 以 `--config` 转交子进程，内置默认启动时无文件不传，子进程按同一顺序得到同一默认值；部署布局定 cargo 产物目录为唯一部署目录，rvc CMake 产物复制进去或用 `MOZART_RVC_BIN` 指绝对路径（SPEC-04）。
+- 2026-11-12：板端实测定稿：同源 60 s 长跑小缓冲零掉帧、49.86 帧/s 1:1，维持大缓冲留 C++；rvc 端到端净滞后约 0.5 s（SPEC-03 补实测确认行）。实测记录入 `reports/realtime-pipeline-20261112`。
