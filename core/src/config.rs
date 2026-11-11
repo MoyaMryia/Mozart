@@ -103,6 +103,16 @@ pub struct RvcConfig {
     pub index_rate: f64,
     pub rms_mix_rate: f64,
     pub protect: f64,
+    /// 以下进程启动键（SPEC-03 参数边界表）由 C++ 推理进程读取与校验；
+    /// daemon 只透传 TOML，这里声明键名以保持共用配置可解析。
+    pub models_dir: String,
+    pub device: String,
+    pub half: bool,
+    pub cache_limit: u32,
+    pub hubert_path: String,
+    pub rmvpe_path: String,
+    pub realtime_hubert_path: String,
+    pub realtime_rmvpe_path: String,
 }
 
 impl Default for RvcConfig {
@@ -117,6 +127,14 @@ impl Default for RvcConfig {
             index_rate: 0.0,
             rms_mix_rate: 1.0,
             protect: 0.33,
+            models_dir: String::new(),
+            device: "cuda".to_string(),
+            half: false,
+            cache_limit: 2,
+            hubert_path: String::new(),
+            rmvpe_path: String::new(),
+            realtime_hubert_path: String::new(),
+            realtime_rmvpe_path: String::new(),
         }
     }
 }
@@ -473,6 +491,29 @@ mod tests {
 
         let unknown: Result<Config, _> = toml::from_str("[daemon]\nunknown_key = 1\n");
         assert!(unknown.is_err());
+
+        // [rvc] 进程启动键（C++ 推理进程读取）：默认零值，可解析。
+        let startup: Config = toml::from_str(
+            r#"
+            [rvc]
+            models_dir = "/opt/mozart/models"
+            device = "cuda"
+            half = false
+            cache_limit = 2
+            hubert_path = "/opt/mozart/hubert.onnx"
+            rmvpe_path = "/opt/mozart/rmvpe.onnx"
+            realtime_hubert_path = "/opt/mozart/hubert-realtime.onnx"
+            realtime_rmvpe_path = "/opt/mozart/rmvpe-realtime.onnx"
+            "#,
+        )
+        .unwrap();
+        assert_eq!(startup.rvc.models_dir, "/opt/mozart/models");
+        assert_eq!(startup.rvc.device, "cuda");
+        assert!(!startup.rvc.half);
+        assert_eq!(startup.rvc.cache_limit, 2);
+        assert_eq!(startup.rvc.realtime_rmvpe_path, "/opt/mozart/rmvpe-realtime.onnx");
+        assert!(startup.validate().is_ok());
+        assert_eq!(Config::default().rvc.models_dir, "");
 
         let unknown_pre_key: Result<Config, _> = toml::from_str("[pre]\nunknown_key = 1\n");
         assert!(unknown_pre_key.is_err());

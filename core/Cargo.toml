@@ -17,6 +17,11 @@ path = "examples/rvc_stub.rs"
 name = "rvc_echo"
 path = "examples/rvc_echo.rs"
 
+# 真模型冒烟探针（Jetson）：驱动 C++ 推理进程六命令 + 数据面收发。
+[[example]]
+name = "rvc_smoke"
+path = "examples/rvc_smoke.rs"
+
 [dependencies]
 libc = "0.2"
 serde = { version = "1", features = ["derive"] }

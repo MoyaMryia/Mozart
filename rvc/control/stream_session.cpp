@@ -243,14 +243,18 @@ void StreamSession::shutdown() {
     {
         std::lock_guard<std::mutex> lock(mutex_);
         worker = std::move(worker_);
-        if (worker) {
-            final_stats_ = worker->stats();
-            has_final_stats_ = true;
-        }
+        // stream_kind 清空后其余命令立即看到「无流」；计数在下面对齐。
         stream_kind_.clear();
     }
-    // 先快照再停流：停流等待当前推理块（约 240 ms），在锁外执行。
-    if (worker) worker->stop();
+    if (worker) {
+        // 停流在锁外等待当前推理块（约 240 ms）；结束后再取快照，
+        // GetStatus 在停流后查到的是包含最后一块的最终计数。
+        worker->stop();
+        const WorkerStats final_stats = worker->stats();
+        std::lock_guard<std::mutex> lock(mutex_);
+        final_stats_ = final_stats;
+        has_final_stats_ = true;
+    }
     worker.reset();
 }
 

@@ -25,6 +25,17 @@ if(NOT spdlog_FOUND)
     FetchContent_MakeAvailable(spdlog)
 endif()
 
+# toml++：部署配置解析（单头库）；find_package 优先。
+find_package(tomlplusplus QUIET)
+if(NOT tomlplusplus_FOUND)
+    include(FetchContent)
+    FetchContent_Declare(tomlplusplus
+        GIT_REPOSITORY https://github.com/marzer/tomlplusplus.git
+        GIT_TAG v3.4.0
+        GIT_SHALLOW TRUE)
+    FetchContent_MakeAvailable(tomlplusplus)
+endif()
+
 # ---- 推理后端：TRT 优先，找不到回退 ORT；两者都关则引擎为桩 ----
 add_library(rvc_backend_flags INTERFACE)
 if(MOZART_WITH_TRT)
@@ -78,6 +89,7 @@ add_library(mozart_rvc_runtime STATIC
     transport/unix_dgram_stream.cpp
     control/ctl_link.cpp
     control/stream_session.cpp
+    config/rvc_config.cpp
 )
 # include/：搬运核心的旧布局（rvc/*.hpp）；仓库内新模块按目录相对包含
 # （transport/、control/、config/），因此把组件根也加入搜索路径。
@@ -85,7 +97,8 @@ target_include_directories(mozart_rvc_runtime PUBLIC
     "${CMAKE_CURRENT_SOURCE_DIR}/include"
     "${CMAKE_CURRENT_SOURCE_DIR}")
 target_link_libraries(mozart_rvc_runtime
-    PUBLIC mozart_core nlohmann_json::nlohmann_json spdlog::spdlog Threads::Threads
+    PUBLIC mozart_core nlohmann_json::nlohmann_json spdlog::spdlog
+           tomlplusplus::tomlplusplus Threads::Threads
     PRIVATE rvc_backend_flags mozart_warnings)
 if(ONNX_RUNTIME_LIB)
     target_compile_definitions(mozart_rvc_runtime PUBLIC USE_ONNX)
@@ -93,6 +106,6 @@ if(ONNX_RUNTIME_LIB)
     target_link_libraries(mozart_rvc_runtime PUBLIC ${ONNX_RUNTIME_LIB})
 endif()
 
-# 占位入口：接线（--socket/--config + StreamSession）见后续提交。
+# 入口：--socket/--config → [rvc] 配置 → StreamSession 服务循环。
 add_executable(mozart-rvc main.cpp)
-target_link_libraries(mozart-rvc PRIVATE mozart_core mozart_warnings)
+target_link_libraries(mozart-rvc PRIVATE mozart_rvc_runtime mozart_warnings)
