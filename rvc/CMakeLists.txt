@@ -14,8 +14,10 @@ if(NOT nlohmann_json_FOUND)
     FetchContent_MakeAvailable(json)
 endif()
 
-# spdlog：搬运文件日志引用面广（9 个源文件），保留；本机无系统包时 FetchContent。
-find_package(spdlog QUIET)
+# spdlog：搬运文件日志引用面广（9 个源文件），保留。系统包要求 ≥ 1.14：
+# Jetson 系统 1.12 捆绑 fmt 9，GCC 13.3 -O3 触发 array-bounds 假阳性
+#（fmt#3354），1.15.1 捆绑 fmt 11 无此问题；不满足版本时 FetchContent。
+find_package(spdlog 1.14 QUIET)
 if(NOT spdlog_FOUND)
     include(FetchContent)
     FetchContent_Declare(spdlog
@@ -59,19 +61,23 @@ if(MOZART_WITH_TRT)
 endif()
 
 if(MOZART_WITH_ORT)
-    set(ONNX_RUNTIME_PATH "/usr/lib/aarch64-linux-gnu" CACHE PATH
-        "ONNX Runtime 库路径（JetPack 默认）")
-    set(ONNX_RUNTIME_INCLUDE_DIR "/usr/include/onnxruntime" CACHE PATH
-        "ONNX Runtime 头文件路径")
-    find_library(ONNX_RUNTIME_LIB onnxruntime PATHS ${ONNX_RUNTIME_PATH} NO_DEFAULT_PATH)
-    if(NOT ONNX_RUNTIME_LIB)
-        find_library(ONNX_RUNTIME_LIB onnxruntime)
-    endif()
-    if(ONNX_RUNTIME_LIB AND EXISTS "${ONNX_RUNTIME_INCLUDE_DIR}/onnxruntime_cxx_api.h")
+    # 两个部署布局都探测：JetPack 包在 /usr/lib/aarch64-linux-gnu +
+    # /usr/include/onnxruntime；手动安装（本机 Jetson）在 /usr/local。
+    # 显式 cache 变量优先，用于其余布局。
+    set(ONNX_RUNTIME_PATH "" CACHE PATH
+        "ONNX Runtime 库路径；默认按 JetPack 与 /usr/local 探测")
+    set(ONNX_RUNTIME_INCLUDE_DIR "" CACHE PATH
+        "ONNX Runtime 头文件路径；默认按 JetPack 与 /usr/local 探测")
+    find_library(ONNX_RUNTIME_LIB onnxruntime
+        HINTS "${ONNX_RUNTIME_PATH}" /usr/lib/aarch64-linux-gnu /usr/local/lib)
+    find_path(RVC_ORT_INCLUDE onnxruntime_cxx_api.h
+        HINTS "${ONNX_RUNTIME_INCLUDE_DIR}" /usr/include/onnxruntime /usr/local/include)
+    if(ONNX_RUNTIME_LIB AND RVC_ORT_INCLUDE)
         message(STATUS "rvc: ONNX Runtime enabled (${ONNX_RUNTIME_LIB})")
     else()
         message(FATAL_ERROR "MOZART_WITH_ORT=ON 需要找到 ONNX Runtime 头文件与库；"
-            "主机无 GPU 测试请用 OFF。")
+            "主机无 GPU 测试请用 OFF，非常规位置用 ONNX_RUNTIME_PATH / "
+            "ONNX_RUNTIME_INCLUDE_DIR 指定。")
     endif()
 endif()
 
@@ -102,7 +108,7 @@ target_link_libraries(mozart_rvc_runtime
     PRIVATE rvc_backend_flags mozart_warnings)
 if(ONNX_RUNTIME_LIB)
     target_compile_definitions(mozart_rvc_runtime PUBLIC USE_ONNX)
-    target_include_directories(mozart_rvc_runtime PUBLIC ${ONNX_RUNTIME_INCLUDE_DIR})
+    target_include_directories(mozart_rvc_runtime PUBLIC ${RVC_ORT_INCLUDE})
     target_link_libraries(mozart_rvc_runtime PUBLIC ${ONNX_RUNTIME_LIB})
 endif()
 

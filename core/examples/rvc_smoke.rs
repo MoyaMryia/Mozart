@@ -20,8 +20,9 @@ use std::time::{Duration, Instant};
 
 /// pre 侧接收缓冲帧数（SPEC-02：4–8 帧取上沿）。
 const QUEUE_FRAMES: usize = 8;
-/// 控制往返超时：LoadModel 冷加载含引擎反序列化，放宽到 30 s。
-const RPC_TIMEOUT: Duration = Duration::from_secs(30);
+/// 控制往返超时：LoadModel 冷加载含多引擎 TRT 反序列化与预热（Nano 实测
+/// 可到数十秒），放宽到 60 s；其余命令远快于此。
+const RPC_TIMEOUT: Duration = Duration::from_secs(60);
 /// 输出帧逐帧超时：正常节拍 20 ms；欠载补零不超时，留裕量。
 const RECV_TIMEOUT: Duration = Duration::from_secs(3);
 
