@@ -10,6 +10,7 @@ MAX_TRACKED_BYTES=$((5 * 1024 * 1024))
 
 # 阶段名与触发路径（扩展正则，匹配暂存文件路径）。
 NATIVE_PATHS='^(core|pre|rvc|daemon|api|tests)/|^CMakeLists\.txt$|^CMakePresets\.json$|^cmake/'
+RUST_PATHS='^(core|pre|daemon)/|^Cargo\.toml$|^Cargo\.lock$'
 WEB_PATHS='^web/'
 
 skip() { echo "跳过 $1：$2" >&2; }
@@ -59,6 +60,15 @@ stage_native() {
     fi
 }
 
+stage_rust() {
+    if [ ! -f Cargo.toml ]; then
+        skip rust "没有 Cargo.toml"
+        return 0
+    fi
+    cargo check --workspace
+    cargo test --workspace
+}
+
 stage_web() {
     if [ ! -f web/package.json ]; then
         skip web "web/package.json 不存在"
@@ -84,6 +94,7 @@ run_stage() {
         repo) stage_repo ;;
         lint) stage_lint ;;
         native) stage_native ;;
+        rust) stage_rust ;;
         web) stage_web ;;
         *) echo "未知阶段：$1" >&2; exit 2 ;;
     esac
@@ -99,9 +110,10 @@ staged() {
     stage_lint --staged ${base:+--base-ref "$base"}
 
     local name paths
-    for name in native web; do
+    for name in native rust web; do
         case $name in
             native) paths=$NATIVE_PATHS ;;
+            rust) paths=$RUST_PATHS ;;
             web) paths=$WEB_PATHS ;;
         esac
         if grep -qE "$paths" <<<"$changed"; then
@@ -115,6 +127,6 @@ staged() {
 
 case "${1:---staged}" in
     --staged) staged ;;
-    all) for s in repo lint native web; do echo "== $s ==" >&2; run_stage "$s"; done ;;
+    all) for s in repo lint native rust web; do echo "== $s ==" >&2; run_stage "$s"; done ;;
     *) run_stage "$1" ;;
 esac

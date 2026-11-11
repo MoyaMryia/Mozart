@@ -6,12 +6,37 @@
 ## 项目边界
 
 Mozart 是面向 NVIDIA Jetson Orin Nano Super 8 GB 的本地语音处理系统。
-实时语音转换、翻译字幕、文件转换和参考音色播报共用一次麦克风采集。
+实时语音转换、翻译字幕、文件转换和翻译播报共用一次麦克风采集。
 产品目标见 [TARGET.md](TARGET.md)，当前状态见 [README.md](README.md)。
 
-本仓库处于重写阶段。新代码按 `README.md` 的目录约定落地，旧实现只在
+本仓库处于重写阶段。模块边界与接口契约见 `docs/SPEC/`，旧实现只在
 `~/Projects/Project-Mozart` 中作为归档参考，不作为依赖。
-运行时只使用 C++20，不启动 Python 进程。离线模型导出可以使用 Python，但不进入构建与部署路径。
+运行时主体用 Rust，推理层保留 C++ 进程。离线模型导出可以使用 Python，但不进入构建与部署路径。
+
+## 文件系统组织
+
+运行时 Rust + C++ 推理，Cargo 与 CMake 并存。
+
+| 目录 | 内容 | 构建 |
+| --- | --- | --- |
+| `core/` | 帧契约 C 头（单一来源）、Rust 镜像、传输、环形队列 | Cargo `mozart-core` + CMake INTERFACE `mozart_core` |
+| `pre/` | 音频进程：采集、DSP、播放、分发 | Cargo `mozart-pre` |
+| `daemon/` | 控制进程：生命周期、控制命令、模式/路由策略 | Cargo `mozart-daemon` |
+| `rvc/` | C++ 推理进程：StreamSession、旧 rvc-backend | CMake `mozart-rvc` |
+| `web/` | TypeScript 前端（后续） | npm |
+| `tests/` | 跨组件 C++ 测试与小型夹具 | CTest |
+| `cmake/` | CMake 模块 | — |
+| `tools/` | 构建、检查、部署脚本 | — |
+| `docs/` | 长期文档；`docs/SPEC/` 模块规格；`docs/FUTURE.md` | — |
+| `reports/` | 带日期的实测记录，只跟踪 Markdown | — |
+
+- `core/include/mozart/` 的 C 头是跨语言契约的唯一定义源。改头必须同步 `core/src/lib.rs` 的 `#[repr(C)]` 镜像与编译期断言。
+- Rust-only 组件（pre、daemon）不放 CMakeLists.txt；CMake 根按目录存在与否自动纳入。
+- 依赖方向：core 不依赖其他组件；pre、daemon、rvc 依赖 core；daemon 通过 IPC 控制 pre 和 rvc，不产生链接依赖。
+- 二进制名统一 `mozart-<组件>`；Rust crate 名 `mozart-<组件>`；CMake 库名 `mozart_<组件>`。
+- 单元测试：Rust 放各 crate 的 `src/` 或 `tests/`；C++ 放 `tests/` 并注册 CTest。
+- 小型对拍夹具放 `tests/fixtures/`，在 `.gitignore` 白名单逐条列出。模型、音频、引擎等大型资产不进仓库。
+- 构建产物：CMake 在 `build/<preset>/`，Cargo 在 `target/`，均已 gitignore。
 
 ## 语言与写作
 
@@ -89,7 +114,7 @@ Mozart 是面向 NVIDIA Jetson Orin Nano Super 8 GB 的本地语音处理系统�
 ## 平台约束
 
 - 目标设备为 Jetson Orin Nano Super 8 GB，ARM64，JetPack 6。
-- 构建使用 CMake ≥ 3.22 + Ninja + CTest；构建目录只使用 `CMakePresets.json` 中的预设名。
+- 构建：Rust 用 Cargo workspace；C++ 用 CMake ≥ 3.22 + Ninja + CTest，构建目录只使用 `CMakePresets.json` 中的预设名。
 - 音频路径使用 ALSA；实时线程不得分配内存或阻塞。
 - 推理后端为 ONNX Runtime 或 TensorRT；所选部署链路不依赖 PyTorch。
 - 主机（x86_64）用于构建与单元测试，声学与延迟验收在目标设备上完成。
@@ -99,6 +124,6 @@ Mozart 是面向 NVIDIA Jetson Orin Nano Super 8 GB 的本地语音处理系统�
 重写期间以下内容尚未确定，确定后写入本文件或对应文档：
 
 - 组件是否保留 `daemon` 与 `api` 的合并形态。
-- 控制面协议（Unix 数据报、HTTP、WebSocket）的最终范围。
+- daemon 与音频进程之间的控制通道；对外控制面（HTTP/SSE）的范围。
 - 文档长度与限制句检查尚未实现（旧实现依赖 Python 脚本），当前只检查行尾空白与报告的“适用范围”一节。
 - 仓外资产的目录约定与环境变量名。
