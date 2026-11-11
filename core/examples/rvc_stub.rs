@@ -44,7 +44,12 @@ fn handle(msg: &Message, state: &mut State) -> Vec<u8> {
                 return fail(ctl::CODE_INVALID_ARGUMENT, "model_id is required");
             };
             state.model = Some(model_id.to_string());
-            ok(json!({"model_id": model_id}))
+            ok(json!({
+                "model_id": model_id,
+                "model_version": "stub",
+                "model_handle": 1,
+                "capabilities": ["realtime"]
+            }))
         }
         ctl::RVC_START_STREAM => {
             if state.model.is_none() {

@@ -1,3 +1,5 @@
+use crate::poller::Poller;
+use crate::services::{self, Services};
 use crate::state::{lock_state, Role, State};
 use crate::supervisor::Supervisor;
 use mozart_core::config::Config;
@@ -26,17 +28,25 @@ pub fn serve(config: &Config) -> io::Result<()> {
 
     let config = Arc::new(config.clone());
     let state = Arc::new(Mutex::new(State::new()));
+    let services = Arc::new(Services::new(&config));
     let running = Arc::new(AtomicBool::new(true));
     let supervisors = [
         Supervisor::spawn(Role::Pre, config.clone(), state.clone(), running.clone())?,
         Supervisor::spawn(Role::Rvc, config.clone(), state.clone(), running.clone())?,
     ];
+    let poller = Poller::spawn(
+        config.clone(),
+        state.clone(),
+        services.clone(),
+        running.clone(),
+    )?;
 
-    let outcome = accept_loop(&listener, &state);
+    let outcome = accept_loop(&listener, &state, &services, &config);
     running.store(false, Ordering::Release);
     for supervisor in supervisors {
         supervisor.join();
     }
+    poller.join();
     drop(listener);
     let _ = std::fs::remove_file(&socket_path);
     outcome
@@ -69,10 +79,15 @@ enum Flow {
     Shutdown,
 }
 
-fn accept_loop(listener: &Seqpacket, state: &Mutex<State>) -> io::Result<()> {
+fn accept_loop(
+    listener: &Seqpacket,
+    state: &Mutex<State>,
+    services: &Services,
+    config: &Config,
+) -> io::Result<()> {
     loop {
         let conn = listener.accept()?;
-        match serve_connection(&conn, state) {
+        match serve_connection(&conn, state, services, config) {
             Ok(Flow::Continue) => {}
             Ok(Flow::Shutdown) => return Ok(()),
             Err(err) => eprintln!("mozart-daemon: control connection: {err}"),
@@ -80,7 +95,12 @@ fn accept_loop(listener: &Seqpacket, state: &Mutex<State>) -> io::Result<()> {
     }
 }
 
-fn serve_connection(conn: &Seqpacket, state: &Mutex<State>) -> io::Result<Flow> {
+fn serve_connection(
+    conn: &Seqpacket,
+    state: &Mutex<State>,
+    services: &Services,
+    config: &Config,
+) -> io::Result<Flow> {
     loop {
         let msg = match conn.recv(Some(IDLE_TIMEOUT)) {
             Ok(msg) => msg,
@@ -92,7 +112,7 @@ fn serve_connection(conn: &Seqpacket, state: &Mutex<State>) -> io::Result<Flow> 
             }
             Err(err) => return Err(err),
         };
-        let (reply, shutdown) = handle_request(state, &msg);
+        let (reply, shutdown) = handle_request(state, services, config, &msg);
         let type_ = msg.header.type_;
         let request_id = msg.header.request_id;
         conn.send(type_, request_id, &reply)?;
@@ -102,20 +122,27 @@ fn serve_connection(conn: &Seqpacket, state: &Mutex<State>) -> io::Result<Flow> 
     }
 }
 
-fn handle_request(state: &Mutex<State>, msg: &Message) -> (Vec<u8>, bool) {
-    let mut state = lock_state(state);
+fn handle_request(
+    state: &Mutex<State>,
+    services: &Services,
+    config: &Config,
+    msg: &Message,
+) -> (Vec<u8>, bool) {
     let type_ = msg.header.type_;
     match type_ {
         ctl::DAEMON_HELLO => (
             schema::ok_body(json!({"version": env!("CARGO_PKG_VERSION")})),
             false,
         ),
-        ctl::DAEMON_GET_STATUS => match serde_json::to_value(state.status()) {
-            Ok(status) => (schema::ok_body(status), false),
-            Err(err) => (schema::error_body(ctl::CODE_INTERNAL, &err.to_string()), false),
-        },
+        ctl::DAEMON_GET_STATUS => {
+            let status = lock_state(state).status();
+            match serde_json::to_value(status) {
+                Ok(status) => (schema::ok_body(status), false),
+                Err(err) => (schema::error_body(ctl::CODE_INTERNAL, &err.to_string()), false),
+            }
+        }
         ctl::DAEMON_ROUTE_SET => match serde_json::from_slice::<RouteSetRequest>(&msg.body) {
-            Ok(request) => match state.set_route(request.route) {
+            Ok(request) => match services::route_set(state, services, config, request.route) {
                 Ok(route) => (schema::ok_body(json!({"route": route})), false),
                 Err((code, reason)) => (schema::error_body(&code, &reason), false),
             },
@@ -125,7 +152,7 @@ fn handle_request(state: &Mutex<State>, msg: &Message) -> (Vec<u8>, bool) {
             ),
         },
         ctl::DAEMON_MUTE_SET => match serde_json::from_slice::<MuteSetRequest>(&msg.body) {
-            Ok(request) => match state.set_mute(request.mute) {
+            Ok(request) => match services::mute_set(state, services, request.mute) {
                 Ok(mute) => (schema::ok_body(json!({"mute": mute})), false),
                 Err((code, reason)) => (schema::error_body(&code, &reason), false),
             },

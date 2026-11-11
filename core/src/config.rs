@@ -11,7 +11,7 @@ pub struct Config {
     pub daemon: DaemonConfig,
     pub process: ProcessConfig,
     pub pre: EndpointConfig,
-    pub rvc: EndpointConfig,
+    pub rvc: RvcConfig,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -40,6 +40,33 @@ pub struct EndpointConfig {
     pub socket: String,
 }
 
+#[derive(Debug, Clone, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct RvcConfig {
+    pub socket: String,
+    /// 空表示沿用推理进程内已加载的模型；变更路由时不调用 LoadModel。
+    pub model_id: String,
+    pub f0_method: String,
+    pub pitch_shift: i32,
+    pub index_rate: f64,
+    pub rms_mix_rate: f64,
+    pub protect: f64,
+}
+
+impl Default for RvcConfig {
+    fn default() -> Self {
+        Self {
+            socket: "rvc.sock".to_string(),
+            model_id: String::new(),
+            f0_method: "rmvpe".to_string(),
+            pitch_shift: 0,
+            index_rate: 0.0,
+            rms_mix_rate: 1.0,
+            protect: 0.33,
+        }
+    }
+}
+
 impl Default for Config {
     fn default() -> Self {
         Self {
@@ -48,9 +75,7 @@ impl Default for Config {
             pre: EndpointConfig {
                 socket: "pre.sock".to_string(),
             },
-            rvc: EndpointConfig {
-                socket: "rvc.sock".to_string(),
-            },
+            rvc: RvcConfig::default(),
         }
     }
 }
@@ -197,6 +222,31 @@ impl Config {
         validate_socket_name(&self.daemon.socket, "daemon.socket")?;
         validate_socket_name(&self.pre.socket, "pre.socket")?;
         validate_socket_name(&self.rvc.socket, "rvc.socket")?;
+        if self.rvc.f0_method != "rmvpe" {
+            return Err(ConfigError::Invalid(
+                "rvc.f0_method must be \"rmvpe\"".to_string(),
+            ));
+        }
+        if !(-12..=12).contains(&self.rvc.pitch_shift) {
+            return Err(ConfigError::Invalid(
+                "rvc.pitch_shift must be within -12..=12".to_string(),
+            ));
+        }
+        if !self.rvc.index_rate.is_finite() || !(0.0..=1.0).contains(&self.rvc.index_rate) {
+            return Err(ConfigError::Invalid(
+                "rvc.index_rate must be within 0.0..=1.0".to_string(),
+            ));
+        }
+        if !self.rvc.rms_mix_rate.is_finite() || !(0.0..=1.0).contains(&self.rvc.rms_mix_rate) {
+            return Err(ConfigError::Invalid(
+                "rvc.rms_mix_rate must be within 0.0..=1.0".to_string(),
+            ));
+        }
+        if !self.rvc.protect.is_finite() || !(0.0..=0.5).contains(&self.rvc.protect) {
+            return Err(ConfigError::Invalid(
+                "rvc.protect must be within 0.0..=0.5".to_string(),
+            ));
+        }
         if self.process.pre_bin.as_os_str().is_empty() {
             return Err(ConfigError::Invalid(
                 "process.pre_bin must not be empty".to_string(),
@@ -257,6 +307,12 @@ mod tests {
 
         let path_socket: Config = toml::from_str("[pre]\nsocket = \"a/b\"\n").unwrap();
         assert!(path_socket.validate().is_err());
+
+        let bad_pitch: Config = toml::from_str("[rvc]\npitch_shift = 13\n").unwrap();
+        assert!(bad_pitch.validate().is_err());
+
+        let bad_method: Config = toml::from_str("[rvc]\nf0_method = \"harvest\"\n").unwrap();
+        assert!(bad_method.validate().is_err());
 
         let unknown: Result<Config, _> = toml::from_str("[daemon]\nunknown_key = 1\n");
         assert!(unknown.is_err());

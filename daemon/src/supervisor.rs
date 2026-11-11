@@ -171,7 +171,7 @@ fn exit_info(status: &std::process::ExitStatus) -> ExitInfo {
     }
 }
 
-fn sleep_unless_stopped(mut remaining: Duration, running: &AtomicBool) -> bool {
+pub(crate) fn sleep_unless_stopped(mut remaining: Duration, running: &AtomicBool) -> bool {
     while !remaining.is_zero() {
         if !running.load(Ordering::Acquire) {
             return false;

@@ -137,6 +137,7 @@ fn rvc_stub_enforces_stream_order() {
 
     let loaded = call(&conn, ctl::RVC_LOAD_MODEL, br#"{"model_id":"demo"}"#);
     assert_eq!(loaded["status"], "ok");
+    assert_eq!(loaded["data"]["model_handle"], 1);
 
     let started = call(&conn, ctl::RVC_START_STREAM, br#"{"kind":"realtime"}"#);
     assert_eq!(started["status"], "ok");

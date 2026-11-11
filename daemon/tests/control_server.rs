@@ -1,7 +1,7 @@
 mod common;
 
 use common::{call, example, status, wait_exit, wait_until, DaemonProcess};
-use mozart_core::ctl::schema::{ProcessState, Route};
+use mozart_core::ctl::schema::{Activity, ProcessState, Route};
 use mozart_core::ctl::{self};
 use std::process::{Command, Stdio};
 use std::time::Duration;
@@ -31,22 +31,12 @@ fn serves_status_and_validates_commands() {
     assert_eq!(status.processes.pre.state, ProcessState::Running);
     assert_eq!(status.processes.rvc.state, ProcessState::Running);
     assert!(status.processes.pre.pid.is_some());
-    assert!(status.pre.is_none());
-    assert!(status.rvc.is_none());
     assert!(status.hw.is_none());
-    assert!(status.degraded.is_empty());
     assert_eq!(status.daemon.version, env!("CARGO_PKG_VERSION"));
 
     let direct = call(&conn, ctl::DAEMON_ROUTE_SET, br#"{"route":"direct"}"#);
     assert_eq!(direct.status, "ok");
     assert_eq!(direct.data["route"], "direct");
-
-    let rvc = call(&conn, ctl::DAEMON_ROUTE_SET, br#"{"route":"rvc"}"#);
-    assert_eq!(rvc.status, "error");
-    assert_eq!(rvc.code, "NotReady");
-
-    let mute = call(&conn, ctl::DAEMON_MUTE_SET, br#"{"mute":true}"#);
-    assert_eq!(mute.code, "NotReady");
 
     let invalid_route = call(&conn, ctl::DAEMON_ROUTE_SET, br#"{"route":"bogus"}"#);
     assert_eq!(invalid_route.code, "InvalidArgument");
@@ -56,6 +46,57 @@ fn serves_status_and_validates_commands() {
 
     let unknown = call(&conn, 0x01FF, b"");
     assert_eq!(unknown.code, "UnknownCommand");
+}
+
+#[test]
+fn switch_applies_route_and_mute() {
+    let daemon = DaemonProcess::start("switch", &example("pre_stub"), &example("rvc_stub"));
+    let conn = daemon.connect();
+    assert!(
+        wait_until(Duration::from_secs(5), || {
+            let status = status(&conn);
+            status.processes.pre.state == ProcessState::Running
+                && status.processes.rvc.state == ProcessState::Running
+        }),
+        "children did not start"
+    );
+
+    let rvc = call(&conn, ctl::DAEMON_ROUTE_SET, br#"{"route":"rvc"}"#);
+    assert_eq!(rvc.status, "ok");
+    assert_eq!(rvc.data["route"], "rvc");
+    assert!(
+        wait_until(Duration::from_secs(5), || {
+            let status = status(&conn);
+            status.route.active == Route::Rvc
+                && status.arbiter.gpu.owner == Some(Activity::Realtime)
+                && status.pre.as_ref().map(|pre| pre.route) == Some(Route::Rvc)
+                && status.rvc.as_ref().map(|rvc| rvc.state.as_str()) == Some("streaming")
+        }),
+        "route rvc was not applied"
+    );
+
+    let mute = call(&conn, ctl::DAEMON_MUTE_SET, br#"{"mute":true}"#);
+    assert_eq!(mute.status, "ok");
+    assert!(
+        wait_until(Duration::from_secs(2), || {
+            let status = status(&conn);
+            status.mute && status.pre.as_ref().map(|pre| pre.mute) == Some(true)
+        }),
+        "mute was not applied"
+    );
+
+    let direct = call(&conn, ctl::DAEMON_ROUTE_SET, br#"{"route":"direct"}"#);
+    assert_eq!(direct.status, "ok");
+    assert!(
+        wait_until(Duration::from_secs(5), || {
+            let status = status(&conn);
+            status.route.active == Route::Direct
+                && status.arbiter.gpu.owner.is_none()
+                && status.pre.as_ref().map(|pre| pre.route) == Some(Route::Direct)
+                && status.rvc.as_ref().map(|rvc| rvc.state.as_str()) == Some("loaded")
+        }),
+        "route direct was not applied"
+    );
 }
 
 #[test]

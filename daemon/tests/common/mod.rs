@@ -38,17 +38,27 @@ pub struct DaemonProcess {
 
 impl DaemonProcess {
     pub fn start(tag: &str, pre_bin: &Path, rvc_bin: &Path) -> Self {
+        Self::start_with_config(
+            tag,
+            pre_bin,
+            rvc_bin,
+            "[daemon]\nrpc_timeout_ms = 300\n\n[rvc]\nmodel_id = \"demo\"\n",
+        )
+    }
+
+    pub fn start_with_config(tag: &str, pre_bin: &Path, rvc_bin: &Path, config_body: &str) -> Self {
         let dir = std::env::temp_dir().join(format!("mozart-daemon-{}-{tag}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         let config = dir.join("config.toml");
-        std::fs::write(&config, "").unwrap();
+        std::fs::write(&config, config_body).unwrap();
         let child = Command::new(env!("CARGO_BIN_EXE_mozart-daemon"))
             .arg("--config")
             .arg(&config)
             .env("MOZART_RUN_DIR", &dir)
             .env("MOZART_PRE_BIN", pre_bin)
             .env("MOZART_RVC_BIN", rvc_bin)
+            .env("MOZART_POLL_INTERVAL_MS", "100")
             .stdout(Stdio::null())
             .stderr(Stdio::inherit())
             .spawn()

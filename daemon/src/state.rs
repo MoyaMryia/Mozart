@@ -1,8 +1,7 @@
 use mozart_core::ctl::schema::{
-    Activity, ArbiterState, DaemonInfo, ExitInfo, GpuState, ProcessInfo, ProcessState, Processes,
-    Route, RouteState, Status,
+    Activity, ArbiterState, DaemonInfo, ExitInfo, GpuState, PreStatus, ProcessInfo, ProcessState,
+    Processes, Route, RouteState, RvcStatus, Status,
 };
-use mozart_core::ctl::{self, CODE_NOT_READY};
 use std::sync::{Mutex, MutexGuard};
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
@@ -26,6 +25,8 @@ pub struct State {
     mute: bool,
     gpu_owner: Option<Activity>,
     processes: Processes,
+    pre: Option<PreStatus>,
+    rvc: Option<RvcStatus>,
     degraded: Vec<String>,
 }
 
@@ -42,6 +43,8 @@ impl State {
                 pre: ProcessInfo::stopped(),
                 rvc: ProcessInfo::stopped(),
             },
+            pre: None,
+            rvc: None,
             degraded: Vec::new(),
         }
     }
@@ -65,36 +68,51 @@ impl State {
                 },
             },
             processes: self.processes.clone(),
-            pre: None,
-            rvc: None,
+            pre: self.pre.clone(),
+            rvc: self.rvc.clone(),
             hw: None,
             degraded: self.degraded.clone(),
         }
     }
 
-    pub fn set_route(&mut self, route: Route) -> Result<Route, (String, String)> {
-        match route {
-            Route::Direct => {
-                if self.route_active != Route::Direct {
-                    self.route_active = Route::Direct;
-                    self.route_since_unix_ms = now_unix_ms();
-                }
-                self.route_desired = Route::Direct;
-                self.gpu_owner = None;
-                Ok(self.route_active)
-            }
-            Route::Rvc => Err((
-                CODE_NOT_READY.to_string(),
-                "rvc process not started".to_string(),
-            )),
-        }
+    pub fn route_desired(&self) -> Route {
+        self.route_desired
     }
 
-    pub fn set_mute(&mut self, _mute: bool) -> Result<bool, (String, String)> {
-        Err((
-            CODE_NOT_READY.to_string(),
-            "pre process not started".to_string(),
-        ))
+    pub fn route_active(&self) -> Route {
+        self.route_active
+    }
+
+    pub fn mute(&self) -> bool {
+        self.mute
+    }
+
+    pub fn commit_route(&mut self, route: Route) {
+        if self.route_active != route || self.route_desired != route {
+            self.route_since_unix_ms = now_unix_ms();
+        }
+        self.route_desired = route;
+        self.route_active = route;
+        self.gpu_owner = match route {
+            Route::Rvc => Some(Activity::Realtime),
+            Route::Direct => None,
+        };
+    }
+
+    pub fn commit_mute(&mut self, mute: bool) {
+        self.mute = mute;
+    }
+
+    pub fn set_pre_status(&mut self, status: Option<PreStatus>) {
+        self.pre = status;
+    }
+
+    pub fn set_rvc_status(&mut self, status: Option<RvcStatus>) {
+        self.rvc = status;
+    }
+
+    pub fn set_degraded(&mut self, reasons: Vec<String>) {
+        self.degraded = reasons;
     }
 
     pub fn process_starting(&mut self, role: Role) {
