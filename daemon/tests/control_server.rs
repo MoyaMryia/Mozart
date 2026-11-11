@@ -4,7 +4,6 @@ use common::{call, example, status, wait_exit, wait_until, DaemonProcess};
 use mozart_core::ctl::schema::{Activity, ProcessState, Route};
 use mozart_core::ctl::{self};
 use std::process::{Command, Stdio};
-use std::thread;
 use std::time::Duration;
 
 #[test]
