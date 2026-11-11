@@ -3,6 +3,18 @@ name = "mozart-core"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
+autoexamples = false
+
+[[example]]
+name = "pre_stub"
+path = "examples/pre_stub.rs"
+
+[[example]]
+name = "rvc_stub"
+path = "examples/rvc_stub.rs"
 
 [dependencies]
 libc = "0.2"
+
+[dev-dependencies]
+serde_json = "1"

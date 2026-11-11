@@ -176,6 +176,40 @@ impl Seqpacket {
         Ok(Self { fd })
     }
 
+    pub fn listen(&self, backlog: libc::c_int) -> io::Result<()> {
+        // SAFETY: fd 是已 bind 的 SEQPACKET 套接字。
+        let rc = unsafe { libc::listen(self.fd.as_raw_fd(), backlog) };
+        if rc != 0 {
+            return Err(io::Error::last_os_error());
+        }
+        Ok(())
+    }
+
+    pub fn accept(&self) -> io::Result<Self> {
+        loop {
+            // SAFETY: fd 处于监听状态；地址参数为空表示不关心对端地址。
+            let raw = unsafe {
+                libc::accept4(
+                    self.fd.as_raw_fd(),
+                    std::ptr::null_mut(),
+                    std::ptr::null_mut(),
+                    libc::SOCK_CLOEXEC,
+                )
+            };
+            if raw < 0 {
+                let err = io::Error::last_os_error();
+                if err.kind() == io::ErrorKind::Interrupted {
+                    continue;
+                }
+                return Err(err);
+            }
+            // SAFETY: raw 是 accept4 新建且未复制的文件描述符。
+            return Ok(Self {
+                fd: unsafe { OwnedFd::from_raw_fd(raw) },
+            });
+        }
+    }
+
     pub fn send(&self, type_: u16, request_id: u32, body: &[u8]) -> io::Result<()> {
         if body.len() > MAX_BODY_BYTES {
             return Err(io::Error::new(
@@ -282,8 +316,14 @@ impl Seqpacket {
 }
 
 fn new_seqpacket() -> io::Result<OwnedFd> {
-    // SAFETY: socket() 不访问其他内存。
-    let raw = unsafe { libc::socket(libc::AF_UNIX, libc::SOCK_SEQPACKET, 0) };
+    // SAFETY: socket() 不访问其他内存。CLOEXEC 防止套接字泄漏给子进程。
+    let raw = unsafe {
+        libc::socket(
+            libc::AF_UNIX,
+            libc::SOCK_SEQPACKET | libc::SOCK_CLOEXEC,
+            0,
+        )
+    };
     if raw < 0 {
         return Err(io::Error::last_os_error());
     }
@@ -395,5 +435,35 @@ mod tests {
         let body = vec![0u8; MAX_BODY_BYTES + 1];
         let err = a.send(DAEMON_HELLO, 1, &body).unwrap_err();
         assert_eq!(err.kind(), io::ErrorKind::InvalidInput);
+    }
+
+    #[test]
+    fn listen_accept_roundtrip() {
+        let dir = std::env::temp_dir().join(format!("mozart-ctl-test-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("listen.sock");
+        let _ = std::fs::remove_file(&path);
+
+        let listener = Seqpacket::bind(&path).unwrap();
+        listener.listen(1).unwrap();
+
+        let client_path = path.clone();
+        let client = std::thread::spawn(move || {
+            let conn = Seqpacket::connect(&client_path).unwrap();
+            conn.send(PRE_GET_STATUS, 9, br#"{"probe":true}"#).unwrap();
+        });
+
+        let conn = listener.accept().unwrap();
+        let msg = conn.recv(Some(Duration::from_secs(1))).unwrap();
+        let msg_type = msg.header.type_;
+        let request_id = msg.header.request_id;
+        assert_eq!(msg_type, PRE_GET_STATUS);
+        assert_eq!(request_id, 9);
+        client.join().unwrap();
+
+        drop(conn);
+        drop(listener);
+        std::fs::remove_file(&path).unwrap();
+        let _ = std::fs::remove_dir(&dir);
     }
 }
