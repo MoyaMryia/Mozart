@@ -4,6 +4,7 @@ use common::{call, example, status, wait_exit, wait_until, DaemonProcess};
 use mozart_core::ctl::schema::{Activity, ProcessState, Route};
 use mozart_core::ctl::{self};
 use std::process::{Command, Stdio};
+use std::thread;
 use std::time::Duration;
 
 #[test]
@@ -106,6 +107,26 @@ fn idle_connection_does_not_block_control() {
 
     let reply = call(&conn, ctl::DAEMON_GET_STATUS, b"");
     assert_eq!(reply.status, "ok");
+}
+
+#[test]
+fn concurrent_down_is_idempotent() {
+    let mut daemon = DaemonProcess::start("twodown", &example("pre_stub"), &example("rvc_stub"));
+    let conn_a = daemon.connect();
+    let conn_b = daemon.connect();
+    // 先在两条连接上各完成一次 Hello，确保都被 accept，避免关停先到把另一条留在积压里。
+    assert_eq!(call(&conn_a, ctl::DAEMON_HELLO, b"").status, "ok");
+    assert_eq!(call(&conn_b, ctl::DAEMON_HELLO, b"").status, "ok");
+
+    let first = std::thread::spawn(move || call(&conn_a, ctl::DAEMON_SHUTDOWN, b""));
+    let second = call(&conn_b, ctl::DAEMON_SHUTDOWN, b"");
+    assert_eq!(second.status, "ok", "关停进行中再次 Shutdown 必须幂等应答 ok");
+    let first_reply = first.join().unwrap();
+    assert_eq!(first_reply.status, "ok");
+
+    let status = wait_exit(&mut daemon.child, Duration::from_secs(5));
+    assert!(status.success());
+    assert!(!daemon.socket.exists());
 }
 
 #[test]

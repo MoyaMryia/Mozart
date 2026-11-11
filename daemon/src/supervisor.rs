@@ -125,6 +125,10 @@ fn start_child(bin: &Path, socket: &Path, log_path: &Path) -> io::Result<Child> 
             if libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGTERM) != 0 {
                 return Err(io::Error::last_os_error());
             }
+            // fork 与 prctl 之间父进程可能已退出（ppid 变为 1）；此时退出，避免孤儿。
+            if libc::getppid() == 1 {
+                return Err(io::Error::other("parent died before PDEATHSIG"));
+            }
             Ok(())
         });
     }

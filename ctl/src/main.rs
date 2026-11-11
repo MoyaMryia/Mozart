@@ -162,7 +162,7 @@ fn up(config: &Config, config_path: Option<&Path>, json_output: bool) -> Result<
 }
 
 fn down(config: &Config, json_output: bool) -> Result<(), CliError> {
-    let conn = match Seqpacket::connect(&config.daemon_socket()) {
+    let conn = match Seqpacket::connect_timeout(&config.daemon_socket(), rpc_timeout(config)) {
         Ok(conn) => conn,
         Err(err) if is_unreachable(&err) => {
             print_state(json_output, "not-running", "daemon not running");
@@ -181,7 +181,7 @@ fn down(config: &Config, json_output: bool) -> Result<(), CliError> {
 
     let deadline = Instant::now() + Duration::from_millis(config.daemon.start_timeout_ms);
     loop {
-        if Seqpacket::connect(&config.daemon_socket()).is_err() {
+        if Seqpacket::connect_timeout(&config.daemon_socket(), rpc_timeout(config)).is_err() {
             print_state(json_output, "stopped", "daemon stopped");
             return Ok(());
         }
@@ -257,7 +257,7 @@ fn mute(config: &Config, mute: bool, json_output: bool) -> Result<(), CliError> 
 }
 
 fn probe(config: &Config) -> io::Result<Response> {
-    let conn = Seqpacket::connect(&config.daemon_socket())?;
+    let conn = Seqpacket::connect_timeout(&config.daemon_socket(), rpc_timeout(config))?;
     request(&conn, ctl::DAEMON_HELLO, b"{}", config.daemon.rpc_timeout_ms)
 }
 
@@ -310,8 +310,12 @@ fn daemon_binary() -> PathBuf {
         .unwrap_or_else(|| PathBuf::from("mozart-daemon"))
 }
 
+fn rpc_timeout(config: &Config) -> Option<Duration> {
+    Some(Duration::from_millis(config.daemon.rpc_timeout_ms))
+}
+
 fn connect(config: &Config) -> Result<Seqpacket, CliError> {
-    Seqpacket::connect(&config.daemon_socket()).map_err(|err| {
+    Seqpacket::connect_timeout(&config.daemon_socket(), rpc_timeout(config)).map_err(|err| {
         if is_unreachable(&err) {
             CliError::new(EXIT_UNREACHABLE, format!("daemon not reachable: {err}"))
         } else {
@@ -341,8 +345,9 @@ fn classify_io(err: io::Error) -> CliError {
 }
 
 fn request(conn: &Seqpacket, type_: u16, body: &[u8], timeout_ms: u64) -> io::Result<Response> {
-    conn.send(type_, 1, body)?;
-    let msg = conn.recv(Some(Duration::from_millis(timeout_ms)))?;
+    let timeout = Duration::from_millis(timeout_ms);
+    conn.send_timeout(type_, 1, body, Some(timeout))?;
+    let msg = conn.recv(Some(timeout))?;
     serde_json::from_slice(&msg.body).map_err(io::Error::other)
 }
 

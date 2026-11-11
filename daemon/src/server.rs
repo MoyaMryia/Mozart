@@ -117,7 +117,12 @@ fn serve_connection(
         let (reply, shutdown) = handle_request(state, services, config, &msg);
         let type_ = msg.header.type_;
         let request_id = msg.header.request_id;
-        conn.send(type_, request_id, &reply)?;
+        conn.send_timeout(
+            type_,
+            request_id,
+            &reply,
+            Some(Duration::from_millis(config.daemon.rpc_timeout_ms)),
+        )?;
         if shutdown {
             running.store(false, Ordering::Release);
             return Ok(());
@@ -132,6 +137,16 @@ fn handle_request(
     msg: &Message,
 ) -> (Vec<u8>, bool) {
     let type_ = msg.header.type_;
+    if type_ == ctl::DAEMON_SHUTDOWN {
+        lock_state(state).begin_shutdown();
+        return (schema::ok_body(json!({})), true);
+    }
+    if lock_state(state).is_shutting_down() {
+        return (
+            schema::error_body(ctl::CODE_BUSY, "daemon is shutting down"),
+            false,
+        );
+    }
     match type_ {
         ctl::DAEMON_HELLO => (
             schema::ok_body(json!({"version": env!("CARGO_PKG_VERSION")})),
@@ -164,7 +179,6 @@ fn handle_request(
                 false,
             ),
         },
-        ctl::DAEMON_SHUTDOWN => (schema::ok_body(json!({})), true),
         _ => (
             schema::error_body(ctl::CODE_UNKNOWN_COMMAND, "unknown command"),
             false,

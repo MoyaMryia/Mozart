@@ -9,7 +9,10 @@ use std::mem;
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
 use std::os::unix::ffi::OsStrExt;
 use std::path::Path;
-use std::time::Duration;
+use std::time::{Duration, Instant};
+
+/// connect 非阻塞重试的间隔。
+const RETRY_STEP: Duration = Duration::from_millis(10);
 
 pub const MAGIC: u32 = 0x4C54_434D;
 pub const VERSION: u16 = 1;
@@ -139,6 +142,7 @@ pub struct Message {
     pub body: Vec<u8>,
 }
 
+#[derive(Debug)]
 pub struct Seqpacket {
     fd: OwnedFd,
 }
@@ -162,20 +166,51 @@ impl Seqpacket {
     }
 
     pub fn connect(path: &Path) -> io::Result<Self> {
+        Self::connect_timeout(path, None)
+    }
+
+    /// 监听积压满时 connect 会无限阻塞；带超时版本以非阻塞重试实现。
+    pub fn connect_timeout(path: &Path, timeout: Option<Duration>) -> io::Result<Self> {
         let fd = new_seqpacket()?;
+        set_nonblocking(&fd, true)?;
         let (addr, len) = sockaddr(path)?;
-        // SAFETY: fd 有效；addr 指向已零初始化的 sockaddr_un。
-        let rc = unsafe {
-            libc::connect(
-                fd.as_raw_fd(),
-                (&addr as *const libc::sockaddr_un).cast(),
-                len,
-            )
-        };
-        if rc != 0 {
-            return Err(io::Error::last_os_error());
+        let deadline = timeout.map(|t| Instant::now() + t);
+        loop {
+            // SAFETY: fd 有效；addr 指向已零初始化的 sockaddr_un。
+            let rc = unsafe {
+                libc::connect(
+                    fd.as_raw_fd(),
+                    (&addr as *const libc::sockaddr_un).cast(),
+                    len,
+                )
+            };
+            if rc == 0 {
+                set_nonblocking(&fd, false)?;
+                return Ok(Self { fd });
+            }
+            let err = io::Error::last_os_error();
+            match err.raw_os_error() {
+                Some(libc::EINTR) | Some(libc::EINPROGRESS) | Some(libc::EAGAIN) => {}
+                Some(libc::EISCONN) => {
+                    set_nonblocking(&fd, false)?;
+                    return Ok(Self { fd });
+                }
+                _ => return Err(err),
+            }
+            match deadline {
+                None => std::thread::sleep(RETRY_STEP),
+                Some(deadline) => {
+                    let now = Instant::now();
+                    if now >= deadline {
+                        return Err(io::Error::new(
+                            io::ErrorKind::TimedOut,
+                            "control socket connect timeout",
+                        ));
+                    }
+                    std::thread::sleep(RETRY_STEP.min(deadline - now));
+                }
+            }
         }
-        Ok(Self { fd })
     }
 
     pub fn listen(&self, backlog: libc::c_int) -> io::Result<()> {
@@ -213,6 +248,17 @@ impl Seqpacket {
     }
 
     pub fn send(&self, type_: u16, request_id: u32, body: &[u8]) -> io::Result<()> {
+        self.send_timeout(type_, request_id, body, None)
+    }
+
+    /// 对端缓冲满时 send 会无限阻塞；带超时版本以 MSG_DONTWAIT + poll 实现。
+    pub fn send_timeout(
+        &self,
+        type_: u16,
+        request_id: u32,
+        body: &[u8],
+        timeout: Option<Duration>,
+    ) -> io::Result<()> {
         if body.len() > MAX_BODY_BYTES {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
@@ -222,25 +268,37 @@ impl Seqpacket {
         let mut packet = Vec::with_capacity(HEADER_BYTES + body.len());
         packet.extend_from_slice(&Header::new(type_, request_id, body.len() as u32).to_bytes());
         packet.extend_from_slice(body);
-        // SAFETY: packet 缓冲区有效；MSG_NOSIGNAL 防止对端关闭时触发 SIGPIPE。
-        let sent = unsafe {
-            libc::send(
-                self.fd.as_raw_fd(),
-                packet.as_ptr().cast(),
-                packet.len(),
-                libc::MSG_NOSIGNAL,
-            )
-        };
-        if sent < 0 {
-            return Err(io::Error::last_os_error());
+        let deadline = timeout.map(|t| Instant::now() + t);
+        loop {
+            // SAFETY: packet 缓冲区有效；MSG_NOSIGNAL 防止对端关闭时触发 SIGPIPE，
+            // MSG_DONTWAIT 让缓冲满时立即返回而不是阻塞。
+            let sent = unsafe {
+                libc::send(
+                    self.fd.as_raw_fd(),
+                    packet.as_ptr().cast(),
+                    packet.len(),
+                    libc::MSG_NOSIGNAL | libc::MSG_DONTWAIT,
+                )
+            };
+            if sent >= 0 {
+                if sent as usize == packet.len() {
+                    return Ok(());
+                }
+                return Err(io::Error::new(
+                    io::ErrorKind::WriteZero,
+                    "short SEQPACKET send",
+                ));
+            }
+            let err = io::Error::last_os_error();
+            match err.kind() {
+                io::ErrorKind::Interrupted => continue,
+                io::ErrorKind::WouldBlock => {
+                    let wait = deadline.map(|d| d.saturating_duration_since(Instant::now()));
+                    self.wait_writable(wait)?;
+                }
+                _ => return Err(err),
+            }
         }
-        if sent as usize != packet.len() {
-            return Err(io::Error::new(
-                io::ErrorKind::WriteZero,
-                "short SEQPACKET send",
-            ));
-        }
-        Ok(())
     }
 
     pub fn recv(&self, timeout: Option<Duration>) -> io::Result<Message> {
@@ -294,9 +352,17 @@ impl Seqpacket {
     }
 
     pub fn wait_readable(&self, timeout: Option<Duration>) -> io::Result<()> {
+        self.wait_ready(libc::POLLIN, timeout)
+    }
+
+    fn wait_writable(&self, timeout: Option<Duration>) -> io::Result<()> {
+        self.wait_ready(libc::POLLOUT, timeout)
+    }
+
+    fn wait_ready(&self, events: libc::c_short, timeout: Option<Duration>) -> io::Result<()> {
         let mut pollfd = libc::pollfd {
             fd: self.fd.as_raw_fd(),
-            events: libc::POLLIN,
+            events,
             revents: 0,
         };
         let timeout_ms = match timeout {
@@ -338,6 +404,24 @@ fn new_seqpacket() -> io::Result<OwnedFd> {
     }
     // SAFETY: raw 是刚创建且未复制的文件描述符。
     Ok(unsafe { OwnedFd::from_raw_fd(raw) })
+}
+
+fn set_nonblocking(fd: &OwnedFd, nonblocking: bool) -> io::Result<()> {
+    // SAFETY: fcntl 只读写该 fd 的标志位。
+    let flags = unsafe { libc::fcntl(fd.as_raw_fd(), libc::F_GETFL) };
+    if flags < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    let target = if nonblocking {
+        flags | libc::O_NONBLOCK
+    } else {
+        flags & !libc::O_NONBLOCK
+    };
+    // SAFETY: target 由上一次 F_GETFL 结果派生。
+    if unsafe { libc::fcntl(fd.as_raw_fd(), libc::F_SETFL, target) } < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(())
 }
 
 fn sockaddr(path: &Path) -> io::Result<(libc::sockaddr_un, libc::socklen_t)> {
@@ -463,6 +547,74 @@ mod tests {
         assert_eq!(sent as usize, packet.len());
         let err = b.recv(Some(Duration::from_secs(1))).unwrap_err();
         assert_eq!(err.kind(), io::ErrorKind::InvalidData);
+    }
+
+    #[test]
+    fn connect_timeout_bounds_backlog_wait() {
+        let dir = std::env::temp_dir().join(format!("mozart-ctl-connect-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("listen.sock");
+        let _ = std::fs::remove_file(&path);
+
+        let listener = Seqpacket::bind(&path).unwrap();
+        listener.listen(1).unwrap();
+        // 内核对积压的比较是严格大于：backlog=1 实际容许两条未 accept 连接。
+        let first = Seqpacket::connect(&path).unwrap();
+        let second = Seqpacket::connect(&path).unwrap();
+
+        let started = Instant::now();
+        let err =
+            Seqpacket::connect_timeout(&path, Some(Duration::from_millis(120))).unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::TimedOut);
+        // poll 毫秒超时允许内核略提前醒来，留 5 ms 容差。
+        assert!(started.elapsed() >= Duration::from_millis(115));
+
+        // accept 释放积压后，重试方在超时内接通。
+        let retry_path = path.clone();
+        let retry = std::thread::spawn(move || {
+            Seqpacket::connect_timeout(&retry_path, Some(Duration::from_secs(2)))
+        });
+        std::thread::sleep(Duration::from_millis(50));
+        let accepted_first = listener.accept().unwrap();
+        retry.join().unwrap().unwrap();
+        let accepted_second = listener.accept().unwrap();
+
+        drop(accepted_first);
+        drop(accepted_second);
+        drop(first);
+        drop(second);
+        drop(listener);
+        std::fs::remove_file(&path).unwrap();
+        let _ = std::fs::remove_dir(&dir);
+    }
+
+    #[test]
+    fn send_timeout_when_peer_stalls() {
+        let (a, _b) = socketpair();
+        // SAFETY: setsockopt 只作用于测试内创建的套接字。Unix 套接字的流控
+        // 记在发送方 sndbuf 上：内核按 2×8192 生效，两条 8 KiB 消息必然放不下第二条。
+        let sndbuf: libc::c_int = 8192;
+        let rc = unsafe {
+            libc::setsockopt(
+                a.fd.as_raw_fd(),
+                libc::SOL_SOCKET,
+                libc::SO_SNDBUF,
+                (&sndbuf as *const libc::c_int).cast(),
+                mem::size_of::<libc::c_int>() as libc::socklen_t,
+            )
+        };
+        assert_eq!(rc, 0);
+
+        let body = vec![0u8; 8192];
+        a.send_timeout(PRE_HELLO, 1, &body, Some(Duration::from_secs(1)))
+            .unwrap();
+        let started = Instant::now();
+        let err = a
+            .send_timeout(PRE_HELLO, 2, &body, Some(Duration::from_millis(120)))
+            .unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::TimedOut);
+        // poll 毫秒超时允许内核略提前醒来，留 5 ms 容差。
+        assert!(started.elapsed() >= Duration::from_millis(115));
     }
 
     #[test]

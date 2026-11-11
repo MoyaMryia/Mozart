@@ -29,6 +29,7 @@ pub struct State {
     rvc: Option<RvcStatus>,
     hw: Option<HardwareStatus>,
     degraded: Vec<String>,
+    shutting_down: bool,
 }
 
 impl State {
@@ -48,6 +49,7 @@ impl State {
             rvc: None,
             hw: None,
             degraded: Vec::new(),
+            shutting_down: false,
         }
     }
 
@@ -115,6 +117,14 @@ impl State {
 
     pub fn set_hw(&mut self, hw: Option<HardwareStatus>) {
         self.hw = hw;
+    }
+
+    pub fn begin_shutdown(&mut self) {
+        self.shutting_down = true;
+    }
+
+    pub fn is_shutting_down(&self) -> bool {
+        self.shutting_down
     }
 
     pub fn set_degraded(&mut self, reasons: Vec<String>) {

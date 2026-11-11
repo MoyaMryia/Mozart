@@ -122,7 +122,7 @@ impl ServiceLink {
     }
 
     fn connect_and_hello(&mut self) -> io::Result<()> {
-        let conn = Seqpacket::connect(&self.socket)?;
+        let conn = Seqpacket::connect_timeout(&self.socket, Some(self.timeout))?;
         self.conn = Some(conn);
         let response = match self.roundtrip(self.hello, b"{}") {
             Ok(response) => response,
@@ -148,7 +148,7 @@ impl ServiceLink {
             .expect("control link must be connected before roundtrip");
         self.next_request = self.next_request.wrapping_add(1);
         let request_id = self.next_request;
-        conn.send(type_, request_id, body)?;
+        conn.send_timeout(type_, request_id, body, Some(self.timeout))?;
         let msg = conn.recv(Some(self.timeout))?;
         let reply_type = msg.header.type_;
         let reply_id = msg.header.request_id;
