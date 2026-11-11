@@ -130,21 +130,30 @@ impl std::error::Error for ConfigError {}
 impl Config {
     /// 解析顺序：显式路径 > `MOZART_CONFIG` > `./mozart.toml` > 内置默认。
     pub fn load(explicit: Option<&Path>) -> Result<Self, ConfigError> {
-        let path = explicit
+        Self::load_from(Self::resolve_path(explicit).as_deref())
+    }
+
+    pub fn resolve_path(explicit: Option<&Path>) -> Option<PathBuf> {
+        explicit
             .map(Path::to_path_buf)
             .or_else(|| std::env::var_os("MOZART_CONFIG").map(PathBuf::from))
             .or_else(|| {
                 let local = PathBuf::from("mozart.toml");
                 local.exists().then_some(local)
-            });
+            })
+    }
 
+    pub fn load_from(path: Option<&Path>) -> Result<Self, ConfigError> {
         let mut config = match path {
             Some(path) => {
-                let text = std::fs::read_to_string(&path).map_err(|source| ConfigError::Read {
-                    path: path.clone(),
+                let text = std::fs::read_to_string(path).map_err(|source| ConfigError::Read {
+                    path: path.to_path_buf(),
                     source,
                 })?;
-                toml::from_str(&text).map_err(|source| ConfigError::Parse { path, source })?
+                toml::from_str(&text).map_err(|source| ConfigError::Parse {
+                    path: path.to_path_buf(),
+                    source,
+                })?
             }
             None => Config::default(),
         };
