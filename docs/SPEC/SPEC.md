@@ -1,6 +1,6 @@
 # SPEC 索引
 
-状态：讨论中。最后更新：2026-11-10。
+状态：讨论中。最后更新：2026-11-11。
 
 ## 总体
 
@@ -15,15 +15,16 @@
 - 前端保持 TypeScript。
 - 离线模型导出也在讨论范围内；导出核心依赖 PyTorch，替代方案待评估。
 - 验收评分标准见 [REQUIREMENTS.md](REQUIREMENTS.md)。
+- 第一版之后的提升点见 [FUTURE.md](../FUTURE.md)。
 
 ## 模块索引
 
 | 顺序 | 文档 | 对应旧模块 | 状态 |
 | --- | --- | --- | --- |
-| 1 | [SPEC-01-core.md](SPEC-01-core.md) | IO：契约帧、环形缓冲、传输 | 待讨论 |
+| 1 | [SPEC-01-core.md](SPEC-01-core.md) | IO：契约帧、环形缓冲、传输 | 讨论中 |
 | 2 | [SPEC-02-pre.md](SPEC-02-pre.md) | preprocessor：采集、DSP、播放、路由 | 讨论中 |
 | 3 | [SPEC-03-rvc.md](SPEC-03-rvc.md) | rvc-backend：推理核心与调度 | 讨论中 |
-| 4 | [SPEC-04-daemon.md](SPEC-04-daemon.md) | state、api、monitor：入口与控制面 | 待讨论 |
+| 4 | [SPEC-04-daemon.md](SPEC-04-daemon.md) | state、api、monitor：入口与控制面 | 讨论中 |
 | 5 | [SPEC-05-language.md](SPEC-05-language.md) | tools：识别、字幕、翻译、翻译播报、投递、变速 | 讨论中 |
 | 6 | [SPEC-06-web.md](SPEC-06-web.md) | frontend | 后续 |
 | 7 | [SPEC-07-device.md](SPEC-07-device.md) | usb-audio、usb-gadget | 待定 |
@@ -50,3 +51,9 @@
 - 2026-11-10：功能验收写入 `SPEC-08-verification.md`；翻译播报替代参考音色播报。
 - 2026-11-10：一致性核对：术语统一、门槛来源标注、待讨论项归位。
 - 2026-11-10：新增开发与部署流水线规格，建立一键本地入口的讨论框架。
+- 2026-11-11：补充推理层接口约束草案。
+- 2026-11-11：新增第一版之后的提升点清单。
+- 2026-11-11：确认同机传输与控制消息格式。
+- 2026-11-11：确认输出缓冲归属，大缓冲留在 C++。
+- 2026-11-11：补写 pre 分发、仲裁与直出决定；确认帧契约 C 单一来源；记录 1:1 泵时钟耦合假设。
+- 2026-11-11：控制面归独立 daemon；基础链路定为三进程，daemon 不在数据路径上。
