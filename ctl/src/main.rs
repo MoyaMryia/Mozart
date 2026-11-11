@@ -1,5 +1,5 @@
 use clap::{Parser, Subcommand, ValueEnum};
-use mozart_core::config::Config;
+use mozart_core::config::{ensure_run_dir, Config};
 use mozart_core::ctl::schema::{Activity, ProcessState, Response, Route, Status};
 use mozart_core::ctl::{self, Seqpacket};
 use serde_json::{json, Value};
@@ -109,6 +109,12 @@ fn up(config: &Config, config_path: Option<&Path>, json_output: bool) -> Result<
         return Ok(());
     }
 
+    ensure_run_dir(&config.daemon.run_dir).map_err(|err| {
+        CliError::new(
+            EXIT_ERROR,
+            format!("prepare {}: {err}", config.daemon.run_dir.display()),
+        )
+    })?;
     std::fs::create_dir_all(config.log_dir()).map_err(|err| {
         CliError::new(
             EXIT_ERROR,

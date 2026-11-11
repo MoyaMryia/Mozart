@@ -2,13 +2,12 @@ use crate::poller::Poller;
 use crate::services::{self, Services};
 use crate::state::{lock_state, Role, State};
 use crate::supervisor::Supervisor;
-use mozart_core::config::Config;
+use mozart_core::config::{ensure_run_dir, Config};
 use mozart_core::ctl::schema::{self, MuteSetRequest, RouteSetRequest};
 use mozart_core::ctl::{self, Message, Seqpacket};
 use serde_json::json;
 use std::fs::{File, OpenOptions};
 use std::io;
-use std::os::unix::fs::PermissionsExt;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread;
@@ -17,7 +16,7 @@ use std::time::Duration;
 const IDLE_TIMEOUT: Duration = Duration::from_secs(30);
 
 pub fn serve(config: &Config) -> io::Result<()> {
-    prepare_run_dir(config)?;
+    ensure_run_dir(&config.daemon.run_dir)?;
     std::fs::create_dir_all(config.log_dir())?;
     let _lock = lock_instance(config)?;
 
@@ -51,16 +50,6 @@ pub fn serve(config: &Config) -> io::Result<()> {
     drop(listener);
     let _ = std::fs::remove_file(&socket_path);
     outcome
-}
-
-fn prepare_run_dir(config: &Config) -> io::Result<()> {
-    let dir = &config.daemon.run_dir;
-    let created = !dir.exists();
-    std::fs::create_dir_all(dir)?;
-    if created {
-        std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700))?;
-    }
-    Ok(())
 }
 
 fn lock_instance(config: &Config) -> io::Result<File> {

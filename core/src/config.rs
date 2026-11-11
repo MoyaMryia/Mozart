@@ -3,6 +3,7 @@
 use serde::Deserialize;
 use std::fmt;
 use std::io;
+use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 
 #[derive(Debug, Clone, Deserialize)]
@@ -279,6 +280,14 @@ fn validate_socket_name(name: &str, field: &str) -> Result<(), ConfigError> {
     Ok(())
 }
 
+/// 运行目录承载控制 socket，统一收敛到 0700；ctl 与 daemon 共用此定义，
+/// 避免 ctl 抢先建目录导致权限策略失效。
+pub fn ensure_run_dir(dir: &Path) -> io::Result<()> {
+    std::fs::create_dir_all(dir)?;
+    std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700))?;
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -325,5 +334,24 @@ mod tests {
 
         let unknown: Result<Config, _> = toml::from_str("[daemon]\nunknown_key = 1\n");
         assert!(unknown.is_err());
+    }
+
+    #[test]
+    fn ensure_run_dir_converges_to_0700() {
+        let dir = std::env::temp_dir().join(format!("mozart-rundir-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+
+        ensure_run_dir(&dir).unwrap();
+        let mode = std::fs::metadata(&dir).unwrap().permissions().mode();
+        assert_eq!(mode & 0o777, 0o700);
+
+        let mut perms = std::fs::metadata(&dir).unwrap().permissions();
+        perms.set_mode(0o755);
+        std::fs::set_permissions(&dir, perms).unwrap();
+        ensure_run_dir(&dir).unwrap();
+        let mode = std::fs::metadata(&dir).unwrap().permissions().mode();
+        assert_eq!(mode & 0o777, 0o700);
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
