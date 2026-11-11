@@ -76,6 +76,8 @@ add_library(mozart_rvc_runtime STATIC
     src/rvc/onnx_engine.cpp
     src/rvc/index_search.cpp
     transport/unix_dgram_stream.cpp
+    control/ctl_link.cpp
+    control/stream_session.cpp
 )
 # include/：搬运核心的旧布局（rvc/*.hpp）；仓库内新模块按目录相对包含
 # （transport/、control/、config/），因此把组件根也加入搜索路径。

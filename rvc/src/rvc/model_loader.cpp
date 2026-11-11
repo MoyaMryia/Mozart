@@ -1,4 +1,7 @@
-// 搬运自 Mozart-Old/rvc-backend/src/rvc/model_loader.cpp，改动：未用形参标注 [[maybe_unused]]（-Werror）。
+// 搬运自 Mozart-Old/rvc-backend/src/rvc/model_loader.cpp，改动：
+//   - 未用形参标注 [[maybe_unused]]（-Werror）；
+//   - RVCModelConfig 增加 model_version 报告口径（config.json 的 version
+//     字段，缺省派生 sr{采样率}.emb{emb_channels}）。
 #include "rvc/model_loader.hpp"
 #include <spdlog/spdlog.h>
 #include <fstream>
@@ -82,6 +85,13 @@ std::optional<RVCModelConfig> RVCModelConfig::from_json(const std::filesystem::p
         }
         if (j.contains("f0")) {
             cfg.has_f0 = j["f0"].get<bool>();
+        }
+        // 版本口径：config.json 带 "version" 用之；缺省派生内容签名。
+        if (j.contains("version") && j["version"].is_string()) {
+            cfg.version = j["version"].get<std::string>();
+        } else {
+            cfg.version = "sr" + std::to_string(cfg.sample_rate)
+                + ".emb" + std::to_string(cfg.emb_channels);
         }
         return cfg;
     } catch (const std::exception& e) {

@@ -22,6 +22,12 @@ target_link_libraries(t_rvc_pump PRIVATE mozart_rvc_runtime mozart_warnings)
 add_test(NAME rvc_pump COMMAND t_rvc_pump)
 set_tests_properties(rvc_pump PROPERTIES LABELS "unit" TIMEOUT 60)
 
+# StreamSession 六命令控制面语义（桩后端，无 GPU 依赖）。
+add_executable(t_rvc_control test_rvc_control.cpp)
+target_link_libraries(t_rvc_control PRIVATE mozart_rvc_runtime mozart_warnings)
+add_test(NAME rvc_control COMMAND t_rvc_control)
+set_tests_properties(rvc_control PROPERTIES LABELS "unit" TIMEOUT 30)
+
 # StreamingRvc 块调度/连续性/静音/断续单测（搬运自旧 tests/test_streaming.cpp）。
 add_executable(t_rvc_streaming test_rvc_streaming.cpp)
 target_link_libraries(t_rvc_streaming PRIVATE mozart_rvc_runtime mozart_warnings)

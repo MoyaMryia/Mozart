@@ -15,6 +15,7 @@
 
 #include <atomic>
 #include <cstdint>
+#include <limits>
 #include <memory>
 #include <mutex>
 #include <string>
@@ -53,7 +54,10 @@ public:
         uint64_t output_underruns = 0;   // 输出欠载补零帧数
         uint64_t startup_output_underruns = 0;
         uint64_t queue_depth_frames = 0; // 输出环待消费帧数
-        std::string last_error;           // 传输/泵级错误；推理错误见 streaming
+        double inference_ms_last = std::numeric_limits<double>::quiet_NaN();
+        double inference_ms_avg = std::numeric_limits<double>::quiet_NaN();
+        double inference_ms_p95 = std::numeric_limits<double>::quiet_NaN();
+        std::string last_error;           // 传输错误优先，其次推理失败原因
     };
 
     // 流不归 worker 所有（StreamSession 持有），生命周期由调用方保证

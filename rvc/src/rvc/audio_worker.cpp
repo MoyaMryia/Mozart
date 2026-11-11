@@ -9,6 +9,7 @@
 
 #include <algorithm>
 #include <chrono>
+#include <cmath>
 #include <cstring>
 #include <stdexcept>
 #include <utility>
@@ -176,6 +177,7 @@ void AudioWorker::process_frame(const mozart_input_frame_t& input,
 
 AudioWorker::StreamStats AudioWorker::get_stream_stats() const {
     StreamStats s;
+    std::string inference_error;
     if (streaming_) {
         const auto& src = streaming_->stats();
         s.blocks = src.blocks.load();
@@ -188,13 +190,23 @@ AudioWorker::StreamStats AudioWorker::get_stream_stats() const {
         s.history_resets = src.history_resets.load();
         s.queue_depth_frames =
             streaming_->output_pending() / MOZART_OUTPUT_SAMPLES;
+        const auto& timing = streaming_->timing();
+        if (timing.count() > 0) {   // 静音跳过的块不计时，保持 NaN
+            s.inference_ms_last = timing.last();
+            s.inference_ms_avg = timing.avg();
+            std::vector<double> scratch;
+            const double p95 = timing.p95(scratch);
+            s.inference_ms_p95 = std::isnan(p95) ? timing.last() : p95;
+        }
+        inference_error = streaming_->last_inference_error();
     }
     std::lock_guard<std::mutex> lock(stats_mutex_);
     s.frames_in = frames_in_;
     s.frames_out = frames_out_;
     s.output_underruns = underrun_count_;
     s.startup_output_underruns = startup_underrun_count_;
-    s.last_error = last_error_;
+    // 传输错误优先（它切断整条链路），其次推理失败原因。
+    s.last_error = !last_error_.empty() ? last_error_ : inference_error;
     return s;
 }
 

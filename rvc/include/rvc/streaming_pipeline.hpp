@@ -61,8 +61,11 @@ public:
         seq_.fetch_add(1, std::memory_order_relaxed);   // 离开写入区间（偶）
     }
 
-    // last/avg：单次原子读；空历史返回 NaN，调用方转为 null。
+    // last/avg：单次原子读；无记录时为 NaN，调用方转 null。
     double last() const noexcept { return last_.load(std::memory_order_relaxed); }
+    uint64_t count() const noexcept {
+        return count_.load(std::memory_order_relaxed);
+    }
     double avg() const noexcept {
         const uint64_t count = count_.load(std::memory_order_relaxed);
         if (count == 0) return std::numeric_limits<double>::quiet_NaN();

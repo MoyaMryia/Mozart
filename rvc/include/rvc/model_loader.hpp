@@ -21,6 +21,9 @@ struct RVCModelConfig {
     uint32_t emb_channels = 768;
     uint32_t spk_id = 0;
     bool has_f0 = true;
+    // config.json 的可选 "version" 字段；缺省派生为 sr{采样率}.emb{emb_channels}
+    // （模型版本报告口径见 stream_session，SPEC-03）。
+    std::string version;
 
     static std::optional<RVCModelConfig> from_json(const std::filesystem::path& path);
 };
