@@ -24,6 +24,10 @@ pub fn parse_args(name: &'static str) -> StubArgs {
             "--socket" => {
                 socket = Some(PathBuf::from(args.next().unwrap_or_else(|| usage(name))));
             }
+            // daemon spawn 传同一 TOML（--config）；协议桩不读配置，接受即忽略。
+            "--config" => {
+                let _ = args.next().unwrap_or_else(|| usage(name));
+            }
             "--exit-after-ms" => {
                 let value = args.next().unwrap_or_else(|| usage(name));
                 let millis = value.parse().unwrap_or_else(|_| usage(name));
@@ -47,7 +51,7 @@ pub fn parse_args(name: &'static str) -> StubArgs {
 
 fn usage(name: &str) -> ! {
     eprintln!(
-        "{name}: usage: --socket <path> [--exit-after-ms <ms>] [--delay-ms <ms>]"
+        "{name}: usage: --socket <path> [--config <path>] [--exit-after-ms <ms>] [--delay-ms <ms>]"
     );
     std::process::exit(2);
 }

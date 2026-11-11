@@ -24,12 +24,15 @@ impl Supervisor {
     pub fn spawn(
         role: Role,
         config: Arc<Config>,
+        config_path: Option<PathBuf>,
         state: Arc<Mutex<State>>,
         running: Arc<AtomicBool>,
     ) -> io::Result<Self> {
         let handle = thread::Builder::new()
             .name(format!("mozart-{}", role_name(role)))
-            .spawn(move || supervise(role, &config, &state, &running))?;
+            .spawn(move || {
+                supervise(role, &config, config_path.as_deref(), &state, &running)
+            })?;
         Ok(Self { handle })
     }
 
@@ -45,7 +48,13 @@ fn role_name(role: Role) -> &'static str {
     }
 }
 
-fn supervise(role: Role, config: &Config, state: &Mutex<State>, running: &AtomicBool) {
+fn supervise(
+    role: Role,
+    config: &Config,
+    config_path: Option<&Path>,
+    state: &Mutex<State>,
+    running: &AtomicBool,
+) {
     let bin = match role {
         Role::Pre => &config.process.pre_bin,
         Role::Rvc => &config.process.rvc_bin,
@@ -62,7 +71,7 @@ fn supervise(role: Role, config: &Config, state: &Mutex<State>, running: &Atomic
 
     while running.load(Ordering::Acquire) {
         lock_state(state).process_starting(role);
-        let mut child = match start_child(bin, &socket, &log_path) {
+        let mut child = match start_child(bin, &socket, config_path, &log_path) {
             Ok(child) => child,
             Err(err) => {
                 lock_state(state).process_failed(role, format!("spawn: {err}"));
@@ -109,13 +118,22 @@ fn supervise(role: Role, config: &Config, state: &Mutex<State>, running: &Atomic
     lock_state(state).process_stopped(role);
 }
 
-fn start_child(bin: &Path, socket: &Path, log_path: &Path) -> io::Result<Child> {
+fn start_child(
+    bin: &Path,
+    socket: &Path,
+    config: Option<&Path>,
+    log_path: &Path,
+) -> io::Result<Child> {
     let log = OpenOptions::new().create(true).append(true).open(log_path)?;
     let stderr = log.try_clone()?;
     let mut command = Command::new(resolve_bin(bin));
+    command.arg("--socket").arg(socket);
+    // SPEC-04：子进程与 daemon 读同一 TOML，各读自己的配置段；daemon 以内置
+    // 默认启动时无文件可传，不传 --config，子进程按同一顺序解析得同一默认值。
+    if let Some(config) = config {
+        command.arg("--config").arg(config);
+    }
     command
-        .arg("--socket")
-        .arg(socket)
         .stdin(Stdio::null())
         .stdout(Stdio::from(log))
         .stderr(Stdio::from(stderr));

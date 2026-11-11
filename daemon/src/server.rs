@@ -8,6 +8,7 @@ use mozart_core::ctl::{self, Message, Seqpacket};
 use serde_json::json;
 use std::fs::{File, OpenOptions};
 use std::io;
+use std::path::Path;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread;
@@ -15,7 +16,7 @@ use std::time::Duration;
 
 const IDLE_TIMEOUT: Duration = Duration::from_secs(30);
 
-pub fn serve(config: &Config) -> io::Result<()> {
+pub fn serve(config: &Config, config_path: Option<&Path>) -> io::Result<()> {
     ensure_run_dir(&config.daemon.run_dir)?;
     std::fs::create_dir_all(config.log_dir())?;
     let _lock = lock_instance(config)?;
@@ -27,12 +28,26 @@ pub fn serve(config: &Config) -> io::Result<()> {
     eprintln!("mozart-daemon: listening on {}", socket_path.display());
 
     let config = Arc::new(config.clone());
+    // 子进程与 daemon 读同一 TOML：解析出的路径随 spawn 传递（--config）。
+    let config_path = config_path.map(|path| path.to_path_buf());
     let state = Arc::new(Mutex::new(State::new()));
     let services = Arc::new(Services::new(&config));
     let running = Arc::new(AtomicBool::new(true));
     let supervisors = [
-        Supervisor::spawn(Role::Pre, config.clone(), state.clone(), running.clone())?,
-        Supervisor::spawn(Role::Rvc, config.clone(), state.clone(), running.clone())?,
+        Supervisor::spawn(
+            Role::Pre,
+            config.clone(),
+            config_path.clone(),
+            state.clone(),
+            running.clone(),
+        )?,
+        Supervisor::spawn(
+            Role::Rvc,
+            config.clone(),
+            config_path,
+            state.clone(),
+            running.clone(),
+        )?,
     ];
     let poller = Poller::spawn(
         config.clone(),

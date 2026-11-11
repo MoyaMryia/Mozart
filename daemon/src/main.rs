@@ -41,6 +41,10 @@ fn parse_args() -> Result<Option<PathBuf>, String> {
 }
 
 fn run(config_path: Option<PathBuf>) -> Result<(), String> {
-    let config = Config::load(config_path.as_deref()).map_err(|err| err.to_string())?;
-    server::serve(&config).map_err(|err| format!("server: {err}"))
+    // 解析顺序只在 core::resolve_path 定义一次。解析出的路径交给 serve，
+    // 由 supervisor 以 --config 转交子进程；无配置文件（内置默认）时不传，
+    // 子进程按同一顺序得到同一默认值。
+    let resolved = Config::resolve_path(config_path.as_deref());
+    let config = Config::load_from(resolved.as_deref()).map_err(|err| err.to_string())?;
+    server::serve(&config, resolved.as_deref()).map_err(|err| format!("server: {err}"))
 }
