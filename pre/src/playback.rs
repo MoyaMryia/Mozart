@@ -1,19 +1,22 @@
-//! 播放线程：路由状态机选源（direct 取主干、rvc 补零），路由与静音淡变，
-//! f32 单声道复制为立体声 S16 写入 ALSA。
+//! 播放线程：路由状态机选源（direct 取主干、rvc 取 AI 接收环），路由与静音
+//! 淡变，f32 单声道复制为立体声 S16 写入 ALSA。
 //! 静音 = 淡到零并保持；设备在静音与欠源期间持续写零，不停流（SPEC-02）。
+//! direct 路由下 AI 环逐帧排空并计数（旧 main.c:112-116 `skipped_replies`：
+//! 直出时后端回包不播、计数）。
 
 use crate::alsa_stream::{self, Op, StreamError};
 use crate::route::{Mute, Router};
 use crate::state::Shared;
 use mozart_core::ctl::schema::Route;
 use mozart_core::ring::Ring;
-use mozart_core::{RawFrame, RAW_SAMPLES};
+use mozart_core::{OutputFrame, RawFrame, RAW_SAMPLES};
 use std::sync::atomic::AtomicBool;
 use std::sync::Arc;
 use std::time::Duration;
 
-/// 主干帧等待预算：一个 20 ms 帧周期；超时补零，吸收采集与播放两硬件时钟的漂移。
-const TRUNK_WAIT: Duration = Duration::from_millis(20);
+/// 帧源等待预算：一个 20 ms 帧周期（主干与 AI 接收环共用）；超时补零续流，
+/// 吸收采集与播放两硬件时钟的漂移。
+const FRAME_WAIT: Duration = Duration::from_millis(20);
 
 /// 单声道 f32 → 立体声 S16（L=R）：钳位 ±1，×32767（旧 float_to_s16_stereo）。
 pub fn mono_to_s16_stereo(mono: &[f32], out: &mut [i16]) {
@@ -25,10 +28,23 @@ pub fn mono_to_s16_stereo(mono: &[f32], out: &mut [i16]) {
     }
 }
 
+/// direct 路由下排空 AI 接收环并计数（帧号即弃）。
+/// 后端回包在 direct 下属设计内丢弃：环不积压，回切 rvc 时无陈货。
+fn drain_rvc_skipped(rvc: &Ring<OutputFrame>, shared: &Shared) {
+    let mut skipped = 0u64;
+    while rvc.pop(Some(Duration::ZERO)).is_some() {
+        skipped += 1;
+    }
+    if skipped > 0 {
+        shared.add_ai_skipped(skipped);
+    }
+}
+
 /// 播放线程主体。返回 Err 表示致命流错误；主线程据此退出进程。
 pub fn run(
     pcm: alsa::pcm::PCM,
     trunk: Arc<Ring<RawFrame>>,
+    rvc: Arc<Ring<OutputFrame>>,
     shared: Arc<Shared>,
     stop: &'static AtomicBool,
 ) -> Result<(), String> {
@@ -48,17 +64,23 @@ pub fn run(
         let mut mono = match router.route() {
             Route::Direct => {
                 // packed 字段按值整块搬出，不取引用。
-                match trunk.pop(Some(TRUNK_WAIT)) {
+                let pcm = match trunk.pop(Some(FRAME_WAIT)) {
                     Some(frame) => frame.pcm,
                     // 主干欠载：补零续流。属两时钟漂移吸收，不计为丢弃。
                     None => [0f32; RAW_SAMPLES],
-                }
+                };
+                // direct 期间后端输出帧不播、排空并计数（旧 skipped_replies）。
+                drain_rvc_skipped(&rvc, &shared);
+                pcm
             }
             Route::Rvc => {
-                // rvc 输出帧由 Task 4 接线；当前补零播放（简报：收到输出帧前补零）。
                 // rvc 路由不消费主干；逐帧排空防积压。
                 let _ = trunk.pop(Some(Duration::ZERO));
-                [0f32; RAW_SAMPLES]
+                // AI 接收环缺帧补零续流（大缓冲与欠载补零归 C++ 侧，SPEC-03）。
+                match rvc.pop(Some(FRAME_WAIT)) {
+                    Some(frame) => frame.pcm,
+                    None => [0f32; RAW_SAMPLES],
+                }
             }
         };
 
@@ -100,6 +122,7 @@ pub fn run(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use mozart_core::FrameMeta;
 
     #[test]
     fn stereo_conversion_copies_mono_to_both_channels() {
@@ -131,9 +154,46 @@ mod tests {
     }
 
     #[test]
-    fn trunk_wait_matches_frame_period() {
+    fn frame_wait_matches_frame_period() {
         // 等待预算等于一个契约帧周期（frame.h：960 样本 @ 48 kHz）。
         let frame_ms = RAW_SAMPLES as u64 * 1000 / mozart_core::RAW_SAMPLE_RATE as u64;
-        assert_eq!(TRUNK_WAIT, Duration::from_millis(frame_ms));
+        assert_eq!(FRAME_WAIT, Duration::from_millis(frame_ms));
+    }
+
+    #[test]
+    fn direct_route_drains_rvc_ring_into_skipped_counter() {
+        // direct 路由下 AI 环逐帧排空、按帧计数、环归零（旧 skipped_replies）。
+        let shared = Shared::new("cap".to_string(), "play".to_string());
+        let rvc = Ring::<OutputFrame>::new(4);
+        for idx in 0..3u32 {
+            rvc.push(OutputFrame {
+                meta: FrameMeta {
+                    pts_ns: 0,
+                    frame_idx: idx,
+                    vad_flag: 0,
+                    energy_db: 0,
+                    conf: 0,
+                    segment_id: 0,
+                },
+                pcm: [0.0; mozart_core::OUTPUT_SAMPLES],
+            });
+        }
+        drain_rvc_skipped(&rvc, &shared);
+        assert_eq!(rvc.depth(), 0, "排空后 AI 环不得有陈货");
+        let status = shared.status(crate::state::QueueReadout {
+            depth: 0,
+            dropped: 0,
+            rvc_dropped: 0,
+        });
+        assert_eq!(status.consumer_drops["rvc.skipped"], 3);
+
+        // 空环再排：计数不增长（无帧不计数）。
+        drain_rvc_skipped(&rvc, &shared);
+        let status = shared.status(crate::state::QueueReadout {
+            depth: 0,
+            dropped: 0,
+            rvc_dropped: 0,
+        });
+        assert_eq!(status.consumer_drops["rvc.skipped"], 3);
     }
 }

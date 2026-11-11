@@ -69,7 +69,7 @@ node_modules/
 *.xlsx
 # 小型回归输入可以入库，必须显式列出。
 !tests/fixtures/**/*.wav
-# pre DSP 对拍夹具（旧 C 核心离线生成，来源与再生命令见 Task 3 报告）：
+# pre DSP 对拍夹具（旧 C 核心离线生成，来源与再生命令见 Task 3/4 报告）：
 # input.f32 输入信号（合成噪声 + 分段正弦，1 s / 48 kHz 单声道 f32）
 !tests/fixtures/dsp/input.f32
 # hp.f32 旧 C 高通输出参考（Rust 侧逐位一致验收）
@@ -78,6 +78,18 @@ node_modules/
 !tests/fixtures/dsp/wola.f32
 # counts.txt 旧 C 每 960 样本块的 WOLA 发射样本数（wrapper 帧对齐验收）
 !tests/fixtures/dsp/counts.txt
+# gate/agc/limiter/stages.f32 旧 C 整形级单开与全开发射流参考（容差对拍验收）
+!tests/fixtures/dsp/gate.f32
+!tests/fixtures/dsp/agc.f32
+!tests/fixtures/dsp/limiter.f32
+!tests/fixtures/dsp/stages.f32
+# limiter_hot.f32 旧 C 输入×4 的限幅器介入态参考（input.f32 电平低于 -1 dB 上限，
+# 冷输入下限幅器不触发，热输入专门对拍介入路径）
+!tests/fixtures/dsp/limiter_hot.f32
+# dec.f32 旧 C 打包链 16 kHz PCM 参考（逐位对拍验收）
+!tests/fixtures/dsp/dec.f32
+# meta.txt 旧 C 打包链每帧 meta 参考（frame_idx/vad/energy/conf/segment 对拍验收）
+!tests/fixtures/dsp/meta.txt
 
 # ---- 日志与本地数据 ----
 *.log

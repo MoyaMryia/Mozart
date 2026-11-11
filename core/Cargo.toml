@@ -13,6 +13,10 @@ path = "examples/pre_stub.rs"
 name = "rvc_stub"
 path = "examples/rvc_stub.rs"
 
+[[example]]
+name = "rvc_echo"
+path = "examples/rvc_echo.rs"
+
 [dependencies]
 libc = "0.2"
 serde = { version = "1", features = ["derive"] }

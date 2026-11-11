@@ -50,18 +50,28 @@ pub struct PreConfig {
 }
 
 /// DSP 阶段配置。开关默认沿用旧 main.c 的代码默认（生产脚本曾用 --no-denoise
-/// 显式关闭）；禁用降噪时整级跳过（SPEC-02 已确认差异）。
+/// 显式关闭、--gate/--agc/--limiter 显式开启）；禁用降噪时整级跳过，
+/// 禁用整形级时逐位恒等（SPEC-02 已确认）。
 #[derive(Debug, Clone, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct PreDspConfig {
     /// WOLA 谱降噪开关，默认 true；false 时该级全部计算跳过。
     pub denoise: bool,
+    /// 48 kHz 噪声门，默认 false。
+    pub gate: bool,
+    /// 48 kHz 自动增益，默认 false。
+    pub agc: bool,
+    /// 48 kHz 峰值限幅，默认 false。
+    pub limiter: bool,
 }
 
 impl Default for PreDspConfig {
     fn default() -> Self {
         Self {
             denoise: true,
+            gate: false,
+            agc: false,
+            limiter: false,
         }
     }
 }
@@ -383,6 +393,9 @@ mod tests {
         assert_eq!(config.pre.playback_device, "default");
         assert_eq!(config.pre.capture_queue_frames, 8);
         assert!(config.pre.dsp.denoise, "denoise 默认沿用旧 main.c 代码默认");
+        assert!(!config.pre.dsp.gate, "gate 默认关（旧 main.c 代码默认）");
+        assert!(!config.pre.dsp.agc, "agc 默认关");
+        assert!(!config.pre.dsp.limiter, "limiter 默认关");
     }
 
     #[test]
@@ -411,6 +424,15 @@ mod tests {
 
         let denoise_off: Config = toml::from_str("[pre.dsp]\ndenoise = false\n").unwrap();
         assert!(!denoise_off.pre.dsp.denoise);
+
+        let stages_on: Config = toml::from_str(
+            "[pre.dsp]\ngate = true\nagc = true\nlimiter = true\n",
+        )
+        .unwrap();
+        assert!(stages_on.pre.dsp.gate);
+        assert!(stages_on.pre.dsp.agc);
+        assert!(stages_on.pre.dsp.limiter);
+        assert!(stages_on.pre.dsp.denoise, "未写的键沿用默认");
     }
 
     #[test]
@@ -460,6 +482,9 @@ mod tests {
 
         let bad_denoise_type: Result<Config, _> = toml::from_str("[pre.dsp]\ndenoise = \"yes\"\n");
         assert!(bad_denoise_type.is_err());
+
+        let bad_gate_type: Result<Config, _> = toml::from_str("[pre.dsp]\ngate = 1\n");
+        assert!(bad_gate_type.is_err());
     }
 
     #[test]

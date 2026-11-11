@@ -1,10 +1,15 @@
 //! mozart-pre：音频前端进程（SPEC-02）。
-//! 线程结构：采集（ALSA 攒块→环）→ 处理（DSP：80 Hz 高通 + WOLA 谱降噪；
-//! gate/AGC/limiter 由 Task 4 插入）→ 播放（路由/静音状态机→淡变→ALSA 写）；
+//! 线程结构：采集（ALSA 攒块→环）→ 处理（DSP 全链：80 Hz 高通 + WOLA 谱降噪
+//! + gate/AGC/limiter → 主干环；主干同帧打包 16 kHz InputFrame 恒定发送到
+//! rvc input_socket）→ 播放（路由/静音状态机→淡变→ALSA 写；rvc 路由取
+//! AI 接收环，direct 路由排空计数）；接收线程独立收 rvc 输出帧入 AI 环；
 //! 控制线程独立服务 SEQPACKET。
+//! 发送恒定不停（旧 main.c L11「AI 路径永不停」）：路由只决定播放源，
+//! 不停发输入帧。发送侧惰性建链，pre 启动不依赖 rvc 生命周期。
 //! 停止：SIGTERM/SIGINT 置停止标志，各线程在时限内退出；设备打开失败立即退出，
 //! daemon 按退避重启（SPEC-02：换设备不做在线命令，由重启代替）。
 
+mod ai;
 mod alsa_stream;
 mod capture;
 mod control;
@@ -16,8 +21,9 @@ mod state;
 use alsa::Direction;
 use mozart_core::config::Config;
 use mozart_core::ctl::Seqpacket;
+use mozart_core::dgram::FrameSocket;
 use mozart_core::ring::Ring;
-use mozart_core::RawFrame;
+use mozart_core::{OutputFrame, RawFrame};
 use state::Shared;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
@@ -87,20 +93,27 @@ fn bind_control_socket(path: &Path) -> Result<Seqpacket, String> {
     Seqpacket::bind(path).map_err(|err| format!("bind {}: {err}", path.display()))
 }
 
-/// 处理线程：采集环 → 主干环。DSP 阶段（本任务：80 Hz 高通 + WOLA 谱降噪）
-/// 在采集环之后、direct 分支之前——direct 取的 48 kHz 主干含 DSP，与旧实现
-/// 一致。置信度返回值由 Task 4 的 VAD/打包消费。
+/// 处理线程：采集环 → DSP 全链 → 主干环 + 16 kHz 打包恒定发送。
+/// DSP 在采集环之后、direct 分支之前——direct 取的 48 kHz 主干含 DSP，
+/// 与旧实现一致。发送不随路由停发（旧 main.c L11）。
 fn process_thread(
     capture_ring: Arc<Ring<RawFrame>>,
     trunk: Arc<Ring<RawFrame>>,
+    shared: Arc<Shared>,
+    mut ai_sender: ai::Sender,
     denoise: bool,
+    gate: bool,
+    agc: bool,
+    limiter: bool,
 ) -> Result<(), String> {
     // DSP 状态为定长数组，构造后热路径零分配。
-    let mut dsp = dsp::Dsp::new(denoise);
+    let mut dsp = dsp::Dsp::new(denoise, gate, agc, limiter);
     while !STOP.load(Ordering::Relaxed) {
         if let Some(mut frame) = capture_ring.pop(Some(PROCESS_POLL)) {
-            dsp.process_frame(&mut frame);
+            let conf = dsp.process_frame(&mut frame);
+            let input_frame = dsp.pack_frame(&frame, conf);
             trunk.push(frame);
+            ai_sender.send(&input_frame, &shared);
         }
     }
     Ok(())
@@ -178,6 +191,7 @@ fn main() -> ExitCode {
         config.pre.capture_queue_frames as usize,
     ));
     let trunk = Arc::new(Ring::<RawFrame>::new(TRUNK_QUEUE_FRAMES));
+    let rvc_ring = Arc::new(Ring::<OutputFrame>::new(ai::RVC_QUEUE_FRAMES));
 
     let listener = match bind_control_socket(&args.socket) {
         Ok(listener) => listener,
@@ -190,6 +204,25 @@ fn main() -> ExitCode {
         eprintln!("mozart-pre: listen: {err}");
         return ExitCode::FAILURE;
     }
+
+    // AI 支路输出侧：pre 绑定 output_socket 收 rvc 输出帧（SPEC-02 方向约定）。
+    // 绑定失败（run_dir 缺失等）立即退出：部署路径属配置错误。
+    let rvc_out_socket = match FrameSocket::<OutputFrame>::bind(
+        &config.rvc_output_socket(),
+        ai::RVC_QUEUE_FRAMES,
+    ) {
+        Ok(socket) => socket,
+        Err(err) => {
+            eprintln!(
+                "mozart-pre: bind {}: {err}",
+                config.rvc_output_socket().display()
+            );
+            return ExitCode::FAILURE;
+        }
+    };
+    // AI 支路输入侧：连接 rvc input_socket，对端未就绪时发送丢弃计数
+    //（惰性建链，不阻塞启动）。
+    let ai_sender = ai::Sender::new(config.rvc_input_socket());
 
     // 设备先就绪，后拉线程（旧实现次序：播放设备先于采集）。
     let capture_pcm = match alsa_stream::open(&config.pre.capture_device, Direction::Capture) {
@@ -208,8 +241,13 @@ fn main() -> ExitCode {
     };
     log_stream_setup("capture", &config.pre.capture_device, &capture_pcm);
     log_stream_setup("playback", &config.pre.playback_device, &playback_pcm);
+    eprintln!(
+        "mozart-pre: ai link out={}",
+        config.rvc_output_socket().display()
+    );
 
-    // 采集与处理线程；播放线程持有状态机；控制线程独立服务。
+    // 采集与处理线程；播放线程持有状态机；接收线程独立收 rvc 输出帧；
+    // 控制线程独立服务。
     let capture_handle = {
         let ring = capture_ring.clone();
         let shared = shared.clone();
@@ -220,20 +258,39 @@ fn main() -> ExitCode {
             Err(err) => return spawn_failure("capture", err),
         }
     };
-    let control_circles = (capture_ring.clone(), trunk.clone());
+    let control_circles = (capture_ring.clone(), trunk.clone(), rvc_ring.clone());
     let process_handle = {
         let from = capture_ring.clone();
         let to = trunk.clone();
+        let shared = shared.clone();
         let denoise = config.pre.dsp.denoise;
-        match spawn_thread("mozart-trunk", move || process_thread(from, to, denoise)) {
+        let gate = config.pre.dsp.gate;
+        let agc = config.pre.dsp.agc;
+        let limiter = config.pre.dsp.limiter;
+        match spawn_thread("mozart-trunk", move || {
+            process_thread(from, to, shared, ai_sender, denoise, gate, agc, limiter)
+        }) {
             Ok(handle) => handle,
             Err(err) => return spawn_failure("process", err),
+        }
+    };
+    let rvc_recv_handle = {
+        let shared = shared.clone();
+        let ring = rvc_ring.clone();
+        match spawn_thread("mozart-rvc-recv", move || {
+            stop_on_fatal(&STOP, ai::recv_loop(rvc_out_socket, ring, shared, &STOP))
+        }) {
+            Ok(handle) => handle,
+            Err(err) => return spawn_failure("rvc-recv", err),
         }
     };
     let playback_handle = {
         let shared = shared.clone();
         match spawn_thread("mozart-playback", move || {
-            stop_on_fatal(&STOP, playback::run(playback_pcm, trunk, shared, &STOP))
+            stop_on_fatal(
+                &STOP,
+                playback::run(playback_pcm, trunk, rvc_ring, shared, &STOP),
+            )
         }) {
             Ok(handle) => handle,
             Err(err) => return spawn_failure("playback", err),
@@ -241,9 +298,9 @@ fn main() -> ExitCode {
     };
     let control_handle = {
         let shared = shared.clone();
-        let (capture_ring, trunk) = control_circles;
+        let (capture_ring, trunk, rvc_ring) = control_circles;
         match spawn_thread("mozart-control", move || {
-            control::serve(listener, shared, capture_ring, trunk, &STOP);
+            control::serve(listener, shared, capture_ring, trunk, rvc_ring, &STOP);
             Ok(())
         }) {
             Ok(handle) => handle,
@@ -254,6 +311,7 @@ fn main() -> ExitCode {
     let failure = join_threads(vec![
         ("capture", capture_handle),
         ("process", process_handle),
+        ("rvc-recv", rvc_recv_handle),
         ("playback", playback_handle),
         ("control", control_handle),
     ]);

@@ -1,8 +1,11 @@
-//! 旧 C 核心对拍夹具测试。夹具由 Task 3 的一次性 harness 用
+//! 旧 C 核心对拍夹具测试。夹具由 Task 3/4 的一次性 harness 用
 //! Mozart-Old/preprocessor 的 C 核心离线生成（来源、编译与再生命令见
-//! Task 3 报告），文件位于 `tests/fixtures/dsp/`，`.gitignore` 白名单管理。
+//! Task 3/4 报告），文件位于 `tests/fixtures/dsp/`，`.gitignore` 白名单管理。
 //! 内容：1 s / 48 kHz 单声道 f32 小端——纯噪声 0–0.2 s、双音 0.2–0.6 s、
 //! 纯噪声 0.6–0.8 s、单音 0.8–1.0 s（噪声用固定种子 xorshift32 合成）。
+//! Task 4 新增：整形级发射流（gate/agc/limiter 单开与全开；input.f32 电平低于
+//! -1 dB 上限，limiter 冷参考与 wola 同流，另有 ×4 热输入参考 limiter_hot.f32
+//! 专拍介入态）、16 kHz 打包 PCM（dec.f32，逐位对拍）与每帧 meta（meta.txt）。
 
 use super::highpass::Highpass80;
 use super::noise_suppressor::NoiseSuppressor;
@@ -21,6 +24,11 @@ const MAX_ABS_DIFF: f64 = 1e-6;
 /// WOLA 容差（RMS）。依据：稀疏单 ulp 翻移的 RMS 量级 ~1e-10；1e-8 用于排除
 /// 系统性漂移——真实算法错配的 RMS 会大几个数量级。
 const MAX_RMS_DIFF: f64 = 1e-8;
+
+/// 能量字节容差 ±1：energy_db 由 log10f 量化到 0..255，跨平台 libm 的 1 ulp
+/// 差可能跨过截断边界；frame_idx/vad_flag/conf/segment_id 为整数量化前的
+/// f32 比较（阈值远离夹具信号的实际取值），按位（整数）断言。
+const ENERGY_TOLERANCE: u8 = 1;
 
 /// 夹具目录：仓库根 tests/fixtures/dsp/（pre/ 上一级）。
 const FIXTURE_DIR: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/../tests/fixtures/dsp");
@@ -79,6 +87,43 @@ fn run_ns_blocks(input: &[f32]) -> Vec<f32> {
     stream
 }
 
+/// 全链 960 定块喂入，按旧 C 每块发射数（counts.txt）截取发射样本。
+/// 整形级按参数开闭；返回发射流与逐帧置信度。
+fn run_dsp_chain(
+    input: &[f32],
+    counts: &[usize],
+    gate: bool,
+    agc: bool,
+    limiter: bool,
+) -> (Vec<f32>, Vec<f32>) {
+    let mut dsp = Dsp::new(true, gate, agc, limiter);
+    let mut stream = Vec::new();
+    let mut confs = Vec::new();
+    for (block, count) in input.chunks(RAW_SAMPLES).zip(counts) {
+        // packed 字段按值整块搬入搬出，不取引用（同 playback.rs 的约定）
+        let mut pcm = [0f32; RAW_SAMPLES];
+        pcm.copy_from_slice(block);
+        let mut frame = RawFrame {
+            meta: FrameMeta {
+                pts_ns: 0,
+                frame_idx: 0,
+                vad_flag: 0,
+                energy_db: 0,
+                conf: 0,
+                segment_id: 0,
+            },
+            pcm,
+        };
+        confs.push(dsp.process_frame(&mut frame));
+        // counts.txt 的每块发射数与 wola 流同源；越界即 panic，不静默截断。
+        let count = *count;
+        // packed 字段按值搬出再切片，不取引用。
+        let pcm = frame.pcm;
+        stream.extend_from_slice(&pcm[..count]);
+    }
+    (stream, confs)
+}
+
 #[test]
 fn highpass_is_bitwise_identical_to_c() {
     // biquad 高通无 FFT、无跨平台 libm 依赖：f32 同序运算要求逐位一致
@@ -131,7 +176,7 @@ fn dsp_frame_stream_matches_c_wrapper_reference() {
     let input = read_f32("input.f32");
     let wola = read_f32("wola.f32");
     let counts = read_counts();
-    let mut dsp = Dsp::new(true);
+    let mut dsp = Dsp::new(true, false, false, false);
 
     let mut base = 0usize;
     let mut confs = Vec::new();
@@ -170,4 +215,201 @@ fn dsp_frame_stream_matches_c_wrapper_reference() {
         tone_mean > 0.5 && noise_mean < tone_mean - 0.2,
         "置信度未区分有声/噪声：tone={tone_mean:.3} noise={noise_mean:.3}"
     );
+}
+
+#[test]
+fn gate_stream_matches_c_within_tolerance() {
+    let input = read_f32("input.f32");
+    let counts = read_counts();
+    let (actual, _) = run_dsp_chain(&input, &counts, true, false, false);
+    let (max_diff, rms) =
+        assert_close(&actual, &read_f32("gate.f32"), "gate 单开对拍");
+    eprintln!("gate_stream: max={max_diff:.3e} rms={rms:.3e} n={}", actual.len());
+}
+
+#[test]
+fn agc_stream_matches_c_within_tolerance() {
+    let input = read_f32("input.f32");
+    let counts = read_counts();
+    let (actual, _) = run_dsp_chain(&input, &counts, false, true, false);
+    let (max_diff, rms) = assert_close(&actual, &read_f32("agc.f32"), "agc 单开对拍");
+    eprintln!("agc_stream: max={max_diff:.3e} rms={rms:.3e} n={}", actual.len());
+}
+
+#[test]
+fn limiter_stream_matches_c_within_tolerance() {
+    // 冷输入对拍：input.f32 峰值 0.532 低于 -1 dB 上限 0.891，限幅器全程透明，
+    // 该流与 wola.f32 逐位相同——本用例验证的是「夹具电平下限幅器不介入」，
+    // 介入路径由下方热输入用例覆盖。
+    let input = read_f32("input.f32");
+    let counts = read_counts();
+    let (actual, _) = run_dsp_chain(&input, &counts, false, false, true);
+    let (max_diff, rms) =
+        assert_close(&actual, &read_f32("limiter.f32"), "limiter 单开对拍");
+    eprintln!(
+        "limiter_stream: max={max_diff:.3e} rms={rms:.3e} n={}",
+        actual.len()
+    );
+}
+
+#[test]
+fn limiter_hot_stream_engages_and_matches_c_within_tolerance() {
+    // 介入态对拍：输入 ×4 驱动限幅器实际压峰。断言介入前提与结果（非自比）：
+    // 不限幅链峰值显著超上限、限幅链峰值钳到上限附近且低于不限幅链。
+    // 夹具 limiter_hot.f32 由同一 ×4 输入经旧 C 链生成（harness gen_pack_fixture.c）。
+    let input = read_f32("input.f32");
+    let counts = read_counts();
+    let hot: Vec<f32> = input.iter().map(|&x| x * 4.0).collect();
+    let (bypassed, _) = run_dsp_chain(&hot, &counts, false, false, false);
+    let (actual, _) = run_dsp_chain(&hot, &counts, false, false, true);
+    let ceiling = 10.0f64.powf(-1.0 / 20.0);
+    let peak_bypassed = bypassed.iter().fold(0.0f32, |acc, &v| acc.max(v.abs())) as f64;
+    let peak_limited = actual.iter().fold(0.0f32, |acc, &v| acc.max(v.abs())) as f64;
+    assert!(
+        peak_bypassed > ceiling * 1.2,
+        "热输入不限幅链峰值 {peak_bypassed} 必须显著超上限 {ceiling}，否则夹具已退化"
+    );
+    assert!(
+        peak_limited <= ceiling * 1.0001,
+        "限幅链峰值 {peak_limited} 必须钳到上限 {ceiling}"
+    );
+    assert!(
+        peak_limited >= ceiling * 0.99,
+        "限幅链峰值 {peak_limited} 必须贴住上限（介入态），否则对拍退化为空转"
+    );
+    let (max_diff, rms) =
+        assert_close(&actual, &read_f32("limiter_hot.f32"), "limiter 热输入对拍");
+    eprintln!(
+        "limiter_hot_stream: max={max_diff:.3e} rms={rms:.3e} n={} peak={peak_limited:.6}",
+        actual.len()
+    );
+}
+
+#[test]
+fn stages_stream_matches_c_within_tolerance() {
+    // 全开：同帧内 gate → AGC → limiter 级联次序（旧 enhance L117-119）。
+    let input = read_f32("input.f32");
+    let counts = read_counts();
+    let (actual, _) = run_dsp_chain(&input, &counts, true, true, true);
+    let (max_diff, rms) =
+        assert_close(&actual, &read_f32("stages.f32"), "整形级全开对拍");
+    eprintln!(
+        "stages_stream: max={max_diff:.3e} rms={rms:.3e} n={}",
+        actual.len()
+    );
+}
+
+#[test]
+fn pack_pcm_is_bitwise_identical_to_c() {
+    // 打包链（denoise 开、整形级全关）：process_frame 对齐 + pack_frame。
+    // dec.f32 为旧 wrapper + pack_frame 输出；FIR 为纯 f32 乘加无超越函数，
+    // 其输入（WOLA 发射流）在两端实测逐位一致（Task 3），故断言按位相等。
+    let input = read_f32("input.f32");
+    let expected = read_f32("dec.f32");
+    let mut dsp = Dsp::new(true, false, false, false);
+    let mut base = 0usize;
+    for block in input.chunks(RAW_SAMPLES) {
+        let mut pcm = [0f32; RAW_SAMPLES];
+        pcm.copy_from_slice(block);
+        let mut frame = RawFrame {
+            meta: FrameMeta {
+                pts_ns: 0,
+                frame_idx: 0,
+                vad_flag: 0,
+                energy_db: 0,
+                conf: 0,
+                segment_id: 0,
+            },
+            pcm,
+        };
+        let conf = dsp.process_frame(&mut frame);
+        let packed = dsp.pack_frame(&frame, conf);
+        let actual = packed.pcm;
+        for (i, (&a, &b)) in actual.iter().zip(expected[base..base + actual.len()].iter()).enumerate()
+        {
+            assert_eq!(
+                a.to_bits(),
+                b.to_bits(),
+                "帧 {} 样本 {}：降采样必须与旧 C 逐位一致",
+                base / mozart_core::INPUT_SAMPLES,
+                i
+            );
+        }
+        base += actual.len();
+    }
+    assert_eq!(base, expected.len(), "打包帧数应与 dec 流一致");
+}
+
+#[test]
+fn pack_meta_matches_c() {
+    // meta.txt 每行：frame_idx vad_flag energy_db conf segment_id。
+    let input = read_f32("input.f32");
+    let meta_lines: Vec<(u32, u8, u8, u8, u8)> = fs::read_to_string(format!(
+        "{FIXTURE_DIR}/meta.txt"
+    ))
+    .expect("meta.txt 读取失败")
+    .lines()
+    .map(|line| {
+        let fields: Vec<&str> = line.split_whitespace().collect();
+        assert_eq!(
+            fields.len(),
+            5,
+            "meta.txt 行格式：frame_idx vad_flag energy_db conf segment_id"
+        );
+        (
+            fields[0].parse().expect("frame_idx 整数"),
+            fields[1].parse().expect("vad_flag 整数"),
+            fields[2].parse().expect("energy_db 整数"),
+            fields[3].parse().expect("conf 整数"),
+            fields[4].parse().expect("segment_id 整数"),
+        )
+    })
+    .collect();
+
+    let mut dsp = Dsp::new(true, false, false, false);
+    let mut energy_deviations = 0u32;
+    for (frame_no, block) in input.chunks(RAW_SAMPLES).enumerate() {
+        let mut pcm = [0f32; RAW_SAMPLES];
+        pcm.copy_from_slice(block);
+        let mut frame = RawFrame {
+            meta: FrameMeta {
+                pts_ns: 0,
+                frame_idx: 0,
+                vad_flag: 0,
+                energy_db: 0,
+                conf: 0,
+                segment_id: 0,
+            },
+            pcm,
+        };
+        let conf = dsp.process_frame(&mut frame);
+        let packed = dsp.pack_frame(&frame, conf);
+        // packed 字段经解构按值读取（dgram.rs 测试同款约定）。
+        let FrameMeta {
+            frame_idx,
+            vad_flag,
+            energy_db,
+            conf: got_conf,
+            segment_id,
+            ..
+        } = packed.meta;
+        let (expect_idx, expect_vad, expect_energy, expect_conf, expect_segment) =
+            meta_lines[frame_no];
+        assert_eq!(frame_idx, expect_idx, "帧 {frame_no}：frame_idx");
+        assert_eq!(vad_flag, expect_vad, "帧 {frame_no}：vad_flag");
+        assert_eq!(got_conf, expect_conf, "帧 {frame_no}：conf 字节");
+        assert_eq!(segment_id, expect_segment, "帧 {frame_no}：segment_id");
+        let diff = energy_db.abs_diff(expect_energy);
+        assert!(
+            diff <= ENERGY_TOLERANCE,
+            "帧 {frame_no}：energy_db {energy_db} 与 {expect_energy} 差 {diff} 超出 ±{ENERGY_TOLERANCE}"
+        );
+        if diff > 0 {
+            energy_deviations += 1;
+        }
+    }
+    // frame_idx 从 1 起单调推进（旧 ++frame_idx 语义，u32 环内 1..=50）。
+    assert_eq!(meta_lines.len(), input.len() / RAW_SAMPLES);
+    assert_eq!(meta_lines[0].0, 1);
+    eprintln!("pack_meta: energy 字节偏差帧数 {energy_deviations}/50");
 }
