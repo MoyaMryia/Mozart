@@ -91,13 +91,19 @@ ctl up
 
 echo "=== wait pre/rvc ready ==="
 RVC_STATE=""
+READY=0
 for i in $(seq 1 60); do
   ctl status --json > "$SMOKE_DIR/st-poll.json" 2>/dev/null
   PRE_OK=$(jget "$SMOKE_DIR/st-poll.json" pre)
   RVC_STATE=$(jget "$SMOKE_DIR/st-poll.json" rvcstate)
-  if [ "$PRE_OK" = "yes" ] && [ -n "$RVC_STATE" ]; then break; fi
+  if [ "$PRE_OK" = "yes" ] && [ -n "$RVC_STATE" ]; then READY=1; break; fi
   sleep 1
 done
+if [ "$READY" != 1 ]; then
+  echo "SMOKE FAILED: pre/rvc not ready after ${i}s (pre=${PRE_OK:-none} rvc.state=${RVC_STATE:-none})" >&2
+  ctl down
+  exit 1
+fi
 cp "$SMOKE_DIR/st-poll.json" "$SMOKE_DIR/st-ready.json"
 echo "ready after ${i}s: pre=$PRE_OK rvc.state=$RVC_STATE"
 
@@ -117,6 +123,11 @@ echo "$(ts) status @ rvc route"
 ctl status > "$SMOKE_DIR/st-rvc.txt" 2>&1
 ctl status --json > "$SMOKE_DIR/st-rvc.json"
 RVC_PID=$(jget "$SMOKE_DIR/st-rvc.json" rvcproc pid)
+if [ -z "$RVC_PID" ] || ! [[ "$RVC_PID" =~ ^[0-9]+$ ]]; then
+  echo "SMOKE FAILED: cannot resolve rvc pid from status" >&2
+  ctl down
+  exit 1
+fi
 echo "$(ts) kill -9 rvc pid=$RVC_PID"
 kill -9 "$RVC_PID"
 sleep 4                            # 崩溃重启 + 重放 LoadModel/StartStream
@@ -136,17 +147,30 @@ wait 2>/dev/null
 echo "=== down ==="
 ctl down
 echo "=== residue check ==="
-pgrep -af "mozart-(daemon|pre|rvc)" && echo "RESIDUE PROCESSES FOUND" || echo "no mozart processes"
+FAILED=0
+if pgrep -f "mozart-(daemon|pre|rvc)" > /dev/null; then
+  pgrep -af "mozart-(daemon|pre|rvc)"
+  echo "SMOKE FAILED: residue processes found" >&2
+  FAILED=1
+else
+  echo "no mozart processes"
+fi
 for f in daemon.sock pre.sock rvc.sock rvc-in.sock rvc-out.sock; do
   if [ -S "$RUN/$f" ]; then
-    python3 - "$RUN/$f" <<'EOF'
+    LIVE=$(python3 - "$RUN/$f" <<'EOF'
 import socket, sys
 s = socket.socket(socket.AF_UNIX, socket.SOCK_SEQPACKET)
 try:
-    s.connect(sys.argv[1]); print(sys.argv[1], "LIVE")
-except OSError as e:
-    print(sys.argv[1], "dead:", e.strerror)
+    s.connect(sys.argv[1]); print("live")
+except OSError:
+    print("dead")
 EOF
+)
+    echo "$RUN/$f: $LIVE"
+    if [ "$LIVE" = "live" ]; then
+      echo "SMOKE FAILED: $RUN/$f still accepts connections" >&2
+      FAILED=1
+    fi
   else
     echo "$RUN/$f: absent"
   fi
@@ -154,3 +178,4 @@ done
 
 echo "=== rvc.log tail ==="
 tail -20 "$RUN/logs/rvc.log"
+exit "$FAILED"
