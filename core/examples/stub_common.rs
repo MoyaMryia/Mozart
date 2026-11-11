@@ -3,8 +3,7 @@
 
 use mozart_core::ctl::{self, Message, Seqpacket};
 use serde_json::{json, Value};
-use std::fs::OpenOptions;
-use std::io::{ErrorKind, Write};
+use std::io::ErrorKind;
 use std::path::PathBuf;
 use std::time::Duration;
 
@@ -12,11 +11,13 @@ pub struct StubArgs {
     pub name: &'static str,
     pub socket: PathBuf,
     pub exit_after: Option<Duration>,
+    pub reply_delay: Duration,
 }
 
 pub fn parse_args(name: &'static str) -> StubArgs {
     let mut socket = None;
     let mut exit_after = None;
+    let mut reply_delay = Duration::ZERO;
     let mut args = std::env::args().skip(1);
     while let Some(arg) = args.next() {
         match arg.as_str() {
@@ -28,6 +29,11 @@ pub fn parse_args(name: &'static str) -> StubArgs {
                 let millis = value.parse().unwrap_or_else(|_| usage(name));
                 exit_after = Some(Duration::from_millis(millis));
             }
+            "--delay-ms" => {
+                let value = args.next().unwrap_or_else(|| usage(name));
+                let millis = value.parse().unwrap_or_else(|_| usage(name));
+                reply_delay = Duration::from_millis(millis);
+            }
             _ => usage(name),
         }
     }
@@ -35,11 +41,14 @@ pub fn parse_args(name: &'static str) -> StubArgs {
         name,
         socket: socket.unwrap_or_else(|| usage(name)),
         exit_after,
+        reply_delay,
     }
 }
 
 fn usage(name: &str) -> ! {
-    eprintln!("{name}: usage: --socket <path> [--exit-after-ms <ms>]");
+    eprintln!(
+        "{name}: usage: --socket <path> [--exit-after-ms <ms>] [--delay-ms <ms>]"
+    );
     std::process::exit(2);
 }
 
@@ -107,9 +116,9 @@ pub fn serve(args: StubArgs, mut handler: impl FnMut(&Message) -> Vec<u8>) -> ! 
                     break;
                 }
             };
-            log_command(&msg);
             let type_ = msg.header.type_;
             let request_id = msg.header.request_id;
+            std::thread::sleep(args.reply_delay);
             let reply = handler(&msg);
             if let Err(err) = conn.send(type_, request_id, &reply) {
                 eprintln!("{}: send: {err}", args.name);
@@ -117,24 +126,4 @@ pub fn serve(args: StubArgs, mut handler: impl FnMut(&Message) -> Vec<u8>) -> ! 
             }
         }
     }
-}
-
-fn log_command(msg: &Message) {
-    let Some(path) = std::env::var_os("MOZART_STUB_CMDLOG") else {
-        return;
-    };
-    let mut file = match OpenOptions::new().create(true).append(true).open(path) {
-        Ok(file) => file,
-        Err(err) => {
-            eprintln!("stub: open command log: {err}");
-            return;
-        }
-    };
-    let type_ = msg.header.type_;
-    let body = if msg.body.is_empty() {
-        "null".to_string()
-    } else {
-        String::from_utf8_lossy(&msg.body).into_owned()
-    };
-    let _ = writeln!(file, "{{\"type\":{type_},\"body\":{body}}}");
 }

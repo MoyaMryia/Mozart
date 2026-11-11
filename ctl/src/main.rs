@@ -124,31 +124,40 @@ fn up(config: &Config, config_path: Option<&Path>, json_output: bool) -> Result<
     let mut child = spawn_daemon(config, config_path)?;
 
     let deadline = Instant::now() + Duration::from_millis(config.daemon.start_timeout_ms);
+    let mut spawn_exit: Option<String> = None;
     loop {
-        if let Some(status) = child
-            .try_wait()
-            .map_err(|err| CliError::new(EXIT_ERROR, err.to_string()))?
-        {
-            return Err(CliError::new(
-                EXIT_ERROR,
-                format!("daemon exited during startup: {status}"),
-            ));
+        if spawn_exit.is_none() {
+            if let Some(status) = child
+                .try_wait()
+                .map_err(|err| CliError::new(EXIT_ERROR, err.to_string()))?
+            {
+                // 并发 up 时本实例可能抢锁失败退出；另一实例正在就绪，继续等 socket，
+                // 保持命令幂等。
+                spawn_exit = Some(format!("daemon exited during startup: {status}"));
+            }
         }
         match probe(config) {
             Ok(_) => {
-                print_state(json_output, "running", "daemon started");
+                if spawn_exit.is_none() {
+                    print_state(json_output, "running", "daemon started");
+                } else {
+                    print_state(json_output, "already-running", "daemon already running");
+                }
                 return Ok(());
             }
             Err(err) => {
                 if Instant::now() >= deadline {
-                    return Err(CliError::new(
-                        EXIT_TIMEOUT,
-                        format!("daemon did not become ready: {err}"),
-                    ));
+                    return Err(match spawn_exit {
+                        Some(message) => CliError::new(EXIT_ERROR, message),
+                        None => CliError::new(
+                            EXIT_TIMEOUT,
+                            format!("daemon did not become ready: {err}"),
+                        ),
+                    });
                 }
-                std::thread::sleep(Duration::from_millis(50));
             }
         }
+        std::thread::sleep(Duration::from_millis(50));
     }
 }
 

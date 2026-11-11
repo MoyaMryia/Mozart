@@ -1,6 +1,6 @@
 use mozart_core::ctl::schema::Status;
 use std::path::PathBuf;
-use std::process::{Command, Output};
+use std::process::{Command, Output, Stdio};
 use std::time::{Duration, Instant};
 
 struct CtlEnv {
@@ -172,6 +172,38 @@ fn route_rejection_exits_4() {
         String::from_utf8_lossy(&output.stderr)
     );
     assert!(String::from_utf8_lossy(&output.stderr).contains("NotReady"));
+}
+
+#[test]
+fn concurrent_up_both_succeed() {
+    let env = CtlEnv::new("race");
+    let first = env
+        .command()
+        .arg("up")
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .unwrap();
+    let second = env
+        .command()
+        .arg("up")
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .unwrap();
+
+    let first_status = first.wait_with_output().unwrap().status;
+    let second_status = second.wait_with_output().unwrap().status;
+    assert!(
+        first_status.success(),
+        "first up failed: {:?}",
+        first_status.code()
+    );
+    assert!(
+        second_status.success(),
+        "second up failed: {:?}",
+        second_status.code()
+    );
 }
 
 #[test]

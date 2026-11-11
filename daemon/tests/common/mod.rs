@@ -100,8 +100,12 @@ pub fn connect(socket: &Path) -> Seqpacket {
 }
 
 pub fn call(conn: &Seqpacket, type_: u16, body: &[u8]) -> Response {
+    call_timeout(conn, type_, body, Duration::from_secs(2))
+}
+
+pub fn call_timeout(conn: &Seqpacket, type_: u16, body: &[u8], timeout: Duration) -> Response {
     conn.send(type_, 7, body).unwrap();
-    let msg = conn.recv(Some(Duration::from_secs(2))).unwrap();
+    let msg = conn.recv(Some(timeout)).unwrap();
     let reply_type = msg.header.type_;
     assert_eq!(reply_type, type_, "响应 type 必须回显");
     serde_json::from_slice(&msg.body).unwrap()

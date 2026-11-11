@@ -1,8 +1,9 @@
 mod common;
 
-use common::{call, example, status, wait_until, DaemonProcess};
+use common::{call, call_timeout, example, status, wait_until, DaemonProcess};
 use mozart_core::ctl::schema::{ProcessState, Route, Status};
 use mozart_core::ctl::{self, Seqpacket};
+use std::os::unix::fs::PermissionsExt;
 use std::time::{Duration, Instant};
 
 fn wait_running(conn: &Seqpacket) -> Status {
@@ -87,4 +88,59 @@ fn route_rejected_without_model_id() {
     assert_eq!(reply.status, "error");
     assert_eq!(reply.code, "NotReady");
     assert!(reply.reason.contains("model_id"));
+}
+
+#[test]
+fn route_set_answer_matches_final_state_under_race() {
+    // 用延迟桩拉长 rvc 切换窗口：切换进行中发出的 route set direct
+    // 必须等切换完成后真实执行，应答与最终路由一致，不得假成功。
+    let script = std::env::temp_dir().join(format!("mozart-slow-rvc-{}.sh", std::process::id()));
+    std::fs::write(
+        &script,
+        format!(
+            "#!/bin/sh\nexec '{}' --delay-ms 200 \"$@\"\n",
+            example("rvc_stub").display()
+        ),
+    )
+    .unwrap();
+    let mut perms = std::fs::metadata(&script).unwrap().permissions();
+    perms.set_mode(0o755);
+    std::fs::set_permissions(&script, perms).unwrap();
+
+    let daemon = DaemonProcess::start_with_config(
+        "race",
+        &example("pre_stub"),
+        &script,
+        "[daemon]\nrpc_timeout_ms = 2000\n\n[rvc]\nmodel_id = \"demo\"\n",
+    );
+    let conn_switch = daemon.connect();
+    let conn_direct = daemon.connect();
+    wait_running(&conn_switch);
+
+    let switch_call = std::thread::spawn(move || {
+        call_timeout(
+            &conn_switch,
+            ctl::DAEMON_ROUTE_SET,
+            br#"{"route":"rvc"}"#,
+            Duration::from_secs(8),
+        )
+    });
+    std::thread::sleep(Duration::from_millis(300));
+    let direct = call_timeout(
+        &conn_direct,
+        ctl::DAEMON_ROUTE_SET,
+        br#"{"route":"direct"}"#,
+        Duration::from_secs(8),
+    );
+    assert_eq!(direct.status, "ok");
+    let switched = switch_call.join().unwrap();
+    assert_eq!(switched.status, "ok");
+
+    let final_status = status(&conn_direct);
+    assert_eq!(
+        final_status.route.active,
+        Route::Direct,
+        "应答 direct 后最终路由必须是 direct"
+    );
+    let _ = std::fs::remove_file(&script);
 }

@@ -69,7 +69,7 @@ fn supervise(role: Role, config: &Config, state: &Mutex<State>, running: &Atomic
                 if !sleep_unless_stopped(backoff, running) {
                     break;
                 }
-                backoff = next_backoff(backoff, base, max);
+                backoff = next_backoff(backoff, max);
                 continue;
             }
         };
@@ -104,7 +104,7 @@ fn supervise(role: Role, config: &Config, state: &Mutex<State>, running: &Atomic
         if !sleep_unless_stopped(backoff, running) {
             break;
         }
-        backoff = next_backoff(backoff, base, max);
+        backoff = next_backoff(backoff, max);
     }
     lock_state(state).process_stopped(role);
 }
@@ -183,6 +183,6 @@ pub(crate) fn sleep_unless_stopped(mut remaining: Duration, running: &AtomicBool
     running.load(Ordering::Acquire)
 }
 
-fn next_backoff(current: Duration, base: Duration, max: Duration) -> Duration {
-    current.saturating_mul(2).min(max).max(base)
+fn next_backoff(current: Duration, max: Duration) -> Duration {
+    current.saturating_mul(2).min(max)
 }

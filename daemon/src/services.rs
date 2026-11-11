@@ -174,13 +174,14 @@ pub fn route_set(
     config: &Config,
     target: Route,
 ) -> Result<Route, (String, String)> {
+    // 快查也必须在 transition 锁内：锁外读取会在切换进行中给出假成功应答。
+    let _transition = services.transition();
     {
         let current = lock_state(state);
         if current.route_desired() == target && current.route_active() == target {
             return Ok(target);
         }
     }
-    let _transition = services.transition();
     match target {
         Route::Direct => switch_direct(state, services),
         Route::Rvc => switch_rvc(state, services, config),
@@ -199,11 +200,7 @@ pub fn mute_set(
 }
 
 fn switch_direct(state: &Mutex<State>, services: &Services) -> Result<Route, (String, String)> {
-    {
-        let mut pre = services.pre();
-        pre.call_ok(ctl::PRE_SET_ROUTE, br#"{"route":"direct"}"#)
-            .map_err(CallError::into_rejection)?;
-    }
+    set_pre_route(services, Route::Direct).map_err(CallError::into_rejection)?;
     if let Err(err) = stop_rvc_stream(services) {
         lock_state(state).push_degraded(format!("rvc stream stop: {}", err.describe()));
     }
