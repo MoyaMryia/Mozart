@@ -9,8 +9,8 @@ Mozart 是面向 NVIDIA Jetson Orin Nano Super 8 GB 的本地语音处理系统�
 实时语音转换、翻译字幕、文件转换和翻译播报共用一次麦克风采集。
 产品目标见 [TARGET.md](TARGET.md)，当前状态见 [README.md](README.md)。
 
-本仓库处于重写阶段。模块边界与接口契约见 `docs/SPEC/`，旧实现只在
-`~/Projects/Project-Mozart` 中作为归档参考，不作为依赖。
+本仓库处于重写阶段。模块边界与接口契约见 `docs/SPEC/`，旧实现只在本机
+`~/Projects/MozartfromSeeck/Mozart-Old/` 中作为归档参考，不作为依赖。
 运行时主体用 Rust，推理层保留 C++ 进程。离线模型导出可以使用 Python，但不进入构建与部署路径。
 
 ## 文件系统组织
