@@ -16,6 +16,8 @@
 - 直出与变声切换用显式状态机；参数入口校验一次。
 - DSP 用 Rust 重写，逐阶段与旧输出对拍。第一版覆盖全部阶段：80 Hz 高通、WOLA 谱降噪、gate、AGC、limiter、FIR 3:1 降采样与 VAD；对拍夹具由旧 C 核心离线生成，小型 PCM 放 `tests/fixtures/` 并在 `.gitignore` 白名单。
 - 采集与播放设备名、数据面 socket 路径等部署配置经 `--config` 读取；daemon 拉起 pre 时传同一配置路径。
+- `[pre]` 配置段键：`capture_device`、`playback_device`（默认 `default`）、`capture_queue_frames`（采集→DSP 环容量，默认 8，1..=1024）。
+- 路由与静音淡变为 10 ms（480 样本）线性增益；direct→rvc 先淡出完成再切源，rvc→direct 立即切源后淡入；静音为淡到零并保持。
 - 分发：音频进程按配置消费者列表逐个 Unix socket 发送；一个消费者一个 socket，背压互不影响。
 - 扬声器仲裁的执行归音频进程（淡变、设备写入）；策略（何时切、切到哪、静音与否）由 daemon 下发。直出、变声、翻译播报共用播放设备。
 - 音频进程不做控制决策，不管理其他进程生命周期；只执行 daemon 下发的路由与模式指令。

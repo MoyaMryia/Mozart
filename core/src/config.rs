@@ -11,7 +11,7 @@ use std::path::{Path, PathBuf};
 pub struct Config {
     pub daemon: DaemonConfig,
     pub process: ProcessConfig,
-    pub pre: EndpointConfig,
+    pub pre: PreConfig,
     pub rvc: RvcConfig,
 }
 
@@ -35,10 +35,27 @@ pub struct ProcessConfig {
     pub rvc_bin: PathBuf,
 }
 
-#[derive(Debug, Clone, Default, Deserialize)]
+#[derive(Debug, Clone, Deserialize)]
 #[serde(default, deny_unknown_fields)]
-pub struct EndpointConfig {
+pub struct PreConfig {
     pub socket: String,
+    /// ALSA 采集设备名（SPEC-02：部署配置经 --config 读取）。
+    pub capture_device: String,
+    /// ALSA 播放设备名。
+    pub playback_device: String,
+    /// 采集 → DSP 环形队列容量（帧），1..=1024。
+    pub capture_queue_frames: u32,
+}
+
+impl Default for PreConfig {
+    fn default() -> Self {
+        Self {
+            socket: "pre.sock".to_string(),
+            capture_device: "default".to_string(),
+            playback_device: "default".to_string(),
+            capture_queue_frames: 8,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -79,9 +96,7 @@ impl Default for Config {
         Self {
             daemon: DaemonConfig::default(),
             process: ProcessConfig::default(),
-            pre: EndpointConfig {
-                socket: "pre.sock".to_string(),
-            },
+            pre: PreConfig::default(),
             rvc: RvcConfig::default(),
         }
     }
@@ -245,6 +260,13 @@ impl Config {
         }
         validate_socket_name(&self.daemon.socket, "daemon.socket")?;
         validate_socket_name(&self.pre.socket, "pre.socket")?;
+        validate_device_name(&self.pre.capture_device, "pre.capture_device")?;
+        validate_device_name(&self.pre.playback_device, "pre.playback_device")?;
+        if self.pre.capture_queue_frames == 0 || self.pre.capture_queue_frames > 1024 {
+            return Err(ConfigError::Invalid(
+                "pre.capture_queue_frames must be within 1..=1024".to_string(),
+            ));
+        }
         validate_socket_name(&self.rvc.socket, "rvc.socket")?;
         validate_socket_name(&self.rvc.input_socket, "rvc.input_socket")?;
         validate_socket_name(&self.rvc.output_socket, "rvc.output_socket")?;
@@ -296,6 +318,19 @@ fn validate_socket_name(name: &str, field: &str) -> Result<(), ConfigError> {
     Ok(())
 }
 
+/// ALSA 设备名不做格式限制；只拦空名与内嵌 NUL（CString 转换会 panic）。
+fn validate_device_name(name: &str, field: &str) -> Result<(), ConfigError> {
+    if name.is_empty() {
+        return Err(ConfigError::Invalid(format!("{field} must not be empty")));
+    }
+    if name.contains('\0') {
+        return Err(ConfigError::Invalid(format!(
+            "{field} must not contain NUL bytes"
+        )));
+    }
+    Ok(())
+}
+
 /// 运行目录承载控制 socket，统一收敛到 0700；ctl 与 daemon 共用此定义，
 /// 避免 ctl 抢先建目录导致权限策略失效。
 pub fn ensure_run_dir(dir: &Path) -> io::Result<()> {
@@ -324,6 +359,9 @@ mod tests {
             PathBuf::from("/run/mozart/rvc-out.sock")
         );
         assert_eq!(config.daemon.poll_interval_ms, 1000);
+        assert_eq!(config.pre.capture_device, "default");
+        assert_eq!(config.pre.playback_device, "default");
+        assert_eq!(config.pre.capture_queue_frames, 8);
     }
 
     #[test]
@@ -334,12 +372,20 @@ mod tests {
             poll_interval_ms = 250
             [pre]
             socket = "audio.sock"
+            capture_device = "plughw:CARD=Loopback,DEV=1,SUBDEV=0"
             "#,
         )
         .unwrap();
         assert_eq!(config.daemon.poll_interval_ms, 250);
         assert_eq!(config.pre_socket(), PathBuf::from("/run/mozart/audio.sock"));
         assert_eq!(config.rvc.socket, "rvc.sock");
+        assert_eq!(
+            config.pre.capture_device,
+            "plughw:CARD=Loopback,DEV=1,SUBDEV=0"
+        );
+        // 未写的键沿用默认。
+        assert_eq!(config.pre.playback_device, "default");
+        assert_eq!(config.pre.capture_queue_frames, 8);
     }
 
     #[test]
@@ -349,6 +395,24 @@ mod tests {
 
         let path_socket: Config = toml::from_str("[pre]\nsocket = \"a/b\"\n").unwrap();
         assert!(path_socket.validate().is_err());
+
+        let empty_device: Config = toml::from_str("[pre]\ncapture_device = \"\"\n").unwrap();
+        assert!(empty_device.validate().is_err());
+
+        let nul_device: Config =
+            toml::from_str("[pre]\nplayback_device = \"defa\\u0000ult\"\n").unwrap();
+        assert!(nul_device.validate().is_err());
+
+        let zero_queue: Config = toml::from_str("[pre]\ncapture_queue_frames = 0\n").unwrap();
+        assert!(zero_queue.validate().is_err());
+
+        let huge_queue: Config =
+            toml::from_str("[pre]\ncapture_queue_frames = 1025\n").unwrap();
+        assert!(huge_queue.validate().is_err());
+
+        let max_queue: Config =
+            toml::from_str("[pre]\ncapture_queue_frames = 1024\n").unwrap();
+        assert!(max_queue.validate().is_ok());
 
         let bad_pitch: Config = toml::from_str("[rvc]\npitch_shift = 13\n").unwrap();
         assert!(bad_pitch.validate().is_err());
@@ -362,6 +426,9 @@ mod tests {
 
         let unknown: Result<Config, _> = toml::from_str("[daemon]\nunknown_key = 1\n");
         assert!(unknown.is_err());
+
+        let unknown_pre_key: Result<Config, _> = toml::from_str("[pre]\nunknown_key = 1\n");
+        assert!(unknown_pre_key.is_err());
     }
 
     #[test]

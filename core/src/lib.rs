@@ -44,9 +44,18 @@ pub struct OutputFrame {
     pub pcm: [f32; OUTPUT_SAMPLES],
 }
 
+/// 48 kHz 原始采集帧（进程内使用，不跨进程边界），对应 frame.h 的 `mozart_raw_frame_t`。
+#[repr(C, packed)]
+#[derive(Clone, Copy)]
+pub struct RawFrame {
+    pub meta: FrameMeta,
+    pub pcm: [f32; RAW_SAMPLES],
+}
+
 const _: () = assert!(std::mem::size_of::<FrameMeta>() == 16);
 const _: () = assert!(std::mem::size_of::<InputFrame>() == 16 + INPUT_SAMPLES * 4);
 const _: () = assert!(std::mem::size_of::<OutputFrame>() == 16 + OUTPUT_SAMPLES * 4);
+const _: () = assert!(std::mem::size_of::<RawFrame>() == 16 + RAW_SAMPLES * 4);
 const _: () = assert!(std::mem::size_of::<InputFrame>() + 4 == 1300);
 const _: () = assert!(std::mem::size_of::<OutputFrame>() + 4 == 3860);
 
@@ -59,5 +68,6 @@ mod tests {
         assert_eq!(std::mem::size_of::<FrameMeta>(), 16);
         assert_eq!(std::mem::size_of::<InputFrame>(), 1296);
         assert_eq!(std::mem::size_of::<OutputFrame>(), 3856);
+        assert_eq!(std::mem::size_of::<RawFrame>(), 3856);
     }
 }
