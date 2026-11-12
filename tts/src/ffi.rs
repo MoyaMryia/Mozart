@@ -207,10 +207,12 @@ mod real {
     use std::os::unix::ffi::OsStrExt;
     use std::path::Path;
 
-    /// 生成参数（brief 固定）：flow-matching 步数 5、原速、seed 42 经 extra JSON。
+    /// 生成参数（brief 固定）：flow-matching 步数 5、原速、silence_scale 1、
+    /// seed 字符串 "42" 经 extra JSON（与旧 clone_worker configure_pocket 一致）。
     const NUM_STEPS: i32 = 5;
     const SPEED: f32 = 1.0;
-    const EXTRA: &str = r#"{"seed":42}"#;
+    const SILENCE_SCALE: f32 = 1.0;
+    const EXTRA: &str = r#"{"seed":"42"}"#;
     /// 每次生成按单句批处理，限制 Orin 上的峰值内存。
     const MAX_NUM_SENTENCES: i32 = 1;
 
@@ -311,6 +313,7 @@ mod real {
             // SAFETY: 全零位模式合法；随后逐字段赋值。
             let mut config: sys::SherpaOnnxGenerationConfig = unsafe { mem::zeroed() };
             config.speed = SPEED;
+            config.silence_scale = SILENCE_SCALE;
             config.num_steps = NUM_STEPS;
             config.extra = extra.as_ptr();
             if !reference.is_empty() {
