@@ -5,8 +5,8 @@ use crate::state::{lock_state, Role, State};
 use crate::supervisor::Supervisor;
 use mozart_core::config::{ensure_run_dir, Config};
 use mozart_core::ctl::schema::{
-    self, FileCancelRequest, FileStatusRequest, FileSubmitRequest, MuteSetRequest, RouteSetRequest,
-    SwitchSetRequest,
+    self, FileCancelRequest, FileFetchRequest, FileStatusRequest, FileSubmitRequest, MuteSetRequest,
+    RouteSetRequest, SwitchSetRequest,
 };
 use mozart_core::ctl::{self, Message, Seqpacket};
 use serde_json::json;
@@ -235,6 +235,10 @@ fn handle_request(
         ctl::DAEMON_FILE_RESUME => file_reply(file.resume()),
         ctl::DAEMON_FILE_CANCEL => match parse_body::<FileCancelRequest>(&msg.body) {
             Ok(request) => file_reply(file.cancel(&request.job_id)),
+            Err(reply) => (reply, false),
+        },
+        ctl::DAEMON_FILE_FETCH => match parse_body::<FileFetchRequest>(&msg.body) {
+            Ok(request) => file_reply(file.fetch(request)),
             Err(reply) => (reply, false),
         },
         ctl::DAEMON_FILE_STATUS => match parse_body::<FileStatusRequest>(&msg.body) {

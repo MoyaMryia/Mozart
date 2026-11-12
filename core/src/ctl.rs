@@ -30,19 +30,22 @@ pub const DAEMON_TRANSLATE_SET: u16 = 0x0106;
 pub const DAEMON_SPEECH_SET: u16 = 0x0107;
 /// 体：{}（空）；daemon 转发到桥 BRIDGE_SPEECH_STOP。
 pub const DAEMON_SPEECH_STOP: u16 = 0x0108;
-/// 文件链路（SPEC-04）：体 schema::FileSubmitRequest {"path","model_id"?}。
+/// 文件链路（SPEC-04）：体 schema::FileSubmitRequest {"path","model_id"?}；
+/// data {"job_id","state","queue_position"}。
 pub const DAEMON_FILE_SUBMIT: u16 = 0x0110;
-/// 体：{}（空）；暂停后不再启动新任务，在跑任务不受影响。
+/// 体：{}（空）；data {"paused":bool}。暂停后不再启动新任务，在跑任务不受影响。
 pub const DAEMON_FILE_PAUSE: u16 = 0x0111;
-/// 体：{}（空）；恢复启动排队任务。
+/// 体：{}（空）；data {"paused":bool}。恢复启动排队任务。
 pub const DAEMON_FILE_RESUME: u16 = 0x0112;
-/// 体：schema::FileCancelRequest {"job_id"}。
+/// 体：schema::FileCancelRequest {"job_id"}；data {"job_id","state"}。
 pub const DAEMON_FILE_CANCEL: u16 = 0x0113;
-/// 体：schema::FileFetchRequest {"job_id","output"?}。
+/// 体：schema::FileFetchRequest {"job_id","output"?}；data {"job_id","output_path","name"}。
+/// v1 同机：daemon 不复制，回受管结果绝对路径与缺省名（源文件名主干 + .wav），
+/// CLI 复制到 output（缺省当前目录下缺省名）；结果不可取（未完成/已驱逐）拒绝 NotReady。
 pub const DAEMON_FILE_FETCH: u16 = 0x0114;
 /// 体：schema::FileStatusRequest {"job_id"}；data 为 schema::FileJob。
 pub const DAEMON_FILE_STATUS: u16 = 0x0115;
-/// 体：{}（空）；data 为 schema::FileJob 数组。
+/// 体：{}（空）；data {"jobs":[schema::FileJob],"paused":bool}。
 pub const DAEMON_FILE_LIST: u16 = 0x0116;
 /// 体：{}（空）；data {"models":[schema::ModelEntry]}。
 pub const DAEMON_MODEL_LIST: u16 = 0x0117;

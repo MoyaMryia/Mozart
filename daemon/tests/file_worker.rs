@@ -142,6 +142,22 @@ fn plain_job_publishes_wav_with_converted_audio() {
     h.assert_batch_counts(50, 50);
     h.assert_temp_clean(&job_id);
     h.assert_gpu_free();
+
+    // 取结果：daemon 回受管结果绝对路径与缺省名（源文件名主干 + .wav），不复制。
+    let body = json!({"job_id": job_id});
+    let reply = call(&h.conn, ctl::DAEMON_FILE_FETCH, body.to_string().as_bytes());
+    assert_eq!(reply.status, "ok", "fetch: {}", reply.reason);
+    assert_eq!(reply.data["job_id"], job_id);
+    assert_eq!(reply.data["name"], "tone.wav");
+    let output_path = PathBuf::from(reply.data["output_path"].as_str().unwrap());
+    assert!(output_path.is_absolute());
+    assert_eq!(output_path, h.result(&job_id).canonicalize().unwrap());
+
+    // 结果被驱逐（文件不在）→ NotReady，即便 result_ready 仍为 true。
+    std::fs::remove_file(h.result(&job_id)).unwrap();
+    let reply = call(&h.conn, ctl::DAEMON_FILE_FETCH, body.to_string().as_bytes());
+    assert_eq!(reply.code, ctl::CODE_NOT_READY);
+    assert!(reply.reason.contains("missing"), "{}", reply.reason);
 }
 
 #[test]

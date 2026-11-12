@@ -15,7 +15,9 @@ use crate::services::{self, Services};
 use crate::state::{lock_state, State};
 use mozart_core::config::Config;
 use mozart_core::ctl;
-use mozart_core::ctl::schema::{FileJob, FileJobState, FileProgress, FileSubmitRequest};
+use mozart_core::ctl::schema::{
+    FileFetchRequest, FileJob, FileJobState, FileProgress, FileSubmitRequest,
+};
 use queue::{FileQueue, QueueError};
 use serde_json::{json, Value};
 use std::fs;
@@ -247,6 +249,42 @@ impl FileCoordinator {
     pub fn list(&self) -> Result<Value, (String, String)> {
         let queue = lock_queue(&self.queue);
         Ok(json!({"jobs": queue.list(), "paused": queue.paused()}))
+    }
+
+    /// 取结果（v1 同机）：daemon 不复制文件，回受管结果的绝对路径与缺省名
+    /// （源文件名主干 + `.wav`），由 CLI 复制到目标；请求里的 `output` 是
+    /// CLI 的目标路径，daemon 不使用。未知 job 拒绝 InvalidArgument（同
+    /// status/cancel）；未完成或结果文件不在（含已驱逐）拒绝 NotReady。
+    pub fn fetch(&self, request: FileFetchRequest) -> Result<Value, (String, String)> {
+        let job = lock_queue(&self.queue)
+            .status(&request.job_id)
+            .ok_or_else(|| QueueError::UnknownJob(request.job_id.clone()).into_rejection())?;
+        if job.state != FileJobState::Completed || !job.result_ready {
+            return Err((
+                ctl::CODE_NOT_READY.to_string(),
+                format!("result not available: job {} not completed", job.job_id),
+            ));
+        }
+        let path = self.storage.result_path(&job.job_id);
+        // result_ready 是发布时标记，驱逐删文件不改它：以盘上实际存在为准。
+        if !path.is_file() {
+            return Err((
+                ctl::CODE_NOT_READY.to_string(),
+                format!("result not available: result file missing: {}", path.display()),
+            ));
+        }
+        // storage_dir 可配相对路径：canonicalize 收敛为绝对路径供同机 CLI 复制。
+        let output_path = fs::canonicalize(&path)
+            .map_err(|err| (ctl::CODE_INTERNAL.to_string(), err.to_string()))?;
+        let stem = Path::new(&job.name)
+            .file_stem()
+            .map(|stem| stem.to_string_lossy().into_owned())
+            .unwrap_or_else(|| job.job_id.clone());
+        Ok(json!({
+            "job_id": job.job_id,
+            "output_path": output_path,
+            "name": format!("{stem}.wav"),
+        }))
     }
 
     /// 显式 --model 经 ListModels 校验存在；缺省用当前已加载模型。
@@ -700,6 +738,66 @@ mod tests {
         assert_eq!(job.state, FileJobState::Failed);
         assert!(job.error.unwrap().contains("source"));
         assert_eq!(lock_state(&coordinator.state).gpu_owner(), None);
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    fn fetch_request(job_id: &str) -> FileFetchRequest {
+        FileFetchRequest {
+            job_id: job_id.to_string(),
+            output: None,
+        }
+    }
+
+    #[test]
+    fn fetch_returns_absolute_result_path_and_default_name() {
+        let (coordinator, _started, _release, dir) = setup("fetch-ok");
+        let job_id = enqueue(&coordinator, "song.mp3");
+        let result = coordinator.storage.result_path(&job_id);
+        fs::write(&result, b"wav-bytes").unwrap();
+        lock_queue(&coordinator.queue)
+            .mark_completed(&job_id, true)
+            .unwrap();
+
+        let reply = coordinator.fetch(fetch_request(&job_id)).unwrap();
+        assert_eq!(reply["job_id"], job_id);
+        // 缺省名 = 源文件名主干 + .wav，与源扩展名无关。
+        assert_eq!(reply["name"], "song.wav");
+        let output_path = PathBuf::from(reply["output_path"].as_str().unwrap());
+        assert!(output_path.is_absolute());
+        assert_eq!(fs::read(&output_path).unwrap(), b"wav-bytes");
+        coordinator.shutdown();
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn fetch_rejects_unknown_unfinished_and_missing_result() {
+        let (coordinator, _started, _release, dir) = setup("fetch-reject");
+        // 未知 job：InvalidArgument（同 status/cancel 口径）。
+        let (code, _) = coordinator.fetch(fetch_request("job_42")).unwrap_err();
+        assert_eq!(code, ctl::CODE_INVALID_ARGUMENT);
+
+        // 未完成：NotReady 带原因。
+        let job_id = enqueue(&coordinator, "a.wav");
+        let (code, reason) = coordinator.fetch(fetch_request(&job_id)).unwrap_err();
+        assert_eq!(code, ctl::CODE_NOT_READY);
+        assert!(reason.contains("not available"), "{reason}");
+
+        // completed 且 result_ready，但结果文件不在（已驱逐）：NotReady。
+        lock_queue(&coordinator.queue)
+            .mark_completed(&job_id, true)
+            .unwrap();
+        let (code, reason) = coordinator.fetch(fetch_request(&job_id)).unwrap_err();
+        assert_eq!(code, ctl::CODE_NOT_READY);
+        assert!(reason.contains("missing"), "{reason}");
+
+        // 发布未成功（result_ready=false）：同样不可取。
+        let other = enqueue(&coordinator, "b.wav");
+        lock_queue(&coordinator.queue)
+            .mark_completed(&other, false)
+            .unwrap();
+        let (code, _) = coordinator.fetch(fetch_request(&other)).unwrap_err();
+        assert_eq!(code, ctl::CODE_NOT_READY);
+        coordinator.shutdown();
         fs::remove_dir_all(&dir).unwrap();
     }
 

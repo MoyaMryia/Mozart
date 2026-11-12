@@ -260,6 +260,7 @@ dependencies = [
  "clap",
  "libc",
  "mozart-core",
+ "serde",
  "serde_json",
 ]
 

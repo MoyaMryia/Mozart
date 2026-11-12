@@ -423,7 +423,7 @@ pub struct FileJob {
 }
 
 /// DAEMON_FILE_SUBMIT 请求体；model_id 缺省用当前已加载模型。
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct FileSubmitRequest {
     pub path: String,
@@ -431,14 +431,16 @@ pub struct FileSubmitRequest {
 }
 
 /// DAEMON_FILE_CANCEL 请求体。
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct FileCancelRequest {
     pub job_id: String,
 }
 
-/// DAEMON_FILE_FETCH 请求体；output 缺省由 daemon 按源文件名定名。
-#[derive(Debug, Deserialize)]
+/// DAEMON_FILE_FETCH 请求体。v1 同机：daemon 不复制文件，data 回
+/// {"job_id","output_path","name"}（受管结果绝对路径 + 缺省名 = 源文件名主干
+/// + .wav）；output 是 CLI 的复制目标，daemon 不使用，缺省名由 CLI 落在当前目录。
+#[derive(Debug, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct FileFetchRequest {
     pub job_id: String,
@@ -446,7 +448,7 @@ pub struct FileFetchRequest {
 }
 
 /// DAEMON_FILE_STATUS 请求体。
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct FileStatusRequest {
     pub job_id: String,

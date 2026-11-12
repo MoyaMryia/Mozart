@@ -152,6 +152,44 @@ fn realtime_busy_file_waits_then_auto_starts() {
 }
 
 #[test]
+fn fetch_rejects_unknown_unfinished_and_failed() {
+    let dir = std::env::temp_dir().join(format!("mozart-daemon-{}-file-fetch", std::process::id()));
+    let storage = dir.join("files");
+    let daemon = spawn("file-fetch", &storage, "", true);
+    let conn = daemon.connect();
+    wait_ready(&conn);
+
+    // 未知 job：InvalidArgument（同 status/cancel 口径）。
+    let reply = call(&conn, ctl::DAEMON_FILE_FETCH, br#"{"job_id":"job_42"}"#);
+    assert_eq!(reply.code, ctl::CODE_INVALID_ARGUMENT);
+
+    // 排队中：结果不可取，NotReady 带原因。
+    call(&conn, ctl::DAEMON_FILE_PAUSE, b"");
+    let src = source(&daemon.dir, "a.wav");
+    let reply = submit_file(&conn, &src, Some("demo"));
+    assert_eq!(reply.status, "ok", "{}", reply.reason);
+    let job_id = reply.data["job_id"].as_str().unwrap().to_string();
+    let body = json!({"job_id": job_id});
+    let reply = call(&conn, ctl::DAEMON_FILE_FETCH, body.to_string().as_bytes());
+    assert_eq!(reply.code, ctl::CODE_NOT_READY);
+    assert!(reply.reason.contains("not available"), "{}", reply.reason);
+
+    // 恢复后占位源解码失败 → failed，仍不可取。
+    call(&conn, ctl::DAEMON_FILE_RESUME, b"");
+    wait_job_state(&conn, &job_id, FileJobState::Failed, Duration::from_secs(5));
+    let reply = call(&conn, ctl::DAEMON_FILE_FETCH, body.to_string().as_bytes());
+    assert_eq!(reply.code, ctl::CODE_NOT_READY);
+
+    // 请求体 deny_unknown_fields。
+    let reply = call(
+        &conn,
+        ctl::DAEMON_FILE_FETCH,
+        br#"{"job_id":"job_1","extra":1}"#,
+    );
+    assert_eq!(reply.code, ctl::CODE_INVALID_ARGUMENT);
+}
+
+#[test]
 fn queue_persists_across_restart() {
     let dir_a =
         std::env::temp_dir().join(format!("mozart-daemon-{}-file-persist-a", std::process::id()));

@@ -47,13 +47,15 @@ enum {
     MOZART_CTL_DAEMON_SPEECH_SET    = 0x0107,  // 体 {"enabled": bool}，转发桥
     MOZART_CTL_DAEMON_SPEECH_STOP   = 0x0108,  // 体 {}（空），转发桥
     // 文件链路与管理命令（SPEC-04 CLI 命令面）；体字段见 core/src/ctl/schema.rs：
-    MOZART_CTL_DAEMON_FILE_SUBMIT = 0x0110,  // 体 {"path","model_id"?}
-    MOZART_CTL_DAEMON_FILE_PAUSE  = 0x0111,  // 体 {}（空）
-    MOZART_CTL_DAEMON_FILE_RESUME = 0x0112,  // 体 {}（空）
-    MOZART_CTL_DAEMON_FILE_CANCEL = 0x0113,  // 体 {"job_id"}
-    MOZART_CTL_DAEMON_FILE_FETCH  = 0x0114,  // 体 {"job_id","output"?}
-    MOZART_CTL_DAEMON_FILE_STATUS = 0x0115,  // 体 {"job_id"}
-    MOZART_CTL_DAEMON_FILE_LIST   = 0x0116,  // 体 {}（空）
+    MOZART_CTL_DAEMON_FILE_SUBMIT = 0x0110,  // 体 {"path","model_id"?}，data {"job_id","state","queue_position"}
+    MOZART_CTL_DAEMON_FILE_PAUSE  = 0x0111,  // 体 {}（空），data {"paused"}
+    MOZART_CTL_DAEMON_FILE_RESUME = 0x0112,  // 体 {}（空），data {"paused"}
+    MOZART_CTL_DAEMON_FILE_CANCEL = 0x0113,  // 体 {"job_id"}，data {"job_id","state"}
+    // 体 {"job_id","output"?}，data {"job_id","output_path","name"}；v1 同机 daemon 不复制，
+    // 回受管结果绝对路径与缺省名（源文件名主干 + .wav），CLI 复制到 output；不可取拒绝 NotReady
+    MOZART_CTL_DAEMON_FILE_FETCH  = 0x0114,
+    MOZART_CTL_DAEMON_FILE_STATUS = 0x0115,  // 体 {"job_id"}，data FileJob
+    MOZART_CTL_DAEMON_FILE_LIST   = 0x0116,  // 体 {}（空），data {"jobs":[FileJob],"paused"}
     MOZART_CTL_DAEMON_MODEL_LIST  = 0x0117,  // 体 {}（空），data {"models":[{"id","exists","loaded"}]}
     MOZART_CTL_DAEMON_RESTART     = 0x0118,  // 体 {"service"}
     MOZART_CTL_DAEMON_DEVICE_LIST = 0x0119,  // 体 {}（空），data {"devices":[{"id","label","kind"}]}
