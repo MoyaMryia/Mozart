@@ -311,6 +311,12 @@ pub struct BridgeStatus {
     pub tts_connected: bool,
     pub subtitles_published: u64,
     pub records_in_memory: u32,
+    /// 事件→字幕有界通道满丢计数（partial 可丢，final/refined 阻塞保留）。
+    pub events_dropped: u64,
+    /// 坏事件（解析失败）丢弃计数。
+    pub events_bad: u64,
+    /// 跨启动号（旧会话）事件丢弃计数。
+    pub events_stale: u64,
     pub subtitles_path: String,
     pub last_write_unix_ms: u64,
     pub degraded: Vec<String>,
@@ -340,6 +346,9 @@ impl Default for BridgeStatus {
             tts_connected: false,
             subtitles_published: 0,
             records_in_memory: 0,
+            events_dropped: 0,
+            events_bad: 0,
+            events_stale: 0,
             subtitles_path: String::new(),
             last_write_unix_ms: 0,
             degraded: Vec::new(),

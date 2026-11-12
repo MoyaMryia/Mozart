@@ -34,6 +34,9 @@ use std::thread::JoinHandle;
 /// 停止标志：信号处理器与各线程共用。
 static STOP: AtomicBool = AtomicBool::new(false);
 
+/// 事件→字幕有界通道容量（几十句量级，板端实测后定）。
+const EVENT_QUEUE_CAPACITY: usize = 64;
+
 extern "C" fn on_signal(_signal: libc::c_int) {
     // 只做原子存储，异步信号安全。
     STOP.store(true, Ordering::Relaxed);
@@ -147,15 +150,22 @@ fn run(cli: Cli) -> Result<(), String> {
         .map_err(|err| format!("listen：{err}"))?;
     let writer = subtitles::JsonlWriter::open(&config.bridge.subtitles_path)
         .map_err(|err| format!("打开字幕 {}：{err}", config.bridge.subtitles_path.display()))?;
+    // 纠错表：内置表叠加可选配置文件（文件条目覆盖同键词条）。
+    let mut corrections = preprocess::builtin_corrections();
+    if let Some(path) = &config.bridge.corrections_path {
+        let extra = preprocess::load_corrections(path)?;
+        corrections = preprocess::merge_corrections(corrections, extra);
+    }
     let store = Arc::new(subtitles::SubtitleStore::new(
         writer,
         config.bridge.subtitles_path.clone(),
-        preprocess::builtin_corrections(),
+        corrections,
     ));
     let llama = http::LlamaClient::new(config.llama_socket());
     let tts_jobs_path = config.tts_jobs_socket();
 
-    let (events_tx, events_rx) = mpsc::channel::<events::Event>();
+    // 事件→字幕有界通道：partial 满丢计数，final/refined 阻塞保留（SPEC-05）。
+    let (events_tx, events_rx) = mpsc::sync_channel::<events::Event>(EVENT_QUEUE_CAPACITY);
 
     eprintln!(
         "mozart-bridge: events={} subtitles={} llama={} tts_jobs={} translate={} speech={}",

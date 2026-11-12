@@ -157,6 +157,9 @@ pub struct Shared {
     speech_enabled: AtomicBool,
     subtitles_published: AtomicU64,
     records_in_memory: AtomicU32,
+    events_dropped: AtomicU64,
+    events_bad: AtomicU64,
+    events_stale: AtomicU64,
     last_write_unix_ms: AtomicU64,
     translate_stats: TranslateStats,
     speech_stats: SpeechStats,
@@ -172,6 +175,9 @@ impl Shared {
             speech_enabled: AtomicBool::new(switches.speech_enabled),
             subtitles_published: AtomicU64::new(0),
             records_in_memory: AtomicU32::new(0),
+            events_dropped: AtomicU64::new(0),
+            events_bad: AtomicU64::new(0),
+            events_stale: AtomicU64::new(0),
             last_write_unix_ms: AtomicU64::new(0),
             translate_stats: TranslateStats::default(),
             speech_stats: SpeechStats::default(),
@@ -212,6 +218,18 @@ impl Shared {
     }
     pub fn set_records_in_memory(&self, count: u32) {
         self.records_in_memory.store(count, Relaxed);
+    }
+    /// 事件→字幕通道满丢（partial）。
+    pub fn add_event_dropped(&self) {
+        self.events_dropped.fetch_add(1, Relaxed);
+    }
+    /// 坏事件（解析失败）丢弃。
+    pub fn add_event_bad(&self) {
+        self.events_bad.fetch_add(1, Relaxed);
+    }
+    /// 跨启动号事件丢弃。
+    pub fn add_event_stale(&self) {
+        self.events_stale.fetch_add(1, Relaxed);
     }
     pub fn set_last_write_unix_ms(&self, ms: u64) {
         self.last_write_unix_ms.store(ms, Relaxed);
@@ -279,6 +297,9 @@ impl Shared {
             tts_connected: speech.tts_connected.load(Relaxed),
             subtitles_published: self.subtitles_published.load(Relaxed),
             records_in_memory: self.records_in_memory.load(Relaxed),
+            events_dropped: self.events_dropped.load(Relaxed),
+            events_bad: self.events_bad.load(Relaxed),
+            events_stale: self.events_stale.load(Relaxed),
             subtitles_path: self.subtitles_path.display().to_string(),
             last_write_unix_ms: self.last_write_unix_ms.load(Relaxed),
             degraded: self.degraded_strings(),
@@ -363,21 +384,18 @@ impl Queues {
                     .speech_rx
                     .lock()
                     .unwrap_or_else(|poisoned| poisoned.into_inner());
-                // 丢最旧腾位；取件竞态下可能已被消费，此时队列已有空位。
-                let dropped = rx.try_recv().is_ok();
-                if dropped {
+                // 丢最旧腾位并减深度；取件竞态下可能已被消费（此时已有空位，不减）。
+                if rx.try_recv().is_ok() {
                     self.speech_dropped.fetch_add(1, Relaxed);
+                    self.speech_depth.fetch_sub(1, Relaxed);
                 }
-                if self.speech_tx.try_send(job).is_ok() {
-                    if !dropped {
+                match self.speech_tx.try_send(job) {
+                    Ok(()) => {
                         self.speech_depth.fetch_add(1, Relaxed);
+                        true
                     }
-                    true
-                } else {
-                    if dropped {
-                        self.speech_depth.fetch_sub(1, Relaxed);
-                    }
-                    false
+                    // 单生产者腾位后必有空位；此分支仅在投递线程退出（断开）时到达。
+                    Err(_) => false,
                 }
             }
             Err(TrySendError::Disconnected(_)) => false,

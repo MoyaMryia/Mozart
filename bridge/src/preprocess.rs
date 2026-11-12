@@ -1,10 +1,12 @@
 //! 翻译预处理（SPEC-05）：显式同音字纠错 → 术语表 → 数字归一化。
-//! v1 只搬显式纠错表（通用常见同音误写，词条级替换，长词优先）；
-//! 拼音与词频依赖的术语同音索引留接口（SPEC：Rust 复现方式实现时定）。
+//! v1 只搬显式纠错表（内置常见同音误写 + 可选配置文件，词条级替换，长词优先）。
+//! 术语同音索引（拼音匹配、词频过滤，旧 homophones.py）留 FUTURE：依赖 pypinyin/jieba
+//! 的 Rust 复现方式未定，v1 不做拼音索引，仅显式表替换。
 //! 数字归一化只处理常见明确模式，成语与单字不改动。
 
 use serde::Serialize;
 use std::collections::HashMap;
+use std::path::Path;
 
 /// 显式纠错表：ASR 常见同音误写 → 正确写法。
 /// 只收词条级、无歧义的替换；上下文相关的「在/再」「做/作」不逐字替换。
@@ -80,6 +82,48 @@ pub fn builtin_corrections() -> Vec<(String, String)> {
         .iter()
         .map(|(from, to)| (from.to_string(), to.to_string()))
         .collect()
+}
+
+/// 从文件加载显式纠错表（JSON {"原文":"改为"}，旧 homophones.load_corrections）。
+/// 文件不存在返回空表；非法 JSON、非对象、非中文条目报错停止。
+pub fn load_corrections(path: &Path) -> Result<Vec<(String, String)>, String> {
+    let text = match std::fs::read_to_string(path) {
+        Ok(text) => text,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(err) => return Err(format!("读纠错表 {}：{err}", path.display())),
+    };
+    let value: serde_json::Value = serde_json::from_str(&text)
+        .map_err(|err| format!("纠错表不是合法 JSON {}：{err}", path.display()))?;
+    let map = value
+        .as_object()
+        .ok_or_else(|| format!("纠错表应为 {{\"原文\":\"改为\"}} 对象：{}", path.display()))?;
+    let mut entries = Vec::new();
+    for (from, to) in map {
+        let to = to
+            .as_str()
+            .ok_or_else(|| format!("纠错条目值必须是字符串：{from}"))?;
+        if !is_chinese(from) || !is_chinese(to) {
+            return Err(format!("纠错条目必须都是中文：{from} -> {to}"));
+        }
+        entries.push((from.clone(), to.to_string()));
+    }
+    Ok(entries)
+}
+
+fn is_chinese(text: &str) -> bool {
+    !text.is_empty() && text.chars().all(|c| ('\u{4e00}'..='\u{9fff}').contains(&c))
+}
+
+/// 合并纠错表：文件条目覆盖内置同键词条（correct 按长词优先，顺序无关）。
+pub fn merge_corrections(
+    base: Vec<(String, String)>,
+    extra: Vec<(String, String)>,
+) -> Vec<(String, String)> {
+    let mut map: HashMap<String, String> = base.into_iter().collect();
+    for (from, to) in extra {
+        map.insert(from, to);
+    }
+    map.into_iter().collect()
 }
 
 /// 按显式纠错表替换并记录改动，长词优先（旧 homophones.apply_corrections）。
@@ -267,6 +311,51 @@ mod tests {
     fn custom_table_is_applied() {
         let table = [("王独", "网赌"), ("王", "网")];
         assert_eq!(apply_corrections("王独说王", &table), "网赌说网");
+    }
+
+    #[test]
+    fn load_corrections_reads_file_and_validates() {
+        let dir = crate::testutil::temp_dir("corr-load");
+        let path = dir.join("corrections.json");
+        // 缺失文件返回空表（缺省用内置表）。
+        assert!(load_corrections(&path).unwrap().is_empty());
+        // 合法对象加载为词条表。
+        std::fs::write(&path, r#"{"王独":"网赌"}"#).unwrap();
+        assert_eq!(
+            load_corrections(&path).unwrap(),
+            vec![("王独".to_string(), "网赌".to_string())]
+        );
+        // 非法 JSON、非对象、非字符串值、非中文条目均报错停止。
+        for bad in [
+            "{not json",
+            "[]",
+            r#"{"甲":1}"#,
+            r#"{"甲":"ab"}"#,
+            r#"{"ab":"甲"}"#,
+            r#"{"":"甲"}"#,
+        ] {
+            std::fs::write(&path, bad).unwrap();
+            assert!(load_corrections(&path).is_err(), "应拒绝：{bad}");
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn merge_corrections_overrides_and_extends() {
+        let base = builtin_corrections();
+        // 文件覆盖内置同键词条（在见→再见 改为 再会），并新增词条。
+        let extra = vec![
+            ("在见".to_string(), "再会".to_string()),
+            ("王独".to_string(), "网赌".to_string()),
+        ];
+        let merged = merge_corrections(base, extra);
+        let (text, fixes) = correct("我以经王独在见", &merged);
+        // 内置「以经→已经」保留，「在见」被覆盖，「王独」新增。
+        assert_eq!(text, "我已经网赌再会");
+        assert!(fixes.iter().any(|f| f.from == "在见" && f.to == "再会"));
+        assert!(fixes.iter().any(|f| f.from == "以经" && f.to == "已经"));
+        assert!(fixes.iter().any(|f| f.from == "王独" && f.to == "网赌"));
+        assert!(!fixes.iter().any(|f| f.to == "再见"));
     }
 
     #[test]

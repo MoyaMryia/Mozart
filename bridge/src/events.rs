@@ -9,7 +9,7 @@ use serde::Deserialize;
 use serde_json::Value;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering::Relaxed};
-use std::sync::mpsc::Sender;
+use std::sync::mpsc::{SyncSender, TrySendError};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -178,7 +178,7 @@ impl Session {
 /// 事件线程主循环：连接 → 读包入队 → 断连重连，直到停止标志置位。
 pub fn run(
     path: PathBuf,
-    tx: Sender<Event>,
+    tx: SyncSender<Event>,
     shared: Arc<Shared>,
     stop: &'static AtomicBool,
 ) -> Result<(), String> {
@@ -196,7 +196,7 @@ pub fn run(
         shared.resolve(DEGRADED_ASR_EVENTS);
         // 重连后重新确立会话：识别服务可能已重启换启动号。
         session.reset();
-        read_loop(&conn, &tx, &mut session, stop);
+        read_loop(&conn, &tx, &mut session, &shared, stop);
         if stop.load(Relaxed) {
             break;
         }
@@ -206,7 +206,14 @@ pub fn run(
 }
 
 /// 读循环：只解析、校验、入队；任何收包错误转断连重连。
-fn read_loop(conn: &Seqpacket, tx: &Sender<Event>, session: &mut Session, stop: &AtomicBool) {
+/// 有界通道：partial 满丢并计数，final/refined 阻塞保留；坏事件与跨启动号丢弃计数。
+fn read_loop(
+    conn: &Seqpacket,
+    tx: &SyncSender<Event>,
+    session: &mut Session,
+    shared: &Shared,
+    stop: &AtomicBool,
+) {
     while !stop.load(Relaxed) {
         let bytes = match conn.recv_raw(Some(RECV_POLL)) {
             Ok(bytes) => bytes,
@@ -220,16 +227,28 @@ fn read_loop(conn: &Seqpacket, tx: &Sender<Event>, session: &mut Session, stop: 
             Ok(Some(event)) => event,
             Ok(None) => continue,
             Err(reason) => {
+                shared.add_event_bad();
                 eprintln!("mozart-bridge: drop event: {reason}");
                 continue;
             }
         };
         if !session.accept(&event) {
+            shared.add_event_stale();
             continue;
         }
-        if tx.send(event).is_err() {
-            // 字幕线程已退出，停止标志由其致命错误路径置位。
-            return;
+        match event.kind {
+            EventKind::Partial => match tx.try_send(event) {
+                Ok(()) => {}
+                Err(TrySendError::Full(_)) => shared.add_event_dropped(),
+                // 字幕线程已退出，停止标志由其致命错误路径置位。
+                Err(TrySendError::Disconnected(_)) => return,
+            },
+            // final/refined 不可丢：阻塞等到通道有空位。
+            _ => {
+                if tx.send(event).is_err() {
+                    return;
+                }
+            }
         }
     }
 }
@@ -335,5 +354,90 @@ mod tests {
         session.reset();
         assert!(session.accept(&event("bbbb")));
         assert!(!session.accept(&event("aaaa")));
+    }
+
+    /// 有界通道语义：partial 满丢并计数，final 阻塞保留（C2）。
+    #[test]
+    fn bounded_channel_drops_partial_and_keeps_final() {
+        use crate::state::{Queues, Switches, STATE_FILE_NAME};
+        use crate::testutil::temp_dir;
+        use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
+        use std::os::unix::ffi::OsStrExt;
+        use std::sync::{mpsc, Arc};
+
+        let dir = temp_dir("evt-bound");
+        let path = dir.join("asr-events.sock");
+        let listener = Seqpacket::bind(&path).unwrap();
+        listener.listen(1).unwrap();
+        // 裸 SEQPACKET 客户端：事件面无控制信封，直接发 JSON。
+        let raw =
+            unsafe { libc::socket(libc::AF_UNIX, libc::SOCK_SEQPACKET | libc::SOCK_CLOEXEC, 0) };
+        assert!(raw >= 0, "socket: {}", std::io::Error::last_os_error());
+        let client = unsafe { OwnedFd::from_raw_fd(raw) };
+        // SAFETY: sockaddr_un 可由全零位模式表示。
+        let mut addr: libc::sockaddr_un = unsafe { std::mem::zeroed() };
+        addr.sun_family = libc::AF_UNIX as libc::sa_family_t;
+        let bytes = path.as_os_str().as_bytes();
+        for (slot, byte) in addr.sun_path.iter_mut().zip(bytes) {
+            *slot = *byte as libc::c_char;
+        }
+        let len = (std::mem::size_of::<libc::sa_family_t>() + bytes.len() + 1) as libc::socklen_t;
+        // SAFETY: client 有效；addr 指向已初始化的 sockaddr_un。
+        let rc = unsafe {
+            libc::connect(client.as_raw_fd(), (&addr as *const libc::sockaddr_un).cast(), len)
+        };
+        assert_eq!(rc, 0, "connect: {}", std::io::Error::last_os_error());
+        let conn = listener.accept().unwrap();
+        let send_json = |value: &serde_json::Value| {
+            let bytes = serde_json::to_vec(value).unwrap();
+            // SAFETY: client 有效；bytes 指向已初始化的缓冲。
+            let sent = unsafe {
+                libc::send(client.as_raw_fd(), bytes.as_ptr().cast(), bytes.len(), libc::MSG_NOSIGNAL)
+            };
+            assert_eq!(sent as usize, bytes.len(), "send: {}", std::io::Error::last_os_error());
+        };
+
+        let shared = Arc::new(Shared::new(
+            Switches { translate_enabled: false, speech_enabled: false },
+            dir.join("subtitles.jsonl"),
+            dir.join(STATE_FILE_NAME),
+        ));
+        let queues = Queues::new(1, 1);
+        let stop = Arc::new(AtomicBool::new(false));
+        // 容量 1：首条 partial 占满，第二条满丢，final 阻塞等待空位。
+        let (tx, rx) = mpsc::sync_channel::<Event>(1);
+        let reader = {
+            let shared = shared.clone();
+            let stop = stop.clone();
+            std::thread::spawn(move || {
+                read_loop(&conn, &tx, &mut Session::default(), &shared, &stop);
+            })
+        };
+
+        send_json(&json!({"type":"partial","startup_id":"s","utterance_id":"s:1","text":"甲"}));
+        send_json(&json!({"type":"partial","startup_id":"s","utterance_id":"s:1","text":"乙"}));
+        send_json(&json!({"type":"final","startup_id":"s","utterance_id":"s:1","text":"丙"}));
+
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        while shared.status(&queues).events_dropped < 1 {
+            assert!(std::time::Instant::now() < deadline, "等待满丢计数超时");
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        // 取走首条 partial 腾位，阻塞的 final 随即送达（不可丢）。
+        let first = rx.recv_timeout(Duration::from_secs(5)).unwrap();
+        assert_eq!(first.kind, EventKind::Partial);
+        assert_eq!(first.text, "甲");
+        let last = rx.recv_timeout(Duration::from_secs(5)).unwrap();
+        assert_eq!(last.kind, EventKind::Final);
+        assert_eq!(last.text, "丙");
+
+        let status = shared.status(&queues);
+        assert_eq!(status.events_dropped, 1);
+        assert_eq!(status.events_bad, 0);
+        assert_eq!(status.events_stale, 0);
+
+        stop.store(true, Relaxed);
+        reader.join().unwrap();
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

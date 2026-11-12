@@ -7,9 +7,11 @@
 
 use serde_json::{json, Value};
 use std::io::{self, Read, Write};
-use std::os::fd::AsRawFd;
+use std::mem;
+use std::os::fd::{AsRawFd, FromRawFd, IntoRawFd, OwnedFd};
+use std::os::unix::ffi::OsStrExt;
 use std::os::unix::net::UnixStream;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering::Relaxed};
 use std::time::{Duration, Instant};
 
@@ -22,6 +24,10 @@ Keep direct address as direct address, not a possession or a family relationship
 
 /// 单请求总时限（含收发）。
 pub const REQUEST_TIMEOUT: Duration = Duration::from_secs(10);
+/// 连接时限：监听积压满时 connect 不无限阻塞。
+const CONNECT_TIMEOUT: Duration = Duration::from_secs(1);
+/// connect 重试步长：AF_UNIX 积压满时轮询重试的粒度（与 core Seqpacket 一致）。
+const CONNECT_RETRY_STEP: Duration = Duration::from_millis(10);
 /// poll 步长：停止标志与总时限的检查粒度。
 const POLL_STEP: Duration = Duration::from_millis(100);
 /// 响应体上限：翻译输出远小于此，超限按坏响应处理。
@@ -56,11 +62,92 @@ impl LlamaClient {
     /// 一次翻译请求。失败返回原因（连接、超时、HTTP 状态、响应解析）；
     /// 停止标志置位时尽快返回 Err，由调用方决定是否计数。
     pub fn translate(&self, text: &str, stop: &AtomicBool) -> Result<Completion, String> {
-        let stream = UnixStream::connect(&self.socket)
+        let stream = connect_timeout(&self.socket, CONNECT_TIMEOUT)
             .map_err(|err| format!("connect {}：{err}", self.socket.display()))?;
         let raw = exchange(&stream, &build_request(text), self.timeout, stop)?;
         parse_response(&raw)
     }
+}
+
+/// 带超时的 Unix STREAM 连接：非阻塞 connect 重试到时限。
+/// AF_UNIX 积压满时 connect 返回 EAGAIN 且无异步完成通知，须轮询重试
+/// （与 core Seqpacket::connect_timeout 同法），不能用 poll 等待可写。
+fn connect_timeout(path: &Path, timeout: Duration) -> io::Result<UnixStream> {
+    // SAFETY: socket() 不访问其他内存；CLOEXEC|NONBLOCK 标志有效。
+    let raw = unsafe {
+        libc::socket(
+            libc::AF_UNIX,
+            libc::SOCK_STREAM | libc::SOCK_CLOEXEC | libc::SOCK_NONBLOCK,
+            0,
+        )
+    };
+    if raw < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    // SAFETY: raw 是新建且未复制的文件描述符。
+    let fd = unsafe { OwnedFd::from_raw_fd(raw) };
+    let (addr, len) = sockaddr_un(path)?;
+    let deadline = Instant::now() + timeout;
+    loop {
+        // SAFETY: fd 有效；addr 指向已零初始化的 sockaddr_un。
+        let rc = unsafe {
+            libc::connect(fd.as_raw_fd(), (&addr as *const libc::sockaddr_un).cast(), len)
+        };
+        if rc == 0 {
+            return into_blocking_stream(fd);
+        }
+        let err = io::Error::last_os_error();
+        match err.raw_os_error() {
+            Some(libc::EINTR) | Some(libc::EINPROGRESS) | Some(libc::EAGAIN) => {}
+            Some(libc::EISCONN) => return into_blocking_stream(fd),
+            _ => return Err(err),
+        }
+        let now = Instant::now();
+        if now >= deadline {
+            return Err(io::Error::new(io::ErrorKind::TimedOut, "connect timeout"));
+        }
+        std::thread::sleep(CONNECT_RETRY_STEP.min(deadline - now));
+    }
+}
+
+/// 连接成功后转回阻塞模式并把所有权移交 UnixStream。
+fn into_blocking_stream(fd: OwnedFd) -> io::Result<UnixStream> {
+    set_nonblocking(&fd, false)?;
+    // SAFETY: fd 是已连接的 STREAM 套接字，所有权移交 UnixStream。
+    Ok(unsafe { UnixStream::from_raw_fd(fd.into_raw_fd()) })
+}
+
+fn set_nonblocking(fd: &OwnedFd, nonblocking: bool) -> io::Result<()> {
+    // SAFETY: fcntl 只读写该 fd 的标志位。
+    let flags = unsafe { libc::fcntl(fd.as_raw_fd(), libc::F_GETFL) };
+    if flags < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    let target = if nonblocking {
+        flags | libc::O_NONBLOCK
+    } else {
+        flags & !libc::O_NONBLOCK
+    };
+    // SAFETY: target 由上一次 F_GETFL 结果派生。
+    if unsafe { libc::fcntl(fd.as_raw_fd(), libc::F_SETFL, target) } < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(())
+}
+
+fn sockaddr_un(path: &Path) -> io::Result<(libc::sockaddr_un, libc::socklen_t)> {
+    // SAFETY: sockaddr_un 可由全零位模式表示。
+    let mut addr: libc::sockaddr_un = unsafe { mem::zeroed() };
+    addr.sun_family = libc::AF_UNIX as libc::sa_family_t;
+    let bytes = path.as_os_str().as_bytes();
+    if bytes.len() >= addr.sun_path.len() {
+        return Err(io::Error::new(io::ErrorKind::InvalidInput, "socket path too long"));
+    }
+    for (slot, byte) in addr.sun_path.iter_mut().zip(bytes) {
+        *slot = *byte as libc::c_char;
+    }
+    let len = mem::size_of::<libc::sa_family_t>() + bytes.len() + 1;
+    Ok((addr, len as libc::socklen_t))
 }
 
 /// 构造请求报文：系统提示词 + 用户原文，参数固定。
@@ -399,6 +486,70 @@ mod tests {
         let err = client.translate("你好", &AtomicBool::new(false)).unwrap_err();
         assert!(err.contains("connect"), "{err}");
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 监听积压满时 connect 不无限阻塞，按 CONNECT_TIMEOUT 返回 TimedOut（C4）。
+    #[test]
+    fn connect_timeout_fires_when_backlog_full() {
+        let dir = temp_dir("http-connect-full");
+        let path = dir.join("llama.sock");
+        // SAFETY: socket() 不访问其他内存；CLOEXEC 标志有效。
+        let raw = unsafe { libc::socket(libc::AF_UNIX, libc::SOCK_STREAM | libc::SOCK_CLOEXEC, 0) };
+        assert!(raw >= 0, "socket: {}", io::Error::last_os_error());
+        // SAFETY: raw 是新建且未复制的文件描述符。
+        let listener = unsafe { OwnedFd::from_raw_fd(raw) };
+        let (addr, len) = sockaddr_un(&path).unwrap();
+        // SAFETY: listener 有效；addr 指向已初始化的 sockaddr_un。
+        let rc =
+            unsafe { libc::bind(listener.as_raw_fd(), (&addr as *const libc::sockaddr_un).cast(), len) };
+        assert_eq!(rc, 0, "bind: {}", io::Error::last_os_error());
+        // SAFETY: listener 已 bind。
+        let rc = unsafe { libc::listen(listener.as_raw_fd(), 1) };
+        assert_eq!(rc, 0, "listen: {}", io::Error::last_os_error());
+
+        // 非阻塞 connect 占满积压直到 EAGAIN（内核可能允许 backlog+1，逐条探测）。
+        let mut fillers = Vec::new();
+        loop {
+            // SAFETY: socket() 不访问其他内存；NONBLOCK|CLOEXEC 标志有效。
+            let raw = unsafe {
+                libc::socket(
+                    libc::AF_UNIX,
+                    libc::SOCK_STREAM | libc::SOCK_CLOEXEC | libc::SOCK_NONBLOCK,
+                    0,
+                )
+            };
+            assert!(raw >= 0);
+            // SAFETY: raw 是新建且未复制的文件描述符。
+            let fd = unsafe { OwnedFd::from_raw_fd(raw) };
+            // SAFETY: fd 有效；addr 指向已初始化的 sockaddr_un。
+            let rc =
+                unsafe { libc::connect(fd.as_raw_fd(), (&addr as *const libc::sockaddr_un).cast(), len) };
+            if rc == 0 {
+                fillers.push(fd);
+                continue;
+            }
+            let err = io::Error::last_os_error();
+            match err.raw_os_error() {
+                Some(libc::EAGAIN) | Some(libc::EINPROGRESS) => break,
+                _ => panic!("filler connect：{err}"),
+            }
+        }
+        assert!(!fillers.is_empty(), "积压应已被占满");
+
+        let started = Instant::now();
+        let err = connect_timeout(&path, Duration::from_millis(200)).unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::TimedOut, "{err}");
+        let elapsed = started.elapsed();
+        assert!(elapsed >= Duration::from_millis(150), "过早返回：{elapsed:?}");
+        assert!(elapsed < Duration::from_secs(2), "超时未生效：{elapsed:?}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn sockaddr_un_rejects_overlong_path() {
+        let long = PathBuf::from("/").join("x".repeat(200));
+        let err = sockaddr_un(&long).unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::InvalidInput);
     }
 
     #[test]

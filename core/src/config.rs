@@ -241,6 +241,8 @@ pub struct BridgeConfig {
     pub socket: String,
     /// 字幕 JSONL 落盘路径；加载时展开开头的 `~`。
     pub subtitles_path: PathBuf,
+    /// 显式同音纠错表文件（JSON {"原文":"改为"}）；缺省用内置表，加载时展开 `~`。
+    pub corrections_path: Option<PathBuf>,
     /// 翻译开关的 TOML 基线。
     pub translate_enabled: bool,
     /// 播报开关的 TOML 基线。
@@ -260,6 +262,7 @@ impl Default for BridgeConfig {
         Self {
             socket: "bridge.sock".to_string(),
             subtitles_path: PathBuf::from("~/.local/state/mozart/subtitles.jsonl"),
+            corrections_path: None,
             translate_enabled: true,
             speech_enabled: true,
             llama_socket: "llama.sock".to_string(),
@@ -357,6 +360,9 @@ impl Config {
         let home = std::env::var_os("HOME").map(PathBuf::from);
         config.bridge.subtitles_path =
             expand_tilde(&config.bridge.subtitles_path, home.as_deref());
+        if let Some(path) = &config.bridge.corrections_path {
+            config.bridge.corrections_path = Some(expand_tilde(path, home.as_deref()));
+        }
         config.validate()?;
         Ok(config)
     }
@@ -1018,17 +1024,32 @@ mod tests {
         let path = dir.join("mozart.toml");
         std::fs::write(
             &path,
-            "[bridge]\nsubtitles_path = \"~/mozart-test/subtitles.jsonl\"\n",
+            "[bridge]\nsubtitles_path = \"~/mozart-test/subtitles.jsonl\"\n\
+             corrections_path = \"~/mozart-test/corrections.json\"\n",
         )
         .unwrap();
 
         let config = Config::load_from(Some(&path)).unwrap();
-        let expected = match std::env::var_os("HOME") {
-            Some(home) => PathBuf::from(home).join("mozart-test/subtitles.jsonl"),
-            None => PathBuf::from("~/mozart-test/subtitles.jsonl"),
+        let home = std::env::var_os("HOME").map(PathBuf::from);
+        let expected = |tail: &str| match &home {
+            Some(home) => home.join(tail),
+            None => PathBuf::from("~/").join(tail),
         };
-        assert_eq!(config.bridge.subtitles_path, expected);
+        assert_eq!(
+            config.bridge.subtitles_path,
+            expected("mozart-test/subtitles.jsonl")
+        );
+        assert_eq!(
+            config.bridge.corrections_path,
+            Some(expected("mozart-test/corrections.json"))
+        );
 
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn corrections_path_defaults_to_none() {
+        let config = Config::load_from(None).unwrap();
+        assert_eq!(config.bridge.corrections_path, None);
     }
 }

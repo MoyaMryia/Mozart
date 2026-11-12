@@ -206,6 +206,18 @@ impl MockConn {
         };
         assert_eq!(sent as usize, bytes.len(), "事件发送：{}", io::Error::last_os_error());
     }
+
+    fn send_raw(&self, bytes: &[u8]) {
+        let sent = unsafe {
+            libc::send(
+                self.fd.as_raw_fd(),
+                bytes.as_ptr().cast(),
+                bytes.len(),
+                libc::MSG_NOSIGNAL,
+            )
+        };
+        assert_eq!(sent as usize, bytes.len(), "原始发送：{}", io::Error::last_os_error());
+    }
 }
 
 fn sockaddr(path: &Path) -> (libc::sockaddr_un, libc::socklen_t) {
@@ -346,6 +358,72 @@ fn startup_id_filters_stale_and_reconnect_adopts_new() {
     let lines = read_lines(&dir);
     assert_eq!(lines[2]["seq"], 2);
     assert_eq!(lines[2]["utterance_id"], "bbbb:2");
+
+    sigterm(&child.0);
+    assert!(wait_exit(&mut child.0, Duration::from_secs(2)).success());
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn event_drop_counters_are_queryable() {
+    let dir = run_dir("drops");
+    let mock = MockAsr::bind(&dir.join("asr-events.sock"));
+    let mut child = spawn_bridge(&dir, "translate_enabled = false\n");
+    let control = connect_control(&dir);
+    let conn = mock.accept();
+
+    // 首条确立会话 s；坏事件与跨启动号事件分别计数。
+    conn.send_event(&event("final", "s", 1, "你好"));
+    conn.send_raw(b"{not json");
+    conn.send_event(&event("final", "other", 2, "旧会话"));
+    wait_until("丢弃计数可查", Duration::from_secs(5), || {
+        let status = get_status(&control);
+        status["events_bad"].as_u64().unwrap() >= 1
+            && status["events_stale"].as_u64().unwrap() >= 1
+    });
+    let status = get_status(&control);
+    assert_eq!(status["events_bad"], 1);
+    assert_eq!(status["events_stale"], 1);
+    // 坏事件与旧会话事件不落盘，只有首条 final。
+    assert_eq!(read_lines(&dir).len(), 1);
+
+    sigterm(&child.0);
+    assert!(wait_exit(&mut child.0, Duration::from_secs(2)).success());
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn corrections_file_overrides_and_extends_builtin() {
+    let dir = run_dir("corr");
+    let corrections = dir.join("corrections.json");
+    // 文件覆盖内置「在见→再见」为「再会」，并新增「王独→网赌」。
+    std::fs::write(&corrections, r#"{"在见":"再会","王独":"网赌"}"#).unwrap();
+    let mock = MockAsr::bind(&dir.join("asr-events.sock"));
+    let mut child = spawn_bridge(
+        &dir,
+        &format!(
+            "translate_enabled = false\ncorrections_path = \"{}\"\n",
+            corrections.display()
+        ),
+    );
+    let _control = connect_control(&dir);
+    let conn = mock.accept();
+
+    conn.send_event(&event("final", "s", 1, "我以经王独在见"));
+    wait_until("字幕落盘", Duration::from_secs(5), || read_lines(&dir).len() == 1);
+    let lines = read_lines(&dir);
+    // 内置「以经→已经」保留，「在见」被文件覆盖，「王独」新增；zh 存纠错后原文。
+    assert_eq!(lines[0]["zh"], "我已经网赌再会");
+    assert_eq!(lines[0]["zh_raw"], "我以经王独在见");
+    let fixes = lines[0]["homophone_fixes"].as_array().unwrap();
+    let has = |from: &str, to: &str| {
+        fixes
+            .iter()
+            .any(|f| f["from"] == from && f["to"] == to && f["count"] == 1)
+    };
+    assert!(has("以经", "已经"), "内置纠错应保留：{fixes:?}");
+    assert!(has("在见", "再会"), "文件应覆盖内置：{fixes:?}");
+    assert!(has("王独", "网赌"), "文件应新增词条：{fixes:?}");
 
     sigterm(&child.0);
     assert!(wait_exit(&mut child.0, Duration::from_secs(2)).success());
