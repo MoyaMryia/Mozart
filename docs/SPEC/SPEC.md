@@ -96,3 +96,15 @@
 - 2026-11-12：数据面缓冲措辞修正：4–8 帧上限由发送方 connect 侧 `SO_SNDBUF` 执行，Linux AF_UNIX 数据报流控不按接收方 `SO_RCVBUF` 记账；非阻塞发送与丢弃计数口径不变（SPEC-02）。
 - 2026-11-12：配置写回定稿（取代同日"不回写 TOML"）：模型甲保留（TOML 基线 + 状态文件覆盖）；新增 `config set` 单键写 TOML、`config save` 批量提升状态→TOML；键分运行时/重启两类，重启键响应带 `restart_required`+`affected` 稳定契约、`status` 显示待重启；重启支持单服务与整栈两粒度；手改 TOML 随意不防冲突。TOML 规范文件后续（SPEC-04）。
 - 2026-11-12：文件任务队列 v1 有界内存不落盘、重启丢待转任务，落盘持久化入 FUTURE；澄清 RVC 模式为资源仲裁派生状态（不入配置状态文件），会话参数实时/文件共用一份配置覆盖（SPEC-04）。
+- 2026-11-12：文件转换入口定稿：v1 用 CLI `file submit` 提交本地路径，daemon 复制进受管目录后入队；校验沿用扩展名白名单、100 MiB 预检、300 s 时长上限（SPEC-04）。
+- 2026-11-12：文件链路冲突裁决定稿：等待能解决则排队/挂起（文件入队等 GPU、GPU 空闲自动转、切实时挂单等待槽），等待不能解决则拒绝；替换原“拒绝或挂等待槽”未定措辞（SPEC-04）。
+- 2026-11-12：文件队列暂停/恢复保留（`file pause`/`file resume`，暂停只停新任务、当前任务跑完）（SPEC-04）。
+- 2026-11-12：文件任务按任务选模型保留（`file submit --model`，缺省用当前模型）；模型存在性改执行时 `LoadModel` 验证，失败标 failed、队列继续（SPEC-04）。第二点队列与仲裁 2.1–2.5 全部定稿。
+- 2026-11-12：文件链路补 model 查询：rvc 增 `ListModels` 命令、CLI `model list`；模型存在性改回入队时校验、不存在当场拒收（取代同日 2.5 的执行时验证）（SPEC-03、SPEC-04）。
+- 2026-11-12：文件数据面定稿：daemon 作 Rust 中间层，C++ 只收/发帧不碰文件；复用帧契约，文件发送不丢（阻塞/流控），输出 socket 由对端绑定（实时 pre/文件 daemon）、切换交接（SPEC-03、SPEC-04）。
+- 2026-11-12：离线推理定稿：v1 整段批处理、质量参数沿用、内存由 300 s 兜底，分块流式入 FUTURE；文件降噪保留，Rust DSP 抽共享 crate 供 pre 实时与 daemon 离线共用（SPEC-02、SPEC-03、SPEC-04）。
+- 2026-11-12：整段 F0 耗时与取消等待的板端实测推迟，作为是否分块 F0 的依据，并入 FUTURE“离线推理分块流式”前置。
+- 2026-11-12：文件取消定稿：daemon 编排（排队移除删源 / 执行中 StopStream），临时文件归 daemon 清理，StopStream 粒度按 kind 区分（实时 240 ms / 文件下一检查点），CLI `file cancel`（SPEC-03、SPEC-04）。
+- 2026-11-12：文件结果生命周期定稿：存储目录默认 `~/.local/state/mozart/files/`（持久、TOML 可配），原子发布沿用，驱逐沿用 1000 MiB/80%/护未完成（已完成可删），取结果 CLI `file fetch`（SPEC-04）。
+- 2026-11-12：文件状态与进度定稿：六态状态字段 + 结果可取标记（去模式枚举），进度粗阶段 + 推理段用 rvc 块计数细化，CLI `file status` / `file list`；rvc 文件模式 blocks 按窗计数（SPEC-03、SPEC-04）。文件转换链路 7 点全部定稿。
+- 2026-11-12：配置分类定稿为机制 + 切换成本、能即时生效就运行时（取代“仅 bridge 两开关”）：daemon 超时 / [file] 阈值 / RVC 会话参数（Stop→Start）/ pre DSP（新增 SetDsp）均运行时，固化进结构者重启；新增 [file] 段；schema 落 docs/config.md（SPEC-02、SPEC-04）。

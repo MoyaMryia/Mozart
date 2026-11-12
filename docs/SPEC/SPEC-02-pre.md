@@ -15,6 +15,7 @@
 - 处理阶段顺序沿用旧实现；禁用阶段直接跳过。
 - 直出与变声切换用显式状态机；参数入口校验一次。
 - DSP 用 Rust 重写，逐阶段与旧输出对拍。第一版覆盖全部阶段：80 Hz 高通、WOLA 谱降噪、gate、AGC、limiter、FIR 3:1 降采样与 VAD；对拍夹具由旧 C 核心离线生成，小型 PCM 放 `tests/fixtures/` 并在 `.gitignore` 白名单。
+- DSP 抽成独立共享 crate：pre 实时链路与 daemon 离线文件降噪共用同一实现，不做两套；逐阶段对拍口径不变。
 - 采集与播放设备名、数据面 socket 路径等部署配置经 `--config` 读取；daemon 拉起 pre 时传同一配置路径。
 - `[pre]` 配置段键：`capture_device`、`playback_device`（默认 `default`）、`capture_queue_frames`（采集→DSP 环容量，默认 8，1..=1024）。
 - `[pre.dsp]` 配置段键：`denoise`（WOLA 谱降噪开关，默认 true，沿用旧 main.c 代码默认）、`gate`、`agc`、`limiter`（整形级开关，默认 false，沿用旧 main.c 代码默认）。禁用降噪时该级全部计算跳过：不走旧实现的旁路 WOLA 重建，无切换收敛期、无发射延迟，置信度恒 0；禁用整形级时逐位恒等跳过。
@@ -32,9 +33,10 @@
 - 数据面过载：非阻塞发送，丢弃计数；对端排队上限由发送方 connect 侧 `SO_SNDBUF` 按 4–8 帧执行——Linux AF_UNIX 数据报流控只按发送方发送缓冲记账，接收方 `SO_RCVBUF` 不约束发送方（bind 侧 `SO_RCVBUF` 保留设置但不参与流控）。
 - 数据面 socket 命名与方向：`input_socket`（默认 `rvc-in.sock`）由 rvc 绑定收输入帧；`output_socket`（默认 `rvc-out.sock`）由 pre 绑定收输出帧；配置键在 `[rvc]`，路径相对 run_dir。
 - Socket 路径在 `/run/mozart/` 下；锁文件防重复实例；对端重启后重连。
-- 控制面（daemon → pre）：Unix SEQPACKET 定长头 + JSON。命令 `Hello`（版本握手）、`SetRoute{route}`（切 direct/rvc）、`SetMute{mute}`（静音开关）、`GetStatus`。路由与静音由 pre 执行淡变，策略归 daemon。
+- 控制面（daemon → pre）：Unix SEQPACKET 定长头 + JSON。命令 `Hello`（版本握手）、`SetRoute{route}`（切 direct/rvc）、`SetMute{mute}`（静音开关）、`SetDsp{denoise,gate,agc,limiter}`（运行中切换 DSP 级）、`GetStatus`。路由与静音由 pre 执行淡变，策略归 daemon。
 - 状态：`GetStatus` 返回运行状态、路由、静音、采集/播放设备名、采集/播放/丢弃帧计数、队列深度、各消费者丢弃计数、最近错误、版本。daemon 每秒轮询，pre 不主动推；旧 `pre-status.json` 废弃。
 - 换设备不做在线命令，由 daemon 重启 pre 代替。
+- DSP 开关经 `SetDsp` 运行时生效；denoise 运行中切换需处理 WOLA 滤波状态避免伪影，gate/agc/limiter 较简单。
 
 ## 改进点
 
