@@ -156,8 +156,8 @@ pub fn run(
     Ok(())
 }
 
-/// 服务循环（引擎可注入，供测试）。停止标志置位后放弃在途结果与队列剩余；
-/// 真实 FFI 的在途生成另经进度回调中止（见 ffi::real）。
+/// 服务循环（引擎可注入，供测试）。停止标志置位后放弃在途结果与队列剩余，
+/// 帧投递中途同样中断；真实 FFI 的在途生成另经进度回调中止（见 ffi::real）。
 pub fn run_with(
     jobs: Receiver<Job>,
     engine: &dyn Synthesizer,
@@ -188,7 +188,7 @@ pub fn run_with(
         match result {
             Ok(pcm) => {
                 if !stop.load(Relaxed) {
-                    writer.write_utterance(&pcm);
+                    writer.write_utterance(&pcm, stop);
                     shared.add_synthesized(1);
                 }
                 // 停止标志置位：在途结果丢弃，不投递。
