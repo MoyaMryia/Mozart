@@ -23,6 +23,10 @@ use std::time::Duration;
 /// 记录表轮询步长：让停止标志在宽限期内生效。
 const RECV_POLL: Duration = Duration::from_millis(100);
 
+/// 内存记录表上限（旧 latest 128）；超限按最久未用淘汰，在途句受保护。
+/// 旧 refined 64 是独立的复核等待表，新架构复核直接并入记录表，不另设。
+const RECORD_CAP: usize = 128;
+
 /// 降级原因：待翻译队列满（后续入队成功时解除）。
 const DEGRADED_TRANSLATE_FULL: &str = "translate queue full";
 
@@ -86,6 +90,88 @@ pub struct SubtitleRecord {
     pub translate_ms: Option<u64>,
 }
 
+/// 带 LRU 淘汰的记录表：按最久未用淘汰，保护在途翻译句（pending/recognizing），
+/// 确保译文修订必能命中记录。落盘存档不受淘汰影响。全是在途句时短暂超界。
+pub struct RecordTable {
+    entries: HashMap<String, (SubtitleRecord, u64)>,
+    clock: u64,
+}
+
+impl RecordTable {
+    pub fn new() -> Self {
+        Self {
+            entries: HashMap::new(),
+            clock: 0,
+        }
+    }
+
+    fn touch(&mut self, key: &str) {
+        self.clock += 1;
+        if let Some(entry) = self.entries.get_mut(key) {
+            entry.1 = self.clock;
+        }
+    }
+
+    pub fn get(&mut self, key: &str) -> Option<&SubtitleRecord> {
+        self.touch(key);
+        self.entries.get(key).map(|(record, _)| record)
+    }
+
+    pub fn get_mut(&mut self, key: &str) -> Option<&mut SubtitleRecord> {
+        self.touch(key);
+        self.entries.get_mut(key).map(|(record, _)| record)
+    }
+
+    pub fn contains_key(&self, key: &str) -> bool {
+        self.entries.contains_key(key)
+    }
+
+    pub fn insert(&mut self, key: String, record: SubtitleRecord) {
+        self.clock += 1;
+        let stamp = self.clock;
+        self.entries.insert(key, (record, stamp));
+        self.evict();
+    }
+
+    pub fn len(&self) -> usize {
+        self.entries.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.entries.is_empty()
+    }
+
+    fn evict(&mut self) {
+        while self.entries.len() > RECORD_CAP {
+            let victim = self
+                .entries
+                .iter()
+                .filter(|(_, (record, _))| {
+                    !matches!(
+                        record.translation_status,
+                        TranslationStatus::Pending | TranslationStatus::Recognizing
+                    )
+                })
+                .min_by_key(|(_, (_, stamp))| *stamp)
+                .map(|(key, _)| key.clone());
+            match victim {
+                Some(key) => {
+                    self.entries.remove(&key);
+                }
+                // 全是在途句：不淘汰，保护译文修订命中。
+                None => break,
+            }
+        }
+    }
+}
+
+impl std::ops::Index<&str> for RecordTable {
+    type Output = SubtitleRecord;
+    fn index(&self, key: &str) -> &SubtitleRecord {
+        &self.entries[key].0
+    }
+}
+
 /// 本地时间 HH:MM:SS（旧 time.strftime('%H:%M:%S') 用本地时区）。
 fn local_hms(unix_secs: f64) -> String {
     let secs = unix_secs as libc::time_t;
@@ -109,7 +195,7 @@ fn seq_from_utterance(utterance_id: &str) -> u64 {
 /// 合并一条事件进记录表，返回应落盘的记录；None 表示忽略。
 /// 事件字段已在 events::parse 入口校验，此处信任。zh 存纠错后原文。
 pub fn apply(
-    table: &mut HashMap<String, SubtitleRecord>,
+    table: &mut RecordTable,
     event: &Event,
     now_ms: u64,
     corrections: &[(String, String)],
@@ -228,7 +314,7 @@ impl JsonlWriter {
 /// 记录表 + 存档文件的共享门面：字幕线程合并事件，翻译线程写入译文修订。
 /// 锁序固定为先记录表后文件，两个线程一致；写盘失败由调用方致命退出。
 pub struct SubtitleStore {
-    records: Mutex<HashMap<String, SubtitleRecord>>,
+    records: Mutex<RecordTable>,
     writer: Mutex<JsonlWriter>,
     path: PathBuf,
     corrections: Vec<(String, String)>,
@@ -237,7 +323,7 @@ pub struct SubtitleStore {
 impl SubtitleStore {
     pub fn new(writer: JsonlWriter, path: PathBuf, corrections: Vec<(String, String)>) -> Self {
         Self {
-            records: Mutex::new(HashMap::new()),
+            records: Mutex::new(RecordTable::new()),
             writer: Mutex::new(writer),
             path,
             corrections,
@@ -441,7 +527,7 @@ mod tests {
 
     #[test]
     fn partial_final_refined_merge_with_revisions() {
-        let mut table = HashMap::new();
+        let mut table = RecordTable::new();
         let first = apply(&mut table, &event(EventKind::Partial, 1, "你"), 100, &no_corrections()).unwrap();
         assert_eq!(first.revision, 0);
         assert!(!first.is_final);
@@ -470,7 +556,7 @@ mod tests {
 
     #[test]
     fn final_is_sticky_against_late_partial_and_final() {
-        let mut table = HashMap::new();
+        let mut table = RecordTable::new();
         apply(&mut table, &event(EventKind::Final, 1, "你好"), 100, &no_corrections());
         assert_eq!(apply(&mut table, &event(EventKind::Partial, 1, "晚到"), 200, &no_corrections()), None);
         assert_eq!(apply(&mut table, &event(EventKind::Final, 1, "重写"), 300, &no_corrections()), None);
@@ -480,7 +566,7 @@ mod tests {
 
     #[test]
     fn empty_text_is_not_published() {
-        let mut table = HashMap::new();
+        let mut table = RecordTable::new();
         assert_eq!(apply(&mut table, &event(EventKind::Partial, 1, ""), 100, &no_corrections()), None);
         assert_eq!(apply(&mut table, &event(EventKind::Final, 1, "  "), 200, &no_corrections()), None);
         assert!(table.is_empty());
@@ -488,7 +574,7 @@ mod tests {
 
     #[test]
     fn final_without_partial_creates_record() {
-        let mut table = HashMap::new();
+        let mut table = RecordTable::new();
         let record = apply(&mut table, &event(EventKind::Final, 7, "整句"), 100, &no_corrections()).unwrap();
         assert_eq!(record.revision, 0);
         assert!(record.is_final);
@@ -497,14 +583,14 @@ mod tests {
 
     #[test]
     fn refined_without_record_is_ignored() {
-        let mut table = HashMap::new();
+        let mut table = RecordTable::new();
         assert_eq!(apply(&mut table, &refined_event(9, Some("无主")), 100, &no_corrections()), None);
         assert!(table.is_empty());
     }
 
     #[test]
     fn refined_without_text_keeps_original_and_bumps_revision() {
-        let mut table = HashMap::new();
+        let mut table = RecordTable::new();
         apply(&mut table, &event(EventKind::Final, 1, "你好"), 100, &no_corrections());
         // 复核 failed/skipped：ASR 不携带 refined_text。
         let record = apply(&mut table, &refined_event(1, None), 200, &no_corrections()).unwrap();
@@ -518,7 +604,7 @@ mod tests {
 
     #[test]
     fn distinct_utterances_keep_separate_revisions() {
-        let mut table = HashMap::new();
+        let mut table = RecordTable::new();
         apply(&mut table, &event(EventKind::Partial, 1, "甲"), 100, &no_corrections());
         let second = apply(&mut table, &event(EventKind::Partial, 2, "乙"), 200, &no_corrections()).unwrap();
         assert_eq!(second.revision, 0);
@@ -527,7 +613,7 @@ mod tests {
 
     #[test]
     fn correction_applies_to_zh_and_records_fixes() {
-        let mut table = HashMap::new();
+        let mut table = RecordTable::new();
         let corrections = preprocess::builtin_corrections();
         let record = apply(&mut table, &event(EventKind::Final, 1, "我以经说了"), 100, &corrections).unwrap();
         assert_eq!(record.zh, "我已经说了");
@@ -540,7 +626,7 @@ mod tests {
 
     #[test]
     fn schema_fields_match_old_source_caption() {
-        let mut table = HashMap::new();
+        let mut table = RecordTable::new();
         let bytes = serde_json::to_vec(&json!({
             "type": "final",
             "startup_id": "a1b2c3d4",
@@ -596,7 +682,7 @@ mod tests {
         ));
         let path = dir.join("nested/subtitles.jsonl");
         let mut writer = JsonlWriter::open(&path).unwrap();
-        let mut table = HashMap::new();
+        let mut table = RecordTable::new();
         let record = apply(&mut table, &event(EventKind::Partial, 1, "你好"), 1, &no_corrections()).unwrap();
         writer.write(&record).unwrap();
         // 不关闭文件即可读到已 flush 的行。
@@ -696,5 +782,36 @@ mod tests {
         assert_eq!(lines[3]["translation_status"], "skipped");
         assert_eq!(lines[3]["translation_error"], "translate off");
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn lru_caps_table_and_protects_in_flight() {
+        let mut table = RecordTable::new();
+        // 一条在途句（pending）先入表。
+        apply(&mut table, &event(EventKind::Final, 0, "在途"), 1, &no_corrections());
+        // 灌入超过上限的已完成句（可淘汰）。
+        for seq in 1..=200u64 {
+            apply(&mut table, &event(EventKind::Final, seq, "句"), seq, &no_corrections());
+            table
+                .get_mut(&format!("a1b2c3d4:{seq}"))
+                .unwrap()
+                .translation_status = TranslationStatus::Completed;
+        }
+        // 表受上限约束，最旧已完成句被淘汰，在途句受保护。
+        assert_eq!(table.len(), RECORD_CAP);
+        assert!(!table.contains_key("a1b2c3d4:1"));
+        assert!(table.contains_key("a1b2c3d4:0"));
+        assert_eq!(table["a1b2c3d4:0"].translation_status, TranslationStatus::Pending);
+    }
+
+    #[test]
+    fn lru_keeps_all_when_every_record_is_in_flight() {
+        let mut table = RecordTable::new();
+        // 全是在途句（pending）：不淘汰，可短暂超界。
+        for seq in 1..=150u64 {
+            apply(&mut table, &event(EventKind::Final, seq, "句"), seq, &no_corrections());
+        }
+        assert_eq!(table.len(), 150);
+        assert!(table.contains_key("a1b2c3d4:1"));
     }
 }
