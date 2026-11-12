@@ -3,7 +3,7 @@ use crate::services::{self, Services};
 use crate::state::{lock_state, Role, State};
 use crate::supervisor::Supervisor;
 use mozart_core::config::{ensure_run_dir, Config};
-use mozart_core::ctl::schema::{self, MuteSetRequest, RouteSetRequest};
+use mozart_core::ctl::schema::{self, MuteSetRequest, RouteSetRequest, SwitchSetRequest};
 use mozart_core::ctl::{self, Message, Seqpacket};
 use serde_json::json;
 use std::fs::{File, OpenOptions};
@@ -34,21 +34,24 @@ pub fn serve(config: &Config, config_path: Option<&Path>) -> io::Result<()> {
     let services = Arc::new(Services::new(&config));
     let running = Arc::new(AtomicBool::new(true));
     let supervisors = [
+        Role::Pre,
+        Role::Rvc,
+        Role::Asr,
+        Role::Tts,
+        Role::Bridge,
+        Role::Llama,
+    ]
+    .into_iter()
+    .map(|role| {
         Supervisor::spawn(
-            Role::Pre,
+            role,
             config.clone(),
             config_path.clone(),
             state.clone(),
             running.clone(),
-        )?,
-        Supervisor::spawn(
-            Role::Rvc,
-            config.clone(),
-            config_path,
-            state.clone(),
-            running.clone(),
-        )?,
-    ];
+        )
+    })
+    .collect::<io::Result<Vec<_>>>()?;
     let poller = Poller::spawn(
         config.clone(),
         state.clone(),
@@ -193,6 +196,30 @@ fn handle_request(
                 schema::error_body(ctl::CODE_INVALID_ARGUMENT, &err.to_string()),
                 false,
             ),
+        },
+        ctl::DAEMON_TRANSLATE_SET => match serde_json::from_slice::<SwitchSetRequest>(&msg.body) {
+            Ok(request) => match services::translate_set(services, request.enabled) {
+                Ok(data) => (schema::ok_body(data), false),
+                Err((code, reason)) => (schema::error_body(&code, &reason), false),
+            },
+            Err(err) => (
+                schema::error_body(ctl::CODE_INVALID_ARGUMENT, &err.to_string()),
+                false,
+            ),
+        },
+        ctl::DAEMON_SPEECH_SET => match serde_json::from_slice::<SwitchSetRequest>(&msg.body) {
+            Ok(request) => match services::speech_set(services, request.enabled) {
+                Ok(data) => (schema::ok_body(data), false),
+                Err((code, reason)) => (schema::error_body(&code, &reason), false),
+            },
+            Err(err) => (
+                schema::error_body(ctl::CODE_INVALID_ARGUMENT, &err.to_string()),
+                false,
+            ),
+        },
+        ctl::DAEMON_SPEECH_STOP => match services::speech_stop(services) {
+            Ok(data) => (schema::ok_body(data), false),
+            Err((code, reason)) => (schema::error_body(&code, &reason), false),
         },
         _ => (
             schema::error_body(ctl::CODE_UNKNOWN_COMMAND, "unknown command"),

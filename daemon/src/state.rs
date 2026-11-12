@@ -1,6 +1,6 @@
 use mozart_core::ctl::schema::{
-    Activity, ArbiterState, DaemonInfo, ExitInfo, GpuState, HardwareStatus, PreStatus, ProcessInfo,
-    ProcessState, Processes, Route, RouteState, RvcStatus, Status,
+    Activity, ArbiterState, AsrStatus, BridgeStatus, DaemonInfo, ExitInfo, GpuState, HardwareStatus,
+    PreStatus, ProcessInfo, ProcessState, Processes, Route, RouteState, RvcStatus, Status, TtsStatus,
 };
 use std::sync::{Mutex, MutexGuard};
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
@@ -9,6 +9,10 @@ use std::time::{Instant, SystemTime, UNIX_EPOCH};
 pub enum Role {
     Pre,
     Rvc,
+    Asr,
+    Tts,
+    Bridge,
+    Llama,
 }
 
 pub fn lock_state(state: &Mutex<State>) -> MutexGuard<'_, State> {
@@ -27,6 +31,9 @@ pub struct State {
     processes: Processes,
     pre: Option<PreStatus>,
     rvc: Option<RvcStatus>,
+    asr: Option<AsrStatus>,
+    tts: Option<TtsStatus>,
+    bridge: Option<BridgeStatus>,
     hw: Option<HardwareStatus>,
     degraded: Vec<String>,
     shutting_down: bool,
@@ -47,9 +54,13 @@ impl State {
                 asr: ProcessInfo::stopped(),
                 tts: ProcessInfo::stopped(),
                 bridge: ProcessInfo::stopped(),
+                llama: ProcessInfo::stopped(),
             },
             pre: None,
             rvc: None,
+            asr: None,
+            tts: None,
+            bridge: None,
             hw: None,
             degraded: Vec::new(),
             shutting_down: false,
@@ -77,9 +88,9 @@ impl State {
             processes: self.processes.clone(),
             pre: self.pre.clone(),
             rvc: self.rvc.clone(),
-            asr: None,
-            tts: None,
-            bridge: None,
+            asr: self.asr.clone(),
+            tts: self.tts.clone(),
+            bridge: self.bridge.clone(),
             hw: self.hw.clone(),
             degraded: self.degraded.clone(),
         }
@@ -119,6 +130,18 @@ impl State {
 
     pub fn set_rvc_status(&mut self, status: Option<RvcStatus>) {
         self.rvc = status;
+    }
+
+    pub fn set_asr_status(&mut self, status: Option<AsrStatus>) {
+        self.asr = status;
+    }
+
+    pub fn set_tts_status(&mut self, status: Option<TtsStatus>) {
+        self.tts = status;
+    }
+
+    pub fn set_bridge_status(&mut self, status: Option<BridgeStatus>) {
+        self.bridge = status;
     }
 
     pub fn set_hw(&mut self, hw: Option<HardwareStatus>) {
@@ -182,6 +205,10 @@ impl State {
         match role {
             Role::Pre => &mut self.processes.pre,
             Role::Rvc => &mut self.processes.rvc,
+            Role::Asr => &mut self.processes.asr,
+            Role::Tts => &mut self.processes.tts,
+            Role::Bridge => &mut self.processes.bridge,
+            Role::Llama => &mut self.processes.llama,
         }
     }
 }

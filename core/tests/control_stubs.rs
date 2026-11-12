@@ -159,3 +159,67 @@ fn stub_exits_after_delay() {
     let status = child.0.wait().unwrap();
     assert!(status.success());
 }
+
+#[test]
+fn asr_stub_serves_control_plane() {
+    let dir = TempDir::new("asr");
+    let _child = spawn("asr_stub", &dir, &[]);
+    let conn = connect(&dir);
+
+    let hello = call(&conn, ctl::ASR_HELLO, b"");
+    assert_eq!(hello["status"], "ok");
+    assert_eq!(hello["data"]["startup_id"], "stub");
+
+    let status = call(&conn, ctl::ASR_GET_STATUS, b"");
+    assert_eq!(status["data"]["state"], "idle");
+    assert_eq!(status["data"]["startup_id"], "stub");
+    assert_eq!(status["data"]["bridge_connected"], false);
+
+    let unknown = call(&conn, ctl::PRE_HELLO, b"");
+    assert_eq!(unknown["code"], "UnknownCommand");
+}
+
+#[test]
+fn tts_stub_serves_control_plane() {
+    let dir = TempDir::new("tts");
+    let _child = spawn("tts_stub", &dir, &[]);
+    let conn = connect(&dir);
+
+    let hello = call(&conn, ctl::TTS_HELLO, b"");
+    assert_eq!(hello["status"], "ok");
+
+    let status = call(&conn, ctl::TTS_GET_STATUS, b"");
+    assert_eq!(status["data"]["state"], "idle");
+    assert_eq!(status["data"]["model_loaded"], false);
+
+    let unknown = call(&conn, ctl::ASR_HELLO, b"");
+    assert_eq!(unknown["code"], "UnknownCommand");
+}
+
+#[test]
+fn bridge_stub_serves_switches() {
+    let dir = TempDir::new("bridge");
+    let _child = spawn("bridge_stub", &dir, &[]);
+    let conn = connect(&dir);
+
+    let hello = call(&conn, ctl::BRIDGE_HELLO, b"");
+    assert_eq!(hello["status"], "ok");
+
+    let status = call(&conn, ctl::BRIDGE_GET_STATUS, b"");
+    assert_eq!(status["data"]["translate_enabled"], true);
+    assert_eq!(status["data"]["speech_enabled"], true);
+
+    let off = call(&conn, ctl::BRIDGE_TRANSLATE_SET, br#"{"enabled":false}"#);
+    assert_eq!(off["data"]["translate_enabled"], false);
+    assert_eq!(off["data"]["speech_enabled"], true);
+
+    let stop = call(&conn, ctl::BRIDGE_SPEECH_STOP, b"{}");
+    assert_eq!(stop["data"]["speech_enabled"], false);
+
+    let status = call(&conn, ctl::BRIDGE_GET_STATUS, b"");
+    assert_eq!(status["data"]["translate_enabled"], false);
+    assert_eq!(status["data"]["speech_enabled"], false);
+
+    let invalid = call(&conn, ctl::BRIDGE_SPEECH_SET, br#"{"enabled":"yes"}"#);
+    assert_eq!(invalid["code"], "InvalidArgument");
+}

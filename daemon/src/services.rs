@@ -1,11 +1,12 @@
-//! 子服务控制：连接 pre/rvc、下发路由与静音、轮询状态并对账。
+//! 子服务控制：连接 pre/rvc/asr/tts/bridge、下发路由与静音、转发字幕开关、轮询状态并对账。
 //! 对账以 daemon 的期望状态为准，切路由与轮询共用同一把 transition 锁。
+//! llama-server 无控制协议，不建 ServiceLink，只由 supervisor 监管进程。
 
 use crate::state::{lock_state, State};
 use mozart_core::config::Config;
-use mozart_core::ctl::schema::{PreStatus, Response, Route, RvcStatus};
+use mozart_core::ctl::schema::{AsrStatus, BridgeStatus, PreStatus, Response, Route, RvcStatus, TtsStatus};
 use mozart_core::ctl::{self, Seqpacket};
-use serde_json::json;
+use serde_json::{json, Value};
 use std::io;
 use std::path::PathBuf;
 use std::sync::{Mutex, MutexGuard, TryLockError};
@@ -14,6 +15,9 @@ use std::time::Duration;
 pub struct Services {
     pre: Mutex<ServiceLink>,
     rvc: Mutex<ServiceLink>,
+    asr: Mutex<ServiceLink>,
+    tts: Mutex<ServiceLink>,
+    bridge: Mutex<ServiceLink>,
     transition: Mutex<()>,
 }
 
@@ -31,6 +35,21 @@ impl Services {
                 config.rvc_socket(),
                 timeout,
             )),
+            asr: Mutex::new(ServiceLink::new(
+                ctl::ASR_HELLO,
+                config.asr_socket(),
+                timeout,
+            )),
+            tts: Mutex::new(ServiceLink::new(
+                ctl::TTS_HELLO,
+                config.tts_socket(),
+                timeout,
+            )),
+            bridge: Mutex::new(ServiceLink::new(
+                ctl::BRIDGE_HELLO,
+                config.bridge_socket(),
+                timeout,
+            )),
             transition: Mutex::new(()),
         }
     }
@@ -43,6 +62,24 @@ impl Services {
 
     fn rvc(&self) -> MutexGuard<'_, ServiceLink> {
         self.rvc
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
+    fn asr(&self) -> MutexGuard<'_, ServiceLink> {
+        self.asr
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
+    fn tts(&self) -> MutexGuard<'_, ServiceLink> {
+        self.tts
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
+    fn bridge(&self) -> MutexGuard<'_, ServiceLink> {
+        self.bridge
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
     }
@@ -199,6 +236,35 @@ pub fn mute_set(
     Ok(mute)
 }
 
+// 字幕链路开关：daemon 不持有桥的活状态（SPEC-04），只转发命令并回传桥的应答数据，
+// 生效值由下一秒轮询汇总进 status。转发不碰路由/静音，无需 transition 锁。
+
+pub fn translate_set(services: &Services, enabled: bool) -> Result<Value, (String, String)> {
+    let body = json!({"enabled": enabled}).to_string();
+    let response = services
+        .bridge()
+        .call_ok(ctl::BRIDGE_TRANSLATE_SET, body.as_bytes())
+        .map_err(CallError::into_rejection)?;
+    Ok(response.data)
+}
+
+pub fn speech_set(services: &Services, enabled: bool) -> Result<Value, (String, String)> {
+    let body = json!({"enabled": enabled}).to_string();
+    let response = services
+        .bridge()
+        .call_ok(ctl::BRIDGE_SPEECH_SET, body.as_bytes())
+        .map_err(CallError::into_rejection)?;
+    Ok(response.data)
+}
+
+pub fn speech_stop(services: &Services) -> Result<Value, (String, String)> {
+    let response = services
+        .bridge()
+        .call_ok(ctl::BRIDGE_SPEECH_STOP, b"{}")
+        .map_err(CallError::into_rejection)?;
+    Ok(response.data)
+}
+
 fn switch_direct(state: &Mutex<State>, services: &Services) -> Result<Route, (String, String)> {
     set_pre_route(services, Route::Direct).map_err(CallError::into_rejection)?;
     if let Err(err) = stop_rvc_stream(services) {
@@ -317,6 +383,9 @@ pub fn poll(state: &Mutex<State>, services: &Services, config: &Config) {
     let mut degraded = Vec::new();
     let pre_status = poll_pre(services, &mut degraded);
     let rvc_status = poll_rvc(services, &mut degraded);
+    let asr_status = poll_asr(services, &mut degraded);
+    let tts_status = poll_tts(services, &mut degraded);
+    let bridge_status = poll_bridge(services, &mut degraded);
 
     let transition = match services.transition.try_lock() {
         Ok(guard) => Some(guard),
@@ -340,6 +409,9 @@ pub fn poll(state: &Mutex<State>, services: &Services, config: &Config) {
     let mut state = lock_state(state);
     state.set_pre_status(pre_status);
     state.set_rvc_status(rvc_status);
+    state.set_asr_status(asr_status);
+    state.set_tts_status(tts_status);
+    state.set_bridge_status(bridge_status);
     state.set_degraded(degraded);
 }
 
@@ -372,6 +444,57 @@ fn poll_rvc(services: &Services, degraded: &mut Vec<String>) -> Option<RvcStatus
         },
         Err(err) => {
             degraded.push(format!("rvc status: {}", err.describe()));
+            None
+        }
+    }
+}
+
+fn poll_asr(services: &Services, degraded: &mut Vec<String>) -> Option<AsrStatus> {
+    let mut asr = services.asr();
+    match asr.call_ok(ctl::ASR_GET_STATUS, b"{}") {
+        Ok(response) => match serde_json::from_value::<AsrStatus>(response.data) {
+            Ok(status) => Some(status),
+            Err(err) => {
+                degraded.push(format!("asr status parse: {err}"));
+                None
+            }
+        },
+        Err(err) => {
+            degraded.push(format!("asr status: {}", err.describe()));
+            None
+        }
+    }
+}
+
+fn poll_tts(services: &Services, degraded: &mut Vec<String>) -> Option<TtsStatus> {
+    let mut tts = services.tts();
+    match tts.call_ok(ctl::TTS_GET_STATUS, b"{}") {
+        Ok(response) => match serde_json::from_value::<TtsStatus>(response.data) {
+            Ok(status) => Some(status),
+            Err(err) => {
+                degraded.push(format!("tts status parse: {err}"));
+                None
+            }
+        },
+        Err(err) => {
+            degraded.push(format!("tts status: {}", err.describe()));
+            None
+        }
+    }
+}
+
+fn poll_bridge(services: &Services, degraded: &mut Vec<String>) -> Option<BridgeStatus> {
+    let mut bridge = services.bridge();
+    match bridge.call_ok(ctl::BRIDGE_GET_STATUS, b"{}") {
+        Ok(response) => match serde_json::from_value::<BridgeStatus>(response.data) {
+            Ok(status) => Some(status),
+            Err(err) => {
+                degraded.push(format!("bridge status parse: {err}"));
+                None
+            }
+        },
+        Err(err) => {
+            degraded.push(format!("bridge status: {}", err.describe()));
             None
         }
     }

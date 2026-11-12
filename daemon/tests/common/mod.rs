@@ -47,6 +47,29 @@ impl DaemonProcess {
     }
 
     pub fn start_with_config(tag: &str, pre_bin: &Path, rvc_bin: &Path, config_body: &str) -> Self {
+        Self::start_full(
+            tag,
+            pre_bin,
+            rvc_bin,
+            &example("asr_stub"),
+            &example("tts_stub"),
+            &example("bridge_stub"),
+            &example("llama_stub"),
+            config_body,
+        )
+    }
+
+    /// 全量指定六个被监管进程的二进制；语言链测试用自定义桩或 wrapper 时走这里。
+    pub fn start_full(
+        tag: &str,
+        pre_bin: &Path,
+        rvc_bin: &Path,
+        asr_bin: &Path,
+        tts_bin: &Path,
+        bridge_bin: &Path,
+        llama_bin: &Path,
+        config_body: &str,
+    ) -> Self {
         let dir = std::env::temp_dir().join(format!("mozart-daemon-{}-{tag}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
@@ -58,6 +81,10 @@ impl DaemonProcess {
             .env("MOZART_RUN_DIR", &dir)
             .env("MOZART_PRE_BIN", pre_bin)
             .env("MOZART_RVC_BIN", rvc_bin)
+            .env("MOZART_ASR_BIN", asr_bin)
+            .env("MOZART_TTS_BIN", tts_bin)
+            .env("MOZART_BRIDGE_BIN", bridge_bin)
+            .env("MOZART_LLAMA_BIN", llama_bin)
             .env("MOZART_POLL_INTERVAL_MS", "100")
             .stdout(Stdio::null())
             .stderr(Stdio::inherit())

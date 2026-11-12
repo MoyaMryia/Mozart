@@ -45,6 +45,10 @@ fn role_name(role: Role) -> &'static str {
     match role {
         Role::Pre => "pre",
         Role::Rvc => "rvc",
+        Role::Asr => "asr",
+        Role::Tts => "tts",
+        Role::Bridge => "bridge",
+        Role::Llama => "llama",
     }
 }
 
@@ -58,10 +62,18 @@ fn supervise(
     let bin = match role {
         Role::Pre => &config.process.pre_bin,
         Role::Rvc => &config.process.rvc_bin,
+        Role::Asr => &config.process.asr_bin,
+        Role::Tts => &config.process.tts_bin,
+        Role::Bridge => &config.process.bridge_bin,
+        Role::Llama => &config.process.llama_bin,
     };
     let socket = match role {
         Role::Pre => config.pre_socket(),
         Role::Rvc => config.rvc_socket(),
+        Role::Asr => config.asr_socket(),
+        Role::Tts => config.tts_socket(),
+        Role::Bridge => config.bridge_socket(),
+        Role::Llama => config.llama_socket(),
     };
     let log_path = config.log_dir().join(format!("{}.log", role_name(role)));
     let base = Duration::from_millis(config.daemon.restart_backoff_ms);
@@ -71,7 +83,7 @@ fn supervise(
 
     while running.load(Ordering::Acquire) {
         lock_state(state).process_starting(role);
-        let mut child = match start_child(bin, &socket, config_path, &log_path) {
+        let mut child = match start_child(role, bin, &socket, config, config_path, &log_path) {
             Ok(child) => child,
             Err(err) => {
                 lock_state(state).process_failed(role, format!("spawn: {err}"));
@@ -119,19 +131,48 @@ fn supervise(
 }
 
 fn start_child(
+    role: Role,
     bin: &Path,
     socket: &Path,
-    config: Option<&Path>,
+    config: &Config,
+    config_path: Option<&Path>,
     log_path: &Path,
 ) -> io::Result<Child> {
     let log = OpenOptions::new().create(true).append(true).open(log_path)?;
     let stderr = log.try_clone()?;
     let mut command = Command::new(resolve_bin(bin));
-    command.arg("--socket").arg(socket);
-    // SPEC-04：子进程与 daemon 读同一 TOML，各读自己的配置段；daemon 以内置
-    // 默认启动时无文件可传，不传 --config，子进程按同一顺序解析得同一默认值。
-    if let Some(config) = config {
-        command.arg("--config").arg(config);
+    if role == Role::Llama {
+        // llama-server 不说控制协议（SPEC-05）：无 --socket/--config 契约，
+        // --host 直接填 Unix socket 路径；启动参数沿用旧实现。
+        command
+            .arg("-m")
+            .arg(&config.bridge.llama_model)
+            .arg("-c")
+            .arg("2048")
+            .arg("-b")
+            .arg("256")
+            .arg("-ub")
+            .arg("128")
+            .arg("--cache-ram")
+            .arg("128")
+            .arg("-ngl")
+            .arg("99")
+            .arg("-np")
+            .arg("1")
+            .arg("-t")
+            .arg("2")
+            .arg("-tb")
+            .arg("2")
+            .arg("--host")
+            .arg(socket)
+            .arg("--jinja");
+    } else {
+        command.arg("--socket").arg(socket);
+        // SPEC-04：子进程与 daemon 读同一 TOML，各读自己的配置段；daemon 以内置
+        // 默认启动时无文件可传，不传 --config，子进程按同一顺序解析得同一默认值。
+        if let Some(config_path) = config_path {
+            command.arg("--config").arg(config_path);
+        }
     }
     command
         .stdin(Stdio::null())

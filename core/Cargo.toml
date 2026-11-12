@@ -22,6 +22,24 @@ path = "examples/rvc_echo.rs"
 name = "rvc_smoke"
 path = "examples/rvc_smoke.rs"
 
+# 语言链协议桩（daemon 监管/轮询/转发测试用）：只实现控制面，不做推理。
+[[example]]
+name = "asr_stub"
+path = "examples/asr_stub.rs"
+
+[[example]]
+name = "tts_stub"
+path = "examples/tts_stub.rs"
+
+[[example]]
+name = "bridge_stub"
+path = "examples/bridge_stub.rs"
+
+# llama-server 无控制协议，桩只保持存活供监管测试。
+[[example]]
+name = "llama_stub"
+path = "examples/llama_stub.rs"
+
 [dependencies]
 libc = "0.2"
 serde = { version = "1", features = ["derive"] }

@@ -24,6 +24,12 @@ pub const DAEMON_GET_STATUS: u16 = 0x0102;
 pub const DAEMON_ROUTE_SET: u16 = 0x0103;
 pub const DAEMON_MUTE_SET: u16 = 0x0104;
 pub const DAEMON_SHUTDOWN: u16 = 0x0105;
+/// 体：{"enabled": bool}；daemon 转发到桥 BRIDGE_TRANSLATE_SET。
+pub const DAEMON_TRANSLATE_SET: u16 = 0x0106;
+/// 体：{"enabled": bool}；daemon 转发到桥 BRIDGE_SPEECH_SET。
+pub const DAEMON_SPEECH_SET: u16 = 0x0107;
+/// 体：{}（空）；daemon 转发到桥 BRIDGE_SPEECH_STOP。
+pub const DAEMON_SPEECH_STOP: u16 = 0x0108;
 
 pub const PRE_HELLO: u16 = 0x0201;
 pub const PRE_SET_ROUTE: u16 = 0x0202;
@@ -539,6 +545,9 @@ mod tests {
 
     #[test]
     fn language_chain_command_numbers_match_c_header() {
+        assert_eq!(DAEMON_TRANSLATE_SET, 0x0106);
+        assert_eq!(DAEMON_SPEECH_SET, 0x0107);
+        assert_eq!(DAEMON_SPEECH_STOP, 0x0108);
         assert_eq!(ASR_HELLO, 0x0401);
         assert_eq!(ASR_GET_STATUS, 0x0402);
         assert_eq!(TTS_HELLO, 0x0501);

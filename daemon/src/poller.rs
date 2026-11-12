@@ -1,4 +1,4 @@
-//! 周期性轮询 pre/rvc 状态，并让实际状态向 daemon 期望状态收敛。
+//! 周期性轮询 pre/rvc/asr/tts/bridge 状态，并让实际状态向 daemon 期望状态收敛。
 
 use crate::hwmon::Monitor;
 use crate::services::{self, Services};

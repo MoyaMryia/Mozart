@@ -46,6 +46,16 @@ enum Action {
         #[arg(value_parser = ["on", "off"])]
         state: String,
     },
+    /// 字幕翻译开关（经 daemon 转发到桥）
+    Translate {
+        #[arg(value_enum)]
+        state: OnOff,
+    },
+    /// 翻译播报开关与急停（经 daemon 转发到桥）
+    Speech {
+        #[command(subcommand)]
+        action: SpeechAction,
+    },
 }
 
 #[derive(Subcommand)]
@@ -60,6 +70,22 @@ enum RouteAction {
 enum RouteArg {
     Direct,
     Rvc,
+}
+
+#[derive(Clone, Copy, ValueEnum)]
+enum OnOff {
+    On,
+    Off,
+}
+
+#[derive(Subcommand)]
+enum SpeechAction {
+    /// 开启播报
+    On,
+    /// 关闭播报（在途自然播完）
+    Off,
+    /// 关播报并清空待播报队列（在途丢弃）
+    Stop,
 }
 
 struct CliError {
@@ -100,6 +126,10 @@ fn run(cli: Cli) -> Result<(), CliError> {
             route_set(&config, route, cli.json)
         }
         Action::Mute { state } => mute(&config, state == "on", cli.json),
+        Action::Translate { state } => {
+            translate(&config, matches!(state, OnOff::On), cli.json)
+        }
+        Action::Speech { action } => speech(&config, action, cli.json),
     }
 }
 
@@ -256,6 +286,56 @@ fn mute(config: &Config, mute: bool, json_output: bool) -> Result<(), CliError> 
     Ok(())
 }
 
+fn translate(config: &Config, enabled: bool, json_output: bool) -> Result<(), CliError> {
+    let conn = connect(config)?;
+    let body = json!({"enabled": enabled}).to_string();
+    let response = request(
+        &conn,
+        ctl::DAEMON_TRANSLATE_SET,
+        body.as_bytes(),
+        config.daemon.rpc_timeout_ms,
+    )
+    .map_err(classify_io)?;
+    let data = expect_ok(response)?;
+    if json_output {
+        println!("{data}");
+    } else {
+        println!("translate: {}", on_off(enabled));
+    }
+    Ok(())
+}
+
+fn speech(config: &Config, action: SpeechAction, json_output: bool) -> Result<(), CliError> {
+    let (type_, body, human) = match action {
+        SpeechAction::On => (
+            ctl::DAEMON_SPEECH_SET,
+            json!({"enabled": true}).to_string(),
+            "speech: on",
+        ),
+        SpeechAction::Off => (
+            ctl::DAEMON_SPEECH_SET,
+            json!({"enabled": false}).to_string(),
+            "speech: off",
+        ),
+        SpeechAction::Stop => (ctl::DAEMON_SPEECH_STOP, "{}".to_string(), "speech: stopped"),
+    };
+    let conn = connect(config)?;
+    let response = request(
+        &conn,
+        type_,
+        body.as_bytes(),
+        config.daemon.rpc_timeout_ms,
+    )
+    .map_err(classify_io)?;
+    let data = expect_ok(response)?;
+    if json_output {
+        println!("{data}");
+    } else {
+        println!("{human}");
+    }
+    Ok(())
+}
+
 fn probe(config: &Config) -> io::Result<Response> {
     let conn = Seqpacket::connect_timeout(&config.daemon_socket(), rpc_timeout(config))?;
     request(&conn, ctl::DAEMON_HELLO, b"{}", config.daemon.rpc_timeout_ms)
@@ -385,6 +465,10 @@ fn print_status(status: &Status) {
     for (name, info) in [
         ("pre", &status.processes.pre),
         ("rvc", &status.processes.rvc),
+        ("asr", &status.processes.asr),
+        ("tts", &status.processes.tts),
+        ("bridge", &status.processes.bridge),
+        ("llama", &status.processes.llama),
     ] {
         let pid = info
             .pid
@@ -421,6 +505,36 @@ fn print_status(status: &Status) {
             rvc.frames_out,
             rvc.frames_dropped,
             rvc.queue_depth
+        );
+    }
+    if let Some(asr) = &status.asr {
+        println!(
+            "asr      state={} finals={} frames={} bridge={}",
+            asr.state,
+            asr.finals,
+            asr.frames_received,
+            on_off(asr.bridge_connected)
+        );
+    }
+    if let Some(tts) = &status.tts {
+        println!(
+            "tts      state={} synthesized={} failed={} queue={} model={}",
+            tts.state,
+            tts.synthesized,
+            tts.failed,
+            tts.queue_depth,
+            on_off(tts.model_loaded)
+        );
+    }
+    if let Some(bridge) = &status.bridge {
+        println!(
+            "bridge   translate={} speech={} translated={} delivered={} llama={} tts={}",
+            on_off(bridge.translate_enabled),
+            on_off(bridge.speech_enabled),
+            bridge.translated,
+            bridge.speech_delivered,
+            on_off(bridge.llama_connected),
+            on_off(bridge.tts_connected)
         );
     }
     if let Some(hw) = &status.hw {
@@ -477,5 +591,57 @@ fn process_state_name(state: ProcessState) -> &'static str {
         ProcessState::Starting => "starting",
         ProcessState::Running => "running",
         ProcessState::Restarting => "restarting",
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use clap::Parser;
+
+    fn parse(args: &[&str]) -> Result<Cli, clap::Error> {
+        Cli::try_parse_from(std::iter::once("mozart-ctl").chain(args.iter().copied()))
+    }
+
+    #[test]
+    fn translate_parses_on_off() {
+        assert!(matches!(
+            parse(&["translate", "on"]).unwrap().command,
+            Action::Translate { state: OnOff::On }
+        ));
+        assert!(matches!(
+            parse(&["translate", "off"]).unwrap().command,
+            Action::Translate { state: OnOff::Off }
+        ));
+        assert!(parse(&["translate", "bogus"]).is_err());
+        assert!(parse(&["translate"]).is_err());
+    }
+
+    #[test]
+    fn speech_parses_on_off_stop() {
+        assert!(matches!(
+            parse(&["speech", "on"]).unwrap().command,
+            Action::Speech { action: SpeechAction::On }
+        ));
+        assert!(matches!(
+            parse(&["speech", "off"]).unwrap().command,
+            Action::Speech { action: SpeechAction::Off }
+        ));
+        assert!(matches!(
+            parse(&["speech", "stop"]).unwrap().command,
+            Action::Speech { action: SpeechAction::Stop }
+        ));
+        assert!(parse(&["speech", "bogus"]).is_err());
+        assert!(parse(&["speech"]).is_err());
+    }
+
+    #[test]
+    fn global_flags_parse_with_language_commands() {
+        let cli = parse(&["--json", "translate", "on"]).unwrap();
+        assert!(cli.json);
+        assert!(matches!(cli.command, Action::Translate { state: OnOff::On }));
+        let cli = parse(&["speech", "stop", "--json"]).unwrap();
+        assert!(cli.json);
+        assert!(matches!(cli.command, Action::Speech { action: SpeechAction::Stop }));
     }
 }

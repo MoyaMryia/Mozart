@@ -32,6 +32,10 @@ impl CtlEnv {
             .env("MOZART_DAEMON_BIN", profile_dir().join("mozart-daemon"))
             .env("MOZART_PRE_BIN", example("pre_stub"))
             .env("MOZART_RVC_BIN", example("rvc_stub"))
+            .env("MOZART_ASR_BIN", example("asr_stub"))
+            .env("MOZART_TTS_BIN", example("tts_stub"))
+            .env("MOZART_BRIDGE_BIN", example("bridge_stub"))
+            .env("MOZART_LLAMA_BIN", example("llama_stub"))
             .env("MOZART_POLL_INTERVAL_MS", "100")
             .arg("--config")
             .arg(&self.config);
@@ -211,4 +215,66 @@ fn rejects_unknown_route_argument() {
     let env = CtlEnv::new("usage");
     let output = env.run(&["route", "set", "bogus"]);
     assert_eq!(output.status.code(), Some(2));
+}
+
+#[test]
+fn translate_and_speech_forward_to_bridge() {
+    let env = CtlEnv::new("language");
+    assert_success(&env.run(&["up"]));
+
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        let status = status_json(&env);
+        if status.bridge.is_some() && status.asr.is_some() && status.tts.is_some() {
+            break;
+        }
+        assert!(Instant::now() < deadline, "language children did not become ready");
+        std::thread::sleep(Duration::from_millis(50));
+    }
+
+    // 开关命令的应答带桥的活状态；整机 status 是轮询读模型，下一秒才汇总。
+    let off = env.run(&["translate", "off", "--json"]);
+    assert_success(&off);
+    let data: serde_json::Value = serde_json::from_slice(&off.stdout).unwrap();
+    assert_eq!(data["translate_enabled"], false);
+    assert!(wait_bridge(&env, |bridge| !bridge.translate_enabled));
+
+    let speech_off = env.run(&["speech", "off"]);
+    assert_success(&speech_off);
+    assert!(String::from_utf8_lossy(&speech_off.stdout).contains("speech: off"));
+    assert!(wait_bridge(&env, |bridge| !bridge.speech_enabled));
+
+    let stop = env.run(&["speech", "stop"]);
+    assert_success(&stop);
+    assert!(String::from_utf8_lossy(&stop.stdout).contains("speech: stopped"));
+
+    let on = env.run(&["translate", "on", "--json"]);
+    assert_success(&on);
+    let data: serde_json::Value = serde_json::from_slice(&on.stdout).unwrap();
+    assert_eq!(data["translate_enabled"], true);
+    assert!(wait_bridge(&env, |bridge| bridge.translate_enabled));
+}
+
+/// 轮询读模型有传播延迟：在时限内等整机 status 的桥快照满足谓词。
+fn wait_bridge(env: &CtlEnv, predicate: impl Fn(&mozart_core::ctl::schema::BridgeStatus) -> bool) -> bool {
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        if let Some(bridge) = status_json(env).bridge {
+            if predicate(&bridge) {
+                return true;
+            }
+        }
+        if Instant::now() >= deadline {
+            return false;
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
+}
+
+#[test]
+fn rejects_unknown_language_arguments() {
+    let env = CtlEnv::new("langusage");
+    assert_eq!(env.run(&["translate", "bogus"]).status.code(), Some(2));
+    assert_eq!(env.run(&["speech", "bogus"]).status.code(), Some(2));
+    assert_eq!(env.run(&["speech"]).status.code(), Some(2));
 }

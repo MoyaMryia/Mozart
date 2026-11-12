@@ -43,6 +43,9 @@ enum {
     MOZART_CTL_DAEMON_ROUTE_SET  = 0x0103,
     MOZART_CTL_DAEMON_MUTE_SET   = 0x0104,
     MOZART_CTL_DAEMON_SHUTDOWN   = 0x0105,
+    MOZART_CTL_DAEMON_TRANSLATE_SET = 0x0106,  // 体 {"enabled": bool}，转发桥
+    MOZART_CTL_DAEMON_SPEECH_SET    = 0x0107,  // 体 {"enabled": bool}，转发桥
+    MOZART_CTL_DAEMON_SPEECH_STOP   = 0x0108,  // 体 {}（空），转发桥
 
     MOZART_CTL_PRE_HELLO      = 0x0201,
     MOZART_CTL_PRE_SET_ROUTE  = 0x0202,

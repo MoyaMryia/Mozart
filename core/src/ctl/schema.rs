@@ -119,6 +119,9 @@ pub struct Processes {
     pub tts: ProcessInfo,
     #[serde(default = "ProcessInfo::stopped")]
     pub bridge: ProcessInfo,
+    /// llama-server 无控制协议，只监管进程存活；状态快照不含其业务字段。
+    #[serde(default = "ProcessInfo::stopped")]
+    pub llama: ProcessInfo,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -346,6 +349,13 @@ pub struct MuteSetRequest {
     pub mute: bool,
 }
 
+/// 字幕链路开关请求体（DAEMON_TRANSLATE_SET / DAEMON_SPEECH_SET）：{"enabled": bool}。
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SwitchSetRequest {
+    pub enabled: bool,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -476,6 +486,7 @@ mod tests {
         assert_eq!(processes.asr.state, ProcessState::Stopped);
         assert_eq!(processes.tts.state, ProcessState::Stopped);
         assert_eq!(processes.bridge.state, ProcessState::Stopped);
+        assert_eq!(processes.llama.state, ProcessState::Stopped);
     }
 
     fn status_json() -> Value {
@@ -511,5 +522,21 @@ mod tests {
         assert!(back.asr.is_some());
         assert!(back.tts.is_some());
         assert!(back.bridge.is_some());
+    }
+
+    #[test]
+    fn switch_set_request_parses_enabled_and_rejects_extras() {
+        let on: SwitchSetRequest = serde_json::from_str(r#"{"enabled":true}"#).unwrap();
+        assert!(on.enabled);
+        let off: SwitchSetRequest = serde_json::from_str(r#"{"enabled":false}"#).unwrap();
+        assert!(!off.enabled);
+        for bad in [
+            "{}",
+            r#"{"enabled":"yes"}"#,
+            r#"{"enabled":true,"x":1}"#,
+            "not json",
+        ] {
+            assert!(serde_json::from_str::<SwitchSetRequest>(bad).is_err(), "应拒绝：{bad}");
+        }
     }
 }
