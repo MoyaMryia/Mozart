@@ -26,12 +26,17 @@ pub trait Synthesizer: Send {
 
 /// 加载 PocketTTS 引擎。model_dir 为空或加载失败返回 Err（进程启动路径据此退出）。
 /// stop 供真实 FFI 的生成进度回调读取：置位时中止在途合成（SIGTERM 2 s 宽限）。
+/// 测试注入口：MOZART_TTS_STUB=1 时即使链接了 sherpa 也用 stub（进程级集成
+/// 测试不依赖模型文件）。
 pub fn load(
     model_dir: &Path,
     threads: u32,
     provider: &str,
     stop: &'static AtomicBool,
 ) -> Result<Box<dyn Synthesizer>, String> {
+    if std::env::var("MOZART_TTS_STUB").map(|v| v == "1").unwrap_or(false) {
+        return stub::load(model_dir, threads, provider, stop);
+    }
     imp::load(model_dir, threads, provider, stop)
 }
 
@@ -336,10 +341,10 @@ mod real {
 }
 
 // ===========================================================================
-// Stub（无 sherpa 库）：返回 0.1 s 440 Hz 正弦（2400 samples @ 24 kHz →
+// Stub：返回 0.1 s 440 Hz 正弦（2400 samples @ 24 kHz →
 // 重采样后 4800 samples @ 48 kHz，恰 5 契约帧），覆盖重采样与输出路径。
+// 链接 sherpa 时仅经上方 load 注入测试路径。
 // ===========================================================================
-#[cfg(not(has_sherpa))]
 mod stub {
     use super::Synthesizer;
     use crate::resample::TTS_NATIVE_SAMPLE_RATE;

@@ -52,7 +52,8 @@ fn spawn_tts(dir: &Path, tts_extra: &str) -> ChildGuard {
         .arg("--config")
         .arg(&config)
         .env_remove("MOZART_CONFIG")
-        .env_remove("MOZART_RUN_DIR");
+        .env_remove("MOZART_RUN_DIR")
+        .env("MOZART_TTS_STUB", "1");
     ChildGuard(command.spawn().expect("启动 mozart-tts"))
 }
 

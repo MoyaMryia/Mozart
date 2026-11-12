@@ -36,13 +36,25 @@ pub trait OfflineRecognizer: Send {
     fn decode(&self, samples: &[f32]) -> Result<String, String>;
 }
 
+/// 测试注入口：非空时即使链接了 sherpa 也用 stub（进程级集成测试验证事件链路，
+/// 不依赖模型文件）。
+fn stub_text_env() -> Option<String> {
+    std::env::var("MOZART_ASR_STUB_TEXT").ok().filter(|t| !t.is_empty())
+}
+
 /// 加载在线识别器。model_dir 为空或加载失败返回 Err（进程启动路径据此退出）。
 pub fn load_online(model_dir: &Path, threads: u32) -> Result<Box<dyn Recognizer>, String> {
+    if stub_text_env().is_some() {
+        return stub::load_online(model_dir, threads);
+    }
     imp::load_online(model_dir, threads)
 }
 
 /// 加载离线复核识别器。失败返回 Err；复核线程据此对每句报 failed，不影响在线识别。
 pub fn load_offline(model_dir: &Path, threads: u32) -> Result<Box<dyn OfflineRecognizer>, String> {
+    if stub_text_env().is_some() {
+        return stub::load_offline(model_dir, threads);
+    }
     imp::load_offline(model_dir, threads)
 }
 
@@ -617,11 +629,10 @@ mod real {
 }
 
 // ===========================================================================
-// Stub（无 sherpa 库）：在线返回空文本、endpoint 恒 false；离线返回空文本。
+// Stub：在线返回空文本、endpoint 恒 false；离线返回空文本。
 // 测试注入口：MOZART_ASR_STUB_TEXT 非空时在线 stub 返回该文本（进程级集成测试
-// 据此验证事件链路），默认空文本；真实 FFI 路径不读该变量。
+// 据此验证事件链路），默认空文本；链接 sherpa 时仅经上方 load_* 注入测试路径。
 // ===========================================================================
-#[cfg(not(has_sherpa))]
 mod stub {
     use super::{OfflineRecognizer, Recognizer, Stream};
     use std::path::Path;
