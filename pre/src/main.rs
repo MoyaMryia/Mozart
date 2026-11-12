@@ -138,10 +138,31 @@ fn stop_on_fatal(stop: &AtomicBool, result: Result<(), String>) -> Result<(), St
     result
 }
 
+/// 设备线程 panic 传播根治：catch_unwind 把 panic 转成 Err，与致命设备
+/// 错误走同一条传播链（stop_on_fatal 置停止标志，join 侧收到 Ok(Err)）。
+/// 不加这一层时，panic 线程的停止标志要等 main join 到它才补置，而 main
+/// 可能正阻塞在前面健康线程的 join 上，进程半死。闭包经 AssertUnwindSafe
+/// 包装：线程退出路径不需要 unwind 一致性保证，正常路径行为不变。
+fn guard_panic<F>(body: F) -> Result<(), String>
+where
+    F: FnOnce() -> Result<(), String>,
+{
+    match std::panic::catch_unwind(std::panic::AssertUnwindSafe(body)) {
+        Ok(result) => result,
+        Err(payload) => Err(payload
+            .downcast_ref::<&str>()
+            .map(|message| (*message).to_string())
+            .or_else(|| payload.downcast_ref::<String>().cloned())
+            .unwrap_or_else(|| "panicked".to_string())),
+    }
+}
+
 /// 依序回收线程。线程返回 Err（致命设备错误、无进展降级）或 panic 时
 /// 置停止标志，让其余线程在时限内退出，主线程得以收尾并失败退出；
 /// daemon 按退避重启（SPEC-02：换设备由重启代替）。
-/// 设备线程返回 Err 前已自置标志（stop_on_fatal）；此处幂等补置兜底。
+/// 设备线程返回 Err 前已自置标志（stop_on_fatal）；panic 由 guard_panic
+/// 转成 Err 走同一条传播链，不再依赖 main join 到该线程才补置；
+/// 此处幂等补置兜底。
 fn join_threads(handles: Vec<(&'static str, JoinHandle<Result<(), String>>)>) -> Option<String> {
     let mut failure = None;
     for (name, handle) in handles {
@@ -153,7 +174,8 @@ fn join_threads(handles: Vec<(&'static str, JoinHandle<Result<(), String>>)>) ->
                 failure = failure.or(Some(format!("{name}: {message}")));
             }
             Err(_) => {
-                // 线程 panic：置停止标志让其余线程退出后一并回收。
+                // 线程 panic 兜底（guard_panic 之外的路径，如控制线程）：
+                // 置停止标志让其余线程退出后一并回收。
                 STOP.store(true, Ordering::Relaxed);
                 failure = failure.or(Some(format!("{name}: panicked")));
             }
@@ -252,7 +274,10 @@ fn main() -> ExitCode {
         let ring = capture_ring.clone();
         let shared = shared.clone();
         match spawn_thread("mozart-capture", move || {
-            stop_on_fatal(&STOP, capture::run(capture_pcm, ring, shared, &STOP))
+            stop_on_fatal(
+                &STOP,
+                guard_panic(move || capture::run(capture_pcm, ring, shared, &STOP)),
+            )
         }) {
             Ok(handle) => handle,
             Err(err) => return spawn_failure("capture", err),
@@ -278,7 +303,10 @@ fn main() -> ExitCode {
         let shared = shared.clone();
         let ring = rvc_ring.clone();
         match spawn_thread("mozart-rvc-recv", move || {
-            stop_on_fatal(&STOP, ai::recv_loop(rvc_out_socket, ring, shared, &STOP))
+            stop_on_fatal(
+                &STOP,
+                guard_panic(move || ai::recv_loop(rvc_out_socket, ring, shared, &STOP)),
+            )
         }) {
             Ok(handle) => handle,
             Err(err) => return spawn_failure("rvc-recv", err),
@@ -289,7 +317,9 @@ fn main() -> ExitCode {
         match spawn_thread("mozart-playback", move || {
             stop_on_fatal(
                 &STOP,
-                playback::run(playback_pcm, trunk, rvc_ring, shared, &STOP),
+                guard_panic(move || {
+                    playback::run(playback_pcm, trunk, rvc_ring, shared, &STOP)
+                }),
             )
         }) {
             Ok(handle) => handle,
@@ -342,11 +372,17 @@ fn log_stream_setup(role: &str, device: &str, pcm: &alsa::pcm::PCM) {
 mod tests {
     use super::*;
 
+    /// 本模块两条用例都操纵全局 STOP，用互斥锁串行：并行置位会让
+    /// "正常退出不得置停止标志"的断言观察到对方线程的置位，必然竞态失败。
+    static STOP_TEST_MUTEX: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
     /// 线程返回 Err（致命设备错误、无进展降级）必须置停止标志，其余线程据此
     /// 退出、主线程得以收尾（审查修正点）；正常退出不得置。
-    /// 全局 STOP 在本 crate 测试中仅本用例使用，串行操纵不与其他用例竞争。
     #[test]
     fn thread_fatal_error_sets_stop_flag() {
+        let _guard = STOP_TEST_MUTEX
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         // 传播点一：设备线程返回 Err 前自置停止标志——playback 先死时 main
         // 还阻塞在 capture join，靠它让 capture 有序退出。
         STOP.store(false, Ordering::Relaxed);
@@ -366,6 +402,62 @@ mod tests {
             Some("err: fatal device error".to_string())
         );
         assert!(STOP.load(Ordering::Relaxed), "线程返回 Err 必须置停止标志");
+        STOP.store(false, Ordering::Relaxed);
+    }
+
+    /// 设备线程 panic 必须转成 Err 并由传播链置停止标志（审查根治点）：
+    /// 不加 catch_unwind 时，main 要 join 到 panic 线程才补置停止标志，
+    /// 而它可能正阻塞在前面健康线程的 join 上，进程半死。
+    #[test]
+    fn device_thread_panic_sets_stop_flag_before_join() {
+        let _guard = STOP_TEST_MUTEX
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        // panic → guard_panic 捕获为 Err → stop_on_fatal 置停止标志。
+        // 模拟 main 的包装次序：spawn + stop_on_fatal(guard_panic(body))。
+        STOP.store(false, Ordering::Relaxed);
+        let handle = std::thread::spawn(|| {
+            stop_on_fatal(
+                &STOP,
+                guard_panic(|| panic!("device exploded")),
+            )
+        });
+        // 主线程此刻可以先收尾其他线程的 Err 再 join 本线程：停止标志在线程
+        // 退出时已置，不依赖 join 结果。
+        let result = handle.join().expect("guard_panic 不让 panic 外逸");
+        assert!(result.is_err(), "panic 必须转成 Err");
+        assert!(
+            STOP.load(Ordering::Relaxed),
+            "设备线程 panic 后、main join 到它之前，停止标志必须已置"
+        );
+        STOP.store(false, Ordering::Relaxed);
+
+        // join 侧收到 Ok(Err(panic 消息))：走既有 Err 传播链（补置幂等）。
+        let handle = std::thread::spawn(|| {
+            stop_on_fatal(
+                &STOP,
+                guard_panic(|| panic!("with payload {}", 42)),
+            )
+        });
+        let joined = join_threads(vec![("panic", handle)]);
+        assert_eq!(joined, Some("panic: with payload 42".to_string()));
+        assert!(STOP.load(Ordering::Relaxed), "join 侧 Err 补置停止标志");
+        STOP.store(false, Ordering::Relaxed);
+
+        // 非 panic 路径不变：正常与 Err 语义保持原样。
+        assert!(guard_panic(|| Ok(())).is_ok());
+        assert_eq!(guard_panic(|| Err("fatal".to_string())), Err("fatal".to_string()));
+        assert!(!STOP.load(Ordering::Relaxed), "guard_panic 不改变正常路径");
+
+        // 无法 downcast 的 payload（如非字符串）降级为通用消息。
+        let handle = std::thread::spawn(|| {
+            stop_on_fatal(
+                &STOP,
+                guard_panic(|| std::panic::panic_any(7_i32)),
+            )
+        });
+        assert_eq!(join_threads(vec![("opaque", handle)]), Some("opaque: panicked".to_string()));
+        assert!(STOP.load(Ordering::Relaxed));
         STOP.store(false, Ordering::Relaxed);
     }
 }
