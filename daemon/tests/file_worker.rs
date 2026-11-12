@@ -19,6 +19,13 @@ const JOB_TIMEOUT: Duration = Duration::from_secs(20);
 /// 状态收敛等待（轮询间隔 100 ms）。
 const POLL_TIMEOUT: Duration = Duration::from_secs(5);
 
+/// 喂帧停住的观察窗：大于 worker 的进度节流间隔（250 ms），
+/// 仍在推进的喂帧必然在窗内落盘一次进度。
+const FEED_STALL_WINDOW: Duration = Duration::from_millis(800);
+
+/// 取消打断阻塞喂帧后的收尾上限：打断本身在一个等待分片（100 ms）量级。
+const CANCEL_SETTLE_TIMEOUT: Duration = Duration::from_secs(5);
+
 struct Harness {
     daemon: DaemonProcess,
     conn: Seqpacket,
@@ -82,6 +89,22 @@ impl Harness {
             "桩批处理计数应为 {frames_in} 入 / {frames_out} 出：{:?}",
             status(&self.conn).rvc
         );
+    }
+
+    /// 喂帧已阻塞在满缓冲上的证据：stage 进入 feed 后进度不再推进。
+    /// 桩持有输入 socket 但永不读帧，缓冲填满后发送方只能等待。
+    fn assert_feed_stalled(&self, job_id: &str) {
+        assert!(
+            wait_until(JOB_TIMEOUT, || {
+                file_job(&self.conn, job_id).progress.stage == "feed"
+            }),
+            "任务应进入 feed 段"
+        );
+        let percent = file_job(&self.conn, job_id).progress.percent;
+        let moved = wait_until(FEED_STALL_WINDOW, || {
+            file_job(&self.conn, job_id).progress.percent != percent
+        });
+        assert!(!moved, "喂帧应阻塞在满缓冲上，进度不应推进");
     }
 }
 
@@ -210,6 +233,45 @@ fn cancel_during_inference_stops_stream_and_cleans() {
     );
     h.assert_gpu_free();
     // 流已停：rvc 不再报 streaming（StopStream 已下发）。
+    assert!(
+        wait_until(POLL_TIMEOUT, || {
+            status(&h.conn)
+                .rvc
+                .is_some_and(|rvc| rvc.state != "streaming")
+        }),
+        "取消后 rvc 流必须停下"
+    );
+}
+
+/// 回归：rvc 活着但挂死（绑定输入 socket 却永不读帧），喂帧填满缓冲后阻塞。
+/// 取消必须打断阻塞等待并走完收尾。旧实现 poll(-1) 无限等待，取消检查点只在
+/// 帧边界，任务永远停在 cancelling，GPU 与队列被楔住。
+#[test]
+fn cancel_interrupts_feed_when_peer_hangs() {
+    let h = Harness::new(
+        "worker-feed-hang",
+        "",
+        &[("MOZART_RVC_STUB_FILE_HANG", "1".to_string())],
+    );
+    // 2 s = 100 契约帧，远多于数据面缓冲：喂帧必然停在满缓冲上。
+    let (job_id, _pcm) = h.submit("tone.wav", 2, 16000);
+    h.assert_feed_stalled(&job_id);
+
+    let body = json!({"job_id": job_id});
+    let reply = call(&h.conn, ctl::DAEMON_FILE_CANCEL, body.to_string().as_bytes());
+    assert_eq!(reply.status, "ok", "cancel: {}", reply.reason);
+    assert_eq!(reply.data["state"], "cancelling");
+
+    let job = wait_job_state(&h.conn, &job_id, FileJobState::Cancelled, CANCEL_SETTLE_TIMEOUT);
+    assert!(!job.result_ready);
+    assert!(!h.result(&job_id).exists());
+    h.assert_temp_clean(&job_id);
+    assert!(
+        !h.storage.join(format!("{job_id}.input.wav")).exists(),
+        "取消收尾必须删源副本"
+    );
+    h.assert_gpu_free();
+    // 停流先于解绑：rvc 不再报 streaming。
     assert!(
         wait_until(POLL_TIMEOUT, || {
             status(&h.conn)

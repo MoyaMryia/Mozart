@@ -125,6 +125,8 @@ fn process(ctx: &JobContext) -> Result<(), StepError> {
 }
 
 /// 喂帧：阻塞发送不丢（SPEC-03 文件帧），逐帧查取消。
+/// 对端活着但停止读帧时缓冲会填满，阻塞等待由同一个取消谓词打断
+/// （用户取消或 daemon 关停），不会把本线程楔死在内核里。
 /// meta 序号从 0 顺序，pts_ns 按 20 ms 节拍合成，vad_flag 取解码结果。
 fn feed(
     ctx: &JobContext,
@@ -150,9 +152,13 @@ fn feed(
             },
             pcm: frame.pcm,
         };
-        input
-            .send_blocking(&wire)
-            .map_err(|err| StepError::Failed(format!("feed frame {idx}: {err}")))?;
+        if let Err(err) = input.send_blocking_with(&wire, cancel) {
+            // 可取消发送只在取消时返回 Interrupted：走取消收尾，不算失败。
+            if err.kind() == io::ErrorKind::Interrupted {
+                return Err(StepError::Cancelled);
+            }
+            return Err(StepError::Failed(format!("feed frame {idx}: {err}")));
+        }
         progress.throttled(
             "feed",
             stage_percent(FEED_START, INFER_START, idx as u64 + 1, total),
@@ -311,5 +317,101 @@ impl Drop for FileStream {
         }
         // output 字段在本 body 之后析构：停流先于解绑。
         let _ = fs::remove_file(&self.path);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::file::lock_queue;
+    use crate::file::queue::FileQueue;
+    use crate::file::storage::Storage;
+    use crate::file::testutil::temp_dir;
+    use crate::state::State;
+    use mozart_core::config::Config;
+    use mozart_core::INPUT_SAMPLES;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::{mpsc, Mutex};
+    use std::thread;
+
+    /// 喂帧停住的观察窗：大于进度节流间隔 PROGRESS_INTERVAL，
+    /// 仍在推进的喂帧必然在窗内落盘一次进度。
+    const STALL_WINDOW: Duration = Duration::from_millis(800);
+
+    /// 回归：daemon 关停（running=false）时喂帧正阻塞在挂死对端的满缓冲上，
+    /// 必须在一个等待分片内返回取消，协调器 shutdown 的 join 才不会被楔住。
+    /// 旧实现 poll(-1) 无限等待，取消检查点只在帧边界，关停永远等不到退出。
+    #[test]
+    fn feed_exits_on_shutdown_when_peer_hangs() {
+        let dir = temp_dir("feed-shutdown");
+        let mut config = Config::default();
+        config.daemon.run_dir = dir.clone();
+        config.file.storage_dir = dir.clone();
+        let config = Arc::new(config);
+        let storage = Arc::new(Storage::new(&config).unwrap());
+        let queue = Arc::new(Mutex::new(FileQueue::load(storage.dir(), 8).unwrap()));
+        let job = {
+            let mut queue = lock_queue(&queue);
+            let job_id = queue.reserve_job_id();
+            let job = queue
+                .submit(job_id, "a.wav".to_string(), "demo".to_string())
+                .unwrap();
+            queue.mark_processing(&job.job_id).unwrap();
+            job
+        };
+        let job_id = job.job_id.clone();
+        let running = Arc::new(AtomicBool::new(true));
+        let ctx = JobContext {
+            job,
+            source: dir.join("a.wav"),
+            storage,
+            queue: queue.clone(),
+            services: Arc::new(Services::new(&config)),
+            state: Arc::new(Mutex::new(State::new())),
+            config: config.clone(),
+            running: running.clone(),
+        };
+
+        // 对端绑定输入 socket 但永不读帧（推理线程挂死）：缓冲填满后只能等待。
+        let peer = FrameSocket::<InputFrame>::bind(&config.rvc_input_socket(), 1).unwrap();
+        // 帧数远多于缓冲容量：不打断就送不完。
+        let frames: Vec<ContractFrame> = (0..200)
+            .map(|_| ContractFrame {
+                pcm: [0.0; INPUT_SAMPLES],
+                vad_flag: 1,
+            })
+            .collect();
+        let (done_tx, done_rx) = mpsc::channel();
+        let worker = thread::spawn(move || {
+            let mut progress = Reporter::new(&ctx);
+            progress.stage("feed", FEED_START);
+            let _ = done_tx.send(feed(&ctx, &frames, &mut progress, &|| ctx.is_cancelled()));
+        });
+
+        // 阻塞证据：stage 落到 feed 后，进度在观察窗内不再推进。
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let percent = loop {
+            let progress = lock_queue(&queue).status(&job_id).unwrap().progress;
+            if progress.stage == "feed" {
+                break progress.percent;
+            }
+            assert!(Instant::now() < deadline, "喂帧阶段应已开始");
+            thread::sleep(Duration::from_millis(5));
+        };
+        thread::sleep(STALL_WINDOW);
+        let settled = lock_queue(&queue).status(&job_id).unwrap().progress.percent;
+        assert_eq!(settled, percent, "喂帧应阻塞在满缓冲上，进度不应推进");
+
+        running.store(false, Ordering::Release);
+        let result = done_rx
+            .recv_timeout(Duration::from_secs(2))
+            .expect("关停必须打断阻塞喂帧，旧实现会在此挂死");
+        worker.join().unwrap();
+        assert!(
+            matches!(result, Err(StepError::Cancelled)),
+            "关停应走取消收尾：{result:?}"
+        );
+        drop(peer);
+        fs::remove_dir_all(&dir).unwrap();
     }
 }

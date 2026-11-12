@@ -30,6 +30,11 @@ pub trait WirePacket: Copy {
 /// 实际收发长度按各帧类型的 `PACKET_BYTES` 截取。
 const MAX_PACKET_BYTES: usize = <OutputFrame as WirePacket>::PACKET_BYTES;
 
+/// 阻塞发送等可写的分片上限，也是取消检查点间隔：对端活着但停止读帧时，
+/// 取消/关停必须能在一个分片内打断等待。与 C++ 侧 `kWaitPollMs` 同值
+/// （rvc/transport/unix_dgram_stream.cpp）。
+const SEND_WAIT_POLL: Duration = Duration::from_millis(100);
+
 const _: () = assert!(<InputFrame as WirePacket>::PACKET_BYTES == mem::size_of::<InputFrame>() + 4);
 const _: () =
     assert!(<OutputFrame as WirePacket>::PACKET_BYTES == mem::size_of::<OutputFrame>() + 4);
@@ -236,17 +241,44 @@ impl<F: WirePacket> FrameSocket<F> {
         }
     }
 
-    /// 阻塞发送一条完整线包（文件链路用，SPEC-03 文件帧不丢）。
-    /// 不带 MSG_DONTWAIT：EINTR 重试；EAGAIN/ENOBUFS 等可写（poll POLLOUT）后重试；
-    /// 对端不在（ENOENT/ECONNREFUSED/ENOTCONN）返回 Err，不丢弃不计数，由调用方处置。
+    /// 阻塞发送一条完整线包（文件链路用，SPEC-03 文件帧不丢）：
+    /// 永不取消的 `send_blocking_with`，等可写直到送出或对端不在。
     /// 与实时路径的非阻塞 `send` 并存；只可在离线线程调用，实时线程不得阻塞。
     pub fn send_blocking(&self, frame: &F) -> io::Result<()> {
+        self.send_blocking_with(frame, || false)
+    }
+
+    /// 可取消的阻塞发送（离线文件喂帧用，SPEC-03 文件帧不丢）。
+    /// 编码一次后重试同一条线包：EINTR 重试；EAGAIN/ENOBUFS 等可写后重试，
+    /// 不丢弃不计数；对端不在（ENOENT/ECONNREFUSED/ENOTCONN）返回 Err，由调用方处置。
+    /// 等可写按 `SEND_WAIT_POLL` 分片，每片复查 `cancel`：对端活着但停止读帧时
+    /// 内核阻塞 send 唤不醒，取消与关停只能靠用户态等待打断。
+    /// `cancel` 为真时返回 `Interrupted`，当前帧未送出，调用方据此走取消收尾。
+    /// 实现与 C++ 侧阻塞发送同构：O_NONBLOCK + poll(POLLOUT) 用户态等待。
+    pub fn send_blocking_with(&self, frame: &F, cancel: impl Fn() -> bool) -> io::Result<()> {
         let mut buf = [0u8; MAX_PACKET_BYTES];
         let packet = &mut buf[..F::PACKET_BYTES];
         frame.encode(packet);
+        let saved = self.enter_nonblocking()?;
+        let sent = self.send_wait_writable(packet, &cancel);
+        if let Some(flags) = saved {
+            // SAFETY: fd 有效；flags 取自本 socket，恢复原值不会失败。
+            let _ = unsafe { libc::fcntl(self.fd.as_raw_fd(), libc::F_SETFL, flags) };
+        }
+        sent
+    }
+
+    /// 阻塞发送的重试循环：调用方已编码线包并置 O_NONBLOCK。
+    fn send_wait_writable(&self, packet: &[u8], cancel: &dyn Fn() -> bool) -> io::Result<()> {
         loop {
+            if cancel() {
+                return Err(io::Error::new(
+                    io::ErrorKind::Interrupted,
+                    "frame send cancelled",
+                ));
+            }
             // SAFETY: packet 有效且长度与传入一致；数据报全有或全无。
-            // MSG_NOSIGNAL 防对端关闭触发 SIGPIPE；不带 MSG_DONTWAIT，缓冲满时等待。
+            // MSG_NOSIGNAL 防对端关闭触发 SIGPIPE；不带 MSG_DONTWAIT，缓冲满不丢帧。
             let rc = unsafe {
                 libc::send(
                     self.fd.as_raw_fd(),
@@ -262,11 +294,36 @@ impl<F: WirePacket> FrameSocket<F> {
             match err.raw_os_error() {
                 Some(libc::EINTR) => continue,
                 Some(libc::EAGAIN) | Some(libc::ENOBUFS) => {
-                    self.wait_writable(None)?;
+                    match self.wait_writable(SEND_WAIT_POLL) {
+                        Ok(()) => {}
+                        // 分片超时不是错误：回循环顶复查取消后继续等。
+                        Err(err) if err.kind() == io::ErrorKind::TimedOut => {}
+                        Err(err) => return Err(err),
+                    }
                 }
                 _ => return Err(err),
             }
         }
+    }
+
+    /// 发送期间置 O_NONBLOCK，让缓冲满以 EAGAIN 返回而不是在内核里等待。
+    /// 返回需要恢复的原标志；本就非阻塞时返回 None。
+    fn enter_nonblocking(&self) -> io::Result<Option<libc::c_int>> {
+        // SAFETY: fcntl 只读写本 socket 的文件状态标志。
+        let flags = unsafe { libc::fcntl(self.fd.as_raw_fd(), libc::F_GETFL) };
+        if flags < 0 {
+            return Err(io::Error::last_os_error());
+        }
+        if flags & libc::O_NONBLOCK != 0 {
+            return Ok(None);
+        }
+        // SAFETY: 同上。
+        let rc =
+            unsafe { libc::fcntl(self.fd.as_raw_fd(), libc::F_SETFL, flags | libc::O_NONBLOCK) };
+        if rc < 0 {
+            return Err(io::Error::last_os_error());
+        }
+        Ok(Some(flags))
     }
 
     /// 尽力重连：失败不阻塞、不补发，留待下一次 send 再试。
@@ -335,9 +392,9 @@ impl<F: WirePacket> FrameSocket<F> {
         self.wait_ready(libc::POLLIN, timeout)
     }
 
-    /// 等可写：文件链路阻塞发送在缓冲满时使用；`None` 无限等待。
-    fn wait_writable(&self, timeout: Option<Duration>) -> io::Result<()> {
-        self.wait_ready(libc::POLLOUT, timeout)
+    /// 等可写：阻塞发送在缓冲满时分片等待，超时返回 TimedOut 交调用方复查取消。
+    fn wait_writable(&self, timeout: Duration) -> io::Result<()> {
+        self.wait_ready(libc::POLLOUT, Some(timeout))
     }
 
     fn wait_ready(&self, events: libc::c_short, timeout: Option<Duration>) -> io::Result<()> {
@@ -422,6 +479,8 @@ mod tests {
     use super::*;
     use std::os::fd::FromRawFd;
     use std::path::PathBuf;
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+    use std::sync::{mpsc, Arc};
 
     /// 独立目录存放本组用例的 socket 文件；bind 会清理陈旧文件，用后手动删除。
     fn socket_path(tag: &str) -> PathBuf {
@@ -824,5 +883,80 @@ mod tests {
         );
         assert_eq!(tx.stats().send_dropped, 0);
         cleanup(&path);
+    }
+
+    /// 回归：对端绑定输入 socket 但永不读帧（推理线程挂死），缓冲填满后
+    /// 阻塞发送必须能被取消打断。旧实现 poll(-1) 无限等待，取消永远看不到，
+    /// 调用方线程楔死在内核里。
+    #[test]
+    fn send_blocking_with_interrupts_when_peer_stalls() {
+        let path = socket_path("blockcancel");
+        // 对端只绑定不收帧；1 帧 SNDBUF 让发送方尽快填满缓冲。
+        let rx = FrameSocket::<InputFrame>::bind(&path, 1).unwrap();
+        let tx = Arc::new(FrameSocket::<InputFrame>::connect(&path, 1).unwrap());
+        let cancel = Arc::new(AtomicBool::new(false));
+        let sent = Arc::new(AtomicUsize::new(0));
+        let (done_tx, done_rx) = mpsc::channel();
+        let sender = {
+            let tx = Arc::clone(&tx);
+            let cancel = Arc::clone(&cancel);
+            let sent = Arc::clone(&sent);
+            std::thread::spawn(move || {
+                // 帧数预算远大于缓冲容量：不取消就送不完。
+                const BUDGET: u32 = 4096;
+                let mut count = 0u32;
+                let outcome = loop {
+                    let frame = sample_input(count);
+                    match tx.send_blocking_with(&frame, || cancel.load(Ordering::Acquire)) {
+                        Ok(()) => {
+                            count += 1;
+                            sent.store(count as usize, Ordering::Release);
+                            if count == BUDGET {
+                                break None;
+                            }
+                        }
+                        Err(err) => break Some(err),
+                    }
+                };
+                let _ = done_tx.send((outcome, tx.stats()));
+            })
+        };
+
+        let delivered = wait_send_stalled(&sent);
+        assert!(delivered > 0, "发送方应先送出若干帧再阻塞");
+        cancel.store(true, Ordering::Release);
+        // 打断必须在一个等待分片量级内发生，取 2 s 上限容忍调度抖动。
+        let (outcome, stats) = done_rx
+            .recv_timeout(Duration::from_secs(2))
+            .expect("取消必须打断阻塞发送，旧实现会在此挂死");
+        sender.join().unwrap();
+        let err = outcome.expect("取消应以错误返回，而不是送完预算");
+        assert_eq!(err.kind(), io::ErrorKind::Interrupted);
+        assert_eq!(stats.send_dropped, 0, "可取消发送同样不丢帧");
+        // O_NONBLOCK 只在发送期间生效：调用结束恢复原标志。
+        // SAFETY: fcntl 只读取本用例创建套接字的标志位。
+        let flags = unsafe { libc::fcntl(tx.fd.as_raw_fd(), libc::F_GETFL) };
+        assert!(flags >= 0);
+        assert_eq!(flags & libc::O_NONBLOCK, 0, "发送结束必须恢复阻塞标志");
+        drop(rx);
+        cleanup(&path);
+    }
+
+    /// 阻塞证据：对端永不读帧，发送计数在 3 个等待分片内不再推进即已阻塞。
+    fn wait_send_stalled(sent: &AtomicUsize) -> usize {
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let mut last = sent.load(Ordering::Acquire);
+        let mut stable_since = Instant::now();
+        loop {
+            std::thread::sleep(Duration::from_millis(20));
+            let now = sent.load(Ordering::Acquire);
+            if now != last {
+                last = now;
+                stable_since = Instant::now();
+            } else if stable_since.elapsed() >= SEND_WAIT_POLL * 3 {
+                return last;
+            }
+            assert!(Instant::now() < deadline, "发送方未进入阻塞，已送 {last} 帧");
+        }
     }
 }

@@ -2,10 +2,10 @@
 //! 再打包成 16 kHz 契约帧。denoise 走与 pre 同一套 mozart-dsp（SPEC-02/04），
 //! vad_flag==0 的帧补零（沿用旧 file_denoise 语义）。
 
-use super::{ffmpeg, StepError};
+use super::{ffmpeg, StepError, FRAME_NS};
 use mozart_core::config::Config;
 use mozart_core::{
-    FrameMeta, RawFrame, FRAME_MS, INPUT_SAMPLES, INPUT_SAMPLE_RATE, RAW_SAMPLES, RAW_SAMPLE_RATE,
+    FrameMeta, RawFrame, INPUT_SAMPLES, INPUT_SAMPLE_RATE, RAW_SAMPLES, RAW_SAMPLE_RATE,
 };
 use mozart_dsp::Dsp;
 use std::ffi::OsString;
@@ -16,9 +16,6 @@ use std::time::Duration;
 
 /// decode 阶段内进度切分：ffmpeg 解码占前半，逐块打包占后半。
 const FFMPEG_PERCENT: u8 = 50;
-
-/// 一帧的时间轴步长（契约帧长 20 ms），取 core 的 FRAME_MS。
-const FRAME_NS: u64 = FRAME_MS as u64 * 1_000_000;
 
 /// 16 kHz 契约帧内容。线包 meta 的序号/时间戳由喂帧阶段统一填。
 #[derive(Debug)]

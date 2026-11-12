@@ -5,6 +5,8 @@
 //!
 //! 测试旋钮 `MOZART_RVC_STUB_FILE_DELAY_MS`：攒满帧后模拟整段推理的等待，
 //! 让取消用例稳定停在 infer 段；等待可被 StopStream 打断。
+//! 测试旋钮 `MOZART_RVC_STUB_FILE_HANG=1`：绑定输入 socket 但永不读帧，
+//! 模拟推理线程挂死（进程活着），让喂帧方填满缓冲后阻塞。
 
 mod stub_common;
 
@@ -49,6 +51,7 @@ struct State {
     batch: Option<Batch>,
     input_socket: PathBuf,
     delay: Duration,
+    hang: bool,
 }
 
 fn main() {
@@ -63,6 +66,7 @@ fn main() {
         .and_then(|value| value.parse::<u64>().ok())
         .map(Duration::from_millis)
         .unwrap_or(Duration::ZERO);
+    let hang = std::env::var("MOZART_RVC_STUB_FILE_HANG").is_ok_and(|value| value == "1");
     let mut state = State {
         model: None,
         streaming: false,
@@ -70,6 +74,7 @@ fn main() {
         batch: None,
         input_socket: config.rvc_input_socket(),
         delay,
+        hang,
     };
     serve(args, move |msg| handle(msg, &mut state));
 }
@@ -230,6 +235,7 @@ fn start_file_batch(state: &mut State, body: &Value) -> Result<(), Vec<u8>> {
         batch.cancel.clone(),
         batch.counters.clone(),
         state.delay,
+        state.hang,
     );
     state.batch = Some(batch);
     Ok(())
@@ -242,8 +248,16 @@ fn spawn_batch(
     cancel: Arc<AtomicBool>,
     counters: Arc<Counters>,
     delay: Duration,
+    hang: bool,
 ) {
     std::thread::spawn(move || {
+        // 挂死对端：持有输入 socket 绑定但永不读帧，直到停流置取消。
+        if hang {
+            while !cancel.load(Ordering::Acquire) {
+                std::thread::sleep(POLL);
+            }
+            return;
+        }
         // ---- 攒帧：total_frames 个 320 样本输入帧 ----
         let mut audio: Vec<[f32; INPUT_SAMPLES]> = Vec::with_capacity(total);
         while audio.len() < total {
