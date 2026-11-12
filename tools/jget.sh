@@ -6,7 +6,6 @@
 #   rvcstate  → rvc.state（缺省为空串）
 #   rvcproc   → processes.rvc[子键]
 #   preproc   → processes.pre[子键]
-#   preroute  → pre.route（缺省为空串）
 # 子键仅 rvcproc/preproc 用；其余调用没有第三参，set -u 下由调用方传空默认。
 jget() { python3 -c '
 import json, sys
@@ -20,6 +19,4 @@ elif key == "rvcproc":
     print(d["processes"]["rvc"][sys.argv[3]])
 elif key == "preproc":
     print(d["processes"]["pre"][sys.argv[3]])
-elif key == "preroute":
-    print((d.get("pre") or {}).get("route") or "")
 ' "$1" "$2" "${3:-}" 2>/dev/null; }
