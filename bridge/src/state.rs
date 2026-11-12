@@ -18,8 +18,17 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 /// 版本号，Hello 与 GetStatus 一致上报。
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");
 
-/// 运行时状态文件名（run_dir 下）：开关覆盖的存档快照。
+/// 运行时状态文件名：开关覆盖的存档快照，放持久目录（与字幕同目录）。
 pub const STATE_FILE_NAME: &str = "bridge-state.json";
+
+/// 状态文件路径：从 subtitles_path 父目录推导（持久存储，重启保留），
+/// 不放 run_dir（tmpfs，重启丢失）。v1 仍由桥写盘。
+pub fn state_path_for(subtitles_path: &Path) -> PathBuf {
+    subtitles_path
+        .parent()
+        .unwrap_or_else(|| Path::new("."))
+        .join(STATE_FILE_NAME)
+}
 
 /// 当前 Unix 毫秒，供字幕时间戳与降级时间。
 pub fn unix_ms() -> u64 {
@@ -442,6 +451,26 @@ mod tests {
         ));
         std::fs::create_dir_all(&dir).unwrap();
         dir
+    }
+
+    #[test]
+    fn state_path_derives_from_subtitles_parent_not_run_dir() {
+        // 持久目录（字幕同目录），而非 run_dir（tmpfs）。
+        let subtitles = Path::new("/home/u/.local/state/mozart/subtitles.jsonl");
+        assert_eq!(
+            state_path_for(subtitles),
+            Path::new("/home/u/.local/state/mozart/bridge-state.json")
+        );
+        // 与 run_dir 无关：即使 run_dir 不同，状态文件仍随字幕目录。
+        assert_ne!(
+            state_path_for(subtitles),
+            Path::new("/run/mozart/bridge-state.json")
+        );
+        // 裸文件名（无目录）回落当前目录。
+        assert_eq!(
+            state_path_for(Path::new("subtitles.jsonl")),
+            Path::new("bridge-state.json")
+        );
     }
 
     #[test]

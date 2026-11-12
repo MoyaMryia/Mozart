@@ -137,10 +137,6 @@ impl RecordTable {
         self.entries.len()
     }
 
-    pub fn is_empty(&self) -> bool {
-        self.entries.is_empty()
-    }
-
     fn evict(&mut self) {
         while self.entries.len() > RECORD_CAP {
             let victim = self
@@ -569,7 +565,7 @@ mod tests {
         let mut table = RecordTable::new();
         assert_eq!(apply(&mut table, &event(EventKind::Partial, 1, ""), 100, &no_corrections()), None);
         assert_eq!(apply(&mut table, &event(EventKind::Final, 1, "  "), 200, &no_corrections()), None);
-        assert!(table.is_empty());
+        assert_eq!(table.len(), 0);
     }
 
     #[test]
@@ -585,7 +581,7 @@ mod tests {
     fn refined_without_record_is_ignored() {
         let mut table = RecordTable::new();
         assert_eq!(apply(&mut table, &refined_event(9, Some("无主")), 100, &no_corrections()), None);
-        assert!(table.is_empty());
+        assert_eq!(table.len(), 0);
     }
 
     #[test]
