@@ -1,5 +1,5 @@
 //! llama-server HTTP 客户端（SPEC-05 翻译）：Unix socket + 原生 HTTP/1.1，
-//! POST /v1/chat/completions，max_tokens=128、temperature=0。
+//! POST /v1/chat/completions，max_tokens=128、temperature=0、关闭思考模式。
 //! 每请求一连（Connection: close），不维护长连接；连通状态由调用方
 //! 按请求结果记入共享状态（GetStatus 的 llama_connected 与最近成功失败）。
 //! 收发用 poll 分步等待：停止标志置位即放弃在途请求（daemon 2 s 宽限），
@@ -63,7 +63,8 @@ pub fn build_request(text: &str) -> Vec<u8> {
             { "role": "user", "content": text }
         ],
         "max_tokens": 128,
-        "temperature": 0
+        "temperature": 0,
+        "chat_template_kwargs": { "enable_thinking": false }
     }))
     .expect("request body is JSON-serializable");
     let mut request = format!(
@@ -265,6 +266,7 @@ mod tests {
         assert_eq!(value["model"], "default");
         assert_eq!(value["max_tokens"], 128);
         assert_eq!(value["temperature"], 0);
+        assert_eq!(value["chat_template_kwargs"]["enable_thinking"], false);
         assert_eq!(value["messages"][0]["role"], "system");
         assert_eq!(value["messages"][0]["content"], SYSTEM_PROMPT);
         assert_eq!(value["messages"][1]["role"], "user");
