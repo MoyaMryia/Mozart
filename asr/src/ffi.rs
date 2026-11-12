@@ -36,15 +36,19 @@ pub trait OfflineRecognizer: Send {
     fn decode(&self, samples: &[f32]) -> Result<String, String>;
 }
 
-/// 测试注入口：非空时即使链接了 sherpa 也用 stub（进程级集成测试验证事件链路，
-/// 不依赖模型文件）。
+/// 测试注入口：MOZART_ASR_STUB=1 强制 stub（进程级集成测试不依赖模型文件）；
+/// MOZART_ASR_STUB_TEXT 非空时同样走 stub 并注入文本。
 fn stub_text_env() -> Option<String> {
     std::env::var("MOZART_ASR_STUB_TEXT").ok().filter(|t| !t.is_empty())
 }
 
+fn stub_forced() -> bool {
+    std::env::var("MOZART_ASR_STUB").map(|v| v == "1").unwrap_or(false) || stub_text_env().is_some()
+}
+
 /// 加载在线识别器。model_dir 为空或加载失败返回 Err（进程启动路径据此退出）。
 pub fn load_online(model_dir: &Path, threads: u32) -> Result<Box<dyn Recognizer>, String> {
-    if stub_text_env().is_some() {
+    if stub_forced() {
         return stub::load_online(model_dir, threads);
     }
     imp::load_online(model_dir, threads)
@@ -52,7 +56,7 @@ pub fn load_online(model_dir: &Path, threads: u32) -> Result<Box<dyn Recognizer>
 
 /// 加载离线复核识别器。失败返回 Err；复核线程据此对每句报 failed，不影响在线识别。
 pub fn load_offline(model_dir: &Path, threads: u32) -> Result<Box<dyn OfflineRecognizer>, String> {
-    if stub_text_env().is_some() {
+    if stub_forced() {
         return stub::load_offline(model_dir, threads);
     }
     imp::load_offline(model_dir, threads)

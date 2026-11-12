@@ -56,7 +56,8 @@ fn spawn_asr(dir: &Path, review_model_dir: &str, stub_text: Option<&str>) -> Chi
         .arg(&config)
         .env_remove("MOZART_CONFIG")
         .env_remove("MOZART_RUN_DIR")
-        .env_remove("MOZART_ASR_STUB_TEXT");
+        .env_remove("MOZART_ASR_STUB_TEXT")
+        .env("MOZART_ASR_STUB", "1");
     if let Some(text) = stub_text {
         command.env("MOZART_ASR_STUB_TEXT", text);
     }
