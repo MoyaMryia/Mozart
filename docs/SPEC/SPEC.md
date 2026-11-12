@@ -88,3 +88,4 @@
 - 2026-11-12：rvc C++ 实现定稿：六命令按 SPEC-03 落地（StartStream 参数此时固定、StopStream 等当前块返回、GetStatus 14 字段）；`[rvc]` 进程启动键（models_dir、device、half、cache_limit、HuBERT/RMVPE/实时资产路径）与 socket 键入部署 TOML；退出用 SIGTERM，第一版无 UnloadModel/Shutdown。
 - 2026-11-12：daemon 接线定稿：daemon 把自己解析出的 TOML 路径随 spawn 以 `--config` 转交子进程，内置默认启动时无文件不传，子进程按同一顺序得到同一默认值；部署布局定 cargo 产物目录为唯一部署目录，rvc CMake 产物复制进去或用 `MOZART_RVC_BIN` 指绝对路径（SPEC-04）。
 - 2026-11-12：板端实测定稿：同源 60 s 长跑小缓冲零掉帧、49.86 帧/s 1:1，维持大缓冲留 C++；rvc 端到端净滞后约 0.5 s（SPEC-03 补实测确认行）。实测记录入 `reports/realtime-pipeline-20261112`。
+- 2026-11-12：路由切换淡变双向对称化：rvc→direct 不再立即切源，与 direct→rvc 一致先淡出到零、帧内零保持、下一帧新源淡入，消除约 14% 满幅的单样本跳变（SPEC-02）。

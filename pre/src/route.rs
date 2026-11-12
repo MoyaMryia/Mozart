@@ -1,8 +1,9 @@
 //! direct/rvc 路由状态机与静音淡变（SPEC-02：路由与静音由 pre 执行淡变，策略归 daemon）。
 //! 增益曲线为线性，长度 10 ms = 480 样本（旧实现 main.c:417,643 的 fade_ms=10）。
-//! 切换次序沿用旧实现（main.c:704-713,768-770）：
-//! - rvc→direct：立即切源，从零淡入；
-//! - direct→rvc：先淡出完成再切源，随后淡入（统一增益路径下新源必须淡入，否则从零硬起）。
+//! 切换次序两个方向对称（direct→rvc 沿用旧实现 main.c:704-713 的先淡出再切源；
+//! rvc→direct 旧实现 main.c:768-770 为立即切源后淡入，实测存在单样本跳变，
+//! 统一到同一淡出-零保持-淡入路径）：
+//! - 先淡出完成再切源，随后新源淡入（统一增益路径下新源必须淡入，否则从零硬起）。
 //!   过零落在帧内时，本帧剩余样本保持零增益（选源发生在帧边界，帧内剩余样本
 //!   仍来自旧源），淡入推迟到下一帧首个新源样本（旧 fade_apply 的零保持语义，
 //!   杜绝旧源回淡入尾巴与新源满增益硬起）。
@@ -63,18 +64,15 @@ impl Router {
             return;
         }
         match (self.route, target) {
-            // direct→rvc：先淡出（从 Stable 或淡入途中都是当前增益起降）。
-            (Route::Direct, Route::Rvc) => self.phase = Phase::FadingOut,
-            // 淡出途中重设 direct：中止淡出，回淡入。
-            (Route::Direct, Route::Direct) => self.phase = Phase::FadingIn,
-            // rvc→direct：立即切源，从零淡入。
-            (Route::Rvc, Route::Direct) => {
-                self.route = Route::Direct;
-                self.gain = 0.0;
+            // 双向统一：先淡出，过零后由 apply 切源并转零保持，消除
+            // rvc→direct 立即切源的单样本跳变。
+            (Route::Direct, Route::Rvc) | (Route::Rvc, Route::Direct) => {
+                self.phase = Phase::FadingOut;
+            }
+            // 淡出途中重设当前源：中止淡出，回淡入。
+            (Route::Direct, Route::Direct) | (Route::Rvc, Route::Rvc) => {
                 self.phase = Phase::FadingIn;
             }
-            // route == Rvc 且 target == Rvc 只会在淡出中翻转后到达，此时 route 已是 Direct。
-            (Route::Rvc, Route::Rvc) => unreachable!("same-target request returned early"),
         }
         self.target = target;
     }
@@ -230,21 +228,69 @@ mod tests {
         }
     }
 
+    /// rvc→direct 与 direct→rvc 对称化验收：从各自稳态发起切换，
+    /// 两条增益曲线逐样本完全一致（同一淡出-零保持-淡入路径）。
     #[test]
-    fn switch_to_direct_is_immediate_with_fade_in() {
-        // 先走到 Stable(Rvc)。
+    fn both_directions_follow_identical_gain_curves() {
+        let mut to_rvc = Router::new(Route::Direct);
+        to_rvc.request(Route::Rvc);
+        let left = drive_router(&mut to_rvc, FADE_SAMPLES * 2 + RAW_SAMPLES);
+
+        let mut to_direct = Router::new(Route::Direct);
+        to_direct.request(Route::Rvc);
+        drive_router(&mut to_direct, FADE_SAMPLES * 2 + 8);
+        assert_eq!(to_direct.route(), Route::Rvc, "应已到稳态 rvc");
+        to_direct.request(Route::Direct);
+        let right = drive_router(&mut to_direct, FADE_SAMPLES * 2 + RAW_SAMPLES);
+
+        assert_eq!(left, right, "两个方向的增益曲线必须逐样本一致");
+        assert_eq!(to_rvc.route(), Route::Rvc);
+        assert_eq!(to_direct.route(), Route::Direct);
+    }
+
+    #[test]
+    fn switch_to_direct_fades_out_before_switching() {
+        // 对称于 switch_to_rvc_fades_out_before_switching：先走到 Stable(Rvc)。
+        // 按播放线程粒度驱动：请求在帧边界读入，选源先于 apply（playback.rs 次序）。
         let mut router = Router::new(Route::Direct);
         router.request(Route::Rvc);
         drive_router(&mut router, FADE_SAMPLES * 2 + 8);
         assert_eq!(router.route(), Route::Rvc);
 
-        // rvc→direct：请求即切源，随后从零淡入。
         router.request(Route::Direct);
+        // 对称路径：请求后不立即切源，可听源保持 rvc，先淡出。
+        assert_eq!(router.route(), Route::Rvc);
+
+        // 第一帧：前 480 样本从 1 线性淡出，帧内过零。
+        let frame = drive_frame(&mut router);
+        for (i, &gain) in frame.iter().take(FADE_SAMPLES - 2).enumerate() {
+            assert_close(gain, 1.0 - (i + 1) as f32 / FADE_SAMPLES as f32);
+        }
+        // 全帧单调不增；过零样本及帧内剩余样本保持零增益——帧内剩余样本
+        // 仍来自旧源，回淡入会形成 10 ms 旧源尾巴（审查修正点）。
+        for pair in frame.windows(2) {
+            assert!(pair[0] >= pair[1], "淡出帧必须单调不增：{pair:?}");
+        }
+        for (i, &gain) in frame.iter().enumerate().skip(FADE_SAMPLES - 1) {
+            assert!(gain <= EPS, "过零后帧内样本必须保持零：样本 {i} 增益 {gain}");
+        }
+        // 帧内已切源，但淡入尚未开始（增益为零）。
         assert_eq!(router.route(), Route::Direct);
-        let gains = drive_router(&mut router, FADE_SAMPLES + 8);
-        assert_close(gains[0], 1.0 / FADE_SAMPLES as f32);
-        assert_close(gains[FADE_SAMPLES - 1], 1.0);
-        assert_eq!(gains[FADE_SAMPLES + 7], 1.0);
+
+        // 第二帧：帧边界请求同目标幂等；样本已真正来自新源，才从零淡入。
+        router.request(Route::Direct);
+        let frame = drive_frame(&mut router);
+        assert_close(frame[0], 1.0 / FADE_SAMPLES as f32);
+        assert_close(frame[FADE_SAMPLES - 1], 1.0);
+        assert_eq!(frame[RAW_SAMPLES - 1], 1.0);
+        assert_eq!(router.route(), Route::Direct);
+
+        // 稳态输出等于输入。
+        let mut probe = [0.5f32; 8];
+        router.apply(&mut probe);
+        for sample in probe {
+            assert_eq!(sample, 0.5);
+        }
     }
 
     #[test]
@@ -265,22 +311,45 @@ mod tests {
     }
 
     #[test]
-    fn re_request_rvc_during_fade_in_fades_out_first() {
-        // rvc→direct 立即切换后处于淡入途中（route=Direct，增益半程）。
+    fn re_request_rvc_during_fade_out_aborts() {
+        // 对称于 re_request_direct_during_fade_out_aborts：Stable(Rvc) 后
+        // 要求 direct 进入淡出（route=Rvc 不变），半程后中止回 rvc。
         let mut router = Router::new(Route::Direct);
         router.request(Route::Rvc);
         drive_router(&mut router, FADE_SAMPLES * 2 + 8);
-        router.request(Route::Direct);
-        drive_router(&mut router, FADE_SAMPLES / 2);
+        assert_eq!(router.route(), Route::Rvc);
 
-        // 此时要求 rvc：direct 侧仍先淡出完成再切源。
+        router.request(Route::Direct);
+        assert_eq!(router.route(), Route::Rvc, "对称路径：请求后不立即切源");
+        let gains = drive_router(&mut router, FADE_SAMPLES / 2);
+        assert_eq!(router.route(), Route::Rvc);
+        assert!(gains[FADE_SAMPLES / 2 - 1] < 1.0, "应处于淡出途中");
+
+        // 淡出途中要求回 rvc：中止淡出，增益回升，不切源。
         router.request(Route::Rvc);
-        assert_eq!(router.route(), Route::Direct);
+        assert_eq!(router.route(), Route::Rvc);
+        let gains = drive_router(&mut router, FADE_SAMPLES / 2 + 8);
+        assert!(gains[0] < gains[1], "中止后应回淡入");
+        assert_eq!(gains[FADE_SAMPLES / 2 + 7], 1.0);
+        assert_eq!(router.route(), Route::Rvc);
+    }
+
+    #[test]
+    fn re_request_direct_during_rvc_fade_in_fades_out_first() {
+        // direct→rvc 过零切源后处于淡入途中（route=Rvc，增益半程）。
+        let mut router = Router::new(Route::Direct);
+        router.request(Route::Rvc);
+        drive_router(&mut router, FADE_SAMPLES + FADE_SAMPLES / 2);
+        assert_eq!(router.route(), Route::Rvc);
+
+        // 此时要求 direct：rvc 侧仍先淡出完成再切源。
+        router.request(Route::Direct);
+        assert_eq!(router.route(), Route::Rvc);
         let gains = drive_router(&mut router, FADE_SAMPLES + 8);
         // 增益半程起降，240 样本内到零；过零后切源，淡入推迟到下一帧
         // （逐样本驱动帧长为 1，即下一样本起淡入）。
         assert!(gains.iter().any(|&gain| gain <= EPS), "必须经过零点再切源");
-        assert_eq!(router.route(), Route::Rvc);
+        assert_eq!(router.route(), Route::Direct);
         assert!(gains[FADE_SAMPLES + 7] > 0.0, "切源后进入淡入");
     }
 
