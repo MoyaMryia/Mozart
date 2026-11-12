@@ -4,7 +4,9 @@
 
 use crate::state::{lock_state, State};
 use mozart_core::config::Config;
-use mozart_core::ctl::schema::{AsrStatus, BridgeStatus, PreStatus, Response, Route, RvcStatus, TtsStatus};
+use mozart_core::ctl::schema::{
+    Activity, AsrStatus, BridgeStatus, ModelEntry, PreStatus, Response, Route, RvcStatus, TtsStatus,
+};
 use mozart_core::ctl::{self, Seqpacket};
 use serde_json::{json, Value};
 use std::io;
@@ -84,7 +86,7 @@ impl Services {
             .unwrap_or_else(|poisoned| poisoned.into_inner())
     }
 
-    fn transition(&self) -> MutexGuard<'_, ()> {
+    pub(crate) fn transition(&self) -> MutexGuard<'_, ()> {
         self.transition
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
@@ -211,11 +213,28 @@ pub fn route_set(
     config: &Config,
     target: Route,
 ) -> Result<Route, (String, String)> {
-    // 快查也必须在 transition 锁内：锁外读取会在切换进行中给出假成功应答。
     let _transition = services.transition();
+    route_set_locked(state, services, config, target)
+}
+
+/// 调用方已持 transition 锁（poller 仲裁应用等待槽路由时用）。
+pub(crate) fn route_set_locked(
+    state: &Mutex<State>,
+    services: &Services,
+    config: &Config,
+    target: Route,
+) -> Result<Route, (String, String)> {
+    // 快查也必须在 transition 锁内：锁外读取会在切换进行中给出假成功应答。
     {
-        let current = lock_state(state);
+        let mut current = lock_state(state);
         if current.route_desired() == target && current.route_active() == target {
+            return Ok(target);
+        }
+        if current.gpu_owner() == Some(Activity::File) {
+            // 文件任务占用 GPU：接受意图但不抢 GPU。rvc 挂等待槽（desired
+            // 单槽，后覆盖前），任务结束后 poller 应用；direct 清等待意图，
+            // 不碰 rvc 流（文件数据面正在用）。
+            current.set_route_desired(target);
             return Ok(target);
         }
     }
@@ -279,19 +298,42 @@ fn switch_direct(state: &Mutex<State>, services: &Services) -> Result<Route, (St
     Ok(Route::Direct)
 }
 
+/// rvc 当前状态快照。文件提交缺省模型解析与实时切换共用。
+pub(crate) fn rvc_get_status(services: &Services) -> Result<RvcStatus, (String, String)> {
+    let response = services
+        .rvc()
+        .call_ok(ctl::RVC_GET_STATUS, b"{}")
+        .map_err(CallError::into_rejection)?;
+    serde_json::from_value::<RvcStatus>(response.data)
+        .map_err(|err| (ctl::CODE_INTERNAL.to_string(), err.to_string()))
+}
+
+/// rvc 模型清单（RVC_LIST_MODELS）。model list 命令与文件提交模型校验共用。
+pub(crate) fn list_models(services: &Services) -> Result<Vec<ModelEntry>, (String, String)> {
+    let response = services
+        .rvc()
+        .call_ok(ctl::RVC_LIST_MODELS, b"{}")
+        .map_err(CallError::into_rejection)?;
+    let models = response
+        .data
+        .get("models")
+        .cloned()
+        .ok_or_else(|| {
+            (
+                ctl::CODE_INTERNAL.to_string(),
+                "ListModels response missing models".to_string(),
+            )
+        })?;
+    serde_json::from_value::<Vec<ModelEntry>>(models)
+        .map_err(|err| (ctl::CODE_INTERNAL.to_string(), err.to_string()))
+}
+
 fn switch_rvc(
     state: &Mutex<State>,
     services: &Services,
     config: &Config,
 ) -> Result<Route, (String, String)> {
-    let status = {
-        let mut rvc = services.rvc();
-        let response = rvc
-            .call_ok(ctl::RVC_GET_STATUS, b"{}")
-            .map_err(CallError::into_rejection)?;
-        serde_json::from_value::<RvcStatus>(response.data)
-            .map_err(|err| (ctl::CODE_INTERNAL.to_string(), err.to_string()))?
-    };
+    let status = rvc_get_status(services)?;
     let model_id = resolve_model_id(config, &status)?;
     let model_matches = status.model_id.as_deref() == Some(model_id.as_str());
     if status.state != "streaming" || !model_matches {
@@ -513,9 +555,9 @@ fn reconcile(
     rvc_status: Option<&RvcStatus>,
     degraded: &mut Vec<String>,
 ) {
-    let (active, mute) = {
+    let (active, mute, gpu_owner) = {
         let state = lock_state(state);
-        (state.route_active(), state.mute())
+        (state.route_active(), state.mute(), state.gpu_owner())
     };
 
     if let Some(status) = pre_status {
@@ -529,6 +571,12 @@ fn reconcile(
                 degraded.push(format!("pre mute apply: {}", err.describe()));
             }
         }
+    }
+
+    // 文件任务持有 GPU 时 rvc 流归文件数据面，实时对账不得停/起流；
+    // pre 路由/静音仍按 active（direct）对账。
+    if gpu_owner == Some(Activity::File) {
+        return;
     }
 
     if let Some(status) = rvc_status {

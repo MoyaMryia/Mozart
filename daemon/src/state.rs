@@ -104,10 +104,32 @@ impl State {
         self.route_active
     }
 
+    pub fn gpu_owner(&self) -> Option<Activity> {
+        self.gpu_owner
+    }
+
+    /// 最近一次轮询是否拿到 rvc 状态（可接受 LoadModel/StartStream）。
+    pub fn rvc_ready(&self) -> bool {
+        self.rvc.is_some()
+    }
+
     pub fn mute(&self) -> bool {
         self.mute
     }
 
+    /// 只记录路由意图，不动 active 与 GPU 归属。
+    /// 文件任务占用 GPU 时 route set 走这里：rvc 挂等待槽（单槽，后覆盖前），
+    /// direct 清等待意图；任务结束后由 poller 应用。
+    pub fn set_route_desired(&mut self, route: Route) {
+        if self.route_desired != route {
+            self.route_since_unix_ms = now_unix_ms();
+            self.route_desired = route;
+        }
+    }
+
+    /// 实时路由切换落地：desired/active/GPU 归属一次写齐。
+    /// 不变量：gpu_owner 为 File 时不得调用（route_set 已先行分流），
+    /// 且 gpu_owner 为 None 当且仅当 route_active 为 Direct。
     pub fn commit_route(&mut self, route: Route) {
         if self.route_active != route || self.route_desired != route {
             self.route_since_unix_ms = now_unix_ms();
@@ -118,6 +140,18 @@ impl State {
             Route::Rvc => Some(Activity::Realtime),
             Route::Direct => None,
         };
+    }
+
+    /// 文件任务启动时 claim GPU。调用方（poller 仲裁）持 transition 锁
+    /// 且已确认 gpu_owner 为 None。
+    pub fn claim_gpu_file(&mut self) {
+        self.gpu_owner = Some(Activity::File);
+    }
+
+    /// 文件任务收尾时释放 GPU。调用方持 transition 锁；
+    /// 任务执行期间路由切换只动 desired，不会改走 File 归属。
+    pub fn release_gpu_file(&mut self) {
+        self.gpu_owner = None;
     }
 
     pub fn commit_mute(&mut self, mute: bool) {

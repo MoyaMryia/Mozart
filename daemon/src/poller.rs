@@ -1,5 +1,7 @@
-//! 周期性轮询 pre/rvc/asr/tts/bridge 状态，并让实际状态向 daemon 期望状态收敛。
+//! 周期性轮询 pre/rvc/asr/tts/bridge 状态，并让实际状态向 daemon 期望状态收敛；
+//! 随后驱动文件仲裁（空闲自动启动任务、应用等待槽路由）。
 
+use crate::file::FileCoordinator;
 use crate::hwmon::Monitor;
 use crate::services::{self, Services};
 use crate::state::{lock_state, State};
@@ -20,6 +22,7 @@ impl Poller {
         config: Arc<Config>,
         state: Arc<Mutex<State>>,
         services: Arc<Services>,
+        file: Arc<FileCoordinator>,
         running: Arc<AtomicBool>,
     ) -> io::Result<Self> {
         let interval = Duration::from_millis(config.daemon.poll_interval_ms);
@@ -29,6 +32,7 @@ impl Poller {
                 let mut monitor = Monitor::new();
                 while running.load(Ordering::Acquire) {
                     services::poll(&state, &services, &config);
+                    file.tick();
                     let hw = monitor.sample();
                     lock_state(&state).set_hw(Some(hw));
                     if !sleep_unless_stopped(interval, &running) {

@@ -270,6 +270,7 @@ dependencies = [
  "libc",
  "mozart-core",
  "mozart-dsp",
+ "serde",
  "serde_json",
 ]
 

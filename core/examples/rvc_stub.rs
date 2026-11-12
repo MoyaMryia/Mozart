@@ -27,6 +27,7 @@ fn handle(msg: &Message, state: &mut State) -> Vec<u8> {
         ctl::RVC_STOP_STREAM,
         ctl::RVC_RESET_STREAM,
         ctl::RVC_GET_STATUS,
+        ctl::RVC_LIST_MODELS,
     ];
     if let Err(reply) = expect_known(msg, &known) {
         return reply;
@@ -97,6 +98,23 @@ fn handle(msg: &Message, state: &mut State) -> Vec<u8> {
                 "queue_depth": 0,
                 "last_error": null
             }))
+        }
+        ctl::RVC_LIST_MODELS => {
+            // 桩模型目录固定一个 demo；已加载的其他模型一并列出。
+            let mut ids = vec!["demo".to_string()];
+            if let Some(model) = state.model.as_ref() {
+                if model != "demo" {
+                    ids.push(model.clone());
+                }
+            }
+            let models: Vec<_> = ids
+                .into_iter()
+                .map(|id| {
+                    let loaded = state.model.as_deref() == Some(id.as_str());
+                    json!({"id": id, "exists": true, "loaded": loaded})
+                })
+                .collect();
+            ok(json!({"models": models}))
         }
         _ => unreachable!("expect_known covers all commands"),
     }
