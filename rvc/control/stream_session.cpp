@@ -341,11 +341,11 @@ private:
 
 InferenceBackend::InferenceBackend(const InferenceBackendConfig& config)
     : config_(config) {
-    std::optional<std::filesystem::path> hubert;
+    // hubert 传裸路径（RealRVCPipeline 契约），rmvpe/实时资产走 optional
+    // （缺省回落内置引擎），此处不做二次包装。
     std::optional<std::filesystem::path> rmvpe;
     std::optional<std::filesystem::path> realtime_hubert;
     std::optional<std::filesystem::path> realtime_rmvpe;
-    if (!config_.hubert_path.empty()) hubert = config_.hubert_path;
     if (!config_.rmvpe_path.empty()) rmvpe = config_.rmvpe_path;
     if (!config_.realtime_hubert_path.empty()) realtime_hubert = config_.realtime_hubert_path;
     if (!config_.realtime_rmvpe_path.empty()) realtime_rmvpe = config_.realtime_rmvpe_path;

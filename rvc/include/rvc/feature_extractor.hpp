@@ -1,4 +1,5 @@
-// 搬运自 Mozart-Old/rvc-backend/include/rvc/feature_extractor.hpp，未改动。
+// 搬运自 Mozart-Old/rvc-backend/include/rvc/feature_extractor.hpp，
+// 删去了零调用方的诊断入口 extract_mel（compute_mel 内部版保留）。
 #pragma once
 
 #include <cstdint>
@@ -46,12 +47,6 @@ public:
     );
 
     std::vector<float> extract_features_realtime(
-        const std::vector<float>& audio,
-        uint32_t sample_rate = 16000
-    );
-
-    // Diagnostic access to the RMVPE front-end mel (time-major [frames, 128]).
-    std::vector<float> extract_mel(
         const std::vector<float>& audio,
         uint32_t sample_rate = 16000
     );

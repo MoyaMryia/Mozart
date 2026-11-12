@@ -246,7 +246,8 @@ fn main() -> ExitCode {
     //（惰性建链，不阻塞启动）。
     let ai_sender = ai::Sender::new(config.rvc_input_socket());
 
-    // 设备先就绪，后拉线程（旧实现次序：播放设备先于采集）。
+    // 设备先就绪，后拉线程（新实现次序：采集设备先于播放；旧实现 main.c
+    // 播放设备先就绪，本实现两设备在拉线程前同步打开，次序差异无行为影响）。
     let capture_pcm = match alsa_stream::open(&config.pre.capture_device, Direction::Capture) {
         Ok(pcm) => pcm,
         Err(message) => {

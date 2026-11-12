@@ -366,7 +366,7 @@ int main() {
               "counter fields come from the worker snapshot");
         CHECK(status.at("capabilities") == nlohmann::json({"realtime", "file"}),
               "capabilities field is present");
-        CHECK(!status.contains("inference_ms_last") == false
+        CHECK(status.contains("inference_ms_last")
               && status.at("inference_ms_last").is_number(),
               "timing fields present when measured");
 

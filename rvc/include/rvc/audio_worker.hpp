@@ -95,8 +95,6 @@ private:
     mutable std::mutex stats_mutex_;
     uint64_t frames_in_{0};
     uint64_t frames_out_{0};
-    uint64_t frames_send_dropped_{0};
-    uint64_t frames_recv_dropped_{0};
     uint64_t underrun_count_{0};
     uint64_t startup_underrun_count_{0};
     bool stream_output_started_{false};

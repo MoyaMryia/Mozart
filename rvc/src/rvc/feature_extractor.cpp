@@ -1,4 +1,5 @@
-// 搬运自 Mozart-Old/rvc-backend/src/rvc/feature_extractor.cpp，改动：未用形参标注 [[maybe_unused]]（-Werror）。
+// 搬运自 Mozart-Old/rvc-backend/src/rvc/feature_extractor.cpp，改动：
+// 未用形参标注 [[maybe_unused]]（-Werror）；删去零调用方的 extract_mel。
 #include "rvc/feature_extractor.hpp"
 #include "rvc/profile.hpp"
 #include "rvc/trt_engine.hpp"
@@ -432,13 +433,6 @@ std::vector<float> FeatureExtractor::compute_mel(
         frame_loop(0, frames);
     }
     return mel;
-}
-
-std::vector<float> FeatureExtractor::extract_mel(
-    const std::vector<float>& audio,
-    uint32_t sample_rate
-) {
-    return compute_mel(audio, sample_rate);
 }
 
 std::vector<float> FeatureExtractor::extract_f0(

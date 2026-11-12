@@ -32,21 +32,8 @@ APLAY_ARGS_COMMON=(-f S16_LE -c 2 -r "$SR" --buffer-size=4096 --period-size=1024
 now_ms() { date +%s%3N; }
 die() { echo "measure: $*" >&2; exit 1; }
 ctl() { "$BIN_DIR/mozart-ctl" --config "$M_DIR/smoke.toml" "$@"; }
-jget() { python3 -c '
-import json, sys
-d = json.load(open(sys.argv[1]))
-key = sys.argv[2]
-if key == "pre":
-    print("yes" if d.get("pre") else "no")
-elif key == "rvcstate":
-    print((d.get("rvc") or {}).get("state") or "")
-elif key == "rvcproc":
-    print(d["processes"]["rvc"][sys.argv[3]])
-elif key == "preproc":
-    print(d["processes"]["pre"][sys.argv[3]])
-elif key == "preroute":
-    print((d.get("pre") or {}).get("route") or "")
-' "$1" "$2" "${3:-}" 2>/dev/null; }
+# status JSON 取值函数与 tools/jetson-smoke.sh 共用（jget.sh 有键位说明）。
+. "$(cd "$(dirname "$0")" && pwd)/jget.sh"
 
 kill_mozart() {
   pkill -f mozart-daemon 2>/dev/null

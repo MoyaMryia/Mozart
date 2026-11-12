@@ -28,18 +28,8 @@ rm -rf "$RUN" "$SMOKE_DIR"/rec.raw "$SMOKE_DIR"/signal.raw "$SMOKE_DIR"/st-*.jso
 
 ts() { printf "[%4ss]" "$SECONDS"; }
 ctl() { "$BIN_DIR/mozart-ctl" --config "$CFG" "$@"; }
-# $3 仅 rvcproc 用；其余调用没有第三参，set -u 下用空默认。
-jget() { python3 -c '
-import json, sys
-d = json.load(open(sys.argv[1]))
-key = sys.argv[2]
-if key == "pre":
-    print("yes" if d.get("pre") else "no")
-elif key == "rvcstate":
-    print((d.get("rvc") or {}).get("state") or "")
-elif key == "rvcproc":
-    print(d["processes"]["rvc"][sys.argv[3]])
-' "$1" "$2" "${3:-}" 2>/dev/null; }
+# status JSON 取值函数与 tools/jetson-measure.sh 共用（jget.sh 有键位说明）。
+. "$(cd "$(dirname "$0")" && pwd)/jget.sh"
 
 # 正弦测试信号：220 Hz、48 kHz、双声道、16 s。每次重新生成，
 # 不复用产物目录中的同名旧文件。
