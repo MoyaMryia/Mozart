@@ -61,6 +61,9 @@ enum {
 
     MOZART_CTL_TTS_HELLO      = 0x0501,
     MOZART_CTL_TTS_GET_STATUS = 0x0502,
+    // 任务面（tts-jobs.sock，自有协议复用本信封）：
+    MOZART_CTL_TTS_JOB_SUBMIT = 0x0510,  // 桥→TTS，体 {"text","utterance_id","voice_params"?}
+    MOZART_CTL_TTS_JOB_REPLY  = 0x0511,  // TTS→桥，体 {"status","utterance_id","reason"?}
 
     MOZART_CTL_BRIDGE_HELLO         = 0x0601,
     MOZART_CTL_BRIDGE_GET_STATUS    = 0x0602,

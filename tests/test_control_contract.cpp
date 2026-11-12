@@ -15,6 +15,8 @@ static_assert(MOZART_CTL_ASR_HELLO == 0x0401);
 static_assert(MOZART_CTL_ASR_GET_STATUS == 0x0402);
 static_assert(MOZART_CTL_TTS_HELLO == 0x0501);
 static_assert(MOZART_CTL_TTS_GET_STATUS == 0x0502);
+static_assert(MOZART_CTL_TTS_JOB_SUBMIT == 0x0510);
+static_assert(MOZART_CTL_TTS_JOB_REPLY == 0x0511);
 static_assert(MOZART_CTL_BRIDGE_HELLO == 0x0601);
 static_assert(MOZART_CTL_BRIDGE_GET_STATUS == 0x0602);
 static_assert(MOZART_CTL_BRIDGE_TRANSLATE_SET == 0x0603);

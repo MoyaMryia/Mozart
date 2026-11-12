@@ -244,8 +244,14 @@ pub struct TtsStatus {
     pub state: String,
     pub synthesized: u64,
     pub failed: u64,
+    /// 队满拒收（受理 skipped）累计。
+    pub skipped: u64,
     pub queue_depth: u32,
     pub model_loaded: bool,
+    /// 输出帧发送尝试累计（含丢弃）。
+    pub frames_out: u64,
+    /// 输出帧丢弃累计（无接收方或缓冲满）。
+    pub output_dropped: u64,
     pub last_error: Option<String>,
     pub version: String,
 }
@@ -256,8 +262,11 @@ impl Default for TtsStatus {
             state: "idle".to_string(),
             synthesized: 0,
             failed: 0,
+            skipped: 0,
             queue_depth: 0,
             model_loaded: false,
+            frames_out: 0,
+            output_dropped: 0,
             last_error: None,
             version: String::new(),
         }
@@ -381,8 +390,11 @@ mod tests {
             "state",
             "synthesized",
             "failed",
+            "skipped",
             "queue_depth",
             "model_loaded",
+            "frames_out",
+            "output_dropped",
             "last_error",
             "version",
         ] {

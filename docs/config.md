@@ -93,6 +93,7 @@
 | reference_wav | path | 空 | — | S |
 | threads | int | 2 | ≥1 | S |
 | provider | string | cpu | 非空 | S |
+| queue_capacity | int | 8 | ≥1 | S |
 
 ### [bridge]
 
@@ -124,7 +125,7 @@
 
 - **RVC 会话参数**（f0_method / pitch_shift / index_rate / rms_mix_rate / protect）运行时生效经 `StopStream`→`StartStream` 带新参：实时在跑立刻用新参（短暂打断）；文件任务在跑则当前任务用旧参跑完、新参下一任务生效，不中途废弃。干净的块边界 `SetParams` 见 FUTURE。
 - **pre DSP 开关**经新增 `SetDsp` 命令运行时生效；denoise 运行中切换需处理 WOLA 滤波状态避免伪影。
-- **逻辑上限 vs 预分配环**：`[file].queue_capacity` 是入队时查的逻辑上限（未预分配）→ R；`[pre].capture_queue_frames` 与 asr/bridge 的 `*_capacity` 是预分配环/队列 → S。
+- **逻辑上限 vs 预分配环**：`[file].queue_capacity` 是入队时查的逻辑上限（未预分配）→ R；`[pre].capture_queue_frames` 与 asr/tts/bridge 的 `*_capacity` 是预分配环/队列 → S。
 - **位置键**（storage_dir、subtitles_path）归 S：运行中改位置会使已有文件/队列分裂，需重启统一。
 - **model_id** 是基线（S）；运行时换模型走控制命令，不经 `config set`。
 

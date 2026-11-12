@@ -213,6 +213,8 @@ pub struct TtsConfig {
     /// sherpa-onnx 推理线程数。
     pub threads: u32,
     pub provider: String,
+    /// 任务队列容量（jobs → synth，板端实测后定）。
+    pub queue_capacity: u32,
 }
 
 impl Default for TtsConfig {
@@ -225,6 +227,7 @@ impl Default for TtsConfig {
             reference_wav: PathBuf::new(),
             threads: 2,
             provider: "cpu".to_string(),
+            queue_capacity: 8,
         }
     }
 }
@@ -540,6 +543,11 @@ impl Config {
                 "tts.provider must not be empty".to_string(),
             ));
         }
+        if self.tts.queue_capacity == 0 {
+            return Err(ConfigError::Invalid(
+                "tts.queue_capacity must be at least 1".to_string(),
+            ));
+        }
         validate_socket_name(&self.bridge.socket, "bridge.socket")?;
         validate_socket_name(&self.bridge.llama_socket, "bridge.llama_socket")?;
         if self.bridge.translate_queue_capacity == 0 {
@@ -825,6 +833,7 @@ mod tests {
         assert_eq!(config.tts.reference_wav, PathBuf::new());
         assert_eq!(config.tts.threads, 2);
         assert_eq!(config.tts.provider, "cpu");
+        assert_eq!(config.tts.queue_capacity, 8);
 
         assert_eq!(
             config.bridge.subtitles_path,
@@ -867,6 +876,7 @@ mod tests {
             reference_wav = "/opt/mozart/voice.wav"
             threads = 3
             provider = "cuda"
+            queue_capacity = 4
             [bridge]
             subtitles_path = "/var/lib/mozart/subtitles.jsonl"
             translate_enabled = false
@@ -895,6 +905,7 @@ mod tests {
         assert_eq!(config.tts.reference_wav, PathBuf::from("/opt/mozart/voice.wav"));
         assert_eq!(config.tts.threads, 3);
         assert_eq!(config.tts.provider, "cuda");
+        assert_eq!(config.tts.queue_capacity, 4);
         assert_eq!(
             config.bridge.subtitles_path,
             PathBuf::from("/var/lib/mozart/subtitles.jsonl")
@@ -941,6 +952,7 @@ mod tests {
             "[tts]\noutput_socket = \"a/b\"\n",
             "[tts]\nthreads = 0\n",
             "[tts]\nprovider = \"\"\n",
+            "[tts]\nqueue_capacity = 0\n",
             "[bridge]\nsocket = \"a/b\"\n",
             "[bridge]\nllama_socket = \"a/b\"\n",
             "[bridge]\ntranslate_queue_capacity = 0\n",
@@ -958,7 +970,7 @@ mod tests {
         // 边界值合法：线程数与队列容量取最小 1。
         let edge: Config = toml::from_str(
             "[asr]\nthreads = 1\nring_capacity = 1\noutput_queue_capacity = 1\n\
-             [tts]\nthreads = 1\n[bridge]\ntranslate_queue_capacity = 1\nspeech_queue_capacity = 1\n",
+             [tts]\nthreads = 1\nqueue_capacity = 1\n[bridge]\ntranslate_queue_capacity = 1\nspeech_queue_capacity = 1\n",
         )
         .unwrap();
         assert!(edge.validate().is_ok());
