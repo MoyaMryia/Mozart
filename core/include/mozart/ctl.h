@@ -62,17 +62,18 @@ enum {
     MOZART_CTL_ASR_HELLO      = 0x0401,
     MOZART_CTL_ASR_GET_STATUS = 0x0402,
 
-    MOZART_CTL_TTS_HELLO      = 0x0501,
-    MOZART_CTL_TTS_GET_STATUS = 0x0502,
-    // 任务面（tts-jobs.sock，自有协议复用本信封）：
-    MOZART_CTL_TTS_JOB_SUBMIT = 0x0510,  // 桥→TTS，体 {"text","utterance_id","voice_params"?}
-    MOZART_CTL_TTS_JOB_REPLY  = 0x0511,  // TTS→桥，体 {"status","utterance_id","reason"?}
+    MOZART_CTL_BRIDGE_HELLO         = 0x0501,
+    MOZART_CTL_BRIDGE_GET_STATUS    = 0x0502,
+    MOZART_CTL_BRIDGE_TRANSLATE_SET = 0x0503,  // 体 {"enabled": bool}
+    MOZART_CTL_BRIDGE_SPEECH_SET    = 0x0504,  // 体 {"enabled": bool}
+    MOZART_CTL_BRIDGE_SPEECH_STOP   = 0x0505,  // 体 {}（空）
 
-    MOZART_CTL_BRIDGE_HELLO         = 0x0601,
-    MOZART_CTL_BRIDGE_GET_STATUS    = 0x0602,
-    MOZART_CTL_BRIDGE_TRANSLATE_SET = 0x0603,  // 体 {"enabled": bool}
-    MOZART_CTL_BRIDGE_SPEECH_SET    = 0x0604,  // 体 {"enabled": bool}
-    MOZART_CTL_BRIDGE_SPEECH_STOP   = 0x0605   // 体 {}（空）
+    MOZART_CTL_TTS_HELLO      = 0x0601,
+    MOZART_CTL_TTS_GET_STATUS = 0x0602,
+    // 任务面（tts-jobs.sock，自有协议复用本信封）：
+    MOZART_CTL_TTS_JOB_SUBMIT = 0x0610,  // 桥→TTS，体 {"text","utterance_id","voice_params"?}
+    MOZART_CTL_TTS_JOB_REPLY  = 0x0611,  // TTS→桥，体 {"status","utterance_id","reason"?}
+    MOZART_CTL_TTS_JOB_STOP   = 0x0612   // 桥→TTS，体 {}（空）；清队列并中止在途合成
 };
 
 // ---- 响应体 {"status","code","reason","data"} 的 code 值 -----------------------

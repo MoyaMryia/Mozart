@@ -46,21 +46,23 @@ pub const RVC_GET_STATUS: u16 = 0x0306;
 pub const ASR_HELLO: u16 = 0x0401;
 pub const ASR_GET_STATUS: u16 = 0x0402;
 
-pub const TTS_HELLO: u16 = 0x0501;
-pub const TTS_GET_STATUS: u16 = 0x0502;
-/// 任务面（tts-jobs.sock，桥连接）：体 {"text","utterance_id","voice_params"?}。
-pub const TTS_JOB_SUBMIT: u16 = 0x0510;
-/// 任务面受理应答：体 {"status","utterance_id","reason"?}，status 取 submitted/skipped/failed。
-pub const TTS_JOB_REPLY: u16 = 0x0511;
-
-pub const BRIDGE_HELLO: u16 = 0x0601;
-pub const BRIDGE_GET_STATUS: u16 = 0x0602;
+pub const BRIDGE_HELLO: u16 = 0x0501;
+pub const BRIDGE_GET_STATUS: u16 = 0x0502;
 /// 体：{"enabled": bool}。
-pub const BRIDGE_TRANSLATE_SET: u16 = 0x0603;
+pub const BRIDGE_TRANSLATE_SET: u16 = 0x0503;
 /// 体：{"enabled": bool}。
-pub const BRIDGE_SPEECH_SET: u16 = 0x0604;
+pub const BRIDGE_SPEECH_SET: u16 = 0x0504;
 /// 体：{}（空）。
-pub const BRIDGE_SPEECH_STOP: u16 = 0x0605;
+pub const BRIDGE_SPEECH_STOP: u16 = 0x0505;
+
+pub const TTS_HELLO: u16 = 0x0601;
+pub const TTS_GET_STATUS: u16 = 0x0602;
+/// 任务面（tts-jobs.sock，桥连接）：体 {"text","utterance_id","voice_params"?}。
+pub const TTS_JOB_SUBMIT: u16 = 0x0610;
+/// 任务面受理应答：体 {"status","utterance_id","reason"?}，status 取 submitted/skipped/failed。
+pub const TTS_JOB_REPLY: u16 = 0x0611;
+/// 任务面停止：体 {}（空）；TTS 清空任务队列并中止在途合成。
+pub const TTS_JOB_STOP: u16 = 0x0612;
 
 pub const CODE_OK: &str = "Ok";
 pub const CODE_INVALID_ARGUMENT: &str = "InvalidArgument";
@@ -550,15 +552,16 @@ mod tests {
         assert_eq!(DAEMON_SPEECH_STOP, 0x0108);
         assert_eq!(ASR_HELLO, 0x0401);
         assert_eq!(ASR_GET_STATUS, 0x0402);
-        assert_eq!(TTS_HELLO, 0x0501);
-        assert_eq!(TTS_GET_STATUS, 0x0502);
-        assert_eq!(TTS_JOB_SUBMIT, 0x0510);
-        assert_eq!(TTS_JOB_REPLY, 0x0511);
-        assert_eq!(BRIDGE_HELLO, 0x0601);
-        assert_eq!(BRIDGE_GET_STATUS, 0x0602);
-        assert_eq!(BRIDGE_TRANSLATE_SET, 0x0603);
-        assert_eq!(BRIDGE_SPEECH_SET, 0x0604);
-        assert_eq!(BRIDGE_SPEECH_STOP, 0x0605);
+        assert_eq!(BRIDGE_HELLO, 0x0501);
+        assert_eq!(BRIDGE_GET_STATUS, 0x0502);
+        assert_eq!(BRIDGE_TRANSLATE_SET, 0x0503);
+        assert_eq!(BRIDGE_SPEECH_SET, 0x0504);
+        assert_eq!(BRIDGE_SPEECH_STOP, 0x0505);
+        assert_eq!(TTS_HELLO, 0x0601);
+        assert_eq!(TTS_GET_STATUS, 0x0602);
+        assert_eq!(TTS_JOB_SUBMIT, 0x0610);
+        assert_eq!(TTS_JOB_REPLY, 0x0611);
+        assert_eq!(TTS_JOB_STOP, 0x0612);
     }
 
     #[test]

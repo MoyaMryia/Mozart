@@ -13,15 +13,16 @@ static_assert(MOZART_CTL_PRE_GET_STATUS == 0x0204);
 static_assert(MOZART_CTL_RVC_GET_STATUS == 0x0306);
 static_assert(MOZART_CTL_ASR_HELLO == 0x0401);
 static_assert(MOZART_CTL_ASR_GET_STATUS == 0x0402);
-static_assert(MOZART_CTL_TTS_HELLO == 0x0501);
-static_assert(MOZART_CTL_TTS_GET_STATUS == 0x0502);
-static_assert(MOZART_CTL_TTS_JOB_SUBMIT == 0x0510);
-static_assert(MOZART_CTL_TTS_JOB_REPLY == 0x0511);
-static_assert(MOZART_CTL_BRIDGE_HELLO == 0x0601);
-static_assert(MOZART_CTL_BRIDGE_GET_STATUS == 0x0602);
-static_assert(MOZART_CTL_BRIDGE_TRANSLATE_SET == 0x0603);
-static_assert(MOZART_CTL_BRIDGE_SPEECH_SET == 0x0604);
-static_assert(MOZART_CTL_BRIDGE_SPEECH_STOP == 0x0605);
+static_assert(MOZART_CTL_BRIDGE_HELLO == 0x0501);
+static_assert(MOZART_CTL_BRIDGE_GET_STATUS == 0x0502);
+static_assert(MOZART_CTL_BRIDGE_TRANSLATE_SET == 0x0503);
+static_assert(MOZART_CTL_BRIDGE_SPEECH_SET == 0x0504);
+static_assert(MOZART_CTL_BRIDGE_SPEECH_STOP == 0x0505);
+static_assert(MOZART_CTL_TTS_HELLO == 0x0601);
+static_assert(MOZART_CTL_TTS_GET_STATUS == 0x0602);
+static_assert(MOZART_CTL_TTS_JOB_SUBMIT == 0x0610);
+static_assert(MOZART_CTL_TTS_JOB_REPLY == 0x0611);
+static_assert(MOZART_CTL_TTS_JOB_STOP == 0x0612);
 
 int main() {
     const mozart_ctl_header_t header{
