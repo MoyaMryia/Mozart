@@ -25,6 +25,37 @@ fn route_from_code(code: u8) -> Route {
     }
 }
 
+/// 扬声器分时状态（SPEC-05 播报投递）：实时与播报共用扬声器，播报优先，
+/// 播报空窗 holdoff 后恢复实时。播放线程写、控制线程只读。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Speaker {
+    Realtime,
+    Broadcast,
+}
+
+fn speaker_code(speaker: Speaker) -> u8 {
+    match speaker {
+        Speaker::Realtime => 0,
+        Speaker::Broadcast => 1,
+    }
+}
+
+fn speaker_from_code(code: u8) -> Speaker {
+    match code {
+        0 => Speaker::Realtime,
+        1 => Speaker::Broadcast,
+        // 写入只经 speaker_code，编码封闭。
+        _ => unreachable!("speaker encoding is closed over 0..=1"),
+    }
+}
+
+fn speaker_name(speaker: Speaker) -> &'static str {
+    match speaker {
+        Speaker::Realtime => "realtime",
+        Speaker::Broadcast => "broadcast",
+    }
+}
+
 /// 状态快照需要的队列读数；控制线程组装 status 时传入。
 pub struct QueueReadout {
     /// 采集 → DSP 环深度（帧）。
@@ -48,6 +79,10 @@ pub struct Shared {
     ai_recv_dropped: AtomicU64,
     /// direct 路由期间丢弃的 rvc 输出帧（旧 skipped_replies），播放线程累加。
     ai_skipped: AtomicU64,
+    /// 扬声器分时状态，播放线程在帧边界写、控制线程只读。
+    speaker_state: AtomicU8,
+    /// 播报帧播放累计，播放线程累加。
+    tts_frames_played: AtomicU64,
     last_error: Mutex<Option<String>>,
     capture_device: String,
     playback_device: String,
@@ -64,6 +99,8 @@ impl Shared {
             asr_send_dropped: AtomicU64::new(0),
             ai_recv_dropped: AtomicU64::new(0),
             ai_skipped: AtomicU64::new(0),
+            speaker_state: AtomicU8::new(speaker_code(Speaker::Realtime)),
+            tts_frames_played: AtomicU64::new(0),
             last_error: Mutex::new(None),
             capture_device,
             playback_device,
@@ -115,6 +152,21 @@ impl Shared {
         self.ai_skipped.fetch_add(frames, Ordering::Relaxed);
     }
 
+    /// 扬声器分时状态；播放线程在帧边界写，控制线程只读。
+    pub fn speaker_state(&self) -> Speaker {
+        speaker_from_code(self.speaker_state.load(Ordering::Relaxed))
+    }
+
+    pub fn set_speaker_state(&self, speaker: Speaker) {
+        self.speaker_state
+            .store(speaker_code(speaker), Ordering::Relaxed);
+    }
+
+    /// 播报帧播放计数（播放线程调用）。
+    pub fn add_tts_frames_played(&self, frames: u64) {
+        self.tts_frames_played.fetch_add(frames, Ordering::Relaxed);
+    }
+
     /// 记录最近降级原因（AGENTS：降级可经状态接口查询）。
     /// 只在降级路径调用：错误分支允许分配，稳态热路径不触碰。
     pub fn set_last_error(&self, message: &str) {
@@ -158,6 +210,8 @@ impl Shared {
             frames_dropped: queue.dropped,
             queue_depth: queue.depth,
             consumer_drops,
+            speaker_state: speaker_name(self.speaker_state()).to_string(),
+            tts_frames_played: self.tts_frames_played.load(Ordering::Relaxed),
             last_error: self
                 .last_error
                 .lock()
@@ -177,6 +231,29 @@ mod tests {
         for route in [Route::Direct, Route::Rvc] {
             assert_eq!(route_from_code(route_code(route)), route);
         }
+    }
+
+    #[test]
+    fn speaker_code_roundtrip_is_closed() {
+        for speaker in [Speaker::Realtime, Speaker::Broadcast] {
+            assert_eq!(speaker_from_code(speaker_code(speaker)), speaker);
+        }
+    }
+
+    #[test]
+    fn status_reports_speaker_state_and_tts_frames() {
+        let shared = Shared::new("cap".to_string(), "play".to_string());
+        // 默认实时、零播报帧。
+        let status = shared.status(QueueReadout { depth: 0, dropped: 0, rvc_dropped: 0 });
+        assert_eq!(status.speaker_state, "realtime");
+        assert_eq!(status.tts_frames_played, 0);
+
+        shared.set_speaker_state(Speaker::Broadcast);
+        shared.add_tts_frames_played(5);
+        let status = shared.status(QueueReadout { depth: 0, dropped: 0, rvc_dropped: 0 });
+        assert_eq!(status.speaker_state, "broadcast");
+        assert_eq!(status.tts_frames_played, 5);
+        assert_eq!(shared.speaker_state(), Speaker::Broadcast);
     }
 
     #[test]

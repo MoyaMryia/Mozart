@@ -1,5 +1,5 @@
 //! 数据面接线：16 kHz InputFrame 恒定发送（rvc AI 支路 + asr 识别支路）与
-//! OutputFrame 接收（rvc AI 支路）。
+//! OutputFrame 接收（rvc AI 支路 + tts 播报支路）。
 //! 发送侧惰性建链：pre 启动不依赖对端生命周期；对端未绑定 socket 时发送
 //! 丢弃计数（旧 main.c L840-842「发送失败只计数继续」），对端就绪后下一帧
 //! 自动接通。接收侧小缓冲只吸收送达抖动，满丢最旧计数（SPEC-03：大缓冲与
@@ -17,6 +17,10 @@ use std::time::Duration;
 
 /// AI 接收环容量：SPEC-02「接收缓冲限制在 4–8 帧」取上沿。
 pub const RVC_QUEUE_FRAMES: usize = 8;
+
+/// TTS 播报接收环容量（SPEC-02 数据面 4–8 帧取上沿）：吸收送达抖动，
+/// 满丢最旧计数；播放线程播报优先消费。
+pub const TTS_QUEUE_FRAMES: usize = 8;
 
 /// 输入支路发送缓冲帧数（SPEC-02 数据面 4–8 帧取上沿）：rvc 与 asr 共用。
 const SEND_BUFFER_FRAMES: usize = 8;
@@ -130,14 +134,16 @@ impl AsrSender {
     }
 }
 
-/// 接收线程主体：绑定好的 output_socket → AI 接收环。
-/// 路由相关丢弃（direct 期排空计数）由播放线程消费时决定，本线程只搬运。
+/// 接收线程共享主体：绑定好的 output_socket → 接收环。
+/// 路由/播报相关丢弃由播放线程消费时决定，本线程只搬运。
 /// 返回 Err 表示致命 socket 错误；主线程据此退出进程。
-pub fn recv_loop(
+fn recv_loop_inner(
     socket: FrameSocket<OutputFrame>,
     ring: Arc<Ring<OutputFrame>>,
     shared: Arc<Shared>,
     stop: &'static AtomicBool,
+    label: &str,
+    publish_recv_dropped: fn(&Shared, u64),
 ) -> Result<(), String> {
     loop {
         if stop.load(Ordering::Relaxed) {
@@ -146,11 +152,39 @@ pub fn recv_loop(
         match socket.recv(Some(RECV_POLL)) {
             Ok(frame) => ring.push(frame),
             Err(err) if err.kind() == io::ErrorKind::TimedOut => {}
-            Err(err) => return Err(format!("rvc output socket: {err}")),
+            Err(err) => return Err(format!("{label}: {err}")),
         }
         // 坏包丢弃计数发布（绝对值）；接收环满丢弃由控制线程直接读环。
-        shared.set_ai_recv_dropped(socket.stats().recv_dropped);
+        publish_recv_dropped(&shared, socket.stats().recv_dropped);
     }
+}
+
+/// rvc AI 支路接收线程：output_socket → AI 接收环，坏包丢弃计入 ai_recv_dropped。
+pub fn recv_loop(
+    socket: FrameSocket<OutputFrame>,
+    ring: Arc<Ring<OutputFrame>>,
+    shared: Arc<Shared>,
+    stop: &'static AtomicBool,
+) -> Result<(), String> {
+    recv_loop_inner(
+        socket,
+        ring,
+        shared,
+        stop,
+        "rvc output socket",
+        Shared::set_ai_recv_dropped,
+    )
+}
+
+/// tts 播报支路接收线程：tts-out.sock → 播报接收环。坏包丢弃 v1 不上报状态
+/// （FrameSocket 内部仍计数）；接收环满丢最旧由播放线程消费时自然体现。
+pub fn tts_recv_loop(
+    socket: FrameSocket<OutputFrame>,
+    ring: Arc<Ring<OutputFrame>>,
+    shared: Arc<Shared>,
+    stop: &'static AtomicBool,
+) -> Result<(), String> {
+    recv_loop_inner(socket, ring, shared, stop, "tts output socket", |_, _| {})
 }
 
 #[cfg(test)]
@@ -319,6 +353,43 @@ mod tests {
         let got = ring.pop(Some(Duration::from_secs(1))).unwrap();
         let FrameMeta { frame_idx, .. } = got.meta;
         assert_eq!(frame_idx, 7, "接收线程必须把输出帧推入 AI 环");
+
+        stop.store(true, Ordering::Relaxed);
+        worker.join().unwrap().unwrap();
+        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_dir(&dir);
+    }
+
+    #[test]
+    fn tts_recv_loop_pushes_frames_and_stops_on_flag() {
+        let dir = socket_dir("tts-recv");
+        let path = dir.join("tts-out.sock");
+        let rx = FrameSocket::<OutputFrame>::bind(&path, TTS_QUEUE_FRAMES).unwrap();
+        let tx = FrameSocket::<OutputFrame>::connect(&path, TTS_QUEUE_FRAMES).unwrap();
+        let ring = Arc::new(Ring::<OutputFrame>::new(TTS_QUEUE_FRAMES));
+        let shared = Arc::new(Shared::new("cap".to_string(), "play".to_string()));
+        let stop: &'static AtomicBool = Box::leak(Box::new(AtomicBool::new(false)));
+        let worker = {
+            let ring = ring.clone();
+            let shared = shared.clone();
+            std::thread::spawn(move || tts_recv_loop(rx, ring, shared, stop))
+        };
+
+        let frame = OutputFrame {
+            meta: FrameMeta {
+                pts_ns: 42,
+                frame_idx: 7,
+                vad_flag: 1,
+                energy_db: 0,
+                conf: 0,
+                segment_id: 0,
+            },
+            pcm: [0.5; mozart_core::OUTPUT_SAMPLES],
+        };
+        tx.send(&frame).unwrap();
+        let got = ring.pop(Some(Duration::from_secs(1))).unwrap();
+        let FrameMeta { frame_idx, .. } = got.meta;
+        assert_eq!(frame_idx, 7, "接收线程必须把播报帧推入播报环");
 
         stop.store(true, Ordering::Relaxed);
         worker.join().unwrap().unwrap();

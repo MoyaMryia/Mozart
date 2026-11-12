@@ -487,9 +487,10 @@ fn print_status(status: &Status) {
     }
     if let Some(pre) = &status.pre {
         println!(
-            "pre      route={} mute={} frames={}/{}/{} queue={}",
+            "pre      route={} mute={} speaker={} frames={}/{}/{} queue={}",
             route_name(pre.route),
             on_off(pre.mute),
+            pre.speaker_state,
             pre.frames_captured,
             pre.frames_played,
             pre.frames_dropped,

@@ -69,6 +69,8 @@ fn handle(msg: &Message, state: &mut State) -> Vec<u8> {
             "frames_dropped": 0,
             "queue_depth": 0,
             "consumer_drops": {},
+            "speaker_state": "realtime",
+            "tts_frames_played": 0,
             "last_error": null,
             "version": "0.1.0"
         })),

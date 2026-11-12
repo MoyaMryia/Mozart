@@ -136,8 +136,19 @@ pub struct PreStatus {
     pub frames_dropped: u64,
     pub queue_depth: u64,
     pub consumer_drops: std::collections::BTreeMap<String, u64>,
+    /// 扬声器分时状态："realtime" | "broadcast"（SPEC-05 播报投递：播报时
+    /// 静音实时，播完恢复）。旧快照缺此字段按 realtime 还原。
+    #[serde(default = "default_speaker_state")]
+    pub speaker_state: String,
+    /// 播报帧播放累计。旧快照缺此字段按 0 还原。
+    #[serde(default)]
+    pub tts_frames_played: u64,
     pub last_error: Option<String>,
     pub version: String,
+}
+
+fn default_speaker_state() -> String {
+    "realtime".to_string()
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -522,6 +533,39 @@ mod tests {
         assert!(back.asr.is_some());
         assert!(back.tts.is_some());
         assert!(back.bridge.is_some());
+    }
+
+    #[test]
+    fn pre_status_speaker_fields_default_for_old_snapshots() {
+        // 旧 pre 快照不含分时字段：按 realtime / 0 还原，daemon 轮询不报错。
+        let old = json!({
+            "state": "running",
+            "route": "direct",
+            "mute": false,
+            "capture_device": "cap",
+            "playback_device": "play",
+            "frames_captured": 1,
+            "frames_played": 2,
+            "frames_dropped": 3,
+            "queue_depth": 4,
+            "consumer_drops": {"rvc": 0, "rvc.skipped": 0, "asr": 0},
+            "last_error": null,
+            "version": "0.1.0"
+        });
+        let status: PreStatus = serde_json::from_value(old).unwrap();
+        assert_eq!(status.speaker_state, "realtime");
+        assert_eq!(status.tts_frames_played, 0);
+
+        // 新快照往返稳定。
+        let mut populated = status;
+        populated.speaker_state = "broadcast".to_string();
+        populated.tts_frames_played = 7;
+        let json = serde_json::to_value(&populated).unwrap();
+        assert_eq!(json["speaker_state"], "broadcast");
+        assert_eq!(json["tts_frames_played"], 7);
+        let back: PreStatus = serde_json::from_value(json).unwrap();
+        assert_eq!(back.speaker_state, "broadcast");
+        assert_eq!(back.tts_frames_played, 7);
     }
 
     #[test]

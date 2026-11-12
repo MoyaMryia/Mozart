@@ -1,11 +1,12 @@
-//! mozart-pre：音频前端进程（SPEC-02）。
+//! mozart-pre：音频前端进程（SPEC-02 / SPEC-05）。
 //! 线程结构：采集（ALSA 攒块→环）→ 处理（DSP 全链：80 Hz 高通 + WOLA 谱降噪
 //! + gate/AGC/limiter → 主干环；主干同帧打包 16 kHz InputFrame 恒定发送到
-//! rvc input_socket）→ 播放（路由/静音状态机→淡变→ALSA 写；rvc 路由取
-//! AI 接收环，direct 路由排空计数）；接收线程独立收 rvc 输出帧入 AI 环；
+//! rvc 与 asr input_socket）→ 播放（扬声器分时：播报优先，空窗 holdoff 恢复
+//! 实时；实时按路由/静音状态机→淡变→ALSA 写，rvc 路由取 AI 接收环，direct
+//! 路由排空计数）；接收线程独立收 rvc 输出帧入 AI 环、TTS 播报帧入播报环；
 //! 控制线程独立服务 SEQPACKET。
 //! 发送恒定不停（旧 main.c L11「AI 路径永不停」）：路由只决定播放源，
-//! 不停发输入帧。发送侧惰性建链，pre 启动不依赖 rvc 生命周期。
+//! 不停发输入帧。发送侧惰性建链，pre 启动不依赖 rvc/asr 生命周期。
 //! 停止：SIGTERM/SIGINT 置停止标志，各线程在时限内退出；设备打开失败立即退出，
 //! daemon 按退避重启（SPEC-02：换设备不做在线命令，由重启代替）。
 
@@ -217,6 +218,7 @@ fn main() -> ExitCode {
     ));
     let trunk = Arc::new(Ring::<RawFrame>::new(TRUNK_QUEUE_FRAMES));
     let rvc_ring = Arc::new(Ring::<OutputFrame>::new(ai::RVC_QUEUE_FRAMES));
+    let tts_ring = Arc::new(Ring::<OutputFrame>::new(ai::TTS_QUEUE_FRAMES));
 
     let listener = match bind_control_socket(&args.socket) {
         Ok(listener) => listener,
@@ -251,6 +253,22 @@ fn main() -> ExitCode {
     // 识别支路输入侧：连接 asr input_socket，与 rvc 同帧恒发；asr 未起时
     // 发送丢弃计数，不阻塞 pre（SPEC-05）。
     let asr_sender = ai::AsrSender::new(config.asr_input_socket());
+
+    // 播报支路输出侧：pre 绑定 tts_output_socket 收 TTS 播报帧（SPEC-05 方向
+    // 约定：pre 绑定、TTS 连接）。绑定失败立即退出：部署路径属配置错误。
+    let tts_out_socket = match FrameSocket::<OutputFrame>::bind(
+        &config.tts_output_socket(),
+        ai::TTS_QUEUE_FRAMES,
+    ) {
+        Ok(socket) => socket,
+        Err(err) => {
+            eprintln!(
+                "mozart-pre: bind {}: {err}",
+                config.tts_output_socket().display()
+            );
+            return ExitCode::FAILURE;
+        }
+    };
 
     // 设备先就绪，后拉线程（新实现次序：采集设备先于播放；旧实现 main.c
     // 播放设备先就绪，本实现两设备在拉线程前同步打开，次序差异无行为影响）。
@@ -319,13 +337,26 @@ fn main() -> ExitCode {
             Err(err) => return spawn_failure("rvc-recv", err),
         }
     };
+    let tts_recv_handle = {
+        let shared = shared.clone();
+        let ring = tts_ring.clone();
+        match spawn_thread("mozart-tts-recv", move || {
+            stop_on_fatal(
+                &STOP,
+                guard_panic(move || ai::tts_recv_loop(tts_out_socket, ring, shared, &STOP)),
+            )
+        }) {
+            Ok(handle) => handle,
+            Err(err) => return spawn_failure("tts-recv", err),
+        }
+    };
     let playback_handle = {
         let shared = shared.clone();
         match spawn_thread("mozart-playback", move || {
             stop_on_fatal(
                 &STOP,
                 guard_panic(move || {
-                    playback::run(playback_pcm, trunk, rvc_ring, shared, &STOP)
+                    playback::run(playback_pcm, trunk, rvc_ring, tts_ring, shared, &STOP)
                 }),
             )
         }) {
@@ -349,6 +380,7 @@ fn main() -> ExitCode {
         ("capture", capture_handle),
         ("process", process_handle),
         ("rvc-recv", rvc_recv_handle),
+        ("tts-recv", tts_recv_handle),
         ("playback", playback_handle),
         ("control", control_handle),
     ]);
