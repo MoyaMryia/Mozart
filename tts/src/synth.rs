@@ -17,6 +17,52 @@ use std::time::Duration;
 /// 队列轮询步长：让停止标志在百毫秒级生效（daemon 宽限 2 s）。
 const QUEUE_POLL: Duration = Duration::from_millis(100);
 
+/// 每句时长上限（沿用旧 speech_service.py:520，中文按字符）：
+/// min(45, max(4, 字符数 × 0.35 + 2)) 秒。超限拒绝计 failed。
+const DURATION_CAP_MAX_S: f64 = 45.0;
+const DURATION_CAP_MIN_S: f64 = 4.0;
+const DURATION_PER_CHAR_S: f64 = 0.35;
+const DURATION_BASE_S: f64 = 2.0;
+/// 引擎幅度安全上限（沿用旧 clone_worker.py:201-203）：peak > 4 拒绝。
+const PEAK_LIMIT: f32 = 4.0;
+/// 归一化目标峰值（沿用旧 clone_worker.py:204）：gain = min(1, 0.98 / peak)。
+const TARGET_PEAK: f32 = 0.98;
+
+/// 每句时长上限（秒）：按文本字符数估算，夹在 [4, 45]。
+pub fn duration_cap_s(text_chars: usize) -> f64 {
+    (text_chars as f64 * DURATION_PER_CHAR_S + DURATION_BASE_S)
+        .clamp(DURATION_CAP_MIN_S, DURATION_CAP_MAX_S)
+}
+
+/// 合成结果安全校验与归一化（沿用旧 clone_worker.py:195-211）：
+/// 空样本、非有限样本（NaN/Inf）、时长超限、peak > 4 一律拒绝（计 failed）；
+/// 否则按 gain = min(1, 0.98 / peak) 原地归一化（peak 为 0 时增益 1）。
+fn sanitize(pcm: &mut [f32], sample_rate: u32, cap_s: f64) -> Result<(), String> {
+    if pcm.is_empty() {
+        return Err("引擎返回空音频".to_string());
+    }
+    if !pcm.iter().all(|v| v.is_finite()) {
+        return Err("引擎返回非有限音频（NaN/Inf）".to_string());
+    }
+    let duration = pcm.len() as f64 / sample_rate as f64;
+    if duration > cap_s {
+        return Err(format!("合成语音时长 {duration:.1}s 超上限 {cap_s:.1}s，拒绝"));
+    }
+    let peak = pcm.iter().fold(0.0f32, |m, v| m.max(v.abs()));
+    if peak > PEAK_LIMIT {
+        return Err(format!("引擎幅度峰值 {peak:.2} 超安全范围 {PEAK_LIMIT}，拒绝"));
+    }
+    let gain = if peak > 0.0 {
+        (TARGET_PEAK / peak).min(1.0)
+    } else {
+        1.0
+    };
+    for v in pcm.iter_mut() {
+        *v *= gain;
+    }
+    Ok(())
+}
+
 /// 句尾闭引号/括号：标点归一化时允许终标点出现在它们之前（沿用旧实现）。
 const CLOSERS: [char; 5] = ['"', '\'', '”', '’', ')'];
 
@@ -199,9 +245,11 @@ pub fn run_with(
         let abort = shared.abort(stop);
         shared.set_synthesizing(true);
         let text = precondition(&job.text);
+        let cap_s = duration_cap_s(job.text.chars().count());
         let result = engine
             .synthesize(&text, ref_samples, ref_rate, &abort)
-            .and_then(|samples| to_48k(samples, engine.sample_rate()));
+            .and_then(|samples| to_48k(samples, engine.sample_rate()))
+            .and_then(|mut pcm| sanitize(&mut pcm, OUTPUT_SAMPLE_RATE, cap_s).map(|()| pcm));
         if abort.aborted() {
             // TTS_JOB_STOP 或 SIGTERM 在途到达：取消本句，不投递、不计失败。
             shared.add_stopped(1);
@@ -254,6 +302,57 @@ mod tests {
         for (input, expected) in cases {
             assert_eq!(precondition(input), expected, "输入 {input:?}");
         }
+    }
+
+    #[test]
+    fn duration_cap_clamps_to_bounds() {
+        assert_eq!(duration_cap_s(0), 4.0); // max(4, 2)
+        assert_eq!(duration_cap_s(10), 5.5); // 3.5 + 2
+        assert_eq!(duration_cap_s(100), 37.0); // 35 + 2
+        assert_eq!(duration_cap_s(200), 45.0); // 72 → 夹到 45
+    }
+
+    #[test]
+    fn sanitize_rejects_empty_and_non_finite() {
+        assert!(sanitize(&mut [], 48000, 45.0).is_err());
+        assert!(sanitize(&mut [f32::NAN], 48000, 45.0).is_err());
+        assert!(sanitize(&mut [f32::INFINITY], 48000, 45.0).is_err());
+        assert!(sanitize(&mut [0.1, f32::NEG_INFINITY], 48000, 45.0).is_err());
+    }
+
+    #[test]
+    fn sanitize_rejects_over_duration_cap() {
+        // 5 s @ 1 kHz，上限 4 s。
+        let mut pcm = vec![0.1f32; 5000];
+        let err = sanitize(&mut pcm, 1000, 4.0).unwrap_err();
+        assert!(err.contains("超上限"), "{err}");
+    }
+
+    #[test]
+    fn sanitize_rejects_peak_over_limit() {
+        let mut pcm = [0.5f32, 4.5];
+        let err = sanitize(&mut pcm, 48000, 45.0).unwrap_err();
+        assert!(err.contains("超安全范围"), "{err}");
+    }
+
+    #[test]
+    fn sanitize_normalizes_peak_to_target() {
+        let mut pcm = [2.0f32, -2.0, 1.0];
+        sanitize(&mut pcm, 48000, 45.0).unwrap();
+        // gain = 0.98 / 2 = 0.49。
+        assert!((pcm[0] - 0.98).abs() < 1e-6);
+        assert!((pcm[1] + 0.98).abs() < 1e-6);
+        assert!((pcm[2] - 0.49).abs() < 1e-6);
+    }
+
+    #[test]
+    fn sanitize_keeps_quiet_audio_unchanged() {
+        let mut pcm = [0.5f32, -0.25];
+        sanitize(&mut pcm, 48000, 45.0).unwrap();
+        assert_eq!(pcm, [0.5, -0.25], "peak < 0.98 不放大");
+        let mut silent = [0.0f32; 4];
+        sanitize(&mut silent, 48000, 45.0).unwrap();
+        assert_eq!(silent, [0.0; 4], "peak 为 0 增益 1");
     }
 
     /// 构造最小 WAV 字节（fmt + data）。
@@ -423,6 +522,42 @@ mod tests {
         let status = shared.status();
         assert_eq!(status.synthesized, 1);
         assert_eq!(status.frames_out, 1);
+        cleanup(&path);
+    }
+
+    #[test]
+    fn worker_rejects_non_finite_audio() {
+        let (path, mut writer, shared, _rx) = writer_fixture("nan");
+        let (tx, rx) = mpsc::sync_channel(4);
+        let stop = AtomicBool::new(false);
+        let engine = FakeEngine { rate: TTS_NATIVE_SAMPLE_RATE, outcome: Ok(vec![f32::NAN; 2400]), hook: None };
+        tx.send(job("a:1")).unwrap();
+        shared.queue_push();
+        drop(tx);
+        run_with(rx, &engine, None, &mut writer, &shared, &stop);
+        let status = shared.status();
+        assert_eq!(status.failed, 1);
+        assert_eq!(status.synthesized, 0);
+        assert_eq!(status.frames_out, 0);
+        assert!(status.last_error.unwrap().contains("非有限"));
+        cleanup(&path);
+    }
+
+    #[test]
+    fn worker_rejects_over_duration_cap() {
+        // 文本 1 字符 → 上限 4 s；引擎返回 5 s @ 24 kHz（重采样后仍 5 s）。
+        let (path, mut writer, shared, _rx) = writer_fixture("long");
+        let (tx, rx) = mpsc::sync_channel(4);
+        let stop = AtomicBool::new(false);
+        let engine = FakeEngine { rate: TTS_NATIVE_SAMPLE_RATE, outcome: Ok(vec![0.1; 120000]), hook: None };
+        tx.send(Job { text: "x".to_string(), utterance_id: "a:1".to_string() }).unwrap();
+        shared.queue_push();
+        drop(tx);
+        run_with(rx, &engine, None, &mut writer, &shared, &stop);
+        let status = shared.status();
+        assert_eq!(status.failed, 1);
+        assert_eq!(status.frames_out, 0);
+        assert!(status.last_error.unwrap().contains("超上限"));
         cleanup(&path);
     }
 
