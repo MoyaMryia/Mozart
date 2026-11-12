@@ -3,19 +3,14 @@
 
 use crate::state::{Shared, VERSION};
 use mozart_core::ctl::schema::{error_body, ok_body};
-use mozart_core::ctl::{self, Message, Seqpacket};
+use mozart_core::ctl::{self, Message, Seqpacket, IDLE_TIMEOUT};
+// 任务面（jobs.rs）复用同一 accept/recv 节拍。
+pub(crate) use mozart_core::ctl::{ACCEPT_POLL, RECV_POLL};
 use serde_json::json;
 use std::io;
 use std::sync::atomic::{AtomicBool, Ordering::Relaxed};
 use std::sync::Arc;
 use std::time::Duration;
-
-/// 控制连接空闲断开，对齐 daemon 侧同一纪律（SPEC-04）。
-const IDLE_TIMEOUT: Duration = Duration::from_secs(30);
-/// recv 轮询步长：让停止标志在秒级内生效，再按累计空闲判断断开。
-pub(crate) const RECV_POLL: Duration = Duration::from_secs(1);
-/// accept 轮询间隔：无连接时周期检查停止标志（任务面复用）。
-pub(crate) const ACCEPT_POLL: Duration = Duration::from_millis(100);
 
 /// 服务循环：绑定与监听由调用方完成；停止标志置位后返回。
 pub fn serve(listener: Seqpacket, shared: Arc<Shared>, stop: &'static AtomicBool) {

@@ -5,6 +5,7 @@ pub mod config;
 pub mod ctl;
 pub mod dgram;
 pub mod ring;
+pub mod thread;
 
 pub const RAW_SAMPLE_RATE: u32 = 48000;
 pub const INPUT_SAMPLE_RATE: u32 = 16000;

@@ -66,6 +66,13 @@ pub const TTS_JOB_REPLY: u16 = 0x0611;
 /// 任务面停止：体 {}（空）；TTS 清空任务队列并中止在途合成，应答体 {"stopped":true}。
 pub const TTS_JOB_STOP: u16 = 0x0612;
 
+/// 控制连接空闲断开，各进程控制面同一纪律（SPEC-04）。
+pub const IDLE_TIMEOUT: Duration = Duration::from_secs(30);
+/// recv 轮询步长：让停止标志在秒级内生效，再按累计空闲判断断开。
+pub const RECV_POLL: Duration = Duration::from_secs(1);
+/// accept 轮询间隔：无连接时周期检查停止标志，保证 SIGTERM 可退出。
+pub const ACCEPT_POLL: Duration = Duration::from_millis(100);
+
 pub const CODE_OK: &str = "Ok";
 pub const CODE_INVALID_ARGUMENT: &str = "InvalidArgument";
 pub const CODE_NOT_LOADED: &str = "NotLoaded";

@@ -21,12 +21,12 @@ mod state;
 
 use alsa::Direction;
 use mozart_core::config::Config;
-use mozart_core::ctl::Seqpacket;
 use mozart_core::dgram::FrameSocket;
 use mozart_core::ring::Ring;
+use mozart_core::thread::{bind_socket as bind_control_socket, guard_panic, spawn_thread};
 use mozart_core::{OutputFrame, RawFrame};
 use state::Shared;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::process::ExitCode;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
@@ -84,16 +84,6 @@ fn parse_args() -> Result<Args, String> {
     })
 }
 
-/// 控制面 socket 绑定：清理陈旧文件后绑定（进程重启无需外部清理）。
-fn bind_control_socket(path: &Path) -> Result<Seqpacket, String> {
-    match std::fs::remove_file(path) {
-        Ok(()) => {}
-        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
-        Err(err) => return Err(format!("remove stale socket {}: {err}", path.display())),
-    }
-    Seqpacket::bind(path).map_err(|err| format!("bind {}: {err}", path.display()))
-}
-
 /// 处理线程：采集环 → DSP 全链 → 主干环 + 16 kHz 打包恒定发送。
 /// DSP 在采集环之后、direct 分支之前——direct 取的 48 kHz 主干含 DSP，
 /// 与旧实现一致。发送不随路由停发（旧 main.c L11）；同一 InputFrame 恒发到
@@ -123,69 +113,21 @@ fn process_thread(
     Ok(())
 }
 
-/// 拉起具名线程；失败由调用方退出（先拉的线程随进程退出回收）。
-fn spawn_thread<F>(name: &str, body: F) -> std::io::Result<std::thread::JoinHandle<Result<(), String>>>
-where
-    F: FnOnce() -> Result<(), String> + Send + 'static,
-{
-    std::thread::Builder::new().name(name.to_string()).spawn(body)
-}
-
 /// 设备线程致命错误传播（审查修正点）：返回 Err 前先置停止标志。
 /// main 按固定顺序 join；只靠 main 在 join 结果里补置时，排在死亡线程
 /// 之前的健康线程（如 playback 先死时的 capture）不会退出，main 永远
 /// 阻塞在它的 join 上。设备线程必须自己传播停止，其余线程才能有序退出。
+/// 逻辑见 core::thread；停止标志经参数传入（设备线程绑定全局 STOP）。
 fn stop_on_fatal(stop: &AtomicBool, result: Result<(), String>) -> Result<(), String> {
-    if result.is_err() {
-        stop.store(true, Ordering::Relaxed);
-    }
-    result
-}
-
-/// 设备线程 panic 传播根治：catch_unwind 把 panic 转成 Err，与致命设备
-/// 错误走同一条传播链（stop_on_fatal 置停止标志，join 侧收到 Ok(Err)）。
-/// 不加这一层时，panic 线程的停止标志要等 main join 到它才补置，而 main
-/// 可能正阻塞在前面健康线程的 join 上，进程半死。闭包经 AssertUnwindSafe
-/// 包装：线程退出路径不需要 unwind 一致性保证，正常路径行为不变。
-fn guard_panic<F>(body: F) -> Result<(), String>
-where
-    F: FnOnce() -> Result<(), String>,
-{
-    match std::panic::catch_unwind(std::panic::AssertUnwindSafe(body)) {
-        Ok(result) => result,
-        Err(payload) => Err(payload
-            .downcast_ref::<&str>()
-            .map(|message| (*message).to_string())
-            .or_else(|| payload.downcast_ref::<String>().cloned())
-            .unwrap_or_else(|| "panicked".to_string())),
-    }
+    mozart_core::thread::stop_on_fatal(stop, result)
 }
 
 /// 依序回收线程。线程返回 Err（致命设备错误、无进展降级）或 panic 时
 /// 置停止标志，让其余线程在时限内退出，主线程得以收尾并失败退出；
-/// daemon 按退避重启（SPEC-02：换设备由重启代替）。
-/// 设备线程返回 Err 前已自置标志（stop_on_fatal）；panic 由 guard_panic
-/// 转成 Err 走同一条传播链，不再依赖 main join 到该线程才补置；
-/// 此处幂等补置兜底。
+/// daemon 按退避重启（SPEC-02：换设备由重启代替）。逻辑见 core::thread，
+/// 绑定本进程全局 STOP；设备线程返回 Err 前已自置标志，此处幂等补置兜底。
 fn join_threads(handles: Vec<(&'static str, JoinHandle<Result<(), String>>)>) -> Option<String> {
-    let mut failure = None;
-    for (name, handle) in handles {
-        match handle.join() {
-            Ok(Ok(())) => {}
-            Ok(Err(message)) => {
-                // 线程致命错误：同样置停止标志，否则其余线程永不退出，进程挂起。
-                STOP.store(true, Ordering::Relaxed);
-                failure = failure.or(Some(format!("{name}: {message}")));
-            }
-            Err(_) => {
-                // 线程 panic 兜底（guard_panic 之外的路径，如控制线程）：
-                // 置停止标志让其余线程退出后一并回收。
-                STOP.store(true, Ordering::Relaxed);
-                failure = failure.or(Some(format!("{name}: panicked")));
-            }
-        }
-    }
-    failure
+    mozart_core::thread::join_threads(&STOP, handles)
 }
 
 fn main() -> ExitCode {

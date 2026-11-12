@@ -15,9 +15,9 @@ mod synth;
 
 use clap::Parser;
 use mozart_core::config::Config;
-use mozart_core::ctl::Seqpacket;
+use mozart_core::thread::{bind_socket, guard_panic, spawn_thread};
 use state::Shared;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::process::ExitCode;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc;
@@ -51,63 +51,14 @@ struct Cli {
     config: Option<PathBuf>,
 }
 
-/// SEQPACKET 绑定：清理陈旧文件后绑定（进程重启无需外部清理）。
-fn bind_socket(path: &Path) -> Result<Seqpacket, String> {
-    match std::fs::remove_file(path) {
-        Ok(()) => {}
-        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
-        Err(err) => return Err(format!("清理陈旧 socket {}：{err}", path.display())),
-    }
-    Seqpacket::bind(path).map_err(|err| format!("绑定 {}：{err}", path.display()))
-}
-
-/// 线程致命错误传播：返回 Err 前置停止标志，其余线程据此有序退出。
+/// 线程致命错误传播：绑定本进程全局 STOP（逻辑见 core::thread）。
 fn stop_on_fatal(result: Result<(), String>) -> Result<(), String> {
-    if result.is_err() {
-        STOP.store(true, Ordering::Relaxed);
-    }
-    result
+    mozart_core::thread::stop_on_fatal(&STOP, result)
 }
 
-/// 把 panic 转成 Err，走与致命错误同一条传播链（避免半死进程）。
-fn guard_panic<F>(body: F) -> Result<(), String>
-where
-    F: FnOnce() -> Result<(), String>,
-{
-    match std::panic::catch_unwind(std::panic::AssertUnwindSafe(body)) {
-        Ok(result) => result,
-        Err(payload) => Err(payload
-            .downcast_ref::<&str>()
-            .map(|message| (*message).to_string())
-            .or_else(|| payload.downcast_ref::<String>().cloned())
-            .unwrap_or_else(|| "panicked".to_string())),
-    }
-}
-
-fn spawn_thread<F>(name: &str, body: F) -> std::io::Result<JoinHandle<Result<(), String>>>
-where
-    F: FnOnce() -> Result<(), String> + Send + 'static,
-{
-    std::thread::Builder::new().name(name.to_string()).spawn(body)
-}
-
-/// 依序回收线程；任一线程 Err/panic 置停止标志并记录首个失败。
+/// 依序回收线程：绑定本进程全局 STOP（逻辑见 core::thread）。
 fn join_threads(handles: Vec<(&'static str, JoinHandle<Result<(), String>>)>) -> Option<String> {
-    let mut failure = None;
-    for (name, handle) in handles {
-        match handle.join() {
-            Ok(Ok(())) => {}
-            Ok(Err(message)) => {
-                STOP.store(true, Ordering::Relaxed);
-                failure = failure.or(Some(format!("{name}: {message}")));
-            }
-            Err(_) => {
-                STOP.store(true, Ordering::Relaxed);
-                failure = failure.or(Some(format!("{name}: panicked")));
-            }
-        }
-    }
-    failure
+    mozart_core::thread::join_threads(&STOP, handles)
 }
 
 fn run(cli: Cli) -> Result<(), String> {
