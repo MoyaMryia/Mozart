@@ -4,6 +4,7 @@
 // 改动：裁掉 filter_radius——旧实现只保存、未参与计算，v1 不暴露死参数
 //（SPEC-03，推迟实现见 FUTURE.md）。
 
+#include <atomic>
 #include <vector>
 #include <memory>
 #include <cstdint>
@@ -47,6 +48,15 @@ public:
     );
     void reset_realtime();
 
+    // 文件批处理进度（SPEC-03）：已完成的 Generator 窗数，infer_window 每窗 +1，
+    // 整段一次过计 1。GetStatus 只读快照；批处理开始时清零。
+    uint64_t generator_window_count() const {
+        return generator_windows_.load(std::memory_order_relaxed);
+    }
+    void reset_generator_window_count() {
+        generator_windows_.store(0, std::memory_order_relaxed);
+    }
+
 private:
     std::shared_ptr<RVCModel> model_;
     std::shared_ptr<FeatureExtractor> feature_extractor_;
@@ -61,6 +71,7 @@ private:
     std::vector<int64_t> realtime_pitch_cache_;
     std::vector<float> realtime_pitchf_cache_;
     std::mt19937 realtime_random_{114514};
+    std::atomic<uint64_t> generator_windows_{0};
 
     std::vector<float> resample(
         const std::vector<float>& audio,

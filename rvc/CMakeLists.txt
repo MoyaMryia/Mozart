@@ -84,6 +84,7 @@ endif()
 # ---- 推理核心运行库（搬运自旧 rvc-backend 的最小集）+ 数据面 ----
 add_library(mozart_rvc_runtime STATIC
     src/rvc/audio_worker.cpp
+    src/rvc/file_worker.cpp
     src/rvc/streaming_pipeline.cpp
     src/rvc/trt_engine.cpp
     src/rvc/pipeline.cpp

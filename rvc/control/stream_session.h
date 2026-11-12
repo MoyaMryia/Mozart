@@ -1,17 +1,22 @@
-// stream_session.h — SPEC-03 控制面：六命令服务端
+// stream_session.h — SPEC-03 控制面：七命令服务端
 // ============================================================================
 // Unix SOCK_SEQPACKET + core/include/mozart/ctl.h 信封（16 B 头 + JSON 体），
 // 应答体 {"status","code","reason","data"} 与 core/src/ctl/schema.rs 一致。
 //
-// 六命令语义（SPEC-03 已确认条款）：
+// 七命令语义（SPEC-03 已确认条款）：
 //   Hello       版本握手；信封版本不兼容时拒绝并断链。
 //   LoadModel   持 ModelManager load_mutex 串行加载；返回 model_handle、
 //               capabilities 与 model_version；入口校验一次，内部信任。
+//   ListModels  模型目录清单 {id,exists,loaded}；只读、不加载、不阻塞推理
+//               线程；loaded 按当前模型 id 判定。
 //   StartStream 参数此时固定（kind/model_handle/pitch_shift/index_rate/
-//               rms_mix_rate/protect/f0_method）；已有活动流返回 Busy；
+//               rms_mix_rate/protect/f0_method）；kind=file 另需 total_frames
+//               （正整数 u32），可选 output_socket（绝对路径，覆盖默认输出
+//               socket）；realtime 忽略这两字段。已有活动流返回 Busy；
 //               未加载返回 NotLoaded；句柄过期返回 InvalidArgument；
 //               缺实时资产返回 Unsupported，不静默降级。
-//   StopStream  停收新帧，等当前推理块结束（约 240 ms）后返回；幂等。
+//   StopStream  停收新帧，等当前推理块结束（实时约 240 ms，文件停在下一个
+//               检查点）后返回；幂等。
 //   ResetStream 断续重置：清环、清淡化尾并恢复启动缓冲；无流时空操作。
 //   GetStatus   只读原子快照，字段名与 core/src/ctl/schema.rs::RvcStatus
 //               一致（daemon 的解析契约），不阻塞推理线程。
@@ -67,6 +72,20 @@ public:
 // Failed → InferenceFailed（引擎加载失败），Ok → 应答带句柄与能力。
 enum class LoadResult { Ok, NotFound, Failed };
 
+// ListModels 清单条目：id + exists（资产齐全可加载）；loaded 由 handler
+// 按当前模型 id 判定（单一口径，core/src/ctl/schema.rs::ModelEntry）。
+struct ModelListing {
+    std::string id;
+    bool exists = false;
+};
+
+// kind=file 批处理选项（计划 D1/D2）；realtime 忽略。
+// StartStream 入口校验一次，内部信任。
+struct FileBatchOptions {
+    uint32_t total_frames = 0;              // 攒帧总数，正整数
+    std::filesystem::path output_socket;    // 空 = 用配置默认输出 socket
+};
+
 // 推理后端 seam。错误用 reason 表达，不跨线程抛异常。
 class SessionBackend {
 public:
@@ -79,12 +98,16 @@ public:
     virtual std::string current_model_id() const = 0;
     virtual std::string model_version() const = 0;
     virtual std::vector<std::string> capabilities() const = 0;
+    // 模型目录清单；只读、不加载、不阻塞推理线程。
+    virtual std::vector<ModelListing> list_models() const = 0;
     // kind=realtime / kind=file 的能力探测（单一探测点，搬运管线提供）。
     virtual bool supports_realtime() const = 0;
     virtual bool supports_file() const = 0;
-    // 启动流 worker；失败时 reason 给出原因（数据面绑定失败等）。
+    // 启动流 worker：realtime → 帧泵，file → 整段批处理（file_options 生效）。
+    // 失败时 reason 给出原因（数据面绑定失败等）。
     virtual std::unique_ptr<StreamWorker> start_worker(
-        bool realtime, const RvcParameters& params, std::string& reason) = 0;
+        bool realtime, const RvcParameters& params,
+        const FileBatchOptions& file_options, std::string& reason) = 0;
 };
 
 class StreamSession {
@@ -138,7 +161,8 @@ struct InferenceBackendConfig {
     std::filesystem::path realtime_hubert_path;
     std::filesystem::path realtime_rmvpe_path;
     std::filesystem::path input_socket;           // rvc 绑定收输入帧
-    std::filesystem::path output_socket;          // connect 发输出帧（pre 绑定）
+    std::filesystem::path output_socket;          // connect 发输出帧（实时默认，pre 绑定；
+                                                  // file 可被 StartStream output_socket 覆盖）
     size_t queue_frames = 8;                      // 数据面内核缓冲帧数
 };
 
@@ -151,10 +175,12 @@ public:
     std::string current_model_id() const override;
     std::string model_version() const override;
     std::vector<std::string> capabilities() const override;
+    std::vector<ModelListing> list_models() const override;
     bool supports_realtime() const override;
     bool supports_file() const override;
     std::unique_ptr<StreamWorker> start_worker(
-        bool realtime, const RvcParameters& params, std::string& reason) override;
+        bool realtime, const RvcParameters& params,
+        const FileBatchOptions& file_options, std::string& reason) override;
 
     // 测试与诊断入口：当前模型目录是否存在（LoadModel 前置探测）。
     bool model_dir_exists(const std::string& model_id) const;

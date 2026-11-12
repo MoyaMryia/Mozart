@@ -1,8 +1,9 @@
-// stream_session.cpp — SPEC-03 六命令服务端实现（见头文件说明）
+// stream_session.cpp — SPEC-03 七命令服务端实现（见头文件说明）
 #include "control/stream_session.h"
 
 #include <chrono>
 #include <cmath>
+#include <limits>
 #include <optional>
 #include <utility>
 
@@ -13,6 +14,7 @@
 
 #include "mozart/ctl.h"
 #include "rvc/audio_worker.hpp"
+#include "rvc/file_worker.hpp"
 #include "transport/unix_dgram_stream.h"
 
 namespace rvc {
@@ -80,6 +82,18 @@ std::vector<uint8_t> StreamSession::handle(const CtlMessage& message) {
         }
         case MOZART_CTL_RVC_LOAD_MODEL:
             return handle_load_model(body);
+        case MOZART_CTL_RVC_LIST_MODELS: {
+            // 只读清单：不加载、不持会话锁、不阻塞推理线程；
+            // loaded 按当前模型 id 判定（SPEC-03）。
+            const std::string current = backend_->current_model_id();
+            nlohmann::json models = nlohmann::json::array();
+            for (const auto& entry : backend_->list_models()) {
+                models.push_back({{"id", entry.id},
+                                  {"exists", entry.exists},
+                                  {"loaded", entry.id == current}});
+            }
+            return ok_body({{"models", std::move(models)}});
+        }
         case MOZART_CTL_RVC_START_STREAM:
             return handle_start_stream(body);
         case MOZART_CTL_RVC_STOP_STREAM: {
@@ -184,6 +198,32 @@ std::vector<uint8_t> StreamSession::handle_start_stream(
         return error_body(MOZART_CTL_CODE_INVALID_ARGUMENT,
                           "kind must be realtime or file");
     }
+    // kind=file 批处理选项（D1/D2）：total_frames 必填正整数（u32 契约），
+    // output_socket 可选绝对路径；realtime 忽略这两字段。
+    FileBatchOptions file_options;
+    if (kind == "file") {
+        if (!body.contains("total_frames")
+            || !body.at("total_frames").is_number_unsigned()
+            || body.at("total_frames").get<uint64_t>() == 0
+            || body.at("total_frames").get<uint64_t>()
+                   > std::numeric_limits<uint32_t>::max()) {
+            return error_body(MOZART_CTL_CODE_INVALID_ARGUMENT,
+                              "total_frames must be a positive integer (u32)");
+        }
+        file_options.total_frames =
+            static_cast<uint32_t>(body.at("total_frames").get<uint64_t>());
+        if (body.contains("output_socket")) {
+            if (!body.at("output_socket").is_string()
+                || !std::filesystem::path(
+                        body.at("output_socket").get<std::string>())
+                        .is_absolute()) {
+                return error_body(MOZART_CTL_CODE_INVALID_ARGUMENT,
+                                  "output_socket must be an absolute path string");
+            }
+            file_options.output_socket =
+                body.at("output_socket").get<std::string>();
+        }
+    }
     RvcParameters parameters;
     parameters.f0_method = body.at("f0_method").get<std::string>();
     parameters.pitch_shift = body.at("pitch_shift").get<int>();
@@ -218,7 +258,8 @@ std::vector<uint8_t> StreamSession::handle_start_stream(
     }
 
     std::string reason;
-    auto worker = backend_->start_worker(realtime, parameters, reason);
+    auto worker = backend_->start_worker(realtime, parameters, file_options,
+                                         reason);
     if (!worker) {
         last_error_ = reason;
         return error_body(MOZART_CTL_CODE_INTERNAL, reason);
@@ -337,6 +378,45 @@ private:
     std::unique_ptr<AudioWorker> worker_;
 };
 
+// StreamWorker 文件实现：持有数据面流（阻塞发送）与 FileWorker。
+// 批处理发完线程自行退出，但流句柄保留到 StopStream（GetStatus 仍报
+// streaming，daemon 读完输出帧后停流）。
+class FileStreamWorker final : public StreamWorker {
+public:
+    FileStreamWorker(std::unique_ptr<UnixDgramStream> stream,
+                     std::unique_ptr<FileWorker> worker)
+        : stream_(std::move(stream)), worker_(std::move(worker)) {}
+
+    void stop() override {
+        // 次序照旧：置取消 + close stream（解除攒帧/发送阻塞）→ join worker。
+        worker_->stop();
+    }
+
+    void reset() override {
+        // ResetStream 是流式断续语义；整段批处理无环可清，空操作。
+    }
+
+    WorkerStats stats() override {
+        const FileWorker::Stats s = worker_->stats();
+        const DgramStreamStats transport = stream_->stats();
+        WorkerStats out;
+        out.frames_in = s.frames_in;
+        out.frames_out = s.frames_out;
+        out.frames_dropped = transport.recv_dropped + transport.send_dropped;
+        out.blocks = s.blocks;
+        out.inference_ms_last = s.inference_ms_last;
+        out.inference_ms_avg = s.inference_ms_avg;
+        out.inference_ms_p95 = s.inference_ms_p95;
+        out.queue_depth = 0;   // 整段批处理无输出环
+        out.last_error = s.last_error;
+        return out;
+    }
+
+private:
+    std::unique_ptr<UnixDgramStream> stream_;
+    std::unique_ptr<FileWorker> worker_;
+};
+
 } // namespace
 
 InferenceBackend::InferenceBackend(const InferenceBackendConfig& config)
@@ -402,28 +482,52 @@ std::vector<std::string> InferenceBackend::capabilities() const {
     return result;
 }
 
+std::vector<ModelListing> InferenceBackend::list_models() const {
+    // ModelManager 目录扫描（其内部锁只保护缓存表，不占推理线程）。
+    std::vector<ModelListing> result;
+    for (const auto& entry : models_->list_models()) {
+        result.push_back({entry.at("id"), entry.at("exists") == "true"});
+    }
+    return result;
+}
+
 bool InferenceBackend::supports_realtime() const {
     return pipeline_->supports_realtime_streaming();
 }
 
 bool InferenceBackend::supports_file() const {
-    // kind=file 需要离线 Generator；quality/full-history 还是滑窗由 AudioWorker
-    // 按管线能力决定（能力探测单一来源）。
+    // kind=file 需要离线 Generator；整段批处理由 FileWorker 走现有离线
+    // 推理路径（整段一次过或 2 s 滑窗由 inferencer 按引擎形状决定）。
     const auto model = models_->current_model();
     return model && model->loaded() && model->has_generator();
 }
 
 std::unique_ptr<StreamWorker> InferenceBackend::start_worker(
-    bool realtime, const RvcParameters& params, std::string& reason) {
+    bool realtime, const RvcParameters& params,
+    const FileBatchOptions& file_options, std::string& reason) {
     // 会话参数在启动时固定（SPEC-03）；先落参数再造推理器。
     pipeline_->set_parameters(params);
     try {
+        // D2：文件输出 socket 由 StartStream 覆盖（daemon 绑定独立输出
+        // socket）；实时用配置默认。C++ 对对端无感知，只连接给定路径。
+        const std::filesystem::path& output_socket =
+            (!realtime && !file_options.output_socket.empty())
+                ? file_options.output_socket
+                : config_.output_socket;
         auto stream = std::make_unique<UnixDgramStream>(
-            config_.input_socket, config_.output_socket, config_.queue_frames);
-        AudioWorker::Config worker_config;
-        worker_config.realtime_kind = realtime;
+            config_.input_socket, output_socket, config_.queue_frames,
+            /*blocking_send=*/!realtime);
+        if (!realtime) {
+            FileWorker::Config worker_config;
+            worker_config.total_frames = file_options.total_frames;
+            auto worker = std::make_unique<FileWorker>(*stream, *pipeline_,
+                                                       worker_config);
+            worker->start();
+            return std::make_unique<FileStreamWorker>(std::move(stream),
+                                                      std::move(worker));
+        }
         auto worker = std::make_unique<AudioWorker>(*stream, *pipeline_,
-                                                    worker_config);
+                                                    AudioWorker::Config{});
         worker->start();
         return std::make_unique<PumpStreamWorker>(std::move(stream),
                                                    std::move(worker));

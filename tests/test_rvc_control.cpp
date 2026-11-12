@@ -1,12 +1,15 @@
-// test_rvc_control.cpp — StreamSession 六命令语义单测（无 GPU 依赖）
+// test_rvc_control.cpp — StreamSession 七命令语义单测（无 GPU 依赖）
 // ============================================================================
 // 用桩后端（SessionBackend seam）覆盖控制面契约：
 //   1. Hello 版本报告与请求体校验
 //   2. LoadModel 三态：NotFound→InvalidArgument / Failed→InferenceFailed / 成功
-//   3. StartStream：NotLoaded / 参数边界 / 句柄校验 / Busy / 能力不足拒绝
-//   4. GetStatus：流式与停流后的原子快照字段（字段名 = RvcStatus 契约）
-//   5. StopStream 幂等、ResetStream 断续重置透传
-//   6. 线上往返：应答信封回显 type/request_id；版本不兼容拒绝并断链；
+//   3. StartStream：NotLoaded / 参数边界 / 句柄校验 / Busy / 能力不足拒绝；
+//      kind=file 的 total_frames / output_socket 入口校验（D1/D2）
+//   4. ListModels：清单字段与 loaded 按当前模型 id 判定；真实 ModelManager
+//      目录扫描（InferenceBackend，无 GPU）
+//   5. GetStatus：流式与停流后的原子快照字段（字段名 = RvcStatus 契约）
+//   6. StopStream 幂等、ResetStream 断续重置透传
+//   7. 线上往返：应答信封回显 type/request_id；版本不兼容拒绝并断链；
 //      坏帧断链；未知命令 UnknownCommand
 #include "control/stream_session.h"
 
@@ -16,6 +19,7 @@
 #include <cstring>
 #include <cstdio>
 #include <filesystem>
+#include <fstream>
 #include <memory>
 #include <string>
 #include <thread>
@@ -60,6 +64,7 @@ struct FakeBackend : SessionBackend {
     bool fail_start = false;
     std::atomic<int> stop_calls{0};
     std::atomic<int> reset_calls{0};
+    std::vector<ModelListing> listing{{"alpha", true}, {"beta", false}};
 
     LoadResult load_model(const std::string& model_id, std::string& reason) override {
         if (model_id == "missing") {
@@ -81,20 +86,24 @@ struct FakeBackend : SessionBackend {
         if (allow_file) caps.push_back("file");
         return caps;
     }
+    std::vector<ModelListing> list_models() const override { return listing; }
     bool supports_realtime() const override { return allow_realtime; }
     bool supports_file() const override { return allow_file; }
     std::unique_ptr<StreamWorker> start_worker(
-        bool realtime, const RvcParameters& params, std::string& reason) override {
+        bool realtime, const RvcParameters& params,
+        const FileBatchOptions& file_options, std::string& reason) override {
         if (fail_start) {
             reason = "bind failed";
             return nullptr;
         }
         last_params = params;
         last_realtime = realtime;
+        last_file_options = file_options;
         return std::make_unique<FakeWorker>(*this);
     }
     RvcParameters last_params{};
     bool last_realtime = false;
+    FileBatchOptions last_file_options{};
 };
 
 void FakeWorker::stop() { owner_.stop_calls.fetch_add(1); }
@@ -337,10 +346,132 @@ int main() {
         backend->allow_file = false;
         nlohmann::json body = start_body(1);
         body["kind"] = "file";
+        body["total_frames"] = 10;
         CHECK(parse_reply(session->handle(make_message(
                   MOZART_CTL_RVC_START_STREAM, body)))
                   .code == MOZART_CTL_CODE_UNSUPPORTED,
               "missing offline generator refuses file kind");
+    }
+
+    std::printf("test_list_models\n");
+    {
+        auto [session, backend] = make_session();
+        Reply reply = parse_reply(session->handle(make_message(
+            MOZART_CTL_RVC_LIST_MODELS, nlohmann::json::object())));
+        CHECK(reply.status == "ok", "list models answers ok");
+        nlohmann::json models = reply.data.at("models");
+        CHECK(models.size() == 2 && models[0].at("id") == "alpha"
+              && models[0].at("exists") == true
+              && models[1].at("id") == "beta"
+              && models[1].at("exists") == false,
+              "listing carries id and exists per entry");
+        CHECK(models[0].at("loaded") == false && models[1].at("loaded") == false,
+              "nothing is loaded before LoadModel");
+
+        parse_reply(session->handle(make_message(
+            MOZART_CTL_RVC_LOAD_MODEL, {{"model_id", "alpha"}})));
+        reply = parse_reply(session->handle(make_message(
+            MOZART_CTL_RVC_LIST_MODELS, nlohmann::json::object())));
+        models = reply.data.at("models");
+        CHECK(models[0].at("loaded") == true && models[1].at("loaded") == false,
+              "loaded follows the current model id");
+        CHECK(parse_reply(session->handle(make_message(
+                  MOZART_CTL_RVC_GET_STATUS, nlohmann::json::object())))
+                  .data.at("state") == "loaded",
+              "list models is read-only and does not start a stream");
+    }
+
+    std::printf("test_list_models_directory_scan\n");
+    {
+        // 真实 ModelManager 目录扫描（InferenceBackend，无 GPU 不加载）：
+        // alpha 资产齐全、beta 空目录、散文件不计入清单。
+        const auto dir = std::filesystem::temp_directory_path()
+            / ("mozart-rvc-models-" + std::to_string(::getpid()));
+        std::filesystem::remove_all(dir);
+        std::filesystem::create_directories(dir / "alpha");
+        std::filesystem::create_directories(dir / "beta");
+        { std::ofstream(dir / "alpha" / "config.json") << "{}"; }
+        { std::ofstream(dir / "alpha" / "alpha.onnx"); }
+        { std::ofstream(dir / "stray.txt"); }
+
+        InferenceBackendConfig config;
+        config.models_dir = dir;
+        StreamSession session(std::make_unique<InferenceBackend>(config));
+        const Reply reply = parse_reply(session.handle(make_message(
+            MOZART_CTL_RVC_LIST_MODELS, nlohmann::json::object())));
+        CHECK(reply.status == "ok", "directory scan answers ok");
+        const nlohmann::json models = reply.data.at("models");
+        CHECK(models.size() == 2, "only model directories are listed");
+        CHECK(models[0].at("id") == "alpha" && models[0].at("exists") == true
+              && models[0].at("loaded") == false,
+              "complete assets report exists and unloaded");
+        CHECK(models[1].at("id") == "beta" && models[1].at("exists") == false,
+              "empty directory reports missing assets");
+        std::filesystem::remove_all(dir);
+    }
+
+    std::printf("test_file_start_validation\n");
+    {
+        auto [session, backend] = make_session();
+        parse_reply(session->handle(make_message(
+            MOZART_CTL_RVC_LOAD_MODEL, {{"model_id", "qiqi"}})));
+        auto file_body = [](uint64_t handle) {
+            nlohmann::json body = start_body(handle);
+            body["kind"] = "file";
+            body["total_frames"] = 10;
+            return body;
+        };
+        auto rejected = [&](const nlohmann::json& body, const char* msg) {
+            CHECK(parse_reply(session->handle(make_message(
+                      MOZART_CTL_RVC_START_STREAM, body)))
+                      .code == MOZART_CTL_CODE_INVALID_ARGUMENT, msg);
+        };
+        nlohmann::json body = file_body(1);
+        body.erase("total_frames");
+        rejected(body, "file without total_frames is rejected");
+        body = file_body(1);
+        body["total_frames"] = 0;
+        rejected(body, "zero total_frames is rejected");
+        body = file_body(1);
+        body["total_frames"] = -3;
+        rejected(body, "negative total_frames is rejected");
+        body = file_body(1);
+        body["total_frames"] = 1.5;
+        rejected(body, "fractional total_frames is rejected");
+        body = file_body(1);
+        body["total_frames"] = "10";
+        rejected(body, "string total_frames is rejected");
+        body = file_body(1);
+        body["total_frames"] = 4'294'967'296ull;   // u32 契约上限之外
+        rejected(body, "total_frames beyond u32 is rejected");
+        body = file_body(1);
+        body["output_socket"] = "relative.sock";
+        rejected(body, "relative output_socket is rejected");
+        body = file_body(1);
+        body["output_socket"] = 42;
+        rejected(body, "non-string output_socket is rejected");
+
+        body = file_body(1);
+        body["output_socket"] = "/tmp/mozart-rvc-file-out.sock";
+        const Reply ok = parse_reply(session->handle(make_message(
+            MOZART_CTL_RVC_START_STREAM, body)));
+        CHECK(ok.status == "ok" && ok.data.at("stream_kind") == "file",
+              "valid file start returns the stream kind");
+        CHECK(!backend->last_realtime
+              && backend->last_file_options.total_frames == 10
+              && backend->last_file_options.output_socket
+                     == "/tmp/mozart-rvc-file-out.sock",
+              "backend receives total_frames and the output socket override");
+        parse_reply(session->handle(make_message(
+            MOZART_CTL_RVC_STOP_STREAM, nlohmann::json::object())));
+
+        // realtime 忽略 file 字段：即使值非法也不校验。
+        body = start_body(1);
+        body["total_frames"] = "bogus";
+        body["output_socket"] = "relative.sock";
+        CHECK(parse_reply(session->handle(make_message(
+                  MOZART_CTL_RVC_START_STREAM, body))).status == "ok",
+              "realtime ignores total_frames and output_socket");
     }
 
     std::printf("test_get_status_snapshot\n");

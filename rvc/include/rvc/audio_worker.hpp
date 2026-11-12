@@ -8,8 +8,9 @@
 // 双模式：
 //   - mock pipeline → 逐帧 1:1 直通（20ms 帧，零附加延迟；单测用）
 //   - real pipeline → kind=realtime 用短块 realtime + SOLA preset；
-//                     kind=file 用 quality/full-history 或 2s 滑窗；
 //                     推理与 IO 分线程。
+// kind=file 的生产流量走 FileWorker 整段批处理，不经本泵；quality/滑窗
+// preset 分支保留为流式兼容能力。
 //
 // 停止次序沿用旧实现：close stream（解除阻塞）→ join inference → join worker。
 

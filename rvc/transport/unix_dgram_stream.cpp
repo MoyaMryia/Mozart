@@ -5,9 +5,11 @@
 
 #include <bit>
 #include <cerrno>
+#include <chrono>
 #include <cstring>
 #include <stdexcept>
 #include <string>
+#include <thread>
 #include <utility>
 
 #include <fcntl.h>
@@ -23,6 +25,9 @@ namespace {
 // 目标平台（x86_64 / aarch64 Jetson）均为小端；PCM 直接按字节搬运。
 static_assert(std::endian::native == std::endian::little,
               "数据面线包假定小端平台");
+
+// 收发等待节拍：poll 超时与对端重连等待共用；Close() 在该节拍内解除阻塞。
+constexpr int kWaitPollMs = 100;
 
 void write_u32_le(uint8_t* p, uint32_t v) {
     p[0] = static_cast<uint8_t>(v);
@@ -146,7 +151,8 @@ bool decode_output_packet(const uint8_t* bytes, size_t len,
 
 UnixDgramStream::UnixDgramStream(const std::filesystem::path& input_path,
                                  const std::filesystem::path& output_path,
-                                 size_t queue_frames) {
+                                 size_t queue_frames, bool blocking_send)
+    : blocking_send_(blocking_send) {
     // ---- 输入侧：绑定收输入帧 ----
     const int in_fd = new_dgram_socket();
     int value = static_cast<int>(queue_frames * kInputPacketBytes);
@@ -179,6 +185,17 @@ UnixDgramStream::UnixDgramStream(const std::filesystem::path& input_path,
         ::close(out_fd);
         ::close(input_fd_.exchange(-1, std::memory_order_acq_rel));
         throw std::runtime_error("connect " + output_path.string() + ": " + reason);
+    }
+    if (blocking_send_) {
+        // 阻塞发送模式：send 不带 MSG_DONTWAIT，O_NONBLOCK 让缓冲满时立即
+        // EAGAIN，由 send_blocking 的 poll(POLLOUT) 等待重试（见文件头语义）。
+        const int flags = ::fcntl(out_fd, F_GETFL, 0);
+        if (flags < 0 || ::fcntl(out_fd, F_SETFL, flags | O_NONBLOCK) != 0) {
+            const std::string reason = std::strerror(errno);
+            ::close(out_fd);
+            ::close(input_fd_.exchange(-1, std::memory_order_acq_rel));
+            throw std::runtime_error("O_NONBLOCK: " + reason);
+        }
     }
     output_fd_.store(out_fd, std::memory_order_release);
 }
@@ -215,7 +232,7 @@ bool UnixDgramStream::ReadFrame(void* out_frame_buf, size_t buf_size) {
 
         // 100 ms poll 等待：Close() 关闭 fd 后以 POLLNVAL 形式解除阻塞。
         pollfd pfd{fd, POLLIN, 0};
-        const int rc = ::poll(&pfd, 1, 100);
+        const int rc = ::poll(&pfd, 1, kWaitPollMs);
         if (input_fd_.load(std::memory_order_acquire) < 0) return false;
         if (rc == 0) continue;
         if (rc < 0) {
@@ -233,6 +250,8 @@ bool UnixDgramStream::WriteFrame(const void* in_frame_buf, size_t buf_size) {
     uint8_t packet[kOutputPacketBytes];
     encode_output_packet(*static_cast<const mozart_output_frame_t*>(in_frame_buf),
                          packet, sizeof(packet));
+
+    if (blocking_send_) return send_blocking(packet);
 
     for (;;) {
         const ssize_t n = ::send(fd, packet, sizeof(packet),
@@ -264,6 +283,31 @@ void UnixDgramStream::Close() {
     const int out_fd = output_fd_.exchange(-1, std::memory_order_acq_rel);
     if (in_fd >= 0) ::close(in_fd);
     if (out_fd >= 0) ::close(out_fd);
+}
+
+// 阻塞发送（文件批处理）：等可写重试，不丢弃；仅流关停或不可恢复错误返回
+// false。Close() 置 fd 标志后，poll/重连等待在一个节拍内退出。
+bool UnixDgramStream::send_blocking(const uint8_t* packet) {
+    for (;;) {
+        const int fd = output_fd_.load(std::memory_order_acquire);
+        if (fd < 0) return false;
+        const ssize_t n = ::send(fd, packet, kOutputPacketBytes, MSG_NOSIGNAL);
+        if (n >= 0) return true;   // 数据报全有或全无
+        if (errno == EINTR) continue;
+        if (errno == ENOENT || errno == ECONNREFUSED || errno == ENOTCONN) {
+            // 对端不在：尽力重连后重试，仍不丢弃；未就绪等一个节拍避免忙转。
+            if (!try_reconnect()) {
+                std::this_thread::sleep_for(std::chrono::milliseconds(kWaitPollMs));
+            }
+            continue;
+        }
+        if (errno != EAGAIN && errno != ENOBUFS) return false;
+        // 缓冲满：等可写重试。poll 超时后复查 fd 标志，Close() 由此解除阻塞。
+        pollfd pfd{fd, POLLOUT, 0};
+        const int rc = ::poll(&pfd, 1, kWaitPollMs);
+        if (output_fd_.load(std::memory_order_acquire) < 0) return false;
+        if (rc < 0 && errno != EINTR) return false;
+    }
 }
 
 DgramStreamStats UnixDgramStream::stats() const noexcept {

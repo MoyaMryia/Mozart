@@ -679,6 +679,8 @@ std::vector<float> RVCInferencer::infer_window(
     const auto profile_index = profile::Clock::now();
     auto output = synthesize_window(feats, pitchf, pitch, unindexed);
     check_cancelled(cancelled);
+    // 窗完成才计数：取消时未完成的窗不计入文件批处理进度。
+    generator_windows_.fetch_add(1, std::memory_order_relaxed);
     if (profile::enabled()) {
         const auto profile_done = profile::Clock::now();
         spdlog::info(
