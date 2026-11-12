@@ -91,12 +91,10 @@ pub struct FileCoordinator {
     services: Arc<Services>,
     config: Arc<Config>,
     running: Arc<AtomicBool>,
-    /// 串行化 submit：reserve_job_id → 复制 → 入队 之间不插入第二个 submit。
-    /// 不用队列锁，复制期间 list/status 仍可应答。
+    /// 串行化 submit 与 finish 驱逐：submit 全程（reserve_job_id → 复制 → 入队）
+    /// 持此锁，finish 快照保护集合并驱逐时也持此锁。两者互斥，新排队任务的
+    /// 源副本不会落在驱逐保护集合之外。不用队列锁，复制期间 list/status 仍可应答。
     submit_lock: Mutex<()>,
-    /// 正在复制入受管目录的 job_id（尚未入队）：驱逐时一并保护，
-    /// 避免并发驱逐删掉在途副本。submit 串行，至多一个。
-    inflight: Mutex<Option<String>>,
     job_thread: Mutex<Option<JoinHandle<()>>>,
 }
 
@@ -119,7 +117,6 @@ impl FileCoordinator {
             config,
             running,
             submit_lock: Mutex::new(()),
-            inflight: Mutex::new(None),
             job_thread: Mutex::new(None),
         })
     }
@@ -180,20 +177,13 @@ impl FileCoordinator {
             .map(|name| name.to_string_lossy().into_owned())
             .unwrap_or_else(|| request.path.clone());
         let job_id = lock_queue(&self.queue).reserve_job_id();
-        *self
-            .inflight
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(job_id.clone());
-        let copy = match self.storage.copy_in(&job_id, source) {
-            Ok(copy) => copy,
-            Err(err) => {
-                self.clear_inflight();
-                return Err(err.into_rejection());
-            }
-        };
+        // submit 全程持 submit_lock，finish 驱逐也持此锁：复制与入队期间
+        // 不会有并发驱逐，新任务源副本无需额外的在途保护标记。
+        let copy = self
+            .storage
+            .copy_in(&job_id, source)
+            .map_err(|err| err.into_rejection())?;
         let result = lock_queue(&self.queue).submit(job_id.clone(), name, model_id);
-        // 入队后任务受未完成任务保护，撤销在途标记。
-        self.clear_inflight();
         match result {
             Ok(job) => {
                 let position = lock_queue(&self.queue).queued_count();
@@ -209,13 +199,6 @@ impl FileCoordinator {
                 Err(err.into_rejection())
             }
         }
-    }
-
-    fn clear_inflight(&self) {
-        *self
-            .inflight
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner()) = None;
     }
 
     pub fn pause(&self) -> Result<Value, (String, String)> {
@@ -336,9 +319,15 @@ impl FileCoordinator {
     fn finish(&self, job_id: &str, outcome: Outcome) {
         let _transition = self.services.transition();
         if self.running.load(Ordering::Acquire) {
+            // 与 submit 串行：快照保护集合 → 驱逐 全程持 submit_lock，
+            // 排除并发 submit 的复制/入队，杜绝新排队任务源副本被驱逐。
+            let _submit = self
+                .submit_lock
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
             let result_ready =
                 matches!(outcome, Outcome::Completed) && self.storage.result_path(job_id).is_file();
-            let (settled, mut protected) = {
+            let (settled, protected) = {
                 let mut queue = lock_queue(&self.queue);
                 let settled = match &outcome {
                     Outcome::Completed => queue.mark_completed(job_id, result_ready),
@@ -354,14 +343,6 @@ impl FileCoordinator {
                 Err(err) => self.report_queue_error("finish", err),
             }
             self.storage.cleanup_temp(job_id);
-            if let Some(inflight) = self
-                .inflight
-                .lock()
-                .unwrap_or_else(|poisoned| poisoned.into_inner())
-                .as_ref()
-            {
-                protected.push(inflight.clone());
-            }
             if let Err(err) = self.storage.evict(&protected) {
                 lock_state(&self.state).push_degraded(format!("file storage evict: {err}"));
             }
@@ -671,5 +652,137 @@ mod tests {
         assert!(job.error.unwrap().contains("source"));
         assert_eq!(lock_state(&coordinator.state).gpu_owner(), None);
         fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// 最小 rvc 控制桩：只应答 HELLO/GET_STATUS/LIST_MODELS，让 coordinator.submit
+    /// 的模型校验在单测内可达，无需外部进程。绑定与 listen 同步完成后再起 accept 循环。
+    fn spawn_rvc_stub(socket: &Path) {
+        let listener = ctl::Seqpacket::bind(socket).unwrap();
+        listener.listen(4).unwrap();
+        thread::spawn(move || {
+            while let Ok(conn) = listener.accept() {
+                while let Ok(msg) = conn.recv(None) {
+                    let type_ = msg.header.type_;
+                    let data = match type_ {
+                        ctl::RVC_HELLO => json!({"version": "0.1.0", "stub": true}),
+                        ctl::RVC_LIST_MODELS => {
+                            json!({"models": [{"id": "demo", "exists": true, "loaded": true}]})
+                        }
+                        ctl::RVC_GET_STATUS => json!({
+                            "state": "loaded", "model_id": "demo", "model_version": null,
+                            "capabilities": [], "stream_kind": null,
+                            "frames_in": 0, "frames_out": 0, "frames_dropped": 0, "blocks": 0,
+                            "inference_ms_last": null, "inference_ms_avg": null,
+                            "inference_ms_p95": null, "queue_depth": 0, "last_error": null
+                        }),
+                        _ => json!({}),
+                    };
+                    let reply =
+                        json!({"status": "ok", "code": ctl::CODE_OK, "reason": "", "data": data})
+                            .to_string()
+                            .into_bytes();
+                    if conn.send(type_, msg.header.request_id, &reply).is_err() {
+                        break;
+                    }
+                }
+            }
+        });
+    }
+
+    /// 回归（Important #1）：finish 快照保护集合与驱逐必须和 submit 串行。
+    /// 旧代码 finish 不持 submit_lock：submit 的“入队 + 清在途标记”若落在 finish
+    /// 快照之后、读在途标记之前，新排队任务的源副本既不在保护集合也不在在途标记里，
+    /// 超限驱逐会删掉它，任务启动时报 source copy missing。
+    /// 本测试持 submit_lock 模拟一个进行中的 submit，再放行 worker 触发 finish：
+    /// 修复后 finish 必须阻塞在 submit_lock 上（任务保持 processing），旧代码则会
+    /// 立即落终态并驱逐——据此断言串行化；随后释放锁，验证新任务源副本在驱逐后存活。
+    #[test]
+    fn finish_eviction_serializes_with_submit_and_protects_new_source() {
+        let dir = temp_dir("evict-submit-race");
+        let src_dir = temp_dir("evict-submit-race-src");
+        let mut config = Config::default();
+        config.daemon.run_dir = dir.clone();
+        config.rvc.socket = "rvc.sock".to_string();
+        config.file.storage_dir = dir.clone();
+        config.file.storage_limit_bytes = 100;
+        let config = Arc::new(config);
+        spawn_rvc_stub(&config.rvc_socket());
+
+        let state = Arc::new(Mutex::new(State::new()));
+        lock_state(&state).set_rvc_status(Some(fake_rvc_status()));
+        let services = Arc::new(Services::new(&config));
+        let running = Arc::new(AtomicBool::new(true));
+        let (started_tx, started_rx) = mpsc::channel();
+        let (release_tx, release_rx) = mpsc::channel();
+        let worker = Arc::new(StubWorker {
+            started: started_tx,
+            release: Mutex::new(release_rx),
+        });
+        let coordinator =
+            Arc::new(FileCoordinator::new(config, state, services, running, worker).unwrap());
+
+        // 预置一个已完成任务的旧文件，确保驱逐必然触发并删到它。
+        let old = dir.join("job_0000000000000.output.wav");
+        fs::write(&old, vec![0u8; 200]).unwrap();
+
+        // 任务 A 进入 processing，worker 阻塞等放行。
+        let job_a = enqueue(&coordinator, "a.wav");
+        coordinator.tick();
+        assert_eq!(
+            started_rx.recv_timeout(Duration::from_secs(2)).unwrap(),
+            job_a
+        );
+
+        // 持 submit_lock 模拟进行中的 submit。新任务 B 的源文件较大且放在受管目录外，
+        // 一旦失去保护就会被驱逐选中删除；放在目录外避免驱逐先删掉待复制的原始源。
+        let submit_guard = coordinator
+            .submit_lock
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let src_b = src_dir.join("b.wav");
+        fs::write(&src_b, vec![0u8; 500]).unwrap();
+        let submitter = {
+            let coordinator = Arc::clone(&coordinator);
+            let path = src_b.to_string_lossy().into_owned();
+            thread::spawn(move || {
+                coordinator.submit(FileSubmitRequest {
+                    path,
+                    model_id: Some("demo".to_string()),
+                })
+            })
+        };
+
+        // 放行 worker → finish 起跑。修复后它应阻塞在 submit_lock 上，A 保持 processing。
+        release_tx.send(Outcome::Failed("done".to_string())).unwrap();
+        let settled_early = wait_until(Duration::from_millis(300), || {
+            lock_queue(&coordinator.queue).state_of(&job_a) != Some(FileJobState::Processing)
+        });
+        assert!(
+            !settled_early,
+            "finish 必须等 submit_lock 释放后才能落终态/驱逐（旧代码会在此抢先驱逐）"
+        );
+        assert_eq!(
+            lock_state(&coordinator.state).gpu_owner(),
+            Some(Activity::File)
+        );
+
+        // 释放 submit_lock：submit 与 finish 串行推进，B 入队后受未完成任务保护。
+        drop(submit_guard);
+        let reply = submitter.join().unwrap().unwrap();
+        let job_b = reply["job_id"].as_str().unwrap().to_string();
+        coordinator.shutdown();
+
+        assert_eq!(
+            lock_queue(&coordinator.queue).state_of(&job_b),
+            Some(FileJobState::Queued)
+        );
+        assert!(
+            coordinator.storage.source_path(&job_b).is_some(),
+            "新排队任务的源副本必须在驱逐后存活"
+        );
+        assert!(!old.exists(), "驱逐应已删除最旧的已完成文件（证明驱逐确实运行）");
+        drop(coordinator);
+        fs::remove_dir_all(&dir).unwrap();
+        fs::remove_dir_all(&src_dir).unwrap();
     }
 }
