@@ -199,7 +199,7 @@ std::vector<uint8_t> StreamSession::handle_start_stream(
                           "kind must be realtime or file");
     }
     // kind=file 批处理选项（D1/D2）：total_frames 必填正整数（u32 契约），
-    // output_socket 可选绝对路径；realtime 忽略这两字段。
+    // output_socket / input_socket 可选绝对路径；realtime 忽略这些字段。
     FileBatchOptions file_options;
     if (kind == "file") {
         if (!body.contains("total_frames")
@@ -222,6 +222,17 @@ std::vector<uint8_t> StreamSession::handle_start_stream(
             }
             file_options.output_socket =
                 body.at("output_socket").get<std::string>();
+        }
+        if (body.contains("input_socket")) {
+            if (!body.at("input_socket").is_string()
+                || !std::filesystem::path(
+                        body.at("input_socket").get<std::string>())
+                        .is_absolute()) {
+                return error_body(MOZART_CTL_CODE_INVALID_ARGUMENT,
+                                  "input_socket must be an absolute path string");
+            }
+            file_options.input_socket =
+                body.at("input_socket").get<std::string>();
         }
     }
     RvcParameters parameters;
@@ -508,14 +519,20 @@ std::unique_ptr<StreamWorker> InferenceBackend::start_worker(
     // 会话参数在启动时固定（SPEC-03）；先落参数再造推理器。
     pipeline_->set_parameters(params);
     try {
-        // D2：文件输出 socket 由 StartStream 覆盖（daemon 绑定独立输出
-        // socket）；实时用配置默认。C++ 对对端无感知，只连接给定路径。
+        // D2：文件输入/输出 socket 由 StartStream 覆盖（daemon 绑定独立输出
+        // socket、连接独立输入 socket）；实时用配置默认。C++ 对对端无感知，
+        // 只绑定/连接给定路径。文件输入独立于 rvc-in.sock：pre 恒发实时帧到
+        // rvc-in.sock（SPEC-02），共享会污染整段攒帧并楔死数据面。
         const std::filesystem::path& output_socket =
             (!realtime && !file_options.output_socket.empty())
                 ? file_options.output_socket
                 : config_.output_socket;
+        const std::filesystem::path& input_socket =
+            (!realtime && !file_options.input_socket.empty())
+                ? file_options.input_socket
+                : config_.input_socket;
         auto stream = std::make_unique<UnixDgramStream>(
-            config_.input_socket, output_socket, config_.queue_frames,
+            input_socket, output_socket, config_.queue_frames,
             /*blocking_send=*/!realtime);
         if (!realtime) {
             FileWorker::Config worker_config;

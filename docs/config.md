@@ -122,6 +122,7 @@
 | ffmpeg_path | string | ffmpeg | — | R |
 | ffmpeg_timeout_ms | int | 120000 | >0 | R |
 | output_socket | string | rvc-file-out.sock | 纯文件名 | S |
+| input_socket | string | rvc-file-in.sock | 纯文件名 | S |
 
 ## 特殊机制说明
 

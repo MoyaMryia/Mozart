@@ -84,6 +84,9 @@ struct ModelListing {
 struct FileBatchOptions {
     uint32_t total_frames = 0;              // 攒帧总数，正整数
     std::filesystem::path output_socket;    // 空 = 用配置默认输出 socket
+    std::filesystem::path input_socket;     // 空 = 用配置默认输入 socket；
+                                            // file 覆盖为独立 socket，隔离 pre
+                                            // 恒发的实时帧（SPEC-02），避免污染攒帧
 };
 
 // 推理后端 seam。错误用 reason 表达，不跨线程抛异常。

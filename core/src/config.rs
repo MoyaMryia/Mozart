@@ -300,6 +300,10 @@ pub struct FileConfig {
     /// 数据面：daemon 绑定收文件输出帧，rvc 连接发送；
     /// 独立于实时 rvc-out.sock，实时路径不参与交接。
     pub output_socket: String,
+    /// 数据面：rvc 绑定收文件输入帧，daemon 连接发送；
+    /// 独立于实时 rvc-in.sock——pre 恒发实时帧到 rvc-in.sock（SPEC-02），
+    /// 共享会污染整段攒帧。文件喂帧只走本 socket。
+    pub input_socket: String,
 }
 
 impl Default for FileConfig {
@@ -314,6 +318,7 @@ impl Default for FileConfig {
             ffmpeg_path: "ffmpeg".to_string(),
             ffmpeg_timeout_ms: 120_000,
             output_socket: "rvc-file-out.sock".to_string(),
+            input_socket: "rvc-file-in.sock".to_string(),
         }
     }
 }
@@ -472,6 +477,10 @@ impl Config {
 
     pub fn file_output_socket(&self) -> PathBuf {
         self.daemon.run_dir.join(&self.file.output_socket)
+    }
+
+    pub fn file_input_socket(&self) -> PathBuf {
+        self.daemon.run_dir.join(&self.file.input_socket)
     }
 
     pub fn log_dir(&self) -> PathBuf {
@@ -656,6 +665,7 @@ impl Config {
             ));
         }
         validate_socket_name(&self.file.output_socket, "file.output_socket")?;
+        validate_socket_name(&self.file.input_socket, "file.input_socket")?;
         if self.process.pre_bin.as_os_str().is_empty() {
             return Err(ConfigError::Invalid(
                 "process.pre_bin must not be empty".to_string(),

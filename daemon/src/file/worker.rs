@@ -13,7 +13,7 @@ use mozart_core::dgram::FrameSocket;
 use mozart_core::{FrameMeta, InputFrame, OutputFrame, OUTPUT_SAMPLES};
 use std::fs;
 use std::io;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -89,6 +89,7 @@ fn process(ctx: &JobContext) -> Result<(), StepError> {
     // ---- feed：绑定输出 socket → LoadModel → StartStream(kind=file) ----
     progress.stage("feed", FEED_START);
     let output_path = config.file_output_socket();
+    let input_path = config.file_input_socket();
     let output = FrameSocket::<OutputFrame>::bind(&output_path, QUEUE_FRAMES)
         .map_err(|err| StepError::Failed(format!("bind file output socket: {err}")))?;
     let mut stream = FileStream::new(ctx.services.clone(), output, output_path.clone());
@@ -100,10 +101,10 @@ fn process(ctx: &JobContext) -> Result<(), StepError> {
     // 不停会留下一个等帧的文件流，下一个任务撞 Busy。
     stream.active = true;
     ctx.services
-        .file_start_stream(config, handle, total_frames, &output_path)
+        .file_start_stream(config, handle, total_frames, &output_path, &input_path)
         .map_err(|(code, reason)| StepError::Failed(format!("start file stream: {code}: {reason}")))?;
 
-    let exchanged = feed(ctx, &frames, &mut progress, &cancel)
+    let exchanged = feed(&frames, &input_path, &mut progress, &cancel)
         .and_then(|()| receive(ctx, &stream.output, total, &mut progress, &cancel));
     // 起流后的唯一停流点：正常收尾、取消、失败都经此，先停流再解绑。
     if let Err((code, reason)) = stream.stop() {
@@ -127,15 +128,16 @@ fn process(ctx: &JobContext) -> Result<(), StepError> {
 /// 喂帧：阻塞发送不丢（SPEC-03 文件帧），逐帧查取消。
 /// 对端活着但停止读帧时缓冲会填满，阻塞等待由同一个取消谓词打断
 /// （用户取消或 daemon 关停），不会把本线程楔死在内核里。
+/// 连接独立文件输入 socket（rvc 绑定），不走 pre 恒发的 rvc-in.sock。
 /// meta 序号从 0 顺序，pts_ns 按 20 ms 节拍合成，vad_flag 取解码结果。
 fn feed(
-    ctx: &JobContext,
     frames: &[ContractFrame],
+    input_path: &Path,
     progress: &mut Reporter<'_>,
     cancel: &dyn Fn() -> bool,
 ) -> Result<(), StepError> {
-    let input = FrameSocket::<InputFrame>::connect(&ctx.config.rvc_input_socket(), QUEUE_FRAMES)
-        .map_err(|err| StepError::Failed(format!("connect rvc input socket: {err}")))?;
+    let input = FrameSocket::<InputFrame>::connect(input_path, QUEUE_FRAMES)
+        .map_err(|err| StepError::Failed(format!("connect file input socket: {err}")))?;
     let total = frames.len() as u64;
     for (idx, frame) in frames.iter().enumerate() {
         if cancel() {
@@ -372,8 +374,9 @@ mod tests {
             running: running.clone(),
         };
 
-        // 对端绑定输入 socket 但永不读帧（推理线程挂死）：缓冲填满后只能等待。
-        let peer = FrameSocket::<InputFrame>::bind(&config.rvc_input_socket(), 1).unwrap();
+        // 对端绑定文件输入 socket 但永不读帧（推理线程挂死）：缓冲填满后只能等待。
+        let input_path = config.file_input_socket();
+        let peer = FrameSocket::<InputFrame>::bind(&input_path, 1).unwrap();
         // 帧数远多于缓冲容量：不打断就送不完。
         let frames: Vec<ContractFrame> = (0..200)
             .map(|_| ContractFrame {
@@ -385,7 +388,12 @@ mod tests {
         let worker = thread::spawn(move || {
             let mut progress = Reporter::new(&ctx);
             progress.stage("feed", FEED_START);
-            let _ = done_tx.send(feed(&ctx, &frames, &mut progress, &|| ctx.is_cancelled()));
+            let _ = done_tx.send(feed(
+                &frames,
+                &input_path,
+                &mut progress,
+                &|| ctx.is_cancelled(),
+            ));
         });
 
         // 阻塞证据：stage 落到 feed 后，进度在观察窗内不再推进。

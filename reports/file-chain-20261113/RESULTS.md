@@ -4,12 +4,13 @@
 
 ## 结论
 
-文件转换链路在 3 s 至 120 s 样本上板端验收通过，10 个场景全部 PASS（实测）。
+文件转换链路在 3 s 至 295 s 样本上板端验收通过（实测）。
 提交、取回、取消、GPU 互斥、重启续转、入口拒绝、时长上限均按 SPEC-04 生效。
 
-近时长上限的 295 s 长文件存在数据面卡死缺陷：推理已完成但任务永不结束（实测）。
-SPEC-08「长文件不会耗尽内存」的内存部分通过，完成部分未通过。
-该缺陷是本次验收的唯一阻塞项，详见「长文件数据面卡死」。
+近时长上限的 295 s 长文件曾存在数据面卡死缺陷：推理已完成但任务永不结束。
+根因已定位并修复（文件输入 socket 与实时共享，pre 恒发实时帧污染整段攒帧），
+板端复测 295 s 与 120 s 均 completed、`frames_in == frames_out`、时长一致（实测）。
+SPEC-08「长文件不会耗尽内存」的内存与完成部分均通过。详见「长文件数据面卡死（已修复）」。
 
 ## 配置
 
@@ -120,34 +121,75 @@ b 3726.5 MiB、c 3717.1 MiB、e 3700.4 MiB、f 3787.4 MiB、i 4257.4 MiB。
   GetStatus 在无流时仍报上一条流的最终计数，不过滤会把上一任务的值算到本任务头上
   （实测：h 在 decode 阶段即失败，全程无流，却带着上一任务的 blocks 与 inference_ms）。
 
-## 长文件数据面卡死
+## 长文件数据面卡死（已修复）
 
-295 s 样本（第 4 轮，`LONG_BUDGET_S=295`）任务永不结束，观察超过 400 s 仍为
-processing（实测）。120 s 样本正常完成，故阈值落在 120 s 与 295 s 之间。
+295 s 样本曾永不结束（第 4 轮，`LONG_BUDGET_S=295`，观察超过 400 s 仍 processing，实测）。
+根因已定位并修复，板端复测 295 s 与 120 s 均 completed（实测，见下「修复与复测」）。
 
-现象与证据：
+### 根因（线程栈 + 代码 + 计数三方印证）
 
-- rvc 侧：`frames_in = 14750`（等于 `total_frames`，整段收齐），`blocks = 296`，
-  `inference_ms_last = 135599.57 ms`，推理已完成；`frames_out = 8` 后不再增长。
-  rvc 日志只有 `FileWorker started: total_frames=14750`，无 `FileWorker finished`。
-- daemon 侧：任务进度冻结在 `stage=feed`、`percent=37`（约第 12537 帧），
-  从未进入 infer；`gpu.owner=file` 不释放；文件 worker 线程连续 3 次采样均为
-  `do_sys_poll`、状态 S；`degraded` 列表为空。
-- 两侧 socket 接收队列均为 0（`ss -x`），`max_dgram_qlen = 512`。
-- 内存未耗尽：rvc VmHWM 4637.5 MiB，daemon VmHWM 28.8 MiB，
-  系统 available 2372 MiB、swap 仅用 99 MiB。故不是 OOM 或直接回收 stalled。
-- 8 帧正好等于数据面缓冲帧数（`QUEUE_FRAMES = 8`）。
-- 楔住状态下 `file cancel` 仍生效（应答 `cancelling`），`down` 正常关停，无进程残留（实测）。
+卡死态用 `sudo gdb -p <pid> -batch -ex 'thread apply all bt'` 抓栈（抓栈前不杀进程，
+证据留设备 `/tmp/mozart-hang-repro/`）。三个关键线程：
 
-推断（未验证）：daemon 停在喂帧阶段而 rvc 已收齐整段并回出 8 帧后阻塞，
-两侧互等，符合「输出缓冲满 + 喂帧未收尾」的死锁形态。
-确切机制尚未定位到代码行：`send_blocking_with` 在 send 成功时立即返回、
-`wait_writable` 方向为 POLLOUT 且按 100 ms 分片复查取消（代码确认），
-与「接收队列为空却持续 EAGAIN」的观测不一致，需要进一步定位。
+- daemon 文件 worker 线程（`mozart-file-job`）阻塞在**喂帧**：
+  `feed`（worker.rs:155）→ `send_blocking_with` → `send_wait_writable` → `wait_writable`
+  → `poll(events=POLLOUT)`（dgram.rs:412）。即输入 socket 缓冲满、等可写，从未进入 `receive`。
+- rvc FileWorker 批处理线程阻塞在**回帧**：
+  `batch_loop` → `WriteFrame` → `send_blocking` → `poll(POLLOUT)`。即输出 socket 缓冲满 8 帧、等可写。
+- rvc 控制 serve 线程**空闲**在 `serve` → `CtlConnection::recv` → `poll`，未卡在任何锁或 `handle()`；
+  daemon poller 线程在 `hrtimer_nanosleep`（轮询间隔睡眠）。故控制面 RPC 阻塞的假设被否定。
 
-影响：SPEC-08「长文件不会耗尽内存」的内存部分通过，完成部分未通过；
-SPEC-04 的 300 s 时长上限兜底在该区间不可用。
-3 s 至 120 s 的常规文件转换不受影响。
+根因是**文件输入 socket 与实时输入 socket 共享 `rvc-in.sock`**：
+
+1. SPEC-02 要求 pre「恒定发送 InputFrame 到 rvc `input_socket`，不随路由停发」
+   （`pre/src/main.rs:108` 无条件 `ai_sender.send`，代码确认）。文件期间 route=direct，pre 仍向 `rvc-in.sock` 发实时帧。
+2. rvc `FileWorker::batch_loop`（file_worker.cpp:70-78）把 `rvc-in.sock` 上**每条**输入帧都计入 `total_frames`，
+   无法区分文件帧与实时帧。
+3. 攒满 `total_frames=14750`（文件帧 + 实时帧混合）后 rvc 停读输入、转推理；
+   daemon 剩余文件帧（被实时帧挤占名额）送不出，阻塞在 feed 的 POLLOUT，永不排空输出。
+4. rvc 推理完成回帧，输出缓冲满 8 帧（daemon 不排空）→ 阻塞在 WriteFrame 的 POLLOUT。两侧互等死锁。
+
+实证计数：卡死态 pre `frames_captured=853`、`consumer_drops.rvc=829` → 成功送达 24 帧实时帧进 `rvc-in.sock`，
+被 FileWorker 计入 `total_frames`，正是 daemon 喂帧缺口（进度冻结 `feed 38%`）。
+8 帧 == `QUEUE_FRAMES`；内存未耗尽（rvc VmHWM 4637.5 MiB、系统 available 2372 MiB），排除 OOM。
+120 s 通过、295 s 卡死：喂帧窗越长，实时帧混入攒帧概率越高，≥1 帧混入即死锁，阈值随时长上升。
+旧观测「两侧接收队列均 0」不构成反证：AF_UNIX DGRAM 流控按发送方 `SO_SNDBUF` 记账，
+`ss` 的 dgram Recv-Q 不反映发送方 wmem；栈已直接证明两侧分别阻塞在输入/输出 POLLOUT。
+
+### 修复（最小，对称于 D2）
+
+文件输入隔离到独立 `rvc-file-in.sock`，pre 实时路径完全不动（满足 SPEC-02 恒发），
+整段批处理 / 无丢帧 / StopStream 语义不变（SPEC-03），daemon 中间层不变（SPEC-04）。
+与 D2 已隔离的文件输出 socket 同一模式，补上输入侧：
+
+- `[file]` 增 `input_socket`（默认 `rvc-file-in.sock`）与 `file_input_socket()` getter、入口校验。
+- `StartStream` kind=file 增可选 `input_socket`（绝对路径，入口校验一次，对称 `output_socket`）；
+  rvc `start_worker` 文件流绑定该输入 socket。
+- daemon `feed` 改连 `file_input_socket()`；`rvc_stub` honor 覆盖。
+
+D2 延伸待确认：D2（独立文件输出 socket）是计划文档标注「偏离 SPEC 字面，待确认」的设计决策；
+输入侧隔离同性质、同理由（pre 终身持有实时 socket，交接需改已验收实时路径），仍满足 SPEC 核心意图
+（C++ 对端无感知、文件不丢、实时/文件互斥）。此延伸与 D2 一样待用户确认；
+若坚持 SPEC 字面输入 socket 交接，需改 pre 路由感知绑定（后续局部改动）。
+
+主机回归 `daemon/tests/file_worker.rs::realtime_flood_on_shared_input_does_not_wedge_file_job`：
+模拟 pre 恒发线程灌共享 `rvc-in.sock` + 20 s 文件任务。旧代码（共享输入 socket）卡死
+`stage=feed percent=29` 超时 FAILED；新代码（独立输入 socket）completed、`frames_in==frames_out==1000`。
+`cargo test --workspace` 全绿，ctest 7/7。
+
+### 修复与复测（实测）
+
+`tools/deploy-jetson.sh` 部署成功（129 s），设备测试门 cargo workspace 全绿、ctest 7/7。
+验证脚本 `/tmp/mozart-fix-verify.sh`（拓扑同本测试，`[file]` 增 `input_socket`），证据 `/tmp/mozart-fix-verify/`。
+
+| 任务 | 终态 | frames_in | frames_out | dropped | blocks | inference_ms | 输出时长 | RMS | submit→completed 墙钟 |
+| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
+| 295 s | completed | 14750 | 14750 | 0 | 296 | 136845 ms | 295.000 s | 0.11597 | 144 s |
+| 120 s | completed | 6000 | 6000 | 0 | 121 | 55269 ms | 120.000 s | 0.11600 | 59 s |
+
+两任务 `result_ready=true`、`stage=publish percent=100`、`frames_in==frames_out`、`frames_dropped=0`；
+取回 WAV 48 kHz 单声道、时长与输入一致（±0.1 s）。修复前 295 s 卡死（>400 s），修复后 144 s 完成；120 s 无回归。
+SPEC-08 内存与完成部分均通过；SPEC-04 的 300 s 时长上限兜底在该区间可用。
 
 ## 适用范围
 
@@ -155,39 +197,43 @@ SPEC-04 的 300 s 时长上限兜底在该区间不可用。
 
 样本数：
 
-- 转换成功样本 5 个（3 s、20 s m4a、30 s、30 s 续转、120 s），各 1 次。
+- 转换成功样本 6 个（3 s、20 s m4a、30 s、30 s 续转、120 s、295 s）；
+  3 s 至 120 s 各 1 次（权威轮），295 s 修复后复测 1 次成功（修复前卡死 1 次）。
 - 取消样本 1 个（60 s），权威轮 1 次；第 3 轮另测 1 次，
   cancel→cancelled 2 s、控制面恢复 4 s 与 9 s，存在轮次波动。
 - 入口拒绝 2 例（不存在模型、坏扩展名），时长上限拒绝 1 例（3453 s）。
-- 卡死样本 1 个（295 s），1 次；阈值下界探针 120 s，2 次均通过。
+- 120 s 阈值探针修复前后多次均通过；295 s 修复后 144 s 完成。
 - 合成 WAV 为确定性信号（180 Hz 基频加谐波、3 Hz 音节节拍），
   真实语音内容仅来自 m4a 截取样本。听感质量未做主观评估。
 
 未验证项：
 
-1. **295 s 至 300 s 区间的转换完成**。阻塞原因：上述数据面卡死缺陷。
-   解除条件：定位并修复长文件喂帧/回帧互等，再用 295 s 与 300 s 样本各跑一次至 completed。
+1. **300 s 整上限的转换完成**。阻塞原因：修复后已实测 295 s 完成，300 s 整上限尚未单独跑。
+   解除条件：用 300 s 样本跑一次至 completed。295 s 已修复并实测完成（见「长文件数据面卡死（已修复）」）。
 2. **整段 F0 的分段耗时**（SPEC-03 推迟项）。阻塞原因：`GetStatus` 只暴露整段
    `process_cancellable` 的 `inference_ms`，契约无 F0/HuBERT/Generator 分段计时字段。
    解除条件：rvc 增分段计时字段，或在板端做离线 profiling。
    整段推理耗时（含 F0）已实测：3 s→3296 ms、20 s→10147 ms、30 s→14515 ms、
-   120 s→55286 ms、295 s→135600 ms。
-3. **近上限长文件的取消等待最坏值**（SPEC-03 推迟项）。阻塞原因：295 s 段数据面卡死，
-   量不到正常推理路径上的取消检查点等待。解除条件：同第 1 项。
-   60 s 段的取消等待已实测（5 s，另轮 2 s）；楔住状态下取消仍可发起（实测）。
-4. **卡死的确切代码机制**。阻塞原因：观测与 `send_blocking_with` 的实现语义不一致，
-   尚未定位到具体阻塞行。解除条件：在板端对长文件任务做线程级 syscall 跟踪或复现最小用例。
-5. **队列串行与满 50 拒收**。阻塞原因：本次每轮只提交单任务，未构造多任务并发排队。
+   120 s→55286 ms、295 s→136845 ms（修复后复测）。
+3. **近上限长文件的取消等待最坏值**（SPEC-03 推迟项）。阻塞原因：未在 295 s 正常推理路径上
+   测取消检查点等待。解除条件：295 s 任务 infer 段发起取消并量等待。
+   60 s 段的取消等待已实测（5 s，另轮 2 s）；修复前楔住状态下取消仍可发起（实测）。
+4. **队列串行与满 50 拒收**。阻塞原因：本次每轮只提交单任务，未构造多任务并发排队。
    解除条件：一次提交多个任务观察串行执行，并提交至 51 个验证容量拒收。
-6. **驱逐策略与结果缓存生命周期**。阻塞原因：受管目录用量远低于 1000 MiB 上限，未触发驱逐。
+5. **驱逐策略与结果缓存生命周期**。阻塞原因：受管目录用量远低于 1000 MiB 上限，未触发驱逐。
    解除条件：调低 `storage_limit_bytes` 或堆积已完成结果至超限，验证按时间戳驱逐与未完成任务保护。
-7. **文件降噪路径**（`file.denoise = true`）。阻塞原因：本次按默认关配置验收。
+6. **文件降噪路径**（`file.denoise = true`）。阻塞原因：本次按默认关配置验收。
    解除条件：开启后重跑 b/c 场景，验证与 pre 共用 DSP 的降噪结果。
-8. **`c78c85a` 之前的 ctest 偶发超时是否可复现**。阻塞原因：5 次复跑全绿，未能复现。
+7. **`c78c85a` 之前的 ctest 偶发超时是否可复现**。阻塞原因：5 次复跑全绿，未能复现。
    解除条件：在高构建负载下重复跑 ctest 若干轮，或延长该用例超时并记录耗时分布。
+8. **D2 输入侧隔离的设计确认**。阻塞原因：文件输入独立 socket 是 D2（独立输出 socket，计划标注待确认）
+   向输入侧的延伸，属设计层偏离 SPEC 字面交接。解除条件：用户确认独立 socket 方案，
+   或改 pre 路由感知绑定走 SPEC 字面交接。功能已板端实测通过。
 
 证据文件留在设备 `/tmp/mozart-file-test`，不入库：`config-used.toml`、`env.txt`、
 `models.json`、`submit-*.json`、`job-*.json`、`progress-*.jsonl`、`st-*.json`、
 `stats-*.json`、`out-*.wav`、`measure.json`、`summary.tsv`、`queue-f-*.json`、
 `storage-after-cancel.txt`、`reject-*.err`、`run/logs/*.log`。
 各轮运行日志为设备上 `/tmp/file-test-run1.log` 至 `run6.log`。
+卡死栈与修复复测证据另留设备 `/tmp/mozart-hang-repro/`（`gdb-*-now.txt`、`proc-*.txt`、`st-hung.json`）
+与 `/tmp/mozart-fix-verify/`（`st-*-final.json`、`stats-*.json`、`out-*.wav`、`monitor-*.log`），不入库。

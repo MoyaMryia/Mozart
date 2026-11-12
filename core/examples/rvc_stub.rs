@@ -52,6 +52,7 @@ struct State {
     input_socket: PathBuf,
     delay: Duration,
     hang: bool,
+    feed_pace: Duration,
 }
 
 fn main() {
@@ -67,6 +68,12 @@ fn main() {
         .map(Duration::from_millis)
         .unwrap_or(Duration::ZERO);
     let hang = std::env::var("MOZART_RVC_STUB_FILE_HANG").is_ok_and(|value| value == "1");
+    // 攒帧逐帧节流：拉宽攒帧窗，让共享输入 socket 上的实时帧污染可复现（回归用）。
+    let feed_pace = std::env::var("MOZART_RVC_STUB_FILE_FEED_PACE_MS")
+        .ok()
+        .and_then(|value| value.parse::<u64>().ok())
+        .map(Duration::from_millis)
+        .unwrap_or(Duration::ZERO);
     let mut state = State {
         model: None,
         streaming: false,
@@ -75,6 +82,7 @@ fn main() {
         input_socket: config.rvc_input_socket(),
         delay,
         hang,
+        feed_pace,
     };
     serve(args, move |msg| handle(msg, &mut state));
 }
@@ -199,7 +207,8 @@ fn handle(msg: &Message, state: &mut State) -> Vec<u8> {
 }
 
 /// kind=file 入口校验一次（同 C++ StreamSession）：total_frames 正整数（u32）、
-/// output_socket 绝对路径；随后绑定输入 socket 并起批处理线程。
+/// output_socket / input_socket 绝对路径；随后绑定输入 socket 并起批处理线程。
+/// input_socket 缺省回退实时 rvc-in.sock；文件链路传独立 socket，隔离 pre 恒发帧。
 fn start_file_batch(state: &mut State, body: &Value) -> Result<(), Vec<u8>> {
     let total = body
         .get("total_frames")
@@ -222,7 +231,13 @@ fn start_file_batch(state: &mut State, body: &Value) -> Result<(), Vec<u8>> {
             "output_socket must be an absolute path string",
         ));
     };
-    let rx = FrameSocket::<InputFrame>::bind(&state.input_socket, QUEUE_FRAMES)
+    let input = body
+        .get("input_socket")
+        .and_then(Value::as_str)
+        .map(PathBuf::from)
+        .filter(|path| path.is_absolute())
+        .unwrap_or_else(|| state.input_socket.clone());
+    let rx = FrameSocket::<InputFrame>::bind(&input, QUEUE_FRAMES)
         .map_err(|err| fail(ctl::CODE_INTERNAL, &format!("bind input socket: {err}")))?;
     let batch = Batch {
         cancel: Arc::new(AtomicBool::new(false)),
@@ -236,6 +251,7 @@ fn start_file_batch(state: &mut State, body: &Value) -> Result<(), Vec<u8>> {
         batch.counters.clone(),
         state.delay,
         state.hang,
+        state.feed_pace,
     );
     state.batch = Some(batch);
     Ok(())
@@ -249,6 +265,7 @@ fn spawn_batch(
     counters: Arc<Counters>,
     delay: Duration,
     hang: bool,
+    feed_pace: Duration,
 ) {
     std::thread::spawn(move || {
         // 挂死对端：持有输入 socket 绑定但永不读帧，直到停流置取消。
@@ -268,6 +285,10 @@ fn spawn_batch(
                 Ok(frame) => {
                     audio.push(frame.pcm);
                     counters.frames_in.fetch_add(1, Ordering::Relaxed);
+                    // 攒帧节流（回归旋钮）：拉宽攒帧窗，复现共享 socket 实时帧污染。
+                    if !feed_pace.is_zero() {
+                        std::thread::sleep(feed_pace);
+                    }
                 }
                 Err(err) if err.kind() == ErrorKind::TimedOut => continue,
                 Err(_) => return,

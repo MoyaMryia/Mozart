@@ -104,7 +104,9 @@ impl Services {
     }
 
     /// StartStream kind=file（D1/D2）：total_frames 作整段结束信号，
-    /// output_socket 覆盖默认输出 socket（daemon 绑定，绝对路径）。
+    /// output_socket 覆盖默认输出 socket（daemon 绑定，绝对路径），
+    /// input_socket 覆盖默认输入 socket（rvc 绑定，绝对路径）——独立于
+    /// pre 恒发的 rvc-in.sock，避免实时帧污染整段攒帧。
     /// 与实时不同，Busy 不吞：已有活动流说明仲裁失守，必须失败带原因。
     pub fn file_start_stream(
         &self,
@@ -112,11 +114,13 @@ impl Services {
         model_handle: u64,
         total_frames: u32,
         output_socket: &Path,
+        input_socket: &Path,
     ) -> Result<(), (String, String)> {
         let mut body = stream_body(config, model_handle);
         body["kind"] = json!("file");
         body["total_frames"] = json!(total_frames);
         body["output_socket"] = json!(output_socket.to_string_lossy());
+        body["input_socket"] = json!(input_socket.to_string_lossy());
         let text = body.to_string();
         self.rvc()
             .call_ok(ctl::RVC_START_STREAM, text.as_bytes())

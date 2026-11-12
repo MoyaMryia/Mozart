@@ -9,8 +9,12 @@ use common::{
 };
 use mozart_core::ctl::schema::FileJobState;
 use mozart_core::ctl::{self, Seqpacket};
+use mozart_core::dgram::FrameSocket;
+use mozart_core::{FrameMeta, InputFrame, INPUT_SAMPLES};
 use serde_json::json;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
 use std::time::Duration;
 
 /// 数据面用例等待上限：真 ffmpeg + DSP + 桩批处理，主机上远小于此。
@@ -296,6 +300,75 @@ fn cancel_interrupts_feed_when_peer_hangs() {
         }),
         "取消后 rvc 流必须停下"
     );
+}
+
+/// 回归（长文件数据面死锁）：pre 恒发实时帧到共享 rvc-in.sock（SPEC-02「AI 路径
+/// 永不停」，不随路由停发）。文件攒帧若读同一 socket，会把实时帧计入 total_frames
+/// 提前停读，daemon 喂帧剩帧阻塞在满缓冲、永不进 receive 排空输出，rvc 回帧填满
+/// 输出缓冲后阻塞——两侧互等死锁（板端 295 s 实测）。修复后文件喂帧走独立
+/// rvc-file-in.sock，实时帧污染不到攒帧，任务必须完成。
+/// 旧实现（daemon 喂 rvc-in.sock、桩绑 rvc-in.sock）在本用例下死锁超时。
+#[test]
+fn realtime_flood_on_shared_input_does_not_wedge_file_job() {
+    // 桩攒帧逐帧节流 2 ms：拉宽攒帧窗（1000 帧约 2 s），让共享 rvc-in.sock 上
+    // 的实时帧必然混入攒帧——复现板端长文件喂帧期间 pre 恒发污染的死锁形态。
+    let h = Harness::new(
+        "worker-realtime-flood",
+        "",
+        &[("MOZART_RVC_STUB_FILE_FEED_PACE_MS", "2".to_string())],
+    );
+    let run_dir = h.daemon.dir.clone();
+
+    // 模拟 pre 的惰性恒发支路（ai.rs LazySender）：持续向共享 rvc-in.sock 发实时
+    // InputFrame，非阻塞满则丢弃；发送失败即弃用通道下一帧重建链——桩起流时重绑
+    // rvc-in.sock（新 inode），恒发方必须跟随重绑才能把实时帧送进攒帧侧。
+    let stop = Arc::new(AtomicBool::new(false));
+    let polluter = {
+        let stop = Arc::clone(&stop);
+        std::thread::spawn(move || {
+            let path = run_dir.join("rvc-in.sock");
+            let mut socket: Option<FrameSocket<InputFrame>> = None;
+            let mut idx = 0u32;
+            while !stop.load(Ordering::Relaxed) {
+                if socket.is_none() {
+                    socket = FrameSocket::<InputFrame>::connect(&path, 8).ok();
+                }
+                if let Some(tx) = socket.as_ref() {
+                    let frame = InputFrame {
+                        meta: FrameMeta {
+                            pts_ns: u64::from(idx) * 20_000_000,
+                            frame_idx: idx,
+                            vad_flag: 1,
+                            energy_db: 0,
+                            conf: 0,
+                            segment_id: 0,
+                        },
+                        pcm: [0.25; INPUT_SAMPLES],
+                    };
+                    if tx.send(&frame).is_err() {
+                        socket = None;
+                    }
+                }
+                idx = idx.wrapping_add(1);
+                std::thread::sleep(Duration::from_micros(200));
+            }
+        })
+    };
+
+    // 20 s = 1000 契约帧：攒帧窗足够宽，共享 socket 下实时帧必然混入。
+    let (job_id, pcm) = h.submit("tone.wav", 20, 16000);
+    let job = wait_job_state(&h.conn, &job_id, FileJobState::Completed, JOB_TIMEOUT);
+    stop.store(true, Ordering::Relaxed);
+    let _ = polluter.join();
+
+    assert!(job.result_ready, "completed 必须附结果可取标记");
+    assert!(job.error.is_none());
+    let wav = read_wav(&h.result(&job_id));
+    assert_eq!(wav.samples.len(), pcm.len() * 3, "输出时长与输入一致");
+    // 文件帧全数过数据面：实时帧未被计入（独立输入 socket 隔离）。
+    h.assert_batch_counts(1000, 1000);
+    h.assert_temp_clean(&job_id);
+    h.assert_gpu_free();
 }
 
 /// 生成 PCM16 单声道正弦 WAV（测试源，留在临时目录不入库），返回样本值。
