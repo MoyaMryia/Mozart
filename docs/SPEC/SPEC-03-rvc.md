@@ -42,6 +42,8 @@
 
 `kind` 只分 `realtime` 和 `file`。C++ 按模型能力选择实时资产或 quality / full-history preset；缺实时资产时拒绝实时，不静默降级。
 
+`StartStream` 会话参数取自 TOML `[rvc]` 会话默认值；v1 无运行时改参数命令。将来 `SetParams` 的运行时改动记入 daemon 运行时状态文件（见 SPEC-04），重启恢复，不回写 TOML。
+
 `filter_radius` 在旧 C++ 里只保存、未参与计算，v1 不放进 `StartStream`、不暴露死参数；保留为 FUTURE 提升项，推迟实现 F0 中值滤波，见 [FUTURE.md](../FUTURE.md)。
 
 若板端实测小缓冲扛不住抖动或时钟漂移，再把大缓冲搬到音频进程，同时把 `startup_delay_out` 设为 0 并重测首帧。

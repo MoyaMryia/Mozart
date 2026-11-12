@@ -82,6 +82,10 @@
 - 2026-11-11：filter_radius 定为保留 FUTURE 提升项、推迟实现，v1 不暴露死参数。
 - 2026-11-11：播报音频由 TTS 进程内重采样到 16 kHz 契约帧，RVC 输入统一 16 kHz；rvc 待讨论清空。
 - 2026-11-11：确认数据面 socket 命名与方向：`rvc-in.sock` 由 rvc 绑定收输入帧，`rvc-out.sock` 由 pre 绑定收输出帧。
+- 2026-11-12：控制面命令覆盖字幕链路；语言服务接线定稿（各绑控制 socket，命令号 asr `0x04xx` / bridge `0x05xx` / tts `0x06xx`，llama-server 可达性由桥带报）。字幕文件改放持久本地存储，默认路径与轮转待确认。
+- 2026-11-12：字幕文件默认 `~/.local/state/mozart/subtitles.jsonl`（XDG 状态目录）；v1 不轮转，留实测后定。
+- 2026-11-12：字幕链路控制定稿（v1 命令 translate/speech on/off、状态归属各归其主、桥/TTS 状态字段）；持久化定为 TOML 只读基线 + 运行时状态文件，每次改动原子写、重启恢复、不回写 TOML。关机缺口（daemon 信号处理、桥 SIGTERM 收尾）入待讨论。
+- 2026-11-12：收尾三开口：speech stop 纳入 v1；daemon 捕获 SIGTERM/SIGINT 走优雅关停；桥 SIGTERM 丢弃在途、字幕存档不受影响。字幕文件与控制面交接定稿。
 - 2026-11-12：确认 `[pre]` 配置段设备与环容量键，以及路由/静音淡变时长与切换次序（SPEC-02）。
 - 2026-11-12：确认 `[pre.dsp]` 配置键（denoise，默认沿用旧代码默认 true；禁用整级跳过）与 WOLA 流式合同（首块 896、稳态 960、发射滞后 64、缺口补零保持 20 ms 节拍），对拍夹具入 `tests/fixtures/dsp/`（SPEC-02）。
 - 2026-11-12：pre AI 支路定稿：整形级配置键（gate/AGC/limiter 默认关）、16 kHz 打包 meta 语义（pts 取采集时间戳、frame_idx 为打包序号）、恒定发送与惰性建链、接收环 8 帧、direct 排空计数与 consumer_drops 口径（rvc / rvc.skipped）（SPEC-02）。
@@ -90,3 +94,5 @@
 - 2026-11-12：板端实测定稿：同源 60 s 长跑小缓冲零掉帧、49.86 帧/s 1:1，维持大缓冲留 C++；rvc 端到端净滞后约 0.5 s（SPEC-03 补实测确认行）。实测记录入 `reports/realtime-pipeline-20261112`。
 - 2026-11-12：路由切换淡变双向对称化：rvc→direct 不再立即切源，与 direct→rvc 一致先淡出到零、帧内零保持、下一帧新源淡入，消除约 14% 满幅的单样本跳变（SPEC-02）。
 - 2026-11-12：数据面缓冲措辞修正：4–8 帧上限由发送方 connect 侧 `SO_SNDBUF` 执行，Linux AF_UNIX 数据报流控不按接收方 `SO_RCVBUF` 记账；非阻塞发送与丢弃计数口径不变（SPEC-02）。
+- 2026-11-12：配置写回定稿（取代同日"不回写 TOML"）：模型甲保留（TOML 基线 + 状态文件覆盖）；新增 `config set` 单键写 TOML、`config save` 批量提升状态→TOML；键分运行时/重启两类，重启键响应带 `restart_required`+`affected` 稳定契约、`status` 显示待重启；重启支持单服务与整栈两粒度；手改 TOML 随意不防冲突。TOML 规范文件后续（SPEC-04）。
+- 2026-11-12：文件任务队列 v1 有界内存不落盘、重启丢待转任务，落盘持久化入 FUTURE；澄清 RVC 模式为资源仲裁派生状态（不入配置状态文件），会话参数实时/文件共用一份配置覆盖（SPEC-04）。

@@ -11,8 +11,8 @@
 - 帧契约：20 ms；输入 16 kHz 单声道 f32（320 点），输出 48 kHz 单声道 f32（960 点）。
 - 环形队列：满时丢最旧，计数，日志限频；空时消费者等待。
 - 数据面：Unix `SOCK_DGRAM`，一帧一条消息；控制面：Unix `SOCK_SEQPACKET`，定长头 + JSON 体。
-- 控制信封：16 B 小端定长头（magic `'MCTL'`、version、type、request_id、body_len），体为 JSON，上限 64 KiB；命令号按平面分段：daemon `0x01xx`、pre `0x02xx`、rvc `0x03xx`；响应 type 回显，体固定 `status` / `code` / `reason` / `data`。
-- 识别事件流（识别服务 → 字幕桥）：Unix `SOCK_SEQPACKET`，一条消息一个 JSON 事件，无定长头；事件契约见 SPEC-05。
+- 控制信封：16 B 小端定长头（magic `'MCTL'`、version、type、request_id、body_len），体为 JSON，上限 64 KiB；命令号按平面分段：daemon `0x01xx`、pre `0x02xx`、rvc `0x03xx`、asr `0x04xx`、bridge `0x05xx`、tts `0x06xx`；响应 type 回显，体固定 `status` / `code` / `reason` / `data`。
+- 识别事件流（识别服务 → 字幕桥）：Unix `SOCK_SEQPACKET`，一条消息一个 JSON 事件，无定长头；socket 默认 `asr-events.sock`（run_dir 下）；事件契约见 SPEC-05。
 - 数据包沿用旧格式：4 字节魔数 + 16 字节元数据 + PCM；输入 1300 字节，输出 3860 字节。
 - 帧契约以 C 头文件为单一来源；Rust 用 `#[repr(C)]` 镜像，加编译期大小和偏移断言；双方用同一组字节夹具对拍。
 - 环形队列用于进程内（采集 → DSP）；Unix 数据报用于进程间（音频 ↔ 推理）。
