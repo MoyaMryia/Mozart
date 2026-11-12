@@ -273,7 +273,7 @@ impl OfflineRecognizer for FakeOffline {
 fn decoder_endpoint_cuts_final_and_submits_review() {
     let (fake, _state) = FakeOnline::new(2);
     let (review_tx, review_rx) = mpsc::sync_channel::<ReviewJob>(2);
-    let (tx, rx) = mpsc::channel();
+    let (tx, rx) = mpsc::sync_channel(crate::event::EVENT_QUEUE_CAPACITY);
     let shared = Arc::new(Shared::new("teststart".to_string()));
     let mut dec = Decoder::new(fake, Some(review_tx), tx, shared.clone());
 
@@ -312,7 +312,7 @@ fn decoder_endpoint_cuts_final_and_submits_review() {
 #[test]
 fn decoder_partial_throttled_and_deduplicated() {
     let (fake, _state) = FakeOnline::new(1000);
-    let (tx, rx) = mpsc::channel();
+    let (tx, rx) = mpsc::sync_channel(crate::event::EVENT_QUEUE_CAPACITY);
     let shared = Arc::new(Shared::new("teststart".to_string()));
     let mut dec = Decoder::new(fake, None, tx, shared);
 
@@ -342,7 +342,7 @@ fn decoder_utterance_cap_is_fatal() {
     for idx in 0..=(MAX_UTTERANCE_FRAMES as u32) {
         ring.push(Inbox::Frame(frame(idx)));
     }
-    let (tx, _rx) = mpsc::channel();
+    let (tx, _rx) = mpsc::sync_channel(crate::event::EVENT_QUEUE_CAPACITY);
     let shared = Arc::new(Shared::new("teststart".to_string()));
     let result = decoder::run_with(fake, ring, None, tx, shared, stop_flag());
     let message = result.unwrap_err();
@@ -356,7 +356,7 @@ fn sigterm_flush_feeds_silence_and_cuts_final() {
     ring.push(Inbox::Frame(frame(0)));
     ring.push(Inbox::Frame(frame(1)));
     let (review_tx, review_rx) = mpsc::sync_channel::<ReviewJob>(2);
-    let (tx, rx) = mpsc::channel();
+    let (tx, rx) = mpsc::sync_channel(crate::event::EVENT_QUEUE_CAPACITY);
     let shared = Arc::new(Shared::new("teststart".to_string()));
     let stop = stop_flag();
     let worker_shared = shared.clone();
@@ -394,7 +394,7 @@ fn sigterm_flush_feeds_silence_and_cuts_final() {
 fn review_queue_full_marks_skipped() {
     let (fake, _state) = FakeOnline::new(1); // 每帧 endpoint
     let (review_tx, review_rx) = mpsc::sync_channel::<ReviewJob>(2);
-    let (tx, rx) = mpsc::channel();
+    let (tx, rx) = mpsc::sync_channel(crate::event::EVENT_QUEUE_CAPACITY);
     let shared = Arc::new(Shared::new("teststart".to_string()));
     let mut dec = Decoder::new(fake, Some(review_tx), tx, shared.clone());
 
@@ -428,7 +428,7 @@ fn review_queue_full_marks_skipped() {
 #[test]
 fn review_load_failure_reports_each_utterance() {
     let (job_tx, job_rx) = mpsc::sync_channel::<ReviewJob>(2);
-    let (tx, rx) = mpsc::channel();
+    let (tx, rx) = mpsc::sync_channel(crate::event::EVENT_QUEUE_CAPACITY);
     let shared = Arc::new(Shared::new("teststart".to_string()));
     let worker_shared = shared.clone();
     let handle = std::thread::spawn(move || {
@@ -464,7 +464,7 @@ fn review_load_failure_reports_each_utterance() {
 fn review_completed_event() {
     let (fake, _started) = FakeOffline::new("复核文本", Duration::ZERO);
     let (job_tx, job_rx) = mpsc::sync_channel::<ReviewJob>(2);
-    let (tx, rx) = mpsc::channel();
+    let (tx, rx) = mpsc::sync_channel(crate::event::EVENT_QUEUE_CAPACITY);
     let shared = Arc::new(Shared::new("teststart".to_string()));
     let worker_shared = shared.clone();
     let handle = std::thread::spawn(move || {
@@ -489,7 +489,7 @@ fn review_completed_event() {
 fn review_empty_text_is_failed() {
     let (fake, _started) = FakeOffline::new("", Duration::ZERO);
     let (job_tx, job_rx) = mpsc::sync_channel::<ReviewJob>(2);
-    let (tx, rx) = mpsc::channel();
+    let (tx, rx) = mpsc::sync_channel(crate::event::EVENT_QUEUE_CAPACITY);
     let shared = Arc::new(Shared::new("teststart".to_string()));
     let worker_shared = shared.clone();
     let handle = std::thread::spawn(move || {
@@ -512,7 +512,7 @@ fn review_drain_deadline_skips_remaining() {
     // 第 3 句出窗时已超时限 → skipped。
     let (fake, started) = FakeOffline::new("慢复核", Duration::from_millis(1500));
     let (job_tx, job_rx) = mpsc::sync_channel::<ReviewJob>(2);
-    let (tx, rx) = mpsc::channel();
+    let (tx, rx) = mpsc::sync_channel(crate::event::EVENT_QUEUE_CAPACITY);
     let shared = Arc::new(Shared::new("teststart".to_string()));
     let stop = stop_flag();
     let worker_shared = shared.clone();
@@ -667,7 +667,7 @@ fn output_buffers_replays_and_drops_oldest() {
     let dir = temp_dir("output");
     let path = dir.join("events.sock");
     let listener = EventListener::bind(&path).unwrap();
-    let (tx, rx) = mpsc::channel();
+    let (tx, rx) = mpsc::sync_channel(crate::event::EVENT_QUEUE_CAPACITY);
     let shared = Arc::new(Shared::new("teststart".to_string()));
     let worker_shared = shared.clone();
     let handle = std::thread::spawn(move || output::run(listener, rx, worker_shared, 4));

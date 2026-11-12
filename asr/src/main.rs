@@ -157,7 +157,7 @@ fn run(cli: Cli) -> Result<(), String> {
     let events_listener = output::EventListener::bind(&config.asr_events_socket())
         .map_err(|err| format!("绑定 {}：{err}", config.asr_events_socket().display()))?;
 
-    let (events_tx, events_rx) = mpsc::channel::<event::Event>();
+    let (events_tx, events_rx) = mpsc::sync_channel::<event::Event>(event::EVENT_QUEUE_CAPACITY);
     let review_enabled = !config.asr.review_model_dir.as_os_str().is_empty();
     let (review_tx, review_rx) = if review_enabled {
         let (tx, rx) = mpsc::sync_channel::<review::ReviewJob>(review::QUEUE_CAPACITY);

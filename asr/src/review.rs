@@ -2,18 +2,20 @@
 //! SenseVoice 离线复核整句，发 refined 事件。模型加载失败不影响在线识别，每句报 failed。
 //! 队满由解码侧标 skipped（见 decoder）。SIGTERM 限时 1 s 排空，剩余标 skipped。
 
-use crate::event::{Event, REVIEW_COMPLETED, REVIEW_FAILED, REVIEW_SKIPPED};
+use crate::event::{deliver, Event, REVIEW_COMPLETED, REVIEW_FAILED, REVIEW_SKIPPED};
 use crate::ffi::{self, OfflineRecognizer};
 use crate::state::Shared;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering::Relaxed};
-use std::sync::mpsc::{Receiver, RecvTimeoutError, Sender};
+use std::sync::mpsc::{Receiver, RecvTimeoutError, SyncSender};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 /// 复核队列容量（SPEC-05：2）。
 pub const QUEUE_CAPACITY: usize = 2;
-/// SIGTERM 复核排空时限（SPEC-05：1 s）。
+/// SIGTERM 复核排空时限（SPEC-05：1 s）。取值依据：daemon 停机宽限 2 s，
+/// 解码收尾喂 0.3 s 静音切句、复核排空、输出补发须共同留在宽限内；复核取 1 s
+/// 给解码收尾与输出补发留余量，超时剩余标 skipped 而非无限等待。
 const DRAIN_TIMEOUT: Duration = Duration::from_secs(1);
 /// 收任务轮询步长：超时后检查停止标志。
 const POLL: Duration = Duration::from_millis(100);
@@ -29,7 +31,7 @@ pub fn run(
     rx: Receiver<ReviewJob>,
     model_dir: PathBuf,
     threads: u32,
-    events: Sender<Event>,
+    events: SyncSender<Event>,
     shared: Arc<Shared>,
     stop: &'static AtomicBool,
 ) {
@@ -44,7 +46,7 @@ pub fn run(
 pub fn run_with(
     rx: Receiver<ReviewJob>,
     recognizer: Result<Box<dyn OfflineRecognizer>, String>,
-    events: Sender<Event>,
+    events: SyncSender<Event>,
     shared: Arc<Shared>,
     stop: &'static AtomicBool,
 ) {
@@ -81,7 +83,7 @@ pub fn run_with(
 }
 
 /// 复核跳过：计数并发 refined skipped 事件（队满/退出时限共用）。
-fn skip(job: ReviewJob, events: &Sender<Event>, shared: &Shared) {
+fn skip(job: ReviewJob, events: &SyncSender<Event>, shared: &Shared) {
     shared.add_review_skipped(1);
     let event = job.final_event.into_refined(
         REVIEW_SKIPPED,
@@ -89,14 +91,14 @@ fn skip(job: ReviewJob, events: &Sender<Event>, shared: &Shared) {
         Some("复核在退出时限内未排空".to_string()),
         0,
     );
-    let _ = events.send(event);
+    deliver(events, event, shared);
 }
 
 /// 复核一句：成功发 completed，空文本或错误发 failed。
 fn process(
     job: ReviewJob,
     recognizer: &Result<Box<dyn OfflineRecognizer>, String>,
-    events: &Sender<Event>,
+    events: &SyncSender<Event>,
     shared: &Shared,
 ) {
     shared.set_reviewing(true);
@@ -128,6 +130,6 @@ fn process(
                 .into_refined(REVIEW_FAILED, None, Some(err), 0)
         }
     };
-    let _ = events.send(event);
+    deliver(events, event, shared);
     shared.set_reviewing(false);
 }

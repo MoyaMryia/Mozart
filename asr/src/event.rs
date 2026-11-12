@@ -2,13 +2,38 @@
 //! 新增 startup_id 与 utterance_id（启动号:句号）。一条 SEQPACKET 消息一个 JSON 事件。
 //! 同音字纠错归字幕桥（SPEC-05 翻译节），识别服务 text 即原始增量，homophone_fixes 恒空。
 
-use crate::state::unix_ms;
+use crate::state::{unix_ms, Shared};
 use serde::Serialize;
 use serde_json::Value;
+use std::sync::mpsc::{SyncSender, TrySendError};
 
 pub const PARTIAL: &str = "partial";
 pub const FINAL: &str = "final";
 pub const REFINED: &str = "refined";
+
+/// 解码/复核 → 输出线程的有界事件通道容量。吸收输出线程向桥发送停顿
+/// （单条发送上限 200 ms）期间的突发；partial 已 100 ms 节流，64 条留足余量。
+/// 满丢当前事件并计数（event_channel_dropped），不阻塞解码热路径。
+pub const EVENT_QUEUE_CAPACITY: usize = 64;
+
+/// 交付事件到有界输出通道：队满丢当前并计数，不阻塞解码/复核线程。
+/// partial 可丢（静默计数）；final/refined 丢失记降级原因，经 GetStatus 可查。
+/// 输出线程退出（进程收尾）后的断开丢弃不计数。
+pub fn deliver(events: &SyncSender<Event>, event: Event, shared: &Shared) {
+    match events.try_send(event) {
+        Ok(()) => {}
+        Err(TrySendError::Full(event)) => {
+            shared.add_event_channel_dropped(1);
+            if event.kind != PARTIAL {
+                shared.set_last_error(&format!(
+                    "事件通道满，丢弃 {} 句 {}",
+                    event.kind, event.seq
+                ));
+            }
+        }
+        Err(TrySendError::Disconnected(_)) => {}
+    }
+}
 
 /// 复核状态取值（沿用旧 refinement_status 语义）。
 pub const REVIEW_PENDING: &str = "pending";
@@ -45,6 +70,14 @@ pub struct Event {
     pub refined_text: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub refinement_error: Option<String>,
+    /// 数字审计（旧 asr_checks.numeric_audit，双解码 ITN 开/关对比）。
+    /// refined 事件携带，可空；完整双解码审计工作量大，v1 留空接口，见 FUTURE。
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub asr_numeric_audit: Option<Value>,
+    /// 极性审计（旧 asr_checks.polarity_audit，在线/复核可能/不可能对比）。
+    /// refined 事件携带，可空；v1 留空接口，见 FUTURE。
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub asr_polarity_audit: Option<Value>,
 }
 
 /// utterance_id = 启动号:句号（SPEC-05 字幕桥节）。
@@ -82,6 +115,8 @@ impl Event {
             refinement_status: None,
             refined_text: None,
             refinement_error: None,
+            asr_numeric_audit: None,
+            asr_polarity_audit: None,
         }
     }
 
@@ -118,10 +153,14 @@ impl Event {
             ),
             refined_text: None,
             refinement_error: None,
+            asr_numeric_audit: None,
+            asr_polarity_audit: None,
         }
     }
 
     /// 由 final 事件派生 refined 事件：保留原字段，覆盖类型与复核结果。
+    /// 审计字段保留为空值接口（null）：完整双解码数字审计与极性审计
+    /// （旧 asr_checks.py）工作量大，v1 不实现，见 FUTURE。
     pub fn into_refined(
         mut self,
         status: &str,
@@ -135,6 +174,8 @@ impl Event {
         self.refined_text = refined_text;
         self.refinement_error = error;
         self.final_decode_ms = Some(decode_ms);
+        self.asr_numeric_audit = Some(Value::Null);
+        self.asr_polarity_audit = Some(Value::Null);
         self
     }
 }
@@ -169,6 +210,8 @@ mod tests {
         // partial 不携带 final 专属字段。
         assert!(json.get("text_raw").is_none());
         assert!(json.get("refinement_status").is_none());
+        assert!(json.get("asr_numeric_audit").is_none());
+        assert!(json.get("asr_polarity_audit").is_none());
     }
 
     #[test]
@@ -209,6 +252,9 @@ mod tests {
         assert_eq!(json["refinement_status"], "completed");
         assert_eq!(json["final_decode_ms"], 12);
         assert!(json.get("refinement_error").is_none());
+        // 审计字段保留为空值接口（null），完整双解码审计见 FUTURE。
+        assert_eq!(json["asr_numeric_audit"], Value::Null);
+        assert_eq!(json["asr_polarity_audit"], Value::Null);
 
         let failed = Event::final_utterance("abcd1234", 8, "x".to_string(), None, None, true)
             .into_refined(REVIEW_FAILED, None, Some("模型未加载".to_string()), 0);
@@ -216,5 +262,30 @@ mod tests {
         assert_eq!(json["refinement_status"], "failed");
         assert_eq!(json["refinement_error"], "模型未加载");
         assert!(json.get("refined_text").is_none());
+    }
+
+    #[test]
+    fn deliver_counts_drop_when_channel_full() {
+        use std::sync::mpsc;
+        let (tx, rx) = mpsc::sync_channel(1);
+        let shared = Shared::new("s".to_string());
+        // 首条填满容量 1 的通道。
+        deliver(&tx, Event::partial("s", 1, "x".to_string(), None, None), &shared);
+        assert_eq!(shared.status(0).event_channel_dropped, 0);
+        // final 满丢：计数并记降级原因。
+        deliver(
+            &tx,
+            Event::final_utterance("s", 2, "y".to_string(), None, None, true),
+            &shared,
+        );
+        assert_eq!(shared.status(0).event_channel_dropped, 1);
+        assert!(shared.status(0).last_error.unwrap().contains("事件通道满"));
+        // partial 满丢：计数但不覆盖降级原因。
+        deliver(&tx, Event::partial("s", 3, "z".to_string(), None, None), &shared);
+        assert_eq!(shared.status(0).event_channel_dropped, 2);
+        // 输出线程退出（断开）后的丢弃不计数。
+        drop(rx);
+        deliver(&tx, Event::partial("s", 4, "w".to_string(), None, None), &shared);
+        assert_eq!(shared.status(0).event_channel_dropped, 2);
     }
 }

@@ -23,6 +23,7 @@ pub struct Shared {
     frames_received: AtomicU64,
     frames_rejected: AtomicU64,
     event_buffer_dropped: AtomicU64,
+    event_channel_dropped: AtomicU64,
     finals: AtomicU64,
     review_skipped: AtomicU64,
     review_failed: AtomicU64,
@@ -40,6 +41,7 @@ impl Shared {
             frames_received: AtomicU64::new(0),
             frames_rejected: AtomicU64::new(0),
             event_buffer_dropped: AtomicU64::new(0),
+            event_channel_dropped: AtomicU64::new(0),
             finals: AtomicU64::new(0),
             review_skipped: AtomicU64::new(0),
             review_failed: AtomicU64::new(0),
@@ -73,6 +75,10 @@ impl Shared {
     /// 发布输出缓冲丢句累计绝对值（输出线程调用）。
     pub fn set_event_buffer_dropped(&self, total: u64) {
         self.event_buffer_dropped.store(total, Relaxed);
+    }
+    /// 解码/复核 → 输出有界通道满丢事件计数（交付侧调用）。
+    pub fn add_event_channel_dropped(&self, count: u64) {
+        self.event_channel_dropped.fetch_add(count, Relaxed);
     }
     pub fn set_bridge_connected(&self, connected: bool) {
         self.bridge_connected.store(connected, Relaxed);
@@ -108,6 +114,7 @@ impl Shared {
             frames_rejected: self.frames_rejected.load(Relaxed),
             ring_dropped,
             event_buffer_dropped: self.event_buffer_dropped.load(Relaxed),
+            event_channel_dropped: self.event_channel_dropped.load(Relaxed),
             finals: self.finals.load(Relaxed),
             review_skipped: self.review_skipped.load(Relaxed),
             review_failed: self.review_failed.load(Relaxed),

@@ -3,7 +3,7 @@
 //! 触发即返回致命错误、进程退出由 daemon 重启。SIGTERM 喂 0.3 s 静音切出最后 final。
 //! 解码与复核线程只交付事件，不碰事件 socket（输出线程独占）。
 
-use crate::event::{Event, REVIEW_SKIPPED};
+use crate::event::{deliver, Event, REVIEW_SKIPPED};
 use crate::ffi::{self, Recognizer, Stream};
 use crate::receiver::Inbox;
 use crate::review::ReviewJob;
@@ -12,7 +12,7 @@ use mozart_core::ring::Ring;
 use mozart_core::{InputFrame, INPUT_SAMPLES};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering::Relaxed};
-use std::sync::mpsc::{Sender, SyncSender, TrySendError};
+use std::sync::mpsc::{SyncSender, TrySendError};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -33,7 +33,7 @@ pub fn run(
     model_dir: PathBuf,
     threads: u32,
     review: Option<SyncSender<ReviewJob>>,
-    events: Sender<Event>,
+    events: SyncSender<Event>,
     shared: Arc<Shared>,
     stop: &'static AtomicBool,
 ) -> Result<(), String> {
@@ -46,7 +46,7 @@ pub fn run_with(
     recognizer: Box<dyn Recognizer>,
     ring: Arc<Ring<Inbox>>,
     review: Option<SyncSender<ReviewJob>>,
-    events: Sender<Event>,
+    events: SyncSender<Event>,
     shared: Arc<Shared>,
     stop: &'static AtomicBool,
 ) -> Result<(), String> {
@@ -68,7 +68,7 @@ pub struct Decoder {
     recognizer: Box<dyn Recognizer>,
     stream: Option<Box<dyn Stream>>,
     review: Option<SyncSender<ReviewJob>>,
-    events: Sender<Event>,
+    events: SyncSender<Event>,
     shared: Arc<Shared>,
     /// 整句 PCM 缓冲（16 kHz f32），endpoint 时所有权移交复核。
     pcm: Vec<f32>,
@@ -85,7 +85,7 @@ impl Decoder {
     pub fn new(
         recognizer: Box<dyn Recognizer>,
         review: Option<SyncSender<ReviewJob>>,
-        events: Sender<Event>,
+        events: SyncSender<Event>,
         shared: Arc<Shared>,
     ) -> Self {
         Self {
@@ -180,7 +180,7 @@ impl Decoder {
                     self.start_pts,
                     Some(self.end_pts),
                 );
-                let _ = self.events.send(event);
+                deliver(&self.events, event, &self.shared);
             }
         }
     }
@@ -222,7 +222,7 @@ impl Decoder {
             Some(end_pts),
             review_enabled,
         );
-        let _ = self.events.send(event.clone());
+        deliver(&self.events, event.clone(), &self.shared);
 
         let Some(tx) = self.review.as_ref() else {
             return;
@@ -244,7 +244,7 @@ impl Decoder {
                     Some("复核队列已满，保留在线文本".to_string()),
                     0,
                 );
-                let _ = self.events.send(skipped);
+                deliver(&self.events, skipped, &self.shared);
             }
             Err(TrySendError::Disconnected(job)) => {
                 self.shared.add_review_skipped(1);
@@ -254,16 +254,18 @@ impl Decoder {
                     Some("复核线程已退出".to_string()),
                     0,
                 );
-                let _ = self.events.send(skipped);
+                deliver(&self.events, skipped, &self.shared);
             }
         }
     }
 }
 
-/// 文本内容判定：含字母/数字/CJK 即视为有内容。
-/// 近似旧 unicodedata「非空白且非标点」判定，用于跳过纯标点 final。
+/// 文本内容判定（沿用旧 stt_service.has_text_content）：含非空白且非 Unicode
+/// 标点（P 类）的字符即视为有内容，用于跳过纯标点 final。
 fn has_text_content(text: &str) -> bool {
-    text.chars().any(|c| c.is_alphanumeric())
+    use unicode_categories::UnicodeCategories;
+    text.chars()
+        .any(|c| !c.is_whitespace() && !c.is_punctuation())
 }
 
 #[cfg(test)]
@@ -275,9 +277,13 @@ mod tests {
         assert!(!has_text_content(""));
         assert!(!has_text_content("。，！？……"));
         assert!(!has_text_content(".,!? "));
+        assert!(!has_text_content("——《》")); // 破折号与书名号属 P 类
         assert!(has_text_content("你好"));
         assert!(has_text_content("hello"));
         assert!(has_text_content("123"));
         assert!(has_text_content("你好。"));
+        // 符号（S 类）非标点，视为有内容（与旧 unicodedata 判定一致）。
+        assert!(has_text_content("＋"));
+        assert!(has_text_content("100°"));
     }
 }

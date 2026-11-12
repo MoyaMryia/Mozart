@@ -221,6 +221,9 @@ pub struct AsrStatus {
     pub frames_rejected: u64,
     pub ring_dropped: u64,
     pub event_buffer_dropped: u64,
+    /// 解码/复核 → 输出有界通道满丢事件累计。旧快照缺此字段按 0 还原。
+    #[serde(default)]
+    pub event_channel_dropped: u64,
     pub finals: u64,
     pub review_skipped: u64,
     pub review_failed: u64,
@@ -239,6 +242,7 @@ impl Default for AsrStatus {
             frames_rejected: 0,
             ring_dropped: 0,
             event_buffer_dropped: 0,
+            event_channel_dropped: 0,
             finals: 0,
             review_skipped: 0,
             review_failed: 0,
