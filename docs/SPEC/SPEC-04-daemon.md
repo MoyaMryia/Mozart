@@ -32,11 +32,11 @@
 - 重启提示契约：`config set` 重启生效键的响应带稳定字段 `restart_required` 与 `affected`（受影响服务）；daemon 判定，CLI 与以后 HTTP 适配器读同一字段提示，不各自实现。写了重启键后 TOML 与运行值分歧，`status` 显示该服务待重启。
 - 重启两粒度：`restart <service>` 重启单个服务（小模块）；整栈重启（大模块）用 `down`/`up`。重启重读配置生效。
 - 控制连接由独立线程处理，空闲 30 s 断开，慢客户端不阻塞其他命令；daemon 退出时先向子进程发 SIGTERM，2 s 后 SIGKILL。
-- `mozart-ctl` v1 命令：`up`、`down`、`status`、`route set <direct|rvc>`、`mute on|off`、`config get|set|save`、`restart <service>`、`translate on|off`、`speech on|off|stop`、`file submit <path> [--model <id>]`、`file pause`、`file resume`、`file cancel <job_id>`、`file fetch <job_id> [-o path]`、`file status <job_id>`、`file list`、`model list`；`--json` 输出稳定数据；退出码：0 成功、1 其他错误、2 参数错、3 daemon 不可达、4 请求被拒、5 超时。
+- `mozart-ctl` v1 命令：`up`、`down`、`status`、`route set <direct|rvc>`、`mute on|off`、`config get|set|save`、`restart <service>`、`translate on|off`、`speech on|off|stop`、`file submit <path> [--model <id>]`、`file pause`、`file resume`、`file cancel <job_id>`、`file fetch <job_id> [-o path]`、`file status <job_id>`、`file list`、`model list`、`device list`；`--json` 输出稳定数据；退出码：0 成功、1 其他错误、2 参数错、3 daemon 不可达、4 请求被拒、5 超时。
 - 控制面命令覆盖字幕链路：字幕开关命令经 daemon 转发到桥执行，命令契约见 SPEC-05。daemon 不持有桥的活状态，只转发命令并轮询汇总。
 - 模式建模用资源仲裁，不用大模式枚举：资源为 GPU 与扬声器；活动（实时变声、文件转换、翻译播报、直出）声明占用，daemon 仲裁，冲突按裁决判据处理；mode 是派生状态。继承旧原则：控制面不碰音频、GPU 互斥、文件队列串行加取消检查点、上限 50。
-- v1 资源仲裁范围：先做 GPU 单资源（实时 / 文件互斥），扬声器仲裁留接口；完整仲裁与播报活动见 [FUTURE.md](../FUTURE.md)。
-- 文件任务队列 v1 为有界内存队列（上限 50 沿用），不落盘；daemon/rvc 重启丢待转任务，不续转。落盘持久化见 [FUTURE.md](../FUTURE.md)。模式是资源仲裁的派生活状态，归 daemon 内存，不入配置状态文件，重启不恢复；会话参数实时与文件共用一份配置覆盖。
+- v1 资源仲裁范围：GPU 仲裁（实时 / 文件互斥）+ 扬声器分时（播报时静音实时、播完恢复，沿用旧实现）；播报经变声占 GPU 的仲裁与混音见 [FUTURE.md](../FUTURE.md)。
+- 文件任务队列 v1 落盘持久化（上限 50 沿用）；daemon/rvc 重启后续转待转任务（推理状态不保留，从头重跑），源副本已在受管存储目录持久。模式是资源仲裁的派生活状态，归 daemon 内存，不入配置状态文件，重启不恢复；会话参数实时与文件共用一份配置覆盖。
 - 冲突裁决判据：等待能解决的接受意图并排队/挂起，不让用户重试；等待不能解决的拒绝带原因。文件提交遇 GPU 被实时占用 → 入文件队列等待；GPU 空闲且有排队任务 → daemon 自动启动转换，无需显式启动命令。文件任务执行中收到 `route set rvc` → 挂路由等待槽（单槽，后请求覆盖前请求），当前任务结束后切换，剩余文件任务继续排队。模型不存在、参数非法、daemon 关停中 → 拒绝。队列满 50 拒收是容量准入规则，独立于本判据。
 - 文件队列暂停/恢复保留：`file pause` 置暂停标志，不再启动新任务，正在执行的任务跑完；`file resume` 清除标志继续。暂停是队列级布尔标志，独立于 GPU 仲裁。
 - 文件任务按任务选模型保留：`file submit <path> [--model <id>]`，不带 `--model` 用当前已加载模型。rvc 增 `ListModels` 查询；daemon 入队时经它校验模型存在，不存在当场拒收（沿用旧行为）。执行时 `LoadModel` 仍可能失败（如模型损坏），失败标 failed 带原因、队列继续。
@@ -48,6 +48,7 @@
 - 文件任务状态与进度：字段 `job_id` / `name` / `model_id` / `state` / `progress` / `error`，state 六态（queued / processing / cancelling / completed / failed / cancelled），completed 附结果可取标记（fetch 提示）；不带模式枚举（mode 派生）。进度 = 粗阶段（解码/喂入/推理/发布）+ 推理段用 rvc `GetStatus` 块/窗计数细化（daemon 每秒轮询已有）；依赖 rvc 文件模式给出有意义块计数，缺则退回粗阶段。CLI `file status <job_id>` 查单个、`file list` 看队列。
 - 文件转换入口（v1）：CLI `file submit <path>` 提交本地路径；daemon 复制文件到受管存储目录后入队，队列只引用副本，原文件变动不影响排队任务。入口校验：扩展名白名单 `.wav` / `.mp3` / `.m4a` / `.aac` / `.flac` / `.ogg`，100 MiB 大小预检；300 s 时长上限在解码后检查。HTTP 上传归 web 适配器，流式写盘后经同一入队契约提交。
 - 监控归 daemon，不独立进程：进程存活与崩溃重启；每秒轮询各服务 `GetStatus` 汇总业务指标与降级原因；收集子进程日志。
+- 音频设备识别归 daemon（硬件发现，与 hwmon 一类）：用 ALSA API（`snd_device_name_hint`）枚举采集/播放设备，不 shell `arecord`/`aplay`；按需查询不缓存（USB 插拔）；返回设备 id（ALSA 名，配置用）+ 人读标签。CLI `device list`。配置/切换设备时对照当前清单校验存在。pre 只打开配置的设备（使用）、不做枚举；换设备仍由 daemon 重启 pre，热切换见 [FUTURE.md](../FUTURE.md)。
 - 语言服务（识别、桥、TTS）各绑控制 socket，daemon 连接并每秒轮询，接法与 pre/rvc 一致。llama-server 不说控制协议：daemon 只管其进程存活与重启，业务可达性由桥的 `GetStatus` 带报。
 - 监管退避：崩溃后从 500 ms 起倍增，上限 10 s；连续稳定运行 30 s 后重置。子进程日志追加到 `run_dir/logs/<name>.log`，daemon 退出前先停止子进程。
 - 路由执行顺序：切到 rvc 先 `LoadModel` / `StartStream` 再让 pre `SetRoute(rvc)`，失败回滚停流；切回 direct 先 pre `SetRoute(direct)` 再 `StopStream` 并释放 GPU。轮询发现实际状态偏离期望时按同一顺序对账。

@@ -35,7 +35,7 @@
 - Socket 路径在 `/run/mozart/` 下；锁文件防重复实例；对端重启后重连。
 - 控制面（daemon → pre）：Unix SEQPACKET 定长头 + JSON。命令 `Hello`（版本握手）、`SetRoute{route}`（切 direct/rvc）、`SetMute{mute}`（静音开关）、`SetDsp{denoise,gate,agc,limiter}`（运行中切换 DSP 级）、`GetStatus`。路由与静音由 pre 执行淡变，策略归 daemon。
 - 状态：`GetStatus` 返回运行状态、路由、静音、采集/播放设备名、采集/播放/丢弃帧计数、队列深度、各消费者丢弃计数、最近错误、版本。daemon 每秒轮询，pre 不主动推；旧 `pre-status.json` 废弃。
-- 换设备不做在线命令，由 daemon 重启 pre 代替。
+- 换设备不做在线命令，由 daemon 重启 pre 代替。设备枚举归 daemon（SPEC-04），pre 只打开配置的设备、打开失败报错。
 - DSP 开关经 `SetDsp` 运行时生效；denoise 运行中切换需处理 WOLA 滤波状态避免伪影，gate/agc/limiter 较简单。
 
 ## 改进点

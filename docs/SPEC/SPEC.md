@@ -108,3 +108,5 @@
 - 2026-11-12：文件结果生命周期定稿：存储目录默认 `~/.local/state/mozart/files/`（持久、TOML 可配），原子发布沿用，驱逐沿用 1000 MiB/80%/护未完成（已完成可删），取结果 CLI `file fetch`（SPEC-04）。
 - 2026-11-12：文件状态与进度定稿：六态状态字段 + 结果可取标记（去模式枚举），进度粗阶段 + 推理段用 rvc 块计数细化，CLI `file status` / `file list`；rvc 文件模式 blocks 按窗计数（SPEC-03、SPEC-04）。文件转换链路 7 点全部定稿。
 - 2026-11-12：配置分类定稿为机制 + 切换成本、能即时生效就运行时（取代“仅 bridge 两开关”）：daemon 超时 / [file] 阈值 / RVC 会话参数（Stop→Start）/ pre DSP（新增 SetDsp）均运行时，固化进结构者重启；新增 [file] 段；schema 落 docs/config.md（SPEC-02、SPEC-04）。
+- 2026-11-12：播报定稿修正：v1 继承旧参考音色播报（TTS 流式直播、扬声器分时），撤销 11-10“走变声替代参考音色”，经变声同音色入 FUTURE；文件队列改落盘续转、SPEC-08 文件验收改 CLI、TARGET 运行时语言改 Rust+C++（SPEC-04、SPEC-05、SPEC-08、TARGET、FUTURE）。
+- 2026-11-13：音频设备识别定稿：枚举归 daemon（ALSA API、按需不缓存、id+标签、配置校验），CLI `device list`；pre 只用设备不枚举；设备热切换入 FUTURE（SPEC-02、SPEC-04）。
