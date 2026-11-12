@@ -564,6 +564,37 @@ fn file_fetch_same_file_is_idempotent() {
 }
 
 #[test]
+fn file_fetch_rejects_dangling_symlink_destination() {
+    let env = CtlEnv::new("file-fetch-dangling");
+    let source = env.dir.join("result.wav");
+    std::fs::write(&source, b"wav-payload").unwrap();
+    // 悬空符号链接：dest 指向不存在的目标。旧代码 dest.exists() 跟随链接判为
+    // 「不存在」，fs::copy 写穿链接在目标处落盘；新代码按已存在拒绝，不写穿。
+    let link_target = env.dir.join("link-target.wav");
+    let dest = env.dir.join("out.wav");
+    std::os::unix::fs::symlink(&link_target, &dest).unwrap();
+    let _stub = StubDaemon::start(
+        &env.socket(),
+        vec![(
+            ctl::DAEMON_FILE_FETCH,
+            ok_body(json!({
+                "job_id": "job_1",
+                "output_path": source.to_str().unwrap(),
+                "name": "tone.wav",
+            })),
+        )],
+    );
+
+    let output = env.run(&["file", "fetch", "job_1", "-o", dest.to_str().unwrap()]);
+    assert_eq!(output.status.code(), Some(1), "stderr: {}", stderr_text(&output));
+    assert!(stderr_text(&output).contains("exists"), "stderr: {}", stderr_text(&output));
+    // 未写穿链接：目标处不应出现文件，dest 仍是悬空链接。
+    assert!(!link_target.exists(), "fetch 写穿了悬空符号链接");
+    assert!(dest.symlink_metadata().unwrap().file_type().is_symlink());
+    assert!(std::fs::metadata(&dest).is_err());
+}
+
+#[test]
 fn file_fetch_missing_source_exits_1() {
     let env = CtlEnv::new("file-fetch-missing");
     let gone = env.dir.join("gone.wav");

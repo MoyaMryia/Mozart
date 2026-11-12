@@ -716,8 +716,11 @@ fn yes_no(value: bool) -> &'static str {
 
 /// 复制结果到目标。目标已存在时不覆盖：同一文件（含硬链接/符号链接）视为
 /// 已取回，幂等成功；不同文件报错退出，不静默清掉用户数据。
+/// 用 symlink_metadata 判定已存在（不跟随符号链接，悬空链接也拒绝，避免写穿）。
+/// 复制先写目标目录下的临时文件再原子改名：中途失败（ENOSPC、源被驱逐）只清
+/// 临时文件，不留半成品目标挡住后续重试。
 fn copy_result(source: &Path, dest: &Path) -> Result<(), CliError> {
-    if dest.exists() {
+    if fs::symlink_metadata(dest).is_ok() {
         let same = same_file(source, dest).map_err(|err| {
             CliError::new(EXIT_ERROR, format!("fetch {}: {err}", source.display()))
         })?;
@@ -729,7 +732,30 @@ fn copy_result(source: &Path, dest: &Path) -> Result<(), CliError> {
             format!("destination exists: {}", dest.display()),
         ));
     }
-    fs::copy(source, dest).map_err(|err| {
+    let dir = dest
+        .parent()
+        .filter(|path| !path.as_os_str().is_empty())
+        .unwrap_or(Path::new("."));
+    let name = dest
+        .file_name()
+        .map(|name| name.to_string_lossy().into_owned())
+        .unwrap_or_else(|| "result".to_string());
+    let stamp = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|elapsed| elapsed.as_nanos())
+        .unwrap_or(0);
+    let tmp = dir.join(format!(".{name}.fetch-{}-{stamp}.tmp", std::process::id()));
+    let copied = (|| -> io::Result<()> {
+        let mut out = OpenOptions::new().write(true).create_new(true).open(&tmp)?;
+        let mut input = fs::File::open(source)?;
+        io::copy(&mut input, &mut out)?;
+        out.sync_all()?;
+        fs::rename(&tmp, dest)
+    })();
+    if copied.is_err() {
+        let _ = fs::remove_file(&tmp);
+    }
+    copied.map_err(|err| {
         CliError::new(
             EXIT_ERROR,
             format!("copy {} -> {}: {err}", source.display(), dest.display()),
@@ -739,10 +765,15 @@ fn copy_result(source: &Path, dest: &Path) -> Result<(), CliError> {
 }
 
 /// 同一文件判定：设备号 + inode（metadata 跟随符号链接，硬链接也算同一文件）。
+/// b 为悬空符号链接时 metadata 失败，视为不同文件：调用方按已存在拒绝，不写穿。
 fn same_file(a: &Path, b: &Path) -> io::Result<bool> {
     use std::os::unix::fs::MetadataExt;
     let a = fs::metadata(a)?;
-    let b = fs::metadata(b)?;
+    let b = match fs::metadata(b) {
+        Ok(meta) => meta,
+        Err(err) if err.kind() == io::ErrorKind::NotFound => return Ok(false),
+        Err(err) => return Err(err),
+    };
     Ok(a.dev() == b.dev() && a.ino() == b.ino())
 }
 

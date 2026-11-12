@@ -154,8 +154,9 @@ impl State {
     }
 
     /// 实时路由切换落地：desired/active/GPU 归属一次写齐。
-    /// 不变量：gpu_owner 为 File 时不得调用（route_set 已先行分流），
-    /// 且 gpu_owner 为 None 当且仅当 route_active 为 Direct。
+    /// 前置：gpu_owner 为 File 时不得调用（route_set 已先行分流）。
+    /// 本函数只写实时归属（Rvc→Realtime、Direct→None）；全局不变量见
+    /// file::arbitrate（Direct 不蕴含 gpu_owner 为 None，文件任务期间即如此）。
     pub fn commit_route(&mut self, route: Route) {
         if self.route_active != route || self.route_desired != route {
             self.route_since_unix_ms = now_unix_ms();

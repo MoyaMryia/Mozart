@@ -1,7 +1,8 @@
 //! GPU 仲裁纯决策（D6）：无锁、无 I/O，poller 每 tick 调用一次，
 //! 是实时/文件互斥与路由等待槽的唯一裁决点。
 //!
-//! 不变量：gpu_owner 为 None 当且仅当 route_active 为 Direct；
+//! 不变量：gpu_owner 为 None 当且仅当无实时 rvc 且无运行中文件任务；
+//! route_active 为 Direct 不蕴含 gpu_owner 为 None（文件任务期间即 Direct + File）。
 //! Realtime 由 route=rvc claim，File 由运行中文件任务 claim。
 
 use mozart_core::ctl::schema::{Activity, Route};

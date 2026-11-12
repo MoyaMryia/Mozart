@@ -34,13 +34,16 @@ D1. **文件批处理输入结束信号**：`StartStream`（kind=file）新增�
 C++ 攒满 `total_frames` 帧后跑整段离线推理，再回输出帧。SPEC-03 未定义结束信号，
 此为最小契约扩展（不新增控制动词，符合粗粒度边界）。取消仍走 `StopStream` 检查点。
 
-D2. **文件输出 socket（偏离 SPEC 字面，待确认）**：SPEC-03 字面要求复用 `rvc-out.sock`
+D2. **文件数据面 socket 隔离（偏离 SPEC 字面）**：输出——SPEC-03 字面要求复用 `rvc-out.sock`
 并在 pre/daemon 间交接绑定。但 pre 现在启动即绑定 `rvc-out.sock` 且终身持有
 （`pre/src/main.rs:179`），交接需改动已板端验收的实时路径，风险高。
 本计划改用**独立文件输出 socket**：daemon 绑定 `rvc-file-out.sock`，`StartStream`
 （kind=file）携带 `output_socket`（绝对路径）覆盖默认；C++ 按对端无感知原则连接该路径。
 pre 实时路径完全不动。仍满足 SPEC 核心意图（C++ 只收发帧、对端无感知、文件不丢、
-实时/文件互斥）。**此偏离需用户确认**；若坚持字面交接，改为 pre 路由感知绑定（后续局部改动）。
+实时/文件互斥）。**输出偏离需用户确认**；若坚持字面交接，改为 pre 路由感知绑定（后续局部改动）。
+输入对称隔离到独立 `rvc-file-in.sock`（`[file].input_socket`，rvc 绑定），`StartStream` 携带
+`input_socket`：pre 恒发实时帧到 `rvc-in.sock`（SPEC-02），共享会污染整段攒帧并楔死数据面，
+已隔离并板端复测（见 reports/file-chain-20261113/RESULTS.md）。
 
 D3. **队列持久化**：SPEC-04 定稿落盘续转。队列快照写 `<storage_dir>/queue.json`，
 每次变更原子写（临时文件 + rename）。重启读回 queued/processing 任务，processing 重置为
@@ -200,8 +203,9 @@ D6. **GPU 仲裁**：`gpu_owner: Option<Activity>`（Realtime/File）。文件�
 2. denoise（可选，`[file].denoise`）：48 kHz 裸流按 960 样本喂 `mozart-dsp`，取 320 样本 16 kHz
    契约帧；vad_flag==0 帧补零（沿用旧 file_denoise 语义）。
 3. worker.rs（独立线程，串行处理队列）：claim GPU → LoadModel（按需）→ 解码/降噪 →
-   绑定 `file_output_socket` → `StartStream{kind:file, model_handle, 会话参数, total_frames, output_socket}` →
-   `send_blocking` 喂 N 帧到 rvc-in.sock → 阻塞收 N 帧 OutputFrame（带超时）→ `StopStream` →
+   绑定 `file_output_socket` → `StartStream{kind:file, model_handle, 会话参数, total_frames, output_socket, input_socket}` →
+   `send_blocking` 喂 N 帧到独立文件输入 socket `rvc-file-in.sock`（rvc 绑定，不走 pre 恒发的
+   `rvc-in.sock`）→ 阻塞收 N 帧 OutputFrame（带超时）→ `StopStream` →
    编码发布。进度按 D5 更新（infer 段读 poller 缓存的 rvc blocks）。取消检查点贯穿各阶段；
    执行中取消 → StopStream + 清临时 + 标 cancelled。失败标 failed 带原因、队列继续。
 4. encode.rs：输出 48 kHz f32 → ffmpeg `-f f32le -ar 48000 -ac 1 -i <raw> -f wav -c:a pcm_f32le <.part>`
