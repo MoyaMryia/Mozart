@@ -13,6 +13,9 @@ pub struct Config {
     pub process: ProcessConfig,
     pub pre: PreConfig,
     pub rvc: RvcConfig,
+    pub asr: AsrConfig,
+    pub tts: TtsConfig,
+    pub bridge: BridgeConfig,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -33,6 +36,10 @@ pub struct DaemonConfig {
 pub struct ProcessConfig {
     pub pre_bin: PathBuf,
     pub rvc_bin: PathBuf,
+    pub asr_bin: PathBuf,
+    pub tts_bin: PathBuf,
+    pub bridge_bin: PathBuf,
+    pub llama_bin: PathBuf,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -139,6 +146,124 @@ impl Default for RvcConfig {
     }
 }
 
+impl Default for ProcessConfig {
+    fn default() -> Self {
+        Self {
+            pre_bin: PathBuf::from("mozart-pre"),
+            rvc_bin: PathBuf::from("mozart-rvc"),
+            asr_bin: PathBuf::from("mozart-asr"),
+            tts_bin: PathBuf::from("mozart-tts"),
+            bridge_bin: PathBuf::from("mozart-bridge"),
+            llama_bin: PathBuf::from("llama-server"),
+        }
+    }
+}
+
+/// ASR 进程配置（语言链）：控制面、音频输入与事件输出 socket，模型与队列参数。
+#[derive(Debug, Clone, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct AsrConfig {
+    /// 控制面：asr 绑定，daemon/ctl 连接。
+    pub socket: String,
+    /// 数据面：asr 绑定收音频 DGRAM，pre 连接发送。
+    pub input_socket: String,
+    /// 事件面：asr 绑定 SEQPACKET 事件，bridge 连接接收。
+    pub events_socket: String,
+    /// 流式 zipformer 模型目录；空表示运行时必须显式提供。
+    pub model_dir: PathBuf,
+    /// SenseVoice 复核模型目录；空表示关闭复核。
+    pub review_model_dir: PathBuf,
+    /// sherpa-onnx 推理线程数。
+    pub threads: u32,
+    /// 接收 → 解码环形队列容量（板端实测后定）。
+    pub ring_capacity: u32,
+    /// 事件输出重连缓冲容量（板端实测后定）。
+    pub output_queue_capacity: u32,
+}
+
+impl Default for AsrConfig {
+    fn default() -> Self {
+        Self {
+            socket: "asr.sock".to_string(),
+            input_socket: "asr-in.sock".to_string(),
+            events_socket: "asr-events.sock".to_string(),
+            model_dir: PathBuf::new(),
+            review_model_dir: PathBuf::new(),
+            threads: 2,
+            ring_capacity: 64,
+            output_queue_capacity: 64,
+        }
+    }
+}
+
+/// TTS 进程配置（语言链）：控制面、任务与音频输出 socket，模型与音色参数。
+#[derive(Debug, Clone, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct TtsConfig {
+    /// 控制面：tts 绑定，daemon/ctl 连接。
+    pub socket: String,
+    /// 任务面：tts 绑定收合成任务，bridge 连接发送。
+    pub jobs_socket: String,
+    /// 数据面：重采样 16 kHz 音频输出 socket（播报喂入 RVC，见 FUTURE）。
+    pub output_socket: String,
+    /// PocketTTS 模型目录。
+    pub model_dir: PathBuf,
+    /// 音色参考 WAV 路径。
+    pub reference_wav: PathBuf,
+    /// sherpa-onnx 推理线程数。
+    pub threads: u32,
+    pub provider: String,
+}
+
+impl Default for TtsConfig {
+    fn default() -> Self {
+        Self {
+            socket: "tts.sock".to_string(),
+            jobs_socket: "tts-jobs.sock".to_string(),
+            output_socket: "tts-out.sock".to_string(),
+            model_dir: PathBuf::new(),
+            reference_wav: PathBuf::new(),
+            threads: 2,
+            provider: "cpu".to_string(),
+        }
+    }
+}
+
+/// 字幕桥配置（语言链）：控制面、字幕落盘、翻译/播报开关与 llama-server 接入。
+#[derive(Debug, Clone, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct BridgeConfig {
+    /// 控制面：bridge 绑定，daemon/ctl 连接。
+    pub socket: String,
+    /// 字幕 JSONL 落盘路径；加载时展开开头的 `~`。
+    pub subtitles_path: PathBuf,
+    /// 翻译开关的 TOML 基线。
+    pub translate_enabled: bool,
+    /// 播报开关的 TOML 基线。
+    pub speech_enabled: bool,
+    /// llama-server HTTP 的 Unix socket。
+    pub llama_socket: String,
+    /// 翻译模型 GGUF 路径；空表示运行时必须显式提供。
+    pub llama_model: PathBuf,
+    pub translate_queue_capacity: u32,
+    pub speech_queue_capacity: u32,
+}
+
+impl Default for BridgeConfig {
+    fn default() -> Self {
+        Self {
+            socket: "bridge.sock".to_string(),
+            subtitles_path: PathBuf::from("~/.local/state/mozart/subtitles.jsonl"),
+            translate_enabled: true,
+            speech_enabled: true,
+            llama_socket: "llama.sock".to_string(),
+            llama_model: PathBuf::new(),
+            translate_queue_capacity: 32,
+            speech_queue_capacity: 16,
+        }
+    }
+}
+
 impl Default for Config {
     fn default() -> Self {
         Self {
@@ -146,6 +271,9 @@ impl Default for Config {
             process: ProcessConfig::default(),
             pre: PreConfig::default(),
             rvc: RvcConfig::default(),
+            asr: AsrConfig::default(),
+            tts: TtsConfig::default(),
+            bridge: BridgeConfig::default(),
         }
     }
 }
@@ -161,15 +289,6 @@ impl Default for DaemonConfig {
             restart_backoff_ms: 500,
             restart_backoff_max_ms: 10_000,
             restart_stable_ms: 30_000,
-        }
-    }
-}
-
-impl Default for ProcessConfig {
-    fn default() -> Self {
-        Self {
-            pre_bin: PathBuf::from("mozart-pre"),
-            rvc_bin: PathBuf::from("mozart-rvc"),
         }
     }
 }
@@ -228,6 +347,9 @@ impl Config {
             None => Config::default(),
         };
         config.apply_env()?;
+        let home = std::env::var_os("HOME").map(PathBuf::from);
+        config.bridge.subtitles_path =
+            expand_tilde(&config.bridge.subtitles_path, home.as_deref());
         config.validate()?;
         Ok(config)
     }
@@ -252,6 +374,38 @@ impl Config {
         self.daemon.run_dir.join(&self.rvc.output_socket)
     }
 
+    pub fn asr_socket(&self) -> PathBuf {
+        self.daemon.run_dir.join(&self.asr.socket)
+    }
+
+    pub fn asr_input_socket(&self) -> PathBuf {
+        self.daemon.run_dir.join(&self.asr.input_socket)
+    }
+
+    pub fn asr_events_socket(&self) -> PathBuf {
+        self.daemon.run_dir.join(&self.asr.events_socket)
+    }
+
+    pub fn tts_socket(&self) -> PathBuf {
+        self.daemon.run_dir.join(&self.tts.socket)
+    }
+
+    pub fn tts_jobs_socket(&self) -> PathBuf {
+        self.daemon.run_dir.join(&self.tts.jobs_socket)
+    }
+
+    pub fn tts_output_socket(&self) -> PathBuf {
+        self.daemon.run_dir.join(&self.tts.output_socket)
+    }
+
+    pub fn bridge_socket(&self) -> PathBuf {
+        self.daemon.run_dir.join(&self.bridge.socket)
+    }
+
+    pub fn llama_socket(&self) -> PathBuf {
+        self.daemon.run_dir.join(&self.bridge.llama_socket)
+    }
+
     pub fn log_dir(&self) -> PathBuf {
         self.daemon.run_dir.join("logs")
     }
@@ -265,6 +419,18 @@ impl Config {
         }
         if let Some(bin) = std::env::var_os("MOZART_RVC_BIN") {
             self.process.rvc_bin = PathBuf::from(bin);
+        }
+        if let Some(bin) = std::env::var_os("MOZART_ASR_BIN") {
+            self.process.asr_bin = PathBuf::from(bin);
+        }
+        if let Some(bin) = std::env::var_os("MOZART_TTS_BIN") {
+            self.process.tts_bin = PathBuf::from(bin);
+        }
+        if let Some(bin) = std::env::var_os("MOZART_BRIDGE_BIN") {
+            self.process.bridge_bin = PathBuf::from(bin);
+        }
+        if let Some(bin) = std::env::var_os("MOZART_LLAMA_BIN") {
+            self.process.llama_bin = PathBuf::from(bin);
         }
         if let Ok(value) = std::env::var("MOZART_POLL_INTERVAL_MS") {
             self.daemon.poll_interval_ms = value.parse().map_err(|_| {
@@ -343,6 +509,49 @@ impl Config {
                 "rvc.protect must be within 0.0..=0.5".to_string(),
             ));
         }
+        validate_socket_name(&self.asr.socket, "asr.socket")?;
+        validate_socket_name(&self.asr.input_socket, "asr.input_socket")?;
+        validate_socket_name(&self.asr.events_socket, "asr.events_socket")?;
+        if self.asr.threads == 0 {
+            return Err(ConfigError::Invalid(
+                "asr.threads must be at least 1".to_string(),
+            ));
+        }
+        if self.asr.ring_capacity == 0 {
+            return Err(ConfigError::Invalid(
+                "asr.ring_capacity must be at least 1".to_string(),
+            ));
+        }
+        if self.asr.output_queue_capacity == 0 {
+            return Err(ConfigError::Invalid(
+                "asr.output_queue_capacity must be at least 1".to_string(),
+            ));
+        }
+        validate_socket_name(&self.tts.socket, "tts.socket")?;
+        validate_socket_name(&self.tts.jobs_socket, "tts.jobs_socket")?;
+        validate_socket_name(&self.tts.output_socket, "tts.output_socket")?;
+        if self.tts.threads == 0 {
+            return Err(ConfigError::Invalid(
+                "tts.threads must be at least 1".to_string(),
+            ));
+        }
+        if self.tts.provider.is_empty() {
+            return Err(ConfigError::Invalid(
+                "tts.provider must not be empty".to_string(),
+            ));
+        }
+        validate_socket_name(&self.bridge.socket, "bridge.socket")?;
+        validate_socket_name(&self.bridge.llama_socket, "bridge.llama_socket")?;
+        if self.bridge.translate_queue_capacity == 0 {
+            return Err(ConfigError::Invalid(
+                "bridge.translate_queue_capacity must be at least 1".to_string(),
+            ));
+        }
+        if self.bridge.speech_queue_capacity == 0 {
+            return Err(ConfigError::Invalid(
+                "bridge.speech_queue_capacity must be at least 1".to_string(),
+            ));
+        }
         if self.process.pre_bin.as_os_str().is_empty() {
             return Err(ConfigError::Invalid(
                 "process.pre_bin must not be empty".to_string(),
@@ -351,6 +560,26 @@ impl Config {
         if self.process.rvc_bin.as_os_str().is_empty() {
             return Err(ConfigError::Invalid(
                 "process.rvc_bin must not be empty".to_string(),
+            ));
+        }
+        if self.process.asr_bin.as_os_str().is_empty() {
+            return Err(ConfigError::Invalid(
+                "process.asr_bin must not be empty".to_string(),
+            ));
+        }
+        if self.process.tts_bin.as_os_str().is_empty() {
+            return Err(ConfigError::Invalid(
+                "process.tts_bin must not be empty".to_string(),
+            ));
+        }
+        if self.process.bridge_bin.as_os_str().is_empty() {
+            return Err(ConfigError::Invalid(
+                "process.bridge_bin must not be empty".to_string(),
+            ));
+        }
+        if self.process.llama_bin.as_os_str().is_empty() {
+            return Err(ConfigError::Invalid(
+                "process.llama_bin must not be empty".to_string(),
             ));
         }
         Ok(())
@@ -364,6 +593,18 @@ fn validate_socket_name(name: &str, field: &str) -> Result<(), ConfigError> {
         )));
     }
     Ok(())
+}
+
+/// 展开路径开头的 `~` 组件；home 缺失或路径不以 `~` 开头时原样返回。
+fn expand_tilde(path: &Path, home: Option<&Path>) -> PathBuf {
+    let Some(home) = home else {
+        return path.to_path_buf();
+    };
+    match path.strip_prefix("~") {
+        Ok(rest) if rest.as_os_str().is_empty() => home.to_path_buf(),
+        Ok(rest) => home.join(rest),
+        Err(_) => path.to_path_buf(),
+    }
 }
 
 /// ALSA 设备名不做格式限制；只拦空名与内嵌 NUL（CString 转换会 panic）。
@@ -543,6 +784,225 @@ mod tests {
         ensure_run_dir(&dir).unwrap();
         let mode = std::fs::metadata(&dir).unwrap().permissions().mode();
         assert_eq!(mode & 0o777, 0o700);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn language_chain_defaults() {
+        let config = Config::default();
+        assert_eq!(config.asr_socket(), PathBuf::from("/run/mozart/asr.sock"));
+        assert_eq!(
+            config.asr_input_socket(),
+            PathBuf::from("/run/mozart/asr-in.sock")
+        );
+        assert_eq!(
+            config.asr_events_socket(),
+            PathBuf::from("/run/mozart/asr-events.sock")
+        );
+        assert_eq!(config.tts_socket(), PathBuf::from("/run/mozart/tts.sock"));
+        assert_eq!(
+            config.tts_jobs_socket(),
+            PathBuf::from("/run/mozart/tts-jobs.sock")
+        );
+        assert_eq!(
+            config.tts_output_socket(),
+            PathBuf::from("/run/mozart/tts-out.sock")
+        );
+        assert_eq!(
+            config.bridge_socket(),
+            PathBuf::from("/run/mozart/bridge.sock")
+        );
+        assert_eq!(config.llama_socket(), PathBuf::from("/run/mozart/llama.sock"));
+
+        assert_eq!(config.asr.model_dir, PathBuf::new());
+        assert_eq!(config.asr.review_model_dir, PathBuf::new());
+        assert_eq!(config.asr.threads, 2);
+        assert_eq!(config.asr.ring_capacity, 64);
+        assert_eq!(config.asr.output_queue_capacity, 64);
+
+        assert_eq!(config.tts.model_dir, PathBuf::new());
+        assert_eq!(config.tts.reference_wav, PathBuf::new());
+        assert_eq!(config.tts.threads, 2);
+        assert_eq!(config.tts.provider, "cpu");
+
+        assert_eq!(
+            config.bridge.subtitles_path,
+            PathBuf::from("~/.local/state/mozart/subtitles.jsonl")
+        );
+        assert!(config.bridge.translate_enabled);
+        assert!(config.bridge.speech_enabled);
+        assert_eq!(config.bridge.llama_model, PathBuf::new());
+        assert_eq!(config.bridge.translate_queue_capacity, 32);
+        assert_eq!(config.bridge.speech_queue_capacity, 16);
+
+        assert_eq!(config.process.asr_bin, PathBuf::from("mozart-asr"));
+        assert_eq!(config.process.tts_bin, PathBuf::from("mozart-tts"));
+        assert_eq!(config.process.bridge_bin, PathBuf::from("mozart-bridge"));
+        assert_eq!(config.process.llama_bin, PathBuf::from("llama-server"));
+        assert!(config.validate().is_ok());
+    }
+
+    #[test]
+    fn language_chain_toml_overrides() {
+        // 旧 TOML 不含新段：沿用默认，可解析、可校验。
+        let legacy: Config = toml::from_str("[daemon]\npoll_interval_ms = 250\n").unwrap();
+        assert_eq!(legacy.asr.socket, "asr.sock");
+        assert_eq!(legacy.tts.provider, "cpu");
+        assert!(legacy.bridge.translate_enabled);
+        assert!(legacy.validate().is_ok());
+
+        let config: Config = toml::from_str(
+            r#"
+            [asr]
+            socket = "recognize.sock"
+            model_dir = "/opt/mozart/zipformer"
+            review_model_dir = "/opt/mozart/sensevoice"
+            threads = 4
+            ring_capacity = 128
+            output_queue_capacity = 32
+            [tts]
+            jobs_socket = "synth-jobs.sock"
+            model_dir = "/opt/mozart/pocket"
+            reference_wav = "/opt/mozart/voice.wav"
+            threads = 3
+            provider = "cuda"
+            [bridge]
+            subtitles_path = "/var/lib/mozart/subtitles.jsonl"
+            translate_enabled = false
+            speech_enabled = false
+            llama_socket = "llm.sock"
+            llama_model = "/opt/mozart/qwen.gguf"
+            translate_queue_capacity = 64
+            speech_queue_capacity = 8
+            [process]
+            asr_bin = "/opt/mozart/bin/mozart-asr"
+            llama_bin = "/opt/llama/bin/llama-server"
+            "#,
+        )
+        .unwrap();
+        assert_eq!(
+            config.asr_socket(),
+            PathBuf::from("/run/mozart/recognize.sock")
+        );
+        assert_eq!(config.asr.model_dir, PathBuf::from("/opt/mozart/zipformer"));
+        assert_eq!(config.asr.threads, 4);
+        assert_eq!(config.asr.output_queue_capacity, 32);
+        assert_eq!(
+            config.tts_jobs_socket(),
+            PathBuf::from("/run/mozart/synth-jobs.sock")
+        );
+        assert_eq!(config.tts.reference_wav, PathBuf::from("/opt/mozart/voice.wav"));
+        assert_eq!(config.tts.threads, 3);
+        assert_eq!(config.tts.provider, "cuda");
+        assert_eq!(
+            config.bridge.subtitles_path,
+            PathBuf::from("/var/lib/mozart/subtitles.jsonl")
+        );
+        assert!(!config.bridge.translate_enabled);
+        assert!(!config.bridge.speech_enabled);
+        assert_eq!(config.llama_socket(), PathBuf::from("/run/mozart/llm.sock"));
+        assert_eq!(config.bridge.llama_model, PathBuf::from("/opt/mozart/qwen.gguf"));
+        assert_eq!(config.bridge.translate_queue_capacity, 64);
+        assert_eq!(config.bridge.speech_queue_capacity, 8);
+        assert_eq!(
+            config.process.asr_bin,
+            PathBuf::from("/opt/mozart/bin/mozart-asr")
+        );
+        assert_eq!(
+            config.process.llama_bin,
+            PathBuf::from("/opt/llama/bin/llama-server")
+        );
+        // 未写的键沿用默认。
+        assert_eq!(config.asr.input_socket, "asr-in.sock");
+        assert_eq!(config.tts.socket, "tts.sock");
+        assert_eq!(config.bridge.socket, "bridge.sock");
+        assert!(config.validate().is_ok());
+
+        let unknown_asr: Result<Config, _> = toml::from_str("[asr]\nunknown_key = 1\n");
+        assert!(unknown_asr.is_err());
+        let unknown_tts: Result<Config, _> = toml::from_str("[tts]\nunknown_key = 1\n");
+        assert!(unknown_tts.is_err());
+        let unknown_bridge: Result<Config, _> = toml::from_str("[bridge]\nunknown_key = 1\n");
+        assert!(unknown_bridge.is_err());
+    }
+
+    #[test]
+    fn language_chain_invalid_values_are_rejected() {
+        let cases = [
+            "[asr]\nsocket = \"a/b\"\n",
+            "[asr]\ninput_socket = \"a/b\"\n",
+            "[asr]\nevents_socket = \"\"\n",
+            "[asr]\nthreads = 0\n",
+            "[asr]\nring_capacity = 0\n",
+            "[asr]\noutput_queue_capacity = 0\n",
+            "[tts]\nsocket = \"a/b\"\n",
+            "[tts]\njobs_socket = \"\"\n",
+            "[tts]\noutput_socket = \"a/b\"\n",
+            "[tts]\nthreads = 0\n",
+            "[tts]\nprovider = \"\"\n",
+            "[bridge]\nsocket = \"a/b\"\n",
+            "[bridge]\nllama_socket = \"a/b\"\n",
+            "[bridge]\ntranslate_queue_capacity = 0\n",
+            "[bridge]\nspeech_queue_capacity = 0\n",
+            "[process]\nasr_bin = \"\"\n",
+            "[process]\ntts_bin = \"\"\n",
+            "[process]\nbridge_bin = \"\"\n",
+            "[process]\nllama_bin = \"\"\n",
+        ];
+        for text in cases {
+            let config: Config = toml::from_str(text).unwrap();
+            assert!(config.validate().is_err(), "应拒绝：{text}");
+        }
+
+        // 边界值合法：线程数与队列容量取最小 1。
+        let edge: Config = toml::from_str(
+            "[asr]\nthreads = 1\nring_capacity = 1\noutput_queue_capacity = 1\n\
+             [tts]\nthreads = 1\n[bridge]\ntranslate_queue_capacity = 1\nspeech_queue_capacity = 1\n",
+        )
+        .unwrap();
+        assert!(edge.validate().is_ok());
+    }
+
+    #[test]
+    fn expand_tilde_only_touches_leading_tilde() {
+        let home = Path::new("/home/tester");
+        assert_eq!(
+            expand_tilde(Path::new("~/state/subtitles.jsonl"), Some(home)),
+            PathBuf::from("/home/tester/state/subtitles.jsonl")
+        );
+        assert_eq!(expand_tilde(Path::new("~"), Some(home)), home);
+        assert_eq!(
+            expand_tilde(Path::new("/var/lib/subtitles.jsonl"), Some(home)),
+            PathBuf::from("/var/lib/subtitles.jsonl")
+        );
+        assert_eq!(
+            expand_tilde(Path::new("~other/subtitles.jsonl"), Some(home)),
+            PathBuf::from("~other/subtitles.jsonl")
+        );
+        assert_eq!(
+            expand_tilde(Path::new("~/subtitles.jsonl"), None),
+            PathBuf::from("~/subtitles.jsonl")
+        );
+    }
+
+    #[test]
+    fn load_from_expands_subtitles_path() {
+        let dir = std::env::temp_dir().join(format!("mozart-bridge-cfg-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("mozart.toml");
+        std::fs::write(
+            &path,
+            "[bridge]\nsubtitles_path = \"~/mozart-test/subtitles.jsonl\"\n",
+        )
+        .unwrap();
+
+        let config = Config::load_from(Some(&path)).unwrap();
+        let expected = match std::env::var_os("HOME") {
+            Some(home) => PathBuf::from(home).join("mozart-test/subtitles.jsonl"),
+            None => PathBuf::from("~/mozart-test/subtitles.jsonl"),
+        };
+        assert_eq!(config.bridge.subtitles_path, expected);
 
         let _ = std::fs::remove_dir_all(&dir);
     }

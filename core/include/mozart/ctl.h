@@ -1,7 +1,8 @@
 // ctl.h — 控制面信封契约唯一定义源（C-ABI，Rust 侧用 #[repr(C)] 镜像）
 // ============================================================================
-// 三端共用：daemon、pre、rvc。只定义跨进程信封；JSON 体字段见各模块规格
-// （SPEC-02/03/04）。修改本文件后必须同步 core/src/ctl.rs 与编译期断言。
+// 各进程共用：daemon、pre、rvc、asr、tts、bridge。只定义跨进程信封；JSON 体
+// 字段见各模块规格（SPEC-02/03/04/05）。修改本文件后必须同步 core/src/ctl.rs
+// 与编译期断言。
 #ifndef MOZART_CTL_H
 #define MOZART_CTL_H
 
@@ -53,7 +54,19 @@ enum {
     MOZART_CTL_RVC_START_STREAM = 0x0303,
     MOZART_CTL_RVC_STOP_STREAM  = 0x0304,
     MOZART_CTL_RVC_RESET_STREAM = 0x0305,
-    MOZART_CTL_RVC_GET_STATUS   = 0x0306
+    MOZART_CTL_RVC_GET_STATUS   = 0x0306,
+
+    MOZART_CTL_ASR_HELLO      = 0x0401,
+    MOZART_CTL_ASR_GET_STATUS = 0x0402,
+
+    MOZART_CTL_TTS_HELLO      = 0x0501,
+    MOZART_CTL_TTS_GET_STATUS = 0x0502,
+
+    MOZART_CTL_BRIDGE_HELLO         = 0x0601,
+    MOZART_CTL_BRIDGE_GET_STATUS    = 0x0602,
+    MOZART_CTL_BRIDGE_TRANSLATE_SET = 0x0603,  // 体 {"enabled": bool}
+    MOZART_CTL_BRIDGE_SPEECH_SET    = 0x0604,  // 体 {"enabled": bool}
+    MOZART_CTL_BRIDGE_SPEECH_STOP   = 0x0605   // 体 {}（空）
 };
 
 // ---- 响应体 {"status","code","reason","data"} 的 code 值 -----------------------

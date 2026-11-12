@@ -44,6 +44,9 @@ impl State {
             processes: Processes {
                 pre: ProcessInfo::stopped(),
                 rvc: ProcessInfo::stopped(),
+                asr: ProcessInfo::stopped(),
+                tts: ProcessInfo::stopped(),
+                bridge: ProcessInfo::stopped(),
             },
             pre: None,
             rvc: None,
@@ -74,6 +77,9 @@ impl State {
             processes: self.processes.clone(),
             pre: self.pre.clone(),
             rvc: self.rvc.clone(),
+            asr: None,
+            tts: None,
+            bridge: None,
             hw: self.hw.clone(),
             degraded: self.degraded.clone(),
         }

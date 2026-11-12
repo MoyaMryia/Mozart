@@ -185,6 +185,26 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "cf8baf1c55e62ffcace7a9f06f4bd9cd3f0c4beb022d3b367256b91b87513d98"
 
 [[package]]
+name = "mozart-asr"
+version = "0.1.0"
+dependencies = [
+ "clap",
+ "mozart-core",
+ "serde",
+ "serde_json",
+]
+
+[[package]]
+name = "mozart-bridge"
+version = "0.1.0"
+dependencies = [
+ "clap",
+ "mozart-core",
+ "serde",
+ "serde_json",
+]
+
+[[package]]
 name = "mozart-core"
 version = "0.1.0"
 dependencies = [
@@ -220,6 +240,16 @@ dependencies = [
  "alsa",
  "libc",
  "mozart-core",
+ "serde_json",
+]
+
+[[package]]
+name = "mozart-tts"
+version = "0.1.0"
+dependencies = [
+ "clap",
+ "mozart-core",
+ "serde",
  "serde_json",
 ]
 

@@ -10,7 +10,7 @@ MAX_TRACKED_BYTES=$((5 * 1024 * 1024))
 
 # 阶段名与触发路径（扩展正则，匹配暂存文件路径）。
 NATIVE_PATHS='^(core|pre|rvc|daemon|api|tests)/|^CMakeLists\.txt$|^CMakePresets\.json$|^cmake/'
-RUST_PATHS='^(core|pre|daemon|ctl)/|^Cargo\.toml$|^Cargo\.lock$'
+RUST_PATHS='^(core|pre|daemon|ctl|asr|tts|bridge)/|^Cargo\.toml$|^Cargo\.lock$'
 WEB_PATHS='^web/'
 
 skip() { echo "跳过 $1：$2" >&2; }

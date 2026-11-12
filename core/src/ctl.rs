@@ -37,6 +37,21 @@ pub const RVC_STOP_STREAM: u16 = 0x0304;
 pub const RVC_RESET_STREAM: u16 = 0x0305;
 pub const RVC_GET_STATUS: u16 = 0x0306;
 
+pub const ASR_HELLO: u16 = 0x0401;
+pub const ASR_GET_STATUS: u16 = 0x0402;
+
+pub const TTS_HELLO: u16 = 0x0501;
+pub const TTS_GET_STATUS: u16 = 0x0502;
+
+pub const BRIDGE_HELLO: u16 = 0x0601;
+pub const BRIDGE_GET_STATUS: u16 = 0x0602;
+/// 体：{"enabled": bool}。
+pub const BRIDGE_TRANSLATE_SET: u16 = 0x0603;
+/// 体：{"enabled": bool}。
+pub const BRIDGE_SPEECH_SET: u16 = 0x0604;
+/// 体：{}（空）。
+pub const BRIDGE_SPEECH_STOP: u16 = 0x0605;
+
 pub const CODE_OK: &str = "Ok";
 pub const CODE_INVALID_ARGUMENT: &str = "InvalidArgument";
 pub const CODE_NOT_LOADED: &str = "NotLoaded";
@@ -476,6 +491,39 @@ mod tests {
         assert_eq!(&bytes[6..8], &DAEMON_HELLO.to_le_bytes());
         assert_eq!(&bytes[8..12], &0x0102_0304u32.to_le_bytes());
         assert_eq!(&bytes[12..16], &5u32.to_le_bytes());
+    }
+
+    #[test]
+    fn language_chain_command_numbers_match_c_header() {
+        assert_eq!(ASR_HELLO, 0x0401);
+        assert_eq!(ASR_GET_STATUS, 0x0402);
+        assert_eq!(TTS_HELLO, 0x0501);
+        assert_eq!(TTS_GET_STATUS, 0x0502);
+        assert_eq!(BRIDGE_HELLO, 0x0601);
+        assert_eq!(BRIDGE_GET_STATUS, 0x0602);
+        assert_eq!(BRIDGE_TRANSLATE_SET, 0x0603);
+        assert_eq!(BRIDGE_SPEECH_SET, 0x0604);
+        assert_eq!(BRIDGE_SPEECH_STOP, 0x0605);
+    }
+
+    #[test]
+    fn bridge_switch_commands_roundtrip() {
+        let (a, b) = socketpair();
+        a.send(BRIDGE_TRANSLATE_SET, 7, br#"{"enabled":true}"#)
+            .unwrap();
+        a.send(BRIDGE_SPEECH_STOP, 8, b"").unwrap();
+
+        let first = b.recv(Some(Duration::from_secs(1))).unwrap();
+        let first_type = first.header.type_;
+        let first_request = first.header.request_id;
+        assert_eq!(first_type, BRIDGE_TRANSLATE_SET);
+        assert_eq!(first_request, 7);
+        assert_eq!(first.body, br#"{"enabled":true}"#);
+
+        let second = b.recv(Some(Duration::from_secs(1))).unwrap();
+        let second_type = second.header.type_;
+        assert_eq!(second_type, BRIDGE_SPEECH_STOP);
+        assert!(second.body.is_empty());
     }
 
     #[test]
