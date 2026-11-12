@@ -90,7 +90,7 @@ pub fn dispatch(msg: &Message, shared: &Shared, queues: &Queues) -> Vec<u8> {
     match msg.header.type_ {
         ctl::BRIDGE_HELLO => ok_body(json!({ "version": VERSION })),
         ctl::BRIDGE_GET_STATUS => {
-            let status = shared.status(queues.translate_depth(), queues.speech_depth());
+            let status = shared.status(queues);
             ok_body(serde_json::to_value(status).expect("bridge status is JSON-serializable"))
         }
         ctl::BRIDGE_TRANSLATE_SET => match parse_enabled(&msg.body) {
@@ -258,10 +258,25 @@ mod tests {
         );
         assert!(status["degraded"].is_array());
         assert_eq!(status["version"], VERSION);
-        // Task 5 字段保持零值。
+        // 翻译/播报组计数字段随共享状态上报。
         assert_eq!(status["translated"], 0);
         assert_eq!(status["llama_connected"], false);
         assert_eq!(status["tts_connected"], false);
+        fixture.shared.translate_stats().add_translated();
+        fixture.shared.translate_stats().attempt_fail("HTTP 500");
+        fixture.shared.speech_stats().add_submitted();
+        fixture.shared.speech_stats().set_connected(true);
+        let reply = dispatch(
+            &message(ctl::BRIDGE_GET_STATUS, b""),
+            &fixture.shared,
+            &fixture.queues,
+        );
+        let status = data(&reply);
+        assert_eq!(status["translated"], 1);
+        assert_eq!(status["llama_connected"], false);
+        assert_eq!(status["last_translate_fail_reason"], "HTTP 500");
+        assert_eq!(status["speech_submitted"], 1);
+        assert_eq!(status["tts_connected"], true);
     }
 
     #[test]

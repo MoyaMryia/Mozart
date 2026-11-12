@@ -107,6 +107,7 @@
 | llama_model | path | 空 | — | S |
 | translate_queue_capacity | int | 32 | ≥1 | S |
 | speech_queue_capacity | int | 16 | ≥1 | S |
+| retry_max | int | 2 | 0..=2 | S |
 
 ### [file]（新增）
 

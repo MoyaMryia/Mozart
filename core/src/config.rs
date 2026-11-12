@@ -250,6 +250,8 @@ pub struct BridgeConfig {
     pub llama_model: PathBuf,
     pub translate_queue_capacity: u32,
     pub speech_queue_capacity: u32,
+    /// 单句翻译失败后的重试上限（SPEC-05：最多 2 次）。
+    pub retry_max: u32,
 }
 
 impl Default for BridgeConfig {
@@ -263,6 +265,7 @@ impl Default for BridgeConfig {
             llama_model: PathBuf::new(),
             translate_queue_capacity: 32,
             speech_queue_capacity: 16,
+            retry_max: 2,
         }
     }
 }
@@ -560,6 +563,11 @@ impl Config {
                 "bridge.speech_queue_capacity must be at least 1".to_string(),
             ));
         }
+        if self.bridge.retry_max > 2 {
+            return Err(ConfigError::Invalid(
+                "bridge.retry_max must be at most 2".to_string(),
+            ));
+        }
         if self.process.pre_bin.as_os_str().is_empty() {
             return Err(ConfigError::Invalid(
                 "process.pre_bin must not be empty".to_string(),
@@ -844,6 +852,7 @@ mod tests {
         assert_eq!(config.bridge.llama_model, PathBuf::new());
         assert_eq!(config.bridge.translate_queue_capacity, 32);
         assert_eq!(config.bridge.speech_queue_capacity, 16);
+        assert_eq!(config.bridge.retry_max, 2);
 
         assert_eq!(config.process.asr_bin, PathBuf::from("mozart-asr"));
         assert_eq!(config.process.tts_bin, PathBuf::from("mozart-tts"));
@@ -885,6 +894,7 @@ mod tests {
             llama_model = "/opt/mozart/qwen.gguf"
             translate_queue_capacity = 64
             speech_queue_capacity = 8
+            retry_max = 1
             [process]
             asr_bin = "/opt/mozart/bin/mozart-asr"
             llama_bin = "/opt/llama/bin/llama-server"
@@ -916,6 +926,7 @@ mod tests {
         assert_eq!(config.bridge.llama_model, PathBuf::from("/opt/mozart/qwen.gguf"));
         assert_eq!(config.bridge.translate_queue_capacity, 64);
         assert_eq!(config.bridge.speech_queue_capacity, 8);
+        assert_eq!(config.bridge.retry_max, 1);
         assert_eq!(
             config.process.asr_bin,
             PathBuf::from("/opt/mozart/bin/mozart-asr")
@@ -957,6 +968,7 @@ mod tests {
             "[bridge]\nllama_socket = \"a/b\"\n",
             "[bridge]\ntranslate_queue_capacity = 0\n",
             "[bridge]\nspeech_queue_capacity = 0\n",
+            "[bridge]\nretry_max = 3\n",
             "[process]\nasr_bin = \"\"\n",
             "[process]\ntts_bin = \"\"\n",
             "[process]\nbridge_bin = \"\"\n",

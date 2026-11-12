@@ -1,7 +1,8 @@
-//! 桥共享状态（SPEC-05）：开关、字幕计数、降级原因，控制线程只读快照。
+//! 桥共享状态（SPEC-05）：开关、字幕计数、翻译/播报计数、降级原因，控制线程只读快照。
 //! 开关以 TOML 为基线，运行时命令覆盖并原子写状态文件存档（SPEC-04 模型甲）；
 //! 桥是开关的活权威，状态文件只是快照，启动恢复一次，运行时不对账。
-//! 待翻译/待播报队列是有界内存队列，Task 5 消费；SIGTERM 退出时丢弃。
+//! 待翻译/待播报队列是有界内存队列：待播报队满丢最旧并计数（SPEC-05 播报投递），
+//! 待翻译队满拒收由字幕线程记降级；SIGTERM 退出时丢弃。
 
 use mozart_core::ctl::schema::BridgeStatus;
 use serde::{Deserialize, Serialize};
@@ -10,9 +11,9 @@ use std::io;
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering::Relaxed};
-use std::sync::mpsc::{self, Receiver, SyncSender};
+use std::sync::mpsc::{self, Receiver, RecvTimeoutError, SyncSender, TrySendError};
 use std::sync::Mutex;
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 /// 版本号，Hello 与 GetStatus 一致上报。
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");
@@ -63,6 +64,83 @@ struct DegradedEntry {
     at_unix_ms: u64,
 }
 
+/// 翻译组计数（SPEC-05 GetStatus）：翻译线程写，控制线程只读。
+/// llama_connected 反映最近一次请求的连通结果（每请求一连，无长连接）。
+#[derive(Default)]
+pub struct TranslateStats {
+    translated: AtomicU64,
+    failed: AtomicU64,
+    retried: AtomicU64,
+    qc_rejected: AtomicU64,
+    llama_connected: AtomicBool,
+    last_ok_unix_ms: AtomicU64,
+    last_fail_unix_ms: AtomicU64,
+    last_fail_reason: Mutex<Option<String>>,
+}
+
+impl TranslateStats {
+    /// 一次 HTTP 推理成功。
+    pub fn attempt_ok(&self) {
+        self.llama_connected.store(true, Relaxed);
+        self.last_ok_unix_ms.store(unix_ms(), Relaxed);
+    }
+
+    /// 一次 HTTP 推理失败：记录时间与原因，供 GetStatus 查询。
+    pub fn attempt_fail(&self, reason: &str) {
+        self.llama_connected.store(false, Relaxed);
+        self.last_fail_unix_ms.store(unix_ms(), Relaxed);
+        *self
+            .last_fail_reason
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(reason.to_string());
+    }
+
+    /// 整句成功（质检通过并落字幕）。
+    pub fn add_translated(&self) {
+        self.translated.fetch_add(1, Relaxed);
+    }
+    /// 重试耗尽后整句失败。
+    pub fn add_failed(&self) {
+        self.failed.fetch_add(1, Relaxed);
+    }
+    /// 一次实际发起的重试。
+    pub fn add_retry(&self) {
+        self.retried.fetch_add(1, Relaxed);
+    }
+    pub fn add_qc_rejected(&self) {
+        self.qc_rejected.fetch_add(1, Relaxed);
+    }
+}
+
+/// 播报组计数（SPEC-05 GetStatus）：投递线程写，控制线程只读。
+/// delivered 计送达并收到受理应答的任务；受理结果再分 submitted/skipped/failed。
+#[derive(Default)]
+pub struct SpeechStats {
+    delivered: AtomicU64,
+    submitted: AtomicU64,
+    skipped: AtomicU64,
+    failed: AtomicU64,
+    tts_connected: AtomicBool,
+}
+
+impl SpeechStats {
+    pub fn add_delivered(&self) {
+        self.delivered.fetch_add(1, Relaxed);
+    }
+    pub fn add_submitted(&self) {
+        self.submitted.fetch_add(1, Relaxed);
+    }
+    pub fn add_skipped(&self) {
+        self.skipped.fetch_add(1, Relaxed);
+    }
+    pub fn add_failed(&self) {
+        self.failed.fetch_add(1, Relaxed);
+    }
+    pub fn set_connected(&self, connected: bool) {
+        self.tts_connected.store(connected, Relaxed);
+    }
+}
+
 pub struct Shared {
     pub subtitles_path: PathBuf,
     state_path: PathBuf,
@@ -71,6 +149,8 @@ pub struct Shared {
     subtitles_published: AtomicU64,
     records_in_memory: AtomicU32,
     last_write_unix_ms: AtomicU64,
+    translate_stats: TranslateStats,
+    speech_stats: SpeechStats,
     degraded: Mutex<Vec<DegradedEntry>>,
 }
 
@@ -84,6 +164,8 @@ impl Shared {
             subtitles_published: AtomicU64::new(0),
             records_in_memory: AtomicU32::new(0),
             last_write_unix_ms: AtomicU64::new(0),
+            translate_stats: TranslateStats::default(),
+            speech_stats: SpeechStats::default(),
             degraded: Mutex::new(Vec::new()),
         }
     }
@@ -93,6 +175,13 @@ impl Shared {
     }
     pub fn speech_enabled(&self) -> bool {
         self.speech_enabled.load(Relaxed)
+    }
+
+    pub fn translate_stats(&self) -> &TranslateStats {
+        &self.translate_stats
+    }
+    pub fn speech_stats(&self) -> &SpeechStats {
+        &self.speech_stats
     }
 
     /// 运行时开关覆盖：先存档再改内存；写盘失败返回错误，内存开关不变，命令整体被拒。
@@ -152,40 +241,60 @@ impl Shared {
             .collect()
     }
 
-    /// 组装 GetStatus 快照。翻译/播报计数字段 Task 5 填充，此处保持默认零值。
-    pub fn status(&self, translate_queue_depth: u32, speech_queue_depth: u32) -> BridgeStatus {
+    /// 组装 GetStatus 快照：四组字段全部来自原子计数与队列深度，只读。
+    pub fn status(&self, queues: &Queues) -> BridgeStatus {
+        let translate = &self.translate_stats;
+        let speech = &self.speech_stats;
         BridgeStatus {
             translate_enabled: self.translate_enabled(),
             speech_enabled: self.speech_enabled(),
-            translate_queue_depth,
-            speech_queue_depth,
+            translate_queue_depth: queues.translate_depth(),
+            translated: translate.translated.load(Relaxed),
+            translate_failed: translate.failed.load(Relaxed),
+            translate_retried: translate.retried.load(Relaxed),
+            qc_rejected: translate.qc_rejected.load(Relaxed),
+            llama_connected: translate.llama_connected.load(Relaxed),
+            last_translate_ok_unix_ms: translate.last_ok_unix_ms.load(Relaxed),
+            last_translate_fail_unix_ms: translate.last_fail_unix_ms.load(Relaxed),
+            last_translate_fail_reason: translate
+                .last_fail_reason
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .clone(),
+            speech_queue_depth: queues.speech_depth(),
+            speech_delivered: speech.delivered.load(Relaxed),
+            speech_dropped: queues.speech_dropped(),
+            speech_submitted: speech.submitted.load(Relaxed),
+            speech_skipped: speech.skipped.load(Relaxed),
+            speech_failed: speech.failed.load(Relaxed),
+            tts_connected: speech.tts_connected.load(Relaxed),
             subtitles_published: self.subtitles_published.load(Relaxed),
             records_in_memory: self.records_in_memory.load(Relaxed),
             subtitles_path: self.subtitles_path.display().to_string(),
             last_write_unix_ms: self.last_write_unix_ms.load(Relaxed),
             degraded: self.degraded_strings(),
             version: VERSION.to_string(),
-            ..Default::default()
         }
     }
 }
 
-/// 待翻译句（Task 5 消费）：final 原文。
+/// 待翻译句：final 原文，翻译线程消费。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TranslateJob {
     pub utterance_id: String,
     pub text: String,
 }
 
-/// 待播报句（Task 5 消费）：合格译文。
+/// 待播报句：合格译文，投递线程消费。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SpeechJob {
     pub utterance_id: String,
     pub text: String,
 }
 
-/// 有界内存队列（SPEC-05）：容量来自配置，队满拒收由调用方记录降级。
-/// 接收端放锁里：Task 5 工作线程取件与 speech stop 清空共用；
+/// 有界内存队列（SPEC-05）：容量来自配置。
+/// 待翻译队满拒收，由字幕线程记录降级；待播报队满丢最旧并计数（播报投递条款）。
+/// 接收端放锁里：工作线程取件与 speech stop 清空共用；
 /// 深度用原子计数（入队 +1、取件 -1），控制线程只读，不跨阻塞持有锁。
 pub struct Queues {
     translate_tx: SyncSender<TranslateJob>,
@@ -194,6 +303,7 @@ pub struct Queues {
     speech_tx: SyncSender<SpeechJob>,
     speech_rx: Mutex<Receiver<SpeechJob>>,
     speech_depth: AtomicU32,
+    speech_dropped: AtomicU64,
 }
 
 impl Queues {
@@ -208,6 +318,7 @@ impl Queues {
             speech_tx,
             speech_rx: Mutex::new(speech_rx),
             speech_depth: AtomicU32::new(0),
+            speech_dropped: AtomicU64::new(0),
         }
     }
 
@@ -220,14 +331,59 @@ impl Queues {
         true
     }
 
-    /// Task 5 播报投递入口：译文入待播报队列；队满返回 false。
-    #[allow(dead_code)] // Task 4 无投递方，Task 5 翻译线程使用。
+    /// 翻译线程取件；超时返回 Timeout，深度随取件递减。
+    pub fn recv_translate(&self, timeout: Duration) -> Result<TranslateJob, RecvTimeoutError> {
+        let rx = self
+            .translate_rx
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let job = rx.recv_timeout(timeout)?;
+        self.translate_depth.fetch_sub(1, Relaxed);
+        Ok(job)
+    }
+
+    /// 译文入待播报队列；队满丢最旧并计数（SPEC-05），返回 false 仅当投递线程已退出。
     pub fn push_speech(&self, job: SpeechJob) -> bool {
-        if self.speech_tx.try_send(job).is_err() {
-            return false;
+        match self.speech_tx.try_send(job) {
+            Ok(()) => {
+                self.speech_depth.fetch_add(1, Relaxed);
+                true
+            }
+            Err(TrySendError::Full(job)) => {
+                let rx = self
+                    .speech_rx
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner());
+                // 丢最旧腾位；取件竞态下可能已被消费，此时队列已有空位。
+                let dropped = rx.try_recv().is_ok();
+                if dropped {
+                    self.speech_dropped.fetch_add(1, Relaxed);
+                }
+                if self.speech_tx.try_send(job).is_ok() {
+                    if !dropped {
+                        self.speech_depth.fetch_add(1, Relaxed);
+                    }
+                    true
+                } else {
+                    if dropped {
+                        self.speech_depth.fetch_sub(1, Relaxed);
+                    }
+                    false
+                }
+            }
+            Err(TrySendError::Disconnected(_)) => false,
         }
-        self.speech_depth.fetch_add(1, Relaxed);
-        true
+    }
+
+    /// 投递线程取件；超时返回 Timeout，深度随取件递减。
+    pub fn recv_speech(&self, timeout: Duration) -> Result<SpeechJob, RecvTimeoutError> {
+        let rx = self
+            .speech_rx
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let job = rx.recv_timeout(timeout)?;
+        self.speech_depth.fetch_sub(1, Relaxed);
+        Ok(job)
     }
 
     pub fn translate_depth(&self) -> u32 {
@@ -236,6 +392,11 @@ impl Queues {
 
     pub fn speech_depth(&self) -> u32 {
         self.speech_depth.load(Relaxed)
+    }
+
+    /// 待播报队满丢弃累计（不含 speech stop 清空）。
+    pub fn speech_dropped(&self) -> u64 {
+        self.speech_dropped.load(Relaxed)
     }
 
     /// speech stop：清空待播报队列，返回丢弃数。
@@ -367,7 +528,11 @@ mod tests {
             .is_err());
         assert!(bad.translate_enabled());
         assert!(bad.speech_enabled());
-        assert!(bad.status(0, 0).degraded.iter().any(|d| d.starts_with("state file write failed")));
+        assert!(bad
+            .status(&Queues::new(1, 1))
+            .degraded
+            .iter()
+            .any(|d| d.starts_with("state file write failed")));
 
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -382,11 +547,11 @@ mod tests {
         );
         shared.degrade("asr events disconnected");
         shared.degrade("asr events disconnected");
-        let status = shared.status(0, 0);
+        let status = shared.status(&Queues::new(1, 1));
         assert_eq!(status.degraded.len(), 1);
         assert!(status.degraded[0].starts_with("asr events disconnected (unix_ms="));
         shared.resolve("asr events disconnected");
-        assert!(shared.status(0, 0).degraded.is_empty());
+        assert!(shared.status(&Queues::new(1, 1)).degraded.is_empty());
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -404,7 +569,7 @@ mod tests {
             utterance_id: "s:2".to_string(),
             text: "世界".to_string(),
         }));
-        // 队满拒收。
+        // 待翻译队满拒收。
         assert!(!queues.push_translate(TranslateJob {
             utterance_id: "s:3".to_string(),
             text: "满".to_string(),
@@ -419,9 +584,121 @@ mod tests {
         assert_eq!(queues.clear_speech(), 1);
         assert_eq!(queues.speech_depth(), 0);
         assert_eq!(queues.clear_speech(), 0);
+        // speech stop 清空不计队满丢弃。
+        assert_eq!(queues.speech_dropped(), 0);
 
         queues.discard();
         assert_eq!(queues.translate_depth(), 0);
         assert_eq!(queues.speech_depth(), 0);
+    }
+
+    #[test]
+    fn speech_queue_full_drops_oldest_and_counts() {
+        let queues = Queues::new(1, 2);
+        for seq in 1..=2 {
+            assert!(queues.push_speech(SpeechJob {
+                utterance_id: format!("s:{seq}"),
+                text: format!("t{seq}"),
+            }));
+        }
+        assert_eq!(queues.speech_depth(), 2);
+        // 队满丢最旧：s:1 被丢，s:3 入队。
+        assert!(queues.push_speech(SpeechJob {
+            utterance_id: "s:3".to_string(),
+            text: "t3".to_string(),
+        }));
+        assert_eq!(queues.speech_depth(), 2);
+        assert_eq!(queues.speech_dropped(), 1);
+
+        let first = queues.recv_speech(Duration::from_millis(100)).unwrap();
+        assert_eq!(first.utterance_id, "s:2");
+        let second = queues.recv_speech(Duration::from_millis(100)).unwrap();
+        assert_eq!(second.utterance_id, "s:3");
+        assert_eq!(queues.speech_depth(), 0);
+        assert!(queues
+            .recv_speech(Duration::from_millis(10))
+            .is_err_and(|err| err == RecvTimeoutError::Timeout));
+    }
+
+    #[test]
+    fn translate_queue_recv_decrements_depth() {
+        let queues = Queues::new(2, 1);
+        assert!(queues.push_translate(TranslateJob {
+            utterance_id: "s:1".to_string(),
+            text: "你好".to_string(),
+        }));
+        assert_eq!(queues.translate_depth(), 1);
+        let job = queues.recv_translate(Duration::from_millis(100)).unwrap();
+        assert_eq!(job.text, "你好");
+        assert_eq!(queues.translate_depth(), 0);
+        assert!(queues
+            .recv_translate(Duration::from_millis(10))
+            .is_err_and(|err| err == RecvTimeoutError::Timeout));
+    }
+
+    #[test]
+    fn status_reports_translate_and_speech_stats() {
+        let dir = temp_dir("stats");
+        let shared = Shared::new(
+            Switches { translate_enabled: true, speech_enabled: true },
+            dir.join("subtitles.jsonl"),
+            dir.join(STATE_FILE_NAME),
+        );
+        let queues = Queues::new(4, 4);
+        let translate = shared.translate_stats();
+        translate.attempt_fail("connect refused");
+        translate.add_retry();
+        translate.attempt_ok();
+        translate.add_translated();
+        translate.add_qc_rejected();
+        translate.attempt_fail("HTTP 500");
+        translate.add_failed();
+        let speech = shared.speech_stats();
+        speech.set_connected(true);
+        speech.add_delivered();
+        speech.add_submitted();
+        speech.add_delivered();
+        speech.add_skipped();
+        speech.add_delivered();
+        speech.add_failed();
+        queues.push_speech(SpeechJob {
+            utterance_id: "s:1".to_string(),
+            text: "hello".to_string(),
+        });
+        queues.push_speech(SpeechJob {
+            utterance_id: "s:2".to_string(),
+            text: "world".to_string(),
+        });
+        queues.push_speech(SpeechJob {
+            utterance_id: "s:3".to_string(),
+            text: "extra".to_string(),
+        });
+        queues.push_speech(SpeechJob {
+            utterance_id: "s:4".to_string(),
+            text: "more".to_string(),
+        });
+        queues.push_speech(SpeechJob {
+            utterance_id: "s:5".to_string(),
+            text: "drop".to_string(),
+        });
+
+        let status = shared.status(&queues);
+        assert_eq!(status.translated, 1);
+        assert_eq!(status.translate_failed, 1);
+        assert_eq!(status.translate_retried, 1);
+        assert_eq!(status.qc_rejected, 1);
+        // 最近一次请求失败：连接状态与失败原因取最后一次。
+        assert!(!status.llama_connected);
+        assert!(status.last_translate_ok_unix_ms > 0);
+        assert!(status.last_translate_fail_unix_ms >= status.last_translate_ok_unix_ms);
+        assert_eq!(status.last_translate_fail_reason.as_deref(), Some("HTTP 500"));
+        assert_eq!(status.speech_delivered, 3);
+        assert_eq!(status.speech_submitted, 1);
+        assert_eq!(status.speech_skipped, 1);
+        assert_eq!(status.speech_failed, 1);
+        assert!(status.tts_connected);
+        assert_eq!(status.speech_queue_depth, 4);
+        assert_eq!(status.speech_dropped, 1);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

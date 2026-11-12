@@ -1,16 +1,20 @@
-//! 进程级集成测试：spawn mozart-bridge 二进制，mock ASR 事件面（裸 JSON SEQPACKET），
-//! 验证字幕落盘、启动号校验与重连、开关命令与状态文件恢复、SIGTERM 收尾。
-//! 翻译/播报投递在 Task 5 接入，此处只验证待翻译队列钩子。
+//! 进程级集成测试：spawn mozart-bridge 二进制，mock ASR 事件面（裸 JSON SEQPACKET）、
+//! mock llama-server（Unix socket HTTP）与 mock TTS 任务面（SEQPACKET 信封），
+//! 验证字幕落盘、启动号校验与重连、开关命令与状态文件恢复、翻译调度与播报投递、
+//! SIGTERM 收尾。
 
 use mozart_core::ctl::{self, Seqpacket};
 use serde_json::{json, Value};
-use std::io;
+use std::io::{self, Read, Write};
 use std::mem;
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
 use std::os::unix::ffi::OsStrExt;
+use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, ExitStatus};
 use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
+use std::sync::{mpsc, Arc, Mutex};
+use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
 /// 子进程守卫：断言失败也不留孤儿进程。
@@ -240,7 +244,8 @@ fn refined_event(startup: &str, seq: u64, text: &str, refined_text: &str) -> Val
 fn subtitles_flow_status_and_sigterm() {
     let dir = run_dir("flow");
     let mock = MockAsr::bind(&dir.join("asr-events.sock"));
-    let mut child = spawn_bridge(&dir, "");
+    // 本用例只验证字幕链路：关翻译，避免 llama 缺席的降级干扰断言。
+    let mut child = spawn_bridge(&dir, "translate_enabled = false\n");
     let control = connect_control(&dir);
     let conn = mock.accept();
 
@@ -275,9 +280,9 @@ fn subtitles_flow_status_and_sigterm() {
     let status = get_status(&control);
     assert_eq!(status["subtitles_published"], 1);
     assert_eq!(status["records_in_memory"], 1);
-    assert_eq!(status["translate_queue_depth"], 1);
+    assert_eq!(status["translate_queue_depth"], 0);
     assert_eq!(status["speech_queue_depth"], 0);
-    assert_eq!(status["translate_enabled"], true);
+    assert_eq!(status["translate_enabled"], false);
     assert_eq!(status["speech_enabled"], true);
     assert_eq!(
         status["subtitles_path"],
@@ -299,7 +304,7 @@ fn subtitles_flow_status_and_sigterm() {
 fn startup_id_filters_stale_and_reconnect_adopts_new() {
     let dir = run_dir("startup");
     let mock = MockAsr::bind(&dir.join("asr-events.sock"));
-    let mut child = spawn_bridge(&dir, "");
+    let mut child = spawn_bridge(&dir, "translate_enabled = false\n");
     let control = connect_control(&dir);
     let conn = mock.accept();
 
@@ -426,7 +431,7 @@ fn toml_baseline_applies_without_state_file() {
     });
     assert_eq!(get_status(&control)["translate_queue_depth"], 0);
 
-    // 运行时打开后，新 final 入队。
+    // 运行时打开后，新 final 入队并被翻译线程消费；llama 缺席，重试耗尽计失败。
     call_ok(
         &control,
         ctl::BRIDGE_TRANSLATE_SET,
@@ -437,9 +442,14 @@ fn toml_baseline_applies_without_state_file() {
     wait_until("第二句落盘", Duration::from_secs(5), || {
         read_lines(&dir).len() == 2
     });
+    wait_until("翻译失败计数", Duration::from_secs(5), || {
+        get_status(&control)["translate_failed"] == 1
+    });
     let status = get_status(&control);
-    assert_eq!(status["translate_queue_depth"], 1);
+    assert_eq!(status["translate_queue_depth"], 0);
     assert_eq!(status["subtitles_published"], 2);
+    assert_eq!(status["translate_retried"], 2);
+    assert_eq!(status["llama_connected"], false);
 
     sigterm(&child.0);
     assert!(wait_exit(&mut child.0, Duration::from_secs(2)).success());
@@ -479,8 +489,8 @@ fn invalid_requests_are_rejected_and_service_continues() {
 #[test]
 fn asr_absent_degrades_then_recovers() {
     let dir = run_dir("absent");
-    // 先不绑定事件面：桥应降级运行并可查询原因。
-    let mut child = spawn_bridge(&dir, "");
+    // 先不绑定事件面：桥应降级运行并可查询原因。关翻译隔离 llama 降级。
+    let mut child = spawn_bridge(&dir, "translate_enabled = false\n");
     let control = connect_control(&dir);
     wait_until("断连降级可查", Duration::from_secs(5), || {
         get_status(&control)["degraded"]
@@ -513,5 +523,381 @@ fn corrupt_state_file_fails_startup() {
     let mut child = spawn_bridge(&dir, "");
     let status = wait_exit(&mut child.0, Duration::from_secs(5));
     assert!(!status.success(), "损坏状态文件应启动失败");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+// ---- mock llama-server：Unix socket HTTP，按连接顺序应答脚本化响应 ----
+
+/// 带 Content-Length 的 HTTP 响应。
+fn http_response(status: u16, body: &str) -> String {
+    let reason = if status == 200 { "OK" } else { "Internal Server Error" };
+    format!(
+        "HTTP/1.1 {status} {reason}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+        body.len()
+    )
+}
+
+/// 翻译成功的响应体。
+fn llama_ok(content: &str) -> String {
+    let body = json!({ "choices": [{ "message": { "content": content } }] });
+    http_response(200, &body.to_string())
+}
+
+/// 读完整 HTTP 请求：头部 + Content-Length 指定的体。
+fn read_http_request(stream: &mut UnixStream) -> Vec<u8> {
+    let mut buf = Vec::new();
+    let mut chunk = [0u8; 4096];
+    let head_end = loop {
+        let n = stream.read(&mut chunk).expect("读请求");
+        assert!(n > 0, "对端提前关闭");
+        buf.extend_from_slice(&chunk[..n]);
+        if let Some(pos) = buf.windows(4).position(|w| w == b"\r\n\r\n") {
+            break pos;
+        }
+    };
+    let head = String::from_utf8_lossy(&buf[..head_end]).into_owned();
+    let len: usize = head
+        .lines()
+        .find_map(|line| {
+            let (name, value) = line.split_once(':')?;
+            name.trim()
+                .eq_ignore_ascii_case("content-length")
+                .then(|| value.trim().parse().expect("Content-Length 是数字"))
+        })
+        .expect("请求带 Content-Length");
+    while buf.len() < head_end + 4 + len {
+        let n = stream.read(&mut chunk).expect("读请求体");
+        assert!(n > 0, "对端提前关闭");
+        buf.extend_from_slice(&chunk[..n]);
+    }
+    buf
+}
+
+struct MockLlama {
+    listener: UnixListener,
+}
+
+impl MockLlama {
+    fn bind(path: &Path) -> Self {
+        let _ = std::fs::remove_file(path);
+        Self {
+            listener: UnixListener::bind(path).expect("绑定 mock llama"),
+        }
+    }
+
+    /// 每个连接读一条请求、回一条响应；记录请求供断言。
+    fn spawn(self, responses: Vec<String>) -> (Arc<Mutex<Vec<Vec<u8>>>>, JoinHandle<()>) {
+        let requests = Arc::new(Mutex::new(Vec::new()));
+        let recorded = requests.clone();
+        let handle = std::thread::spawn(move || {
+            for response in responses {
+                let (mut stream, _) = self.listener.accept().expect("accept");
+                recorded.lock().unwrap().push(read_http_request(&mut stream));
+                stream.write_all(response.as_bytes()).expect("写响应");
+                stream.flush().expect("flush");
+            }
+        });
+        (requests, handle)
+    }
+
+    /// 收下请求但不应答（SIGTERM 宽限测试）；连接保持到 release 通道关闭。
+    fn spawn_stall(self, received: mpsc::Sender<()>, release: mpsc::Receiver<()>) -> JoinHandle<()> {
+        std::thread::spawn(move || {
+            let (mut stream, _) = self.listener.accept().expect("accept");
+            let _ = read_http_request(&mut stream);
+            let _ = received.send(());
+            let _ = release.recv();
+            drop(stream);
+        })
+    }
+}
+
+// ---- mock TTS 任务面：SEQPACKET 信封，按脚本回受理状态 ----
+
+struct MockTts {
+    listener: Seqpacket,
+}
+
+impl MockTts {
+    fn bind(path: &Path) -> Self {
+        let _ = std::fs::remove_file(path);
+        let listener = Seqpacket::bind(path).expect("绑定 mock tts");
+        listener.listen(4).expect("listen");
+        Self { listener }
+    }
+
+    /// 限时等待桥连接；无连接返回 None（验证未发起投递）。
+    fn wait_connection(&self, timeout: Duration) -> Option<Seqpacket> {
+        match self.listener.wait_readable(Some(timeout)) {
+            Ok(()) => Some(self.listener.accept().expect("accept")),
+            Err(_) => None,
+        }
+    }
+
+    /// 服务一条连接：按序应答 statuses 并记录任务体；之后保持连接到对端关闭。
+    fn spawn(self, statuses: Vec<&'static str>) -> (Arc<Mutex<Vec<Value>>>, JoinHandle<()>) {
+        let jobs = Arc::new(Mutex::new(Vec::new()));
+        let recorded = jobs.clone();
+        let handle = std::thread::spawn(move || {
+            let conn = self.listener.accept().expect("accept");
+            for status in statuses {
+                let msg = conn.recv(Some(Duration::from_secs(5))).expect("收任务");
+                let msg_type = msg.header.type_;
+                let request_id = msg.header.request_id;
+                assert_eq!(msg_type, ctl::TTS_JOB_SUBMIT);
+                let body: Value = serde_json::from_slice(&msg.body).expect("任务体是 JSON");
+                let utterance_id = body["utterance_id"].as_str().expect("utterance_id");
+                let reply = json!({ "status": status, "utterance_id": utterance_id });
+                recorded.lock().unwrap().push(body);
+                conn.send(ctl::TTS_JOB_REPLY, request_id, &serde_json::to_vec(&reply).unwrap())
+                    .expect("回受理");
+            }
+            loop {
+                match conn.recv(Some(Duration::from_millis(200))) {
+                    Ok(_) => {}
+                    Err(err) if err.kind() == io::ErrorKind::TimedOut => continue,
+                    Err(_) => break,
+                }
+            }
+        });
+        (jobs, handle)
+    }
+}
+
+// ---- 翻译调度与播报投递用例 ----
+
+#[test]
+fn translation_and_speech_full_chain() {
+    let dir = run_dir("chain");
+    let asr = MockAsr::bind(&dir.join("asr-events.sock"));
+    let llama = MockLlama::bind(&dir.join("llama.sock"));
+    let (requests, llama_server) = llama.spawn(vec![llama_ok("Hello.")]);
+    let tts = MockTts::bind(&dir.join("tts-jobs.sock"));
+    let (jobs, tts_server) = tts.spawn(vec!["submitted"]);
+    let mut child = spawn_bridge(&dir, "");
+    let control = connect_control(&dir);
+    let conn = asr.accept();
+
+    conn.send_event(&event("final", "a1b2c3d4", 1, "你好"));
+    wait_until("原文 + 译文修订落盘", Duration::from_secs(5), || {
+        read_lines(&dir).len() == 2
+    });
+    let lines = read_lines(&dir);
+    assert_eq!(lines[0]["text"], "你好");
+    assert!(lines[0].get("translation").is_none());
+    assert_eq!(lines[1]["text"], "你好");
+    assert_eq!(lines[1]["translation"], "Hello.");
+    assert_eq!(lines[1]["revision"], 1);
+    assert_eq!(lines[1]["type"], "final");
+    assert_eq!(lines[1]["utterance_id"], "a1b2c3d4:1");
+
+    wait_until("播报受理计数", Duration::from_secs(5), || {
+        get_status(&control)["speech_submitted"] == 1
+    });
+    let status = get_status(&control);
+    assert_eq!(status["translated"], 1);
+    assert_eq!(status["translate_failed"], 0);
+    assert_eq!(status["translate_retried"], 0);
+    assert_eq!(status["qc_rejected"], 0);
+    assert_eq!(status["llama_connected"], true);
+    assert!(status["last_translate_ok_unix_ms"].as_u64().unwrap() > 0);
+    assert_eq!(status["last_translate_fail_reason"], Value::Null);
+    assert_eq!(status["speech_delivered"], 1);
+    assert_eq!(status["speech_dropped"], 0);
+    assert_eq!(status["tts_connected"], true);
+    assert_eq!(status["translate_queue_depth"], 0);
+    assert_eq!(status["speech_queue_depth"], 0);
+    assert_eq!(status["degraded"], json!([]));
+
+    // llama 收到契约请求；TTS 收到译文 + utterance_id。
+    let requests = requests.lock().unwrap();
+    assert_eq!(requests.len(), 1);
+    let text = String::from_utf8(requests[0].clone()).unwrap();
+    assert!(text.starts_with("POST /v1/chat/completions HTTP/1.1\r\n"));
+    let (_, body) = text.split_once("\r\n\r\n").unwrap();
+    let value: Value = serde_json::from_str(body).unwrap();
+    assert_eq!(value["messages"][1]["content"], "你好");
+    assert_eq!(value["max_tokens"], 128);
+    assert_eq!(value["temperature"], 0);
+    let jobs = jobs.lock().unwrap();
+    assert_eq!(jobs.len(), 1);
+    assert_eq!(jobs[0]["text"], "Hello.");
+    assert_eq!(jobs[0]["utterance_id"], "a1b2c3d4:1");
+
+    sigterm(&child.0);
+    assert!(wait_exit(&mut child.0, Duration::from_secs(2)).success());
+    llama_server.join().unwrap();
+    tts_server.join().unwrap();
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn translation_retries_then_succeeds() {
+    let dir = run_dir("retry");
+    let asr = MockAsr::bind(&dir.join("asr-events.sock"));
+    let llama = MockLlama::bind(&dir.join("llama.sock"));
+    let (_requests, llama_server) = llama.spawn(vec![
+        http_response(500, "{}"),
+        http_response(500, "{}"),
+        llama_ok("Hi."),
+    ]);
+    let tts = MockTts::bind(&dir.join("tts-jobs.sock"));
+    let (_jobs, tts_server) = tts.spawn(vec!["submitted"]);
+    let mut child = spawn_bridge(&dir, "");
+    let control = connect_control(&dir);
+    let conn = asr.accept();
+
+    conn.send_event(&event("final", "s", 1, "你好"));
+    wait_until("重试后翻译成功", Duration::from_secs(5), || {
+        get_status(&control)["translated"] == 1
+    });
+    let status = get_status(&control);
+    assert_eq!(status["translate_retried"], 2);
+    assert_eq!(status["translate_failed"], 0);
+    assert_eq!(status["llama_connected"], true);
+    assert_eq!(status["speech_submitted"], 1);
+    assert_eq!(status["degraded"], json!([]));
+
+    sigterm(&child.0);
+    assert!(wait_exit(&mut child.0, Duration::from_secs(2)).success());
+    llama_server.join().unwrap();
+    tts_server.join().unwrap();
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn translation_failure_degrades_then_recovers() {
+    let dir = run_dir("tr-fail");
+    let asr = MockAsr::bind(&dir.join("asr-events.sock"));
+    let tts = MockTts::bind(&dir.join("tts-jobs.sock"));
+    let (jobs, tts_server) = tts.spawn(vec!["submitted"]);
+    // llama 缺席：连接失败，重试耗尽。
+    let mut child = spawn_bridge(&dir, "");
+    let control = connect_control(&dir);
+    let conn = asr.accept();
+
+    conn.send_event(&event("final", "s", 1, "你好"));
+    wait_until("翻译失败计数", Duration::from_secs(5), || {
+        get_status(&control)["translate_failed"] == 1
+    });
+    let status = get_status(&control);
+    assert_eq!(status["translate_retried"], 2);
+    assert_eq!(status["translated"], 0);
+    assert_eq!(status["llama_connected"], false);
+    assert!(status["last_translate_fail_unix_ms"].as_u64().unwrap() > 0);
+    assert!(status["last_translate_fail_reason"]
+        .as_str()
+        .unwrap()
+        .contains("connect"));
+    assert!(status["degraded"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|d| d.as_str().unwrap().starts_with("translation failed")));
+    // 失败句不投递、不落译文。
+    assert!(jobs.lock().unwrap().is_empty());
+    assert_eq!(read_lines(&dir).len(), 1);
+
+    // llama 上线：新句成功，降级解除。
+    let llama = MockLlama::bind(&dir.join("llama.sock"));
+    let (_requests, llama_server) = llama.spawn(vec![llama_ok("Late.")]);
+    conn.send_event(&event("final", "s", 2, "世界"));
+    wait_until("恢复后翻译成功", Duration::from_secs(5), || {
+        get_status(&control)["translated"] == 1
+    });
+    let status = get_status(&control);
+    assert_eq!(status["llama_connected"], true);
+    assert_eq!(status["speech_submitted"], 1);
+    assert_eq!(status["degraded"], json!([]));
+    assert_eq!(jobs.lock().unwrap()[0]["text"], "Late.");
+
+    sigterm(&child.0);
+    assert!(wait_exit(&mut child.0, Duration::from_secs(2)).success());
+    llama_server.join().unwrap();
+    tts_server.join().unwrap();
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn qc_rejection_blocks_delivery() {
+    let dir = run_dir("qc");
+    let asr = MockAsr::bind(&dir.join("asr-events.sock"));
+    let llama = MockLlama::bind(&dir.join("llama.sock"));
+    // 译文与原文相同：质检拒绝。
+    let (_requests, llama_server) = llama.spawn(vec![llama_ok("你好")]);
+    // 只绑定不应答：拒绝句不应发起投递连接。
+    let tts = MockTts::bind(&dir.join("tts-jobs.sock"));
+    let mut child = spawn_bridge(&dir, "");
+    let control = connect_control(&dir);
+    let conn = asr.accept();
+
+    conn.send_event(&event("final", "s", 1, "你好"));
+    wait_until("质检拒绝计数", Duration::from_secs(5), || {
+        get_status(&control)["qc_rejected"] == 1
+    });
+    let status = get_status(&control);
+    assert_eq!(status["translated"], 0);
+    assert_eq!(status["speech_delivered"], 0);
+    assert!(tts.wait_connection(Duration::from_millis(300)).is_none());
+    // 拒绝句不落译文修订。
+    assert_eq!(read_lines(&dir).len(), 1);
+
+    sigterm(&child.0);
+    assert!(wait_exit(&mut child.0, Duration::from_secs(2)).success());
+    llama_server.join().unwrap();
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn speech_stop_clears_pending_queue() {
+    let dir = run_dir("sp-stop");
+    let asr = MockAsr::bind(&dir.join("asr-events.sock"));
+    let llama = MockLlama::bind(&dir.join("llama.sock"));
+    let (_requests, llama_server) =
+        llama.spawn(vec![llama_ok("One."), llama_ok("Two."), llama_ok("Three.")]);
+    // TTS 缺席：投递线程卡在重连，译文在待播报队列积压。
+    let mut child = spawn_bridge(&dir, "");
+    let control = connect_control(&dir);
+    let conn = asr.accept();
+
+    for seq in 1..=3 {
+        conn.send_event(&event("final", "s", seq, &format!("句{seq}")));
+    }
+    wait_until("待播报队列积压", Duration::from_secs(5), || {
+        get_status(&control)["speech_queue_depth"].as_u64().unwrap() >= 1
+    });
+    let stop = call_ok(&control, ctl::BRIDGE_SPEECH_STOP, 2, b"{}");
+    assert_eq!(stop["speech_enabled"], false);
+    assert!(stop["queue_cleared"].as_u64().unwrap() >= 1);
+    let status = get_status(&control);
+    assert_eq!(status["speech_enabled"], false);
+    assert_eq!(status["speech_queue_depth"], 0);
+    assert_eq!(status["speech_delivered"], 0);
+
+    sigterm(&child.0);
+    assert!(wait_exit(&mut child.0, Duration::from_secs(2)).success());
+    llama_server.join().unwrap();
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn sigterm_during_stalled_llama_exits_within_grace() {
+    let dir = run_dir("stall");
+    let asr = MockAsr::bind(&dir.join("asr-events.sock"));
+    let llama = MockLlama::bind(&dir.join("llama.sock"));
+    let (stall_tx, stall_rx) = mpsc::channel::<()>();
+    let (release_tx, release_rx) = mpsc::channel::<()>();
+    let llama_server = llama.spawn_stall(stall_tx, release_rx);
+    let mut child = spawn_bridge(&dir, "");
+    let _control = connect_control(&dir);
+    let conn = asr.accept();
+
+    conn.send_event(&event("final", "s", 1, "你好"));
+    // 请求已送达 llama 且不应答：翻译线程在途等待（10 s 时限）。
+    stall_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+    sigterm(&child.0);
+    assert!(wait_exit(&mut child.0, Duration::from_secs(2)).success());
+    drop(release_tx);
+    llama_server.join().unwrap();
     let _ = std::fs::remove_dir_all(&dir);
 }

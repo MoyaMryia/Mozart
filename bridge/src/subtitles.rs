@@ -2,6 +2,8 @@
 //! 一条记录一行 JSON，逐行 flush。revision 覆盖语义沿用旧实现：
 //! 创建记 0，每次更新 +1；final 之后不再被 partial/final 覆盖；
 //! refined 只更新文本，不重新触发翻译。
+//! 记录表与写盘由 SubtitleStore 共享给字幕线程与翻译线程：
+//! 译文合格即追加一行带 translation 的修订记录，先于播报投递落盘。
 
 use crate::events::{Event, EventKind};
 use crate::state::{unix_ms, Queues, Shared, TranslateJob};
@@ -9,16 +11,16 @@ use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, Write};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering::Relaxed};
 use std::sync::mpsc::{Receiver, RecvTimeoutError};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 /// 记录表轮询步长：让停止标志在宽限期内生效。
 const RECV_POLL: Duration = Duration::from_millis(100);
 
-/// 降级原因：待翻译队列满（Task 5 消费后按需解除）。
+/// 降级原因：待翻译队列满（后续入队成功时解除）。
 const DEGRADED_TRANSLATE_FULL: &str = "translate queue full";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -30,6 +32,7 @@ pub enum RecordType {
 }
 
 /// 一条字幕记录；序列化形态即 JSONL 行。complete 是内存合并标记，不落盘。
+/// translation 仅在译文合格后写入（沿用旧实现：原文保留，译文另字段）。
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct SubtitleRecord {
     pub utterance_id: String,
@@ -39,6 +42,8 @@ pub struct SubtitleRecord {
     pub revision: u64,
     pub timestamp_ms: u64,
     pub startup_id: String,
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub translation: Option<String>,
     #[serde(skip)]
     pub complete: bool,
 }
@@ -72,6 +77,7 @@ pub fn apply(
                 revision: previous.map_or(0, |record| record.revision + 1),
                 timestamp_ms: now_ms,
                 startup_id: event.startup_id.clone(),
+                translation: None,
                 complete: kind == RecordType::Final,
             };
             table.insert(event.utterance_id.clone(), record.clone());
@@ -116,16 +122,89 @@ impl JsonlWriter {
     }
 }
 
+/// 记录表 + 存档文件的共享门面：字幕线程合并事件，翻译线程写入译文修订。
+/// 锁序固定为先记录表后文件，两个线程一致；写盘失败由调用方致命退出。
+pub struct SubtitleStore {
+    records: Mutex<HashMap<String, SubtitleRecord>>,
+    writer: Mutex<JsonlWriter>,
+    path: PathBuf,
+}
+
+impl SubtitleStore {
+    pub fn new(writer: JsonlWriter, path: PathBuf) -> Self {
+        Self {
+            records: Mutex::new(HashMap::new()),
+            writer: Mutex::new(writer),
+            path,
+        }
+    }
+
+    /// 合并一条事件并落盘，返回应入待翻译队列的记录；None 表示忽略。
+    pub fn apply_event(&self, event: &Event, shared: &Shared) -> Result<Option<SubtitleRecord>, String> {
+        let now = unix_ms();
+        let mut records = self
+            .records
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let created = !records.contains_key(&event.utterance_id);
+        let Some(record) = apply(&mut records, event, now) else {
+            return Ok(None);
+        };
+        self.write_locked(&record)?;
+        if created {
+            shared.add_published();
+        }
+        shared.set_records_in_memory(records.len() as u32);
+        shared.set_last_write_unix_ms(now);
+        Ok(Some(record))
+    }
+
+    /// 译文合格：更新记录并追加一行修订（先于播报投递落盘，SPEC-05）。
+    /// 记录必然存在：final 先入表落盘才入待翻译队列，表不淘汰。
+    pub fn publish_translation(
+        &self,
+        utterance_id: &str,
+        translation: &str,
+        shared: &Shared,
+    ) -> Result<(), String> {
+        let now = unix_ms();
+        let mut records = self
+            .records
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let record = records
+            .get_mut(utterance_id)
+            .expect("translate job enqueued after record insert");
+        record.translation = Some(translation.to_string());
+        record.revision += 1;
+        record.timestamp_ms = now;
+        let snapshot = record.clone();
+        self.write_locked(&snapshot)?;
+        shared.set_last_write_unix_ms(now);
+        Ok(())
+    }
+
+    /// 调用方已持记录表锁；文件锁内只做写盘。
+    fn write_locked(&self, record: &SubtitleRecord) -> Result<(), String> {
+        let mut writer = self
+            .writer
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        writer
+            .write(record)
+            .map_err(|err| format!("写字幕 {}：{err}", self.path.display()))
+    }
+}
+
 /// 字幕线程：消费事件队列，合并记录表、逐行落盘、final 入待翻译队列。
 /// 停止标志置位后不再处理新事件；存档已逐行 flush，不受收尾影响。
 pub fn run(
     rx: Receiver<Event>,
-    mut writer: JsonlWriter,
+    store: Arc<SubtitleStore>,
     queues: Arc<Queues>,
     shared: Arc<Shared>,
     stop: &'static AtomicBool,
 ) -> Result<(), String> {
-    let mut table: HashMap<String, SubtitleRecord> = HashMap::new();
     while !stop.load(Relaxed) {
         let event = match rx.recv_timeout(RECV_POLL) {
             Ok(event) => event,
@@ -133,9 +212,9 @@ pub fn run(
             // 事件线程已退出。
             Err(RecvTimeoutError::Disconnected) => break,
         };
-        process(event, &mut table, &mut writer, &queues, &shared)?;
+        process(event, &store, &queues, &shared)?;
         while let Ok(event) = rx.try_recv() {
-            process(event, &mut table, &mut writer, &queues, &shared)?;
+            process(event, &store, &queues, &shared)?;
         }
     }
     Ok(())
@@ -143,25 +222,14 @@ pub fn run(
 
 fn process(
     event: Event,
-    table: &mut HashMap<String, SubtitleRecord>,
-    writer: &mut JsonlWriter,
+    store: &SubtitleStore,
     queues: &Queues,
     shared: &Shared,
 ) -> Result<(), String> {
-    let created = !table.contains_key(&event.utterance_id);
-    let now = unix_ms();
-    let Some(record) = apply(table, &event, now) else {
+    let Some(record) = store.apply_event(&event, shared)? else {
         return Ok(());
     };
-    writer
-        .write(&record)
-        .map_err(|err| format!("写字幕 {}：{err}", shared.subtitles_path.display()))?;
-    if created {
-        shared.add_published();
-    }
-    shared.set_records_in_memory(table.len() as u32);
-    shared.set_last_write_unix_ms(now);
-    // final 入待翻译队列（Task 5 消费）；translate off 只发布原文，不入队。
+    // final 入待翻译队列；translate off 只发布原文，不入队。
     if record.kind == RecordType::Final && shared.translate_enabled() {
         let job = TranslateJob {
             utterance_id: record.utterance_id.clone(),
@@ -169,6 +237,8 @@ fn process(
         };
         if !queues.push_translate(job) {
             shared.degrade(DEGRADED_TRANSLATE_FULL);
+        } else {
+            shared.resolve(DEGRADED_TRANSLATE_FULL);
         }
     }
     Ok(())
@@ -301,11 +371,12 @@ mod tests {
             revision: 2,
             timestamp_ms: 1731234567890,
             startup_id: "a1b2c3d4".to_string(),
+            translation: None,
             complete: true,
         };
         let line = serde_json::to_string(&record).unwrap();
         let value: Value = serde_json::from_str(&line).unwrap();
-        // 落盘形态只含契约六字段。
+        // 未翻译记录落盘形态只含契约六字段。
         assert_eq!(value.as_object().unwrap().len(), 6);
         assert_eq!(value["type"], "final");
         assert_eq!(value["revision"], 2);
@@ -317,6 +388,20 @@ mod tests {
         assert_eq!(back.revision, record.revision);
         assert_eq!(back.timestamp_ms, record.timestamp_ms);
         assert_eq!(back.startup_id, record.startup_id);
+        assert_eq!(back.translation, None);
+
+        // 译文合格后多一个 translation 字段，原文保留。
+        let mut translated = record.clone();
+        translated.translation = Some("Hello.".to_string());
+        translated.revision += 1;
+        let value: Value =
+            serde_json::from_str(&serde_json::to_string(&translated).unwrap()).unwrap();
+        assert_eq!(value.as_object().unwrap().len(), 7);
+        assert_eq!(value["text"], "你好");
+        assert_eq!(value["translation"], "Hello.");
+        assert_eq!(value["revision"], 3);
+        let back: SubtitleRecord = serde_json::from_value(value).unwrap();
+        assert_eq!(back.translation.as_deref(), Some("Hello."));
     }
 
     #[test]
@@ -335,6 +420,7 @@ mod tests {
             revision: 0,
             timestamp_ms: 1,
             startup_id: "s".to_string(),
+            translation: None,
             complete: false,
         };
         writer.write(&record).unwrap();
@@ -349,6 +435,52 @@ mod tests {
             let back: SubtitleRecord = serde_json::from_str(line).unwrap();
             assert_eq!(back.utterance_id, "s:1");
         }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn store_publishes_translation_as_revision() {
+        use crate::state::{Shared, Switches, STATE_FILE_NAME};
+
+        let dir = std::env::temp_dir().join(format!(
+            "mozart-bridge-store-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let path = dir.join("subtitles.jsonl");
+        let shared = Shared::new(
+            Switches { translate_enabled: true, speech_enabled: true },
+            path.clone(),
+            dir.join(STATE_FILE_NAME),
+        );
+        let store = SubtitleStore::new(JsonlWriter::open(&path).unwrap(), path.clone());
+
+        let record = store
+            .apply_event(&event(EventKind::Final, 1, "你好"), &shared)
+            .unwrap()
+            .unwrap();
+        assert_eq!(record.revision, 0);
+        assert_eq!(shared.status(&Queues::new(1, 1)).subtitles_published, 1);
+
+        store.publish_translation("a1b2c3d4:1", "Hello.", &shared).unwrap();
+        let lines: Vec<Value> = std::fs::read_to_string(&path)
+            .unwrap()
+            .lines()
+            .map(|line| serde_json::from_str(line).unwrap())
+            .collect();
+        assert_eq!(lines.len(), 2);
+        // 原文行不带 translation；译文行保留原文、revision +1。
+        assert!(lines[0].get("translation").is_none());
+        assert_eq!(lines[1]["text"], "你好");
+        assert_eq!(lines[1]["translation"], "Hello.");
+        assert_eq!(lines[1]["revision"], 1);
+        assert_eq!(lines[1]["type"], "final");
+        // 译文修订不新增已发布句数。
+        let status = shared.status(&Queues::new(1, 1));
+        assert_eq!(status.subtitles_published, 1);
+        assert_eq!(status.records_in_memory, 1);
+        assert!(status.last_write_unix_ms > 0);
+
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

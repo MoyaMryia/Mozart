@@ -1,15 +1,23 @@
 //! mozart-bridge：字幕桥进程（SPEC-05）。
 //! 线程结构：事件（连接 asr-events.sock，读循环只入队）→ 字幕（记录表合并 +
-//! subtitles.jsonl 逐行落盘 + final 入待翻译队列）；控制线程独立服务 bridge.sock
-//! （Hello/GetStatus + 翻译/播报开关）。翻译调度与播报投递在 Task 5 接入队列。
+//! subtitles.jsonl 逐行落盘 + final 入待翻译队列）→ 翻译（预处理 + llama-server
+//! 推理 + 质检 + 译文落盘 + 入待播报队列）→ 播报投递（tts-jobs.sock 发译文）；
+//! 控制线程独立服务 bridge.sock（Hello/GetStatus + 翻译/播报开关）。
 //! 开关以 TOML 为基线，运行时命令覆盖并存档 run_dir/bridge-state.json，重启恢复。
-//! 停止：SIGTERM/SIGINT 置停止标志；停收新事件，丢弃在途队列，
-//! 字幕存档已逐行 flush，在 daemon 2 s 宽限内退出。
+//! 停止：SIGTERM/SIGINT 置停止标志；停收新事件，放弃在途翻译/播报请求，
+//! 丢弃在途队列，字幕存档已逐行 flush，在 daemon 2 s 宽限内退出。
 
 mod control;
 mod events;
+mod http;
+mod preprocess;
+mod quality;
+mod speech;
 mod state;
 mod subtitles;
+#[cfg(test)]
+mod testutil;
+mod translate;
 
 use clap::Parser;
 use mozart_core::config::Config;
@@ -138,13 +146,21 @@ fn run(cli: Cli) -> Result<(), String> {
         .map_err(|err| format!("listen：{err}"))?;
     let writer = subtitles::JsonlWriter::open(&config.bridge.subtitles_path)
         .map_err(|err| format!("打开字幕 {}：{err}", config.bridge.subtitles_path.display()))?;
+    let store = Arc::new(subtitles::SubtitleStore::new(
+        writer,
+        config.bridge.subtitles_path.clone(),
+    ));
+    let llama = http::LlamaClient::new(config.llama_socket());
+    let tts_jobs_path = config.tts_jobs_socket();
 
     let (events_tx, events_rx) = mpsc::channel::<events::Event>();
 
     eprintln!(
-        "mozart-bridge: events={} subtitles={} translate={} speech={}",
+        "mozart-bridge: events={} subtitles={} llama={} tts_jobs={} translate={} speech={}",
         config.asr_events_socket().display(),
         config.bridge.subtitles_path.display(),
+        config.llama_socket().display(),
+        tts_jobs_path.display(),
         switches.translate_enabled,
         switches.speech_enabled,
     );
@@ -162,12 +178,35 @@ fn run(cli: Cli) -> Result<(), String> {
     let subtitles_handle = {
         let shared = shared.clone();
         let queues = queues.clone();
+        let store = store.clone();
         spawn_thread("mozart-bridge-subtitles", move || {
             stop_on_fatal(guard_panic(move || {
-                subtitles::run(events_rx, writer, queues, shared, &STOP)
+                subtitles::run(events_rx, store, queues, shared, &STOP)
             }))
         })
         .map_err(|err| format!("启动字幕线程：{err}"))?
+    };
+    let translate_handle = {
+        let shared = shared.clone();
+        let queues = queues.clone();
+        let store = store.clone();
+        let retry_max = config.bridge.retry_max;
+        spawn_thread("mozart-bridge-translate", move || {
+            stop_on_fatal(guard_panic(move || {
+                translate::run(queues, shared, store, llama, retry_max, &STOP)
+            }))
+        })
+        .map_err(|err| format!("启动翻译线程：{err}"))?
+    };
+    let speech_handle = {
+        let shared = shared.clone();
+        let queues = queues.clone();
+        spawn_thread("mozart-bridge-speech", move || {
+            stop_on_fatal(guard_panic(move || {
+                speech::run(queues, shared, tts_jobs_path, &STOP)
+            }))
+        })
+        .map_err(|err| format!("启动投递线程：{err}"))?
     };
     let control_handle = {
         let shared = shared.clone();
@@ -184,6 +223,8 @@ fn run(cli: Cli) -> Result<(), String> {
     let failure = join_threads(vec![
         ("events", events_handle),
         ("subtitles", subtitles_handle),
+        ("translate", translate_handle),
+        ("speech", speech_handle),
         ("control", control_handle),
     ]);
     // 收尾：丢弃在途队列（SPEC-05）；字幕存档已逐行 flush，无需额外写盘。
