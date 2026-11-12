@@ -13,10 +13,12 @@ use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering::Relaxed};
 use std::time::{Duration, Instant};
 
-/// 翻译系统提示词（沿用旧实现的职责边界：只做中译英纯推理）。
-pub const SYSTEM_PROMPT: &str = "You are a translator. Translate Chinese to English. \
-Output only the translation. Preserve names, years, numbers, negation, and uncertainty. \
-Use Arabic numerals. Do not invent context.";
+/// 翻译系统提示词（旧实现原文，subtitle_bridge.py SYSTEM_PROMPT）。
+pub const SYSTEM_PROMPT: &str = "Translate the Chinese utterance into English. \
+Return only the translation. Preserve names, years, numbers, negation and uncertainty exactly. \
+Use Arabic numerals for years and large quantities. \
+Do not invent context, people, relationships or events. \
+Keep direct address as direct address, not a possession or a family relationship.";
 
 /// 单请求总时限（含收发）。
 pub const REQUEST_TIMEOUT: Duration = Duration::from_secs(10);
@@ -268,7 +270,15 @@ mod tests {
         assert_eq!(value["temperature"], 0);
         assert_eq!(value["chat_template_kwargs"]["enable_thinking"], false);
         assert_eq!(value["messages"][0]["role"], "system");
-        assert_eq!(value["messages"][0]["content"], SYSTEM_PROMPT);
+        // 旧实现原文逐字对拍，防止提示词被改写。
+        assert_eq!(
+            value["messages"][0]["content"],
+            "Translate the Chinese utterance into English. Return only the translation. \
+             Preserve names, years, numbers, negation and uncertainty exactly. \
+             Use Arabic numerals for years and large quantities. \
+             Do not invent context, people, relationships or events. \
+             Keep direct address as direct address, not a possession or a family relationship."
+        );
         assert_eq!(value["messages"][1]["role"], "user");
         assert_eq!(value["messages"][1]["content"], "你好");
     }
