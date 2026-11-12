@@ -29,7 +29,7 @@
 - 扬声器仲裁的执行归音频进程（淡变、设备写入）；策略（何时切、切到哪、静音与否）由 daemon 下发。直出、变声、翻译播报共用播放设备。
 - 音频进程不做控制决策，不管理其他进程生命周期；只执行 daemon 下发的路由与模式指令。
 - 直出分支取在降采样前，用 48 kHz 主干；AI 支路降采样到 16 kHz。
-- 数据面过载：非阻塞发送，丢弃计数；接收缓冲限制在 4–8 帧。
+- 数据面过载：非阻塞发送，丢弃计数；对端排队上限由发送方 connect 侧 `SO_SNDBUF` 按 4–8 帧执行——Linux AF_UNIX 数据报流控只按发送方发送缓冲记账，接收方 `SO_RCVBUF` 不约束发送方（bind 侧 `SO_RCVBUF` 保留设置但不参与流控）。
 - 数据面 socket 命名与方向：`input_socket`（默认 `rvc-in.sock`）由 rvc 绑定收输入帧；`output_socket`（默认 `rvc-out.sock`）由 pre 绑定收输出帧；配置键在 `[rvc]`，路径相对 run_dir。
 - Socket 路径在 `/run/mozart/` 下；锁文件防重复实例；对端重启后重连。
 - 控制面（daemon → pre）：Unix SEQPACKET 定长头 + JSON。命令 `Hello`（版本握手）、`SetRoute{route}`（切 direct/rvc）、`SetMute{mute}`（静音开关）、`GetStatus`。路由与静音由 pre 执行淡变，策略归 daemon。

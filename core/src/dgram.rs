@@ -143,8 +143,10 @@ pub type OutputSocket = FrameSocket<OutputFrame>;
 
 impl<F: WirePacket> FrameSocket<F> {
     /// 服务方绑定 socket 文件并设置接收缓冲。
-    /// `frames` 为接收缓冲帧数（SPEC-02 限制在 4–8 帧），
+    /// `frames` 为接收缓冲帧数（SPEC-02 数据面上限 4–8 帧），
     /// 换算为 `SO_RCVBUF = frames × PACKET_BYTES`。
+    /// Linux AF_UNIX 数据报流控不看接收方该值（依据见 connect），
+    /// 该设置在 Linux 上不约束发送方，仅保留。
     /// 绑定前清理同名陈旧 socket 文件，进程重启后无需外部清理。
     pub fn bind(path: &Path, frames: usize) -> io::Result<Self> {
         let fd = new_dgram()?;
@@ -167,8 +169,9 @@ impl<F: WirePacket> FrameSocket<F> {
     /// 连接单一对端并设置发送缓冲为 `frames × PACKET_BYTES`。
     /// Linux 对 Unix 数据报的流控按队列长度（`net.unix.max_dgram_qlen`）与
     /// 发送方 `SO_SNDBUF` 记账，接收方 `SO_RCVBUF` 不约束发送方；
-    /// 本调用把对端排队上限夹在约 `frames` 帧，是 SPEC-02「接收缓冲限制 4–8 帧」
-    /// 的实际执行点。对端重启后由 `send` 在失败时自动重连，无需调用方介入。
+    /// 本调用把对端排队上限夹在约 `frames` 帧，是 SPEC-02「发送方
+    /// `SO_SNDBUF` 执行 4–8 帧上限」的实际执行点。对端重启后由 `send`
+    /// 在失败时自动重连，无需调用方介入。
     pub fn connect(path: &Path, frames: usize) -> io::Result<Self> {
         let fd = new_dgram()?;
         set_socket_buffer(&fd, libc::SO_SNDBUF, frames * F::PACKET_BYTES)?;
