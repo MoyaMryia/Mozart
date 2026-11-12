@@ -144,6 +144,9 @@ fn start_child(
     if role == Role::Llama {
         // llama-server 不说控制协议（SPEC-05）：无 --socket/--config 契约，
         // --host 直接填 Unix socket 路径；启动参数沿用旧实现。
+        // 第三方进程不会自清陈旧 socket 文件，daemon 重启后残留文件会让其
+        // bind 失败崩溃循环，故启动前由 daemon 清除（mozart 子进程自行 unlink）。
+        let _ = std::fs::remove_file(socket);
         command
             .arg("-m")
             .arg(&config.bridge.llama_model)
