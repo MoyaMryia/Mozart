@@ -30,6 +30,26 @@ pub const DAEMON_TRANSLATE_SET: u16 = 0x0106;
 pub const DAEMON_SPEECH_SET: u16 = 0x0107;
 /// 体：{}（空）；daemon 转发到桥 BRIDGE_SPEECH_STOP。
 pub const DAEMON_SPEECH_STOP: u16 = 0x0108;
+/// 文件链路（SPEC-04）：体 schema::FileSubmitRequest {"path","model_id"?}。
+pub const DAEMON_FILE_SUBMIT: u16 = 0x0110;
+/// 体：{}（空）；暂停后不再启动新任务，在跑任务不受影响。
+pub const DAEMON_FILE_PAUSE: u16 = 0x0111;
+/// 体：{}（空）；恢复启动排队任务。
+pub const DAEMON_FILE_RESUME: u16 = 0x0112;
+/// 体：schema::FileCancelRequest {"job_id"}。
+pub const DAEMON_FILE_CANCEL: u16 = 0x0113;
+/// 体：schema::FileFetchRequest {"job_id","output"?}。
+pub const DAEMON_FILE_FETCH: u16 = 0x0114;
+/// 体：schema::FileStatusRequest {"job_id"}；data 为 schema::FileJob。
+pub const DAEMON_FILE_STATUS: u16 = 0x0115;
+/// 体：{}（空）；data 为 schema::FileJob 数组。
+pub const DAEMON_FILE_LIST: u16 = 0x0116;
+/// 体：{}（空）；data {"models":[schema::ModelEntry]}。
+pub const DAEMON_MODEL_LIST: u16 = 0x0117;
+/// 体：schema::RestartRequest {"service"}。
+pub const DAEMON_RESTART: u16 = 0x0118;
+/// 体：{}（空）；data {"devices":[schema::DeviceEntry]}。
+pub const DAEMON_DEVICE_LIST: u16 = 0x0119;
 
 pub const PRE_HELLO: u16 = 0x0201;
 pub const PRE_SET_ROUTE: u16 = 0x0202;
@@ -44,6 +64,8 @@ pub const RVC_START_STREAM: u16 = 0x0303;
 pub const RVC_STOP_STREAM: u16 = 0x0304;
 pub const RVC_RESET_STREAM: u16 = 0x0305;
 pub const RVC_GET_STATUS: u16 = 0x0306;
+/// 体：{}（空）；data {"models":[schema::ModelEntry]}。
+pub const RVC_LIST_MODELS: u16 = 0x0307;
 
 pub const ASR_HELLO: u16 = 0x0401;
 pub const ASR_GET_STATUS: u16 = 0x0402;
@@ -572,6 +594,87 @@ mod tests {
         assert_eq!(TTS_JOB_SUBMIT, 0x0610);
         assert_eq!(TTS_JOB_REPLY, 0x0611);
         assert_eq!(TTS_JOB_STOP, 0x0612);
+    }
+
+    #[test]
+    fn file_chain_command_numbers_match_c_header() {
+        assert_eq!(DAEMON_FILE_SUBMIT, 0x0110);
+        assert_eq!(DAEMON_FILE_PAUSE, 0x0111);
+        assert_eq!(DAEMON_FILE_RESUME, 0x0112);
+        assert_eq!(DAEMON_FILE_CANCEL, 0x0113);
+        assert_eq!(DAEMON_FILE_FETCH, 0x0114);
+        assert_eq!(DAEMON_FILE_STATUS, 0x0115);
+        assert_eq!(DAEMON_FILE_LIST, 0x0116);
+        assert_eq!(DAEMON_MODEL_LIST, 0x0117);
+        assert_eq!(DAEMON_RESTART, 0x0118);
+        assert_eq!(DAEMON_DEVICE_LIST, 0x0119);
+        assert_eq!(RVC_LIST_MODELS, 0x0307);
+    }
+
+    /// 全部命令号清单：唯一性与分段检查用，新增命令必须登记。
+    const ALL_COMMANDS: &[(&str, u16)] = &[
+        ("DAEMON_HELLO", DAEMON_HELLO),
+        ("DAEMON_GET_STATUS", DAEMON_GET_STATUS),
+        ("DAEMON_ROUTE_SET", DAEMON_ROUTE_SET),
+        ("DAEMON_MUTE_SET", DAEMON_MUTE_SET),
+        ("DAEMON_SHUTDOWN", DAEMON_SHUTDOWN),
+        ("DAEMON_TRANSLATE_SET", DAEMON_TRANSLATE_SET),
+        ("DAEMON_SPEECH_SET", DAEMON_SPEECH_SET),
+        ("DAEMON_SPEECH_STOP", DAEMON_SPEECH_STOP),
+        ("DAEMON_FILE_SUBMIT", DAEMON_FILE_SUBMIT),
+        ("DAEMON_FILE_PAUSE", DAEMON_FILE_PAUSE),
+        ("DAEMON_FILE_RESUME", DAEMON_FILE_RESUME),
+        ("DAEMON_FILE_CANCEL", DAEMON_FILE_CANCEL),
+        ("DAEMON_FILE_FETCH", DAEMON_FILE_FETCH),
+        ("DAEMON_FILE_STATUS", DAEMON_FILE_STATUS),
+        ("DAEMON_FILE_LIST", DAEMON_FILE_LIST),
+        ("DAEMON_MODEL_LIST", DAEMON_MODEL_LIST),
+        ("DAEMON_RESTART", DAEMON_RESTART),
+        ("DAEMON_DEVICE_LIST", DAEMON_DEVICE_LIST),
+        ("PRE_HELLO", PRE_HELLO),
+        ("PRE_SET_ROUTE", PRE_SET_ROUTE),
+        ("PRE_SET_MUTE", PRE_SET_MUTE),
+        ("PRE_GET_STATUS", PRE_GET_STATUS),
+        ("PRE_SPEECH_STOP", PRE_SPEECH_STOP),
+        ("RVC_HELLO", RVC_HELLO),
+        ("RVC_LOAD_MODEL", RVC_LOAD_MODEL),
+        ("RVC_START_STREAM", RVC_START_STREAM),
+        ("RVC_STOP_STREAM", RVC_STOP_STREAM),
+        ("RVC_RESET_STREAM", RVC_RESET_STREAM),
+        ("RVC_GET_STATUS", RVC_GET_STATUS),
+        ("RVC_LIST_MODELS", RVC_LIST_MODELS),
+        ("ASR_HELLO", ASR_HELLO),
+        ("ASR_GET_STATUS", ASR_GET_STATUS),
+        ("BRIDGE_HELLO", BRIDGE_HELLO),
+        ("BRIDGE_GET_STATUS", BRIDGE_GET_STATUS),
+        ("BRIDGE_TRANSLATE_SET", BRIDGE_TRANSLATE_SET),
+        ("BRIDGE_SPEECH_SET", BRIDGE_SPEECH_SET),
+        ("BRIDGE_SPEECH_STOP", BRIDGE_SPEECH_STOP),
+        ("TTS_HELLO", TTS_HELLO),
+        ("TTS_GET_STATUS", TTS_GET_STATUS),
+        ("TTS_JOB_SUBMIT", TTS_JOB_SUBMIT),
+        ("TTS_JOB_REPLY", TTS_JOB_REPLY),
+        ("TTS_JOB_STOP", TTS_JOB_STOP),
+    ];
+
+    #[test]
+    fn command_numbers_unique_and_segmented() {
+        for (i, (name, value)) in ALL_COMMANDS.iter().enumerate() {
+            for (other_name, other) in &ALL_COMMANDS[i + 1..] {
+                assert_ne!(value, other, "{name} 与 {other_name} 命令号重复");
+            }
+            // 命令号按平面分段：高字节是平面号（ctl.h 注释）。
+            let plane = match name.split('_').next().unwrap() {
+                "DAEMON" => 0x01u16,
+                "PRE" => 0x02,
+                "RVC" => 0x03,
+                "ASR" => 0x04,
+                "BRIDGE" => 0x05,
+                "TTS" => 0x06,
+                other => panic!("未知命令平面：{other}"),
+            };
+            assert_eq!(value >> 8, plane, "{name} 不在 0x{plane:02x}xx 段");
+        }
     }
 
     #[test]

@@ -384,6 +384,100 @@ pub struct SwitchSetRequest {
     pub enabled: bool,
 }
 
+/// 文件任务六态（SPEC-04）：queued/processing/cancelling/completed/failed/cancelled。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum FileJobState {
+    Queued,
+    Processing,
+    Cancelling,
+    Completed,
+    Failed,
+    Cancelled,
+}
+
+/// 文件任务进度：粗阶段 percent 0..=100；infer 段以块计数细化，缺则 None。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct FileProgress {
+    /// decode/feed/infer/publish。
+    pub stage: String,
+    pub percent: u8,
+    pub blocks_done: Option<u64>,
+    pub blocks_total: Option<u64>,
+}
+
+/// 文件任务快照（DAEMON_FILE_STATUS 的 data、DAEMON_FILE_LIST 的 data 元素）。
+/// model_id 在 submit 时定妥（显式指定或当前已加载模型）。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct FileJob {
+    pub job_id: String,
+    /// 源文件名（结果缺省名取其主干 + .wav）。
+    pub name: String,
+    pub model_id: String,
+    pub state: FileJobState,
+    pub progress: FileProgress,
+    pub error: Option<String>,
+    /// completed 且结果未被驱逐时为 true，fetch 可取。
+    pub result_ready: bool,
+    pub created_unix_ms: u64,
+}
+
+/// DAEMON_FILE_SUBMIT 请求体；model_id 缺省用当前已加载模型。
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct FileSubmitRequest {
+    pub path: String,
+    pub model_id: Option<String>,
+}
+
+/// DAEMON_FILE_CANCEL 请求体。
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct FileCancelRequest {
+    pub job_id: String,
+}
+
+/// DAEMON_FILE_FETCH 请求体；output 缺省由 daemon 按源文件名定名。
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct FileFetchRequest {
+    pub job_id: String,
+    pub output: Option<String>,
+}
+
+/// DAEMON_FILE_STATUS 请求体。
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct FileStatusRequest {
+    pub job_id: String,
+}
+
+/// 模型清单条目（DAEMON_MODEL_LIST / RVC_LIST_MODELS 的 data.models 元素）。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ModelEntry {
+    pub id: String,
+    /// 模型文件在 models_dir 下存在。
+    pub exists: bool,
+    /// 推理进程当前已加载。
+    pub loaded: bool,
+}
+
+/// 音频设备条目（DAEMON_DEVICE_LIST 的 data.devices 元素）。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DeviceEntry {
+    pub id: String,
+    pub label: String,
+    /// capture/playback。
+    pub kind: String,
+}
+
+/// DAEMON_RESTART 请求体；service 取进程名（pre/rvc/asr/tts/bridge/llama）。
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RestartRequest {
+    pub service: String,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -598,6 +692,181 @@ mod tests {
             "not json",
         ] {
             assert!(serde_json::from_str::<SwitchSetRequest>(bad).is_err(), "应拒绝：{bad}");
+        }
+    }
+
+    #[test]
+    fn file_job_state_serializes_lowercase() {
+        let states = [
+            (FileJobState::Queued, "queued"),
+            (FileJobState::Processing, "processing"),
+            (FileJobState::Cancelling, "cancelling"),
+            (FileJobState::Completed, "completed"),
+            (FileJobState::Failed, "failed"),
+            (FileJobState::Cancelled, "cancelled"),
+        ];
+        for (state, text) in states {
+            assert_eq!(serde_json::to_value(state).unwrap(), json!(text));
+            let back: FileJobState = serde_json::from_value(json!(text)).unwrap();
+            assert_eq!(back, state);
+        }
+        // 大小写是稳定契约：大写变体名不接受。
+        assert!(serde_json::from_str::<FileJobState>("\"Queued\"").is_err());
+    }
+
+    fn sample_file_job() -> FileJob {
+        FileJob {
+            job_id: "job_1700000000000000".to_string(),
+            name: "input.wav".to_string(),
+            model_id: "model-a".to_string(),
+            state: FileJobState::Processing,
+            progress: FileProgress {
+                stage: "infer".to_string(),
+                percent: 60,
+                blocks_done: Some(12),
+                blocks_total: Some(20),
+            },
+            error: None,
+            result_ready: false,
+            created_unix_ms: 1_700_000_000_000,
+        }
+    }
+
+    #[test]
+    fn file_job_round_trips_with_stable_fields() {
+        let job = sample_file_job();
+        let json = round_trip(&job);
+        for key in [
+            "job_id",
+            "name",
+            "model_id",
+            "state",
+            "progress",
+            "error",
+            "result_ready",
+            "created_unix_ms",
+        ] {
+            assert!(json.get(key).is_some(), "FileJob 缺字段 {key}");
+        }
+        assert_eq!(json["state"], "processing");
+        assert_eq!(json["progress"]["stage"], "infer");
+        assert_eq!(json["progress"]["percent"], 60);
+        assert_eq!(json["progress"]["blocks_done"], 12);
+        assert_eq!(json["progress"]["blocks_total"], 20);
+
+        // 失败态带原因；块计数缺省为 null。
+        let mut failed = job.clone();
+        failed.state = FileJobState::Failed;
+        failed.error = Some("decode failed".to_string());
+        failed.progress = FileProgress {
+            stage: "decode".to_string(),
+            percent: 0,
+            blocks_done: None,
+            blocks_total: None,
+        };
+        let json = round_trip(&failed);
+        assert_eq!(json["state"], "failed");
+        assert_eq!(json["error"], "decode failed");
+        assert!(json["progress"]["blocks_done"].is_null());
+        assert!(json["progress"]["blocks_total"].is_null());
+
+        // 完成态结果可取。
+        let mut completed = job;
+        completed.state = FileJobState::Completed;
+        completed.result_ready = true;
+        completed.progress = FileProgress {
+            stage: "publish".to_string(),
+            percent: 100,
+            blocks_done: None,
+            blocks_total: None,
+        };
+        let json = round_trip(&completed);
+        assert_eq!(json["state"], "completed");
+        assert_eq!(json["result_ready"], true);
+    }
+
+    #[test]
+    fn model_and_device_entries_round_trip() {
+        let model = ModelEntry {
+            id: "model-a".to_string(),
+            exists: true,
+            loaded: false,
+        };
+        let json = round_trip(&model);
+        assert_eq!(json["id"], "model-a");
+        assert_eq!(json["exists"], true);
+        assert_eq!(json["loaded"], false);
+
+        let capture = DeviceEntry {
+            id: "plughw:0,0".to_string(),
+            label: "Loopback".to_string(),
+            kind: "capture".to_string(),
+        };
+        let json = round_trip(&capture);
+        assert_eq!(json["id"], "plughw:0,0");
+        assert_eq!(json["label"], "Loopback");
+        assert_eq!(json["kind"], "capture");
+        let playback = DeviceEntry {
+            kind: "playback".to_string(),
+            ..capture
+        };
+        assert_eq!(round_trip(&playback)["kind"], "playback");
+    }
+
+    #[test]
+    fn file_submit_request_parses_and_rejects_extras() {
+        let minimal: FileSubmitRequest = serde_json::from_str(r#"{"path":"/tmp/a.wav"}"#).unwrap();
+        assert_eq!(minimal.path, "/tmp/a.wav");
+        assert_eq!(minimal.model_id, None);
+        let full: FileSubmitRequest =
+            serde_json::from_str(r#"{"path":"/tmp/a.wav","model_id":"model-a"}"#).unwrap();
+        assert_eq!(full.model_id.as_deref(), Some("model-a"));
+        for bad in [
+            "{}",
+            r#"{"path":1}"#,
+            r#"{"path":"/tmp/a.wav","model_id":2}"#,
+            r#"{"path":"/tmp/a.wav","x":1}"#,
+            "not json",
+        ] {
+            assert!(serde_json::from_str::<FileSubmitRequest>(bad).is_err(), "应拒绝：{bad}");
+        }
+    }
+
+    #[test]
+    fn file_job_id_requests_parse_and_reject_extras() {
+        let cancel: FileCancelRequest = serde_json::from_str(r#"{"job_id":"job_1"}"#).unwrap();
+        assert_eq!(cancel.job_id, "job_1");
+        let status: FileStatusRequest = serde_json::from_str(r#"{"job_id":"job_1"}"#).unwrap();
+        assert_eq!(status.job_id, "job_1");
+        for bad in ["{}", r#"{"job_id":1}"#, r#"{"job_id":"job_1","x":1}"#] {
+            assert!(serde_json::from_str::<FileCancelRequest>(bad).is_err(), "应拒绝：{bad}");
+            assert!(serde_json::from_str::<FileStatusRequest>(bad).is_err(), "应拒绝：{bad}");
+        }
+    }
+
+    #[test]
+    fn file_fetch_request_parses_and_rejects_extras() {
+        let minimal: FileFetchRequest = serde_json::from_str(r#"{"job_id":"job_1"}"#).unwrap();
+        assert_eq!(minimal.job_id, "job_1");
+        assert_eq!(minimal.output, None);
+        let full: FileFetchRequest =
+            serde_json::from_str(r#"{"job_id":"job_1","output":"/tmp/out.wav"}"#).unwrap();
+        assert_eq!(full.output.as_deref(), Some("/tmp/out.wav"));
+        for bad in [
+            "{}",
+            r#"{"job_id":"job_1","output":1}"#,
+            r#"{"job_id":"job_1","x":1}"#,
+        ] {
+            assert!(serde_json::from_str::<FileFetchRequest>(bad).is_err(), "应拒绝：{bad}");
+        }
+    }
+
+    #[test]
+    fn restart_request_parses_and_rejects_extras() {
+        let request: RestartRequest = serde_json::from_str(r#"{"service":"rvc"}"#).unwrap();
+        assert_eq!(request.service, "rvc");
+        for bad in ["{}", r#"{"service":1}"#, r#"{"service":"rvc","x":1}"#] {
+            assert!(serde_json::from_str::<RestartRequest>(bad).is_err(), "应拒绝：{bad}");
         }
     }
 }

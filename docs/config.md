@@ -1,8 +1,8 @@
 # Mozart 配置规范（TOML schema）
 
-状态：定稿中。最后更新：2026-11-12。
+状态：定稿中。最后更新：2026-11-13。
 
-本文件是 TOML 配置的唯一 schema 依据：段、键、类型、默认、范围、运行时/重启分类。配置模型（TOML 基线 + 运行时状态文件、`config set`/`config save`、`restart_required` 契约）见 [SPEC-04](SPEC/SPEC-04-daemon.md)，本文件不复述。解析与校验实现于 `core/src/config.rs`，须与本文件一致；`[file]` 段为新增，尚未落入 `config.rs`。
+本文件是 TOML 配置的唯一 schema 依据：段、键、类型、默认、范围、运行时/重启分类。配置模型（TOML 基线 + 运行时状态文件、`config set`/`config save`、`restart_required` 契约）见 [SPEC-04](SPEC/SPEC-04-daemon.md)，本文件不复述。解析与校验实现于 `core/src/config.rs`，须与本文件一致。
 
 ## 分类原则
 
@@ -109,7 +109,7 @@
 | speech_queue_capacity | int | 16 | ≥1 | S |
 | retry_max | int | 2 | 0..=2 | S |
 
-### [file]（新增）
+### [file]
 
 | 键 | 类型 | 默认 | 范围 | 类别 |
 | --- | --- | --- | --- | --- |
@@ -121,6 +121,7 @@
 | max_upload_bytes | int | 104857600（100 MiB） | >0 | R |
 | ffmpeg_path | string | ffmpeg | — | R |
 | ffmpeg_timeout_ms | int | 120000 | >0 | R |
+| output_socket | string | rvc-file-out.sock | 纯文件名 | S |
 
 ## 特殊机制说明
 

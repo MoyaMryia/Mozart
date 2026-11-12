@@ -236,6 +236,39 @@ impl<F: WirePacket> FrameSocket<F> {
         }
     }
 
+    /// 阻塞发送一条完整线包（文件链路用，SPEC-03 文件帧不丢）。
+    /// 不带 MSG_DONTWAIT：EINTR 重试；EAGAIN/ENOBUFS 等可写（poll POLLOUT）后重试；
+    /// 对端不在（ENOENT/ECONNREFUSED/ENOTCONN）返回 Err，不丢弃不计数，由调用方处置。
+    /// 与实时路径的非阻塞 `send` 并存；只可在离线线程调用，实时线程不得阻塞。
+    pub fn send_blocking(&self, frame: &F) -> io::Result<()> {
+        let mut buf = [0u8; MAX_PACKET_BYTES];
+        let packet = &mut buf[..F::PACKET_BYTES];
+        frame.encode(packet);
+        loop {
+            // SAFETY: packet 有效且长度与传入一致；数据报全有或全无。
+            // MSG_NOSIGNAL 防对端关闭触发 SIGPIPE；不带 MSG_DONTWAIT，缓冲满时等待。
+            let rc = unsafe {
+                libc::send(
+                    self.fd.as_raw_fd(),
+                    packet.as_ptr().cast(),
+                    packet.len(),
+                    libc::MSG_NOSIGNAL,
+                )
+            };
+            if rc >= 0 {
+                return Ok(());
+            }
+            let err = io::Error::last_os_error();
+            match err.raw_os_error() {
+                Some(libc::EINTR) => continue,
+                Some(libc::EAGAIN) | Some(libc::ENOBUFS) => {
+                    self.wait_writable(None)?;
+                }
+                _ => return Err(err),
+            }
+        }
+    }
+
     /// 尽力重连：失败不阻塞、不补发，留待下一次 send 再试。
     fn try_reconnect(&self) {
         let Some(peer) = &self.peer else {
@@ -299,9 +332,18 @@ impl<F: WirePacket> FrameSocket<F> {
     }
 
     fn wait_readable(&self, timeout: Option<Duration>) -> io::Result<()> {
+        self.wait_ready(libc::POLLIN, timeout)
+    }
+
+    /// 等可写：文件链路阻塞发送在缓冲满时使用；`None` 无限等待。
+    fn wait_writable(&self, timeout: Option<Duration>) -> io::Result<()> {
+        self.wait_ready(libc::POLLOUT, timeout)
+    }
+
+    fn wait_ready(&self, events: libc::c_short, timeout: Option<Duration>) -> io::Result<()> {
         let mut pollfd = libc::pollfd {
             fd: self.fd.as_raw_fd(),
-            events: libc::POLLIN,
+            events,
             revents: 0,
         };
         let timeout_ms = match timeout {
@@ -321,7 +363,7 @@ impl<F: WirePacket> FrameSocket<F> {
             if rc == 0 {
                 return Err(io::Error::new(
                     io::ErrorKind::TimedOut,
-                    "frame socket recv timeout",
+                    "frame socket poll timeout",
                 ));
             }
             return Ok(());
@@ -718,6 +760,69 @@ mod tests {
         assert_eq!(tx.stats().send_dropped, 3);
         let got = rx2.recv(Some(Duration::from_secs(1))).unwrap();
         assert_same_meta(got.meta, sample_input(5).meta);
+        cleanup(&path);
+    }
+
+    #[test]
+    fn send_blocking_delivers_after_peer_binds() {
+        let path = socket_path("blockok");
+        let rx = FrameSocket::<InputFrame>::bind(&path, 8).unwrap();
+        let tx = FrameSocket::<InputFrame>::connect(&path, 8).unwrap();
+        let frame = sample_input(11);
+        tx.send_blocking(&frame).unwrap();
+        let got = rx.recv(Some(Duration::from_secs(1))).unwrap();
+        assert_same_meta(got.meta, frame.meta);
+        assert_same_pcm(got.pcm, frame.pcm);
+        assert_eq!(tx.stats(), DgramStats::default());
+        cleanup(&path);
+    }
+
+    #[test]
+    fn send_blocking_waits_when_buffer_full_and_keeps_all_frames() {
+        let path = socket_path("blockfull");
+        let rx = FrameSocket::<InputFrame>::bind(&path, 4).unwrap();
+        // 1 帧 SNDBUF：队列很快占满，阻塞发送须等可写而不是丢弃。
+        let tx = FrameSocket::<InputFrame>::connect(&path, 1).unwrap();
+        // 置 O_NONBLOCK 让缓冲满时 send 返回 EAGAIN，覆盖 poll 可写后重试分支；
+        // 阻塞 fd 时同一分支由内核等待代劳，语义一致。
+        // SAFETY: fcntl 只读写测试内创建套接字的标志位。
+        let flags = unsafe { libc::fcntl(tx.fd.as_raw_fd(), libc::F_GETFL) };
+        assert!(flags >= 0);
+        let rc = unsafe { libc::fcntl(tx.fd.as_raw_fd(), libc::F_SETFL, flags | libc::O_NONBLOCK) };
+        assert_eq!(rc, 0);
+        const COUNT: u32 = 16;
+        let sender = std::thread::spawn(move || {
+            for idx in 0..COUNT {
+                tx.send_blocking(&sample_input(idx)).unwrap();
+            }
+            tx.stats()
+        });
+        // 接收方逐帧取走，发送方在缓冲满处等待；全部帧按序送达。
+        for idx in 0..COUNT {
+            let got = rx.recv(Some(Duration::from_secs(5))).unwrap();
+            assert_same_meta(got.meta, sample_input(idx).meta);
+        }
+        let stats = sender.join().unwrap();
+        assert_eq!(stats.send_dropped, 0);
+        cleanup(&path);
+    }
+
+    #[test]
+    fn send_blocking_errors_when_peer_absent() {
+        let path = socket_path("blockpeer");
+        let rx = FrameSocket::<InputFrame>::bind(&path, 4).unwrap();
+        let tx = FrameSocket::<InputFrame>::connect(&path, 4).unwrap();
+        // 对端关闭后 socket 文件仍在：发送必须报错，不丢弃不计数。
+        drop(rx);
+        let err = tx.send_blocking(&sample_input(1)).unwrap_err();
+        assert!(
+            matches!(
+                err.raw_os_error(),
+                Some(libc::ENOENT) | Some(libc::ECONNREFUSED) | Some(libc::ENOTCONN)
+            ),
+            "unexpected error: {err}"
+        );
+        assert_eq!(tx.stats().send_dropped, 0);
         cleanup(&path);
     }
 }

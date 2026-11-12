@@ -16,6 +16,7 @@ pub struct Config {
     pub asr: AsrConfig,
     pub tts: TtsConfig,
     pub bridge: BridgeConfig,
+    pub file: FileConfig,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -274,6 +275,49 @@ impl Default for BridgeConfig {
     }
 }
 
+/// 文件转换链路配置（[file]，SPEC-04）：队列、受管存储、ffmpeg 解码与输出 socket。
+/// v1 仅启动读取；键分类见 config.md（storage_dir/output_socket 为 S，其余 R）。
+#[derive(Debug, Clone, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct FileConfig {
+    /// 受管目录（源副本、结果、队列快照）；加载时展开开头的 `~`，
+    /// 经 `Config::file_storage_dir` 取用。
+    pub storage_dir: PathBuf,
+    /// 入队时查的逻辑上限（未预分配）。
+    pub queue_capacity: u32,
+    /// 受管目录总大小上限，超出按时间戳驱逐已完成任务。
+    pub storage_limit_bytes: u64,
+    /// 解码后是否经 DSP 降噪（48 kHz 路径）。
+    pub denoise: bool,
+    /// 单任务时长上限。
+    pub max_duration_seconds: u64,
+    /// 源文件上传（复制入受管目录）大小上限。
+    pub max_upload_bytes: u64,
+    /// ffmpeg 可执行文件（裸名走 PATH，或绝对路径）。
+    pub ffmpeg_path: String,
+    /// 单次 ffmpeg 调用超时，超时杀进程。
+    pub ffmpeg_timeout_ms: u64,
+    /// 数据面：daemon 绑定收文件输出帧，rvc 连接发送；
+    /// 独立于实时 rvc-out.sock，实时路径不参与交接。
+    pub output_socket: String,
+}
+
+impl Default for FileConfig {
+    fn default() -> Self {
+        Self {
+            storage_dir: PathBuf::from("~/.local/state/mozart/files/"),
+            queue_capacity: 50,
+            storage_limit_bytes: 1_048_576_000,
+            denoise: false,
+            max_duration_seconds: 300,
+            max_upload_bytes: 104_857_600,
+            ffmpeg_path: "ffmpeg".to_string(),
+            ffmpeg_timeout_ms: 120_000,
+            output_socket: "rvc-file-out.sock".to_string(),
+        }
+    }
+}
+
 impl Default for Config {
     fn default() -> Self {
         Self {
@@ -284,6 +328,7 @@ impl Default for Config {
             asr: AsrConfig::default(),
             tts: TtsConfig::default(),
             bridge: BridgeConfig::default(),
+            file: FileConfig::default(),
         }
     }
 }
@@ -363,6 +408,7 @@ impl Config {
         if let Some(path) = &config.bridge.corrections_path {
             config.bridge.corrections_path = Some(expand_tilde(path, home.as_deref()));
         }
+        config.file.storage_dir = expand_tilde(&config.file.storage_dir, home.as_deref());
         config.validate()?;
         Ok(config)
     }
@@ -417,6 +463,15 @@ impl Config {
 
     pub fn llama_socket(&self) -> PathBuf {
         self.daemon.run_dir.join(&self.bridge.llama_socket)
+    }
+
+    /// 受管文件目录；`load_from` 已展开开头的 `~`（同 subtitles_path）。
+    pub fn file_storage_dir(&self) -> PathBuf {
+        self.file.storage_dir.clone()
+    }
+
+    pub fn file_output_socket(&self) -> PathBuf {
+        self.daemon.run_dir.join(&self.file.output_socket)
     }
 
     pub fn log_dir(&self) -> PathBuf {
@@ -575,6 +630,32 @@ impl Config {
                 "bridge.retry_max must be at most 2".to_string(),
             ));
         }
+        if self.file.queue_capacity == 0 {
+            return Err(ConfigError::Invalid(
+                "file.queue_capacity must be at least 1".to_string(),
+            ));
+        }
+        if self.file.storage_limit_bytes == 0 {
+            return Err(ConfigError::Invalid(
+                "file.storage_limit_bytes must be greater than zero".to_string(),
+            ));
+        }
+        if self.file.max_duration_seconds == 0 {
+            return Err(ConfigError::Invalid(
+                "file.max_duration_seconds must be at least 1".to_string(),
+            ));
+        }
+        if self.file.max_upload_bytes == 0 {
+            return Err(ConfigError::Invalid(
+                "file.max_upload_bytes must be greater than zero".to_string(),
+            ));
+        }
+        if self.file.ffmpeg_timeout_ms == 0 {
+            return Err(ConfigError::Invalid(
+                "file.ffmpeg_timeout_ms must be greater than zero".to_string(),
+            ));
+        }
+        validate_socket_name(&self.file.output_socket, "file.output_socket")?;
         if self.process.pre_bin.as_os_str().is_empty() {
             return Err(ConfigError::Invalid(
                 "process.pre_bin must not be empty".to_string(),
@@ -1051,5 +1132,122 @@ mod tests {
     fn corrections_path_defaults_to_none() {
         let config = Config::load_from(None).unwrap();
         assert_eq!(config.bridge.corrections_path, None);
+    }
+
+    #[test]
+    fn file_chain_defaults() {
+        let config = Config::default();
+        assert_eq!(
+            config.file.storage_dir,
+            PathBuf::from("~/.local/state/mozart/files/")
+        );
+        assert_eq!(config.file.queue_capacity, 50);
+        assert_eq!(config.file.storage_limit_bytes, 1_048_576_000);
+        assert!(!config.file.denoise);
+        assert_eq!(config.file.max_duration_seconds, 300);
+        assert_eq!(config.file.max_upload_bytes, 104_857_600);
+        assert_eq!(config.file.ffmpeg_path, "ffmpeg");
+        assert_eq!(config.file.ffmpeg_timeout_ms, 120_000);
+        assert_eq!(config.file.output_socket, "rvc-file-out.sock");
+        assert_eq!(
+            config.file_output_socket(),
+            PathBuf::from("/run/mozart/rvc-file-out.sock")
+        );
+        assert!(config.validate().is_ok());
+    }
+
+    #[test]
+    fn file_chain_toml_overrides() {
+        // 旧 TOML 不含 [file]：沿用默认，可解析、可校验。
+        let legacy: Config = toml::from_str("[daemon]\npoll_interval_ms = 250\n").unwrap();
+        assert_eq!(legacy.file.queue_capacity, 50);
+        assert_eq!(legacy.file.output_socket, "rvc-file-out.sock");
+        assert!(legacy.validate().is_ok());
+
+        let config: Config = toml::from_str(
+            r#"
+            [file]
+            storage_dir = "/var/lib/mozart/files"
+            queue_capacity = 10
+            storage_limit_bytes = 2048
+            denoise = true
+            max_duration_seconds = 60
+            max_upload_bytes = 4096
+            ffmpeg_path = "/usr/bin/ffmpeg"
+            ffmpeg_timeout_ms = 5000
+            output_socket = "file-out.sock"
+            "#,
+        )
+        .unwrap();
+        assert_eq!(
+            config.file_storage_dir(),
+            PathBuf::from("/var/lib/mozart/files")
+        );
+        assert_eq!(config.file.queue_capacity, 10);
+        assert_eq!(config.file.storage_limit_bytes, 2048);
+        assert!(config.file.denoise);
+        assert_eq!(config.file.max_duration_seconds, 60);
+        assert_eq!(config.file.max_upload_bytes, 4096);
+        assert_eq!(config.file.ffmpeg_path, "/usr/bin/ffmpeg");
+        assert_eq!(config.file.ffmpeg_timeout_ms, 5000);
+        assert_eq!(
+            config.file_output_socket(),
+            PathBuf::from("/run/mozart/file-out.sock")
+        );
+        assert!(config.validate().is_ok());
+
+        let unknown: Result<Config, _> = toml::from_str("[file]\nunknown_key = 1\n");
+        assert!(unknown.is_err());
+    }
+
+    #[test]
+    fn file_chain_invalid_values_are_rejected() {
+        let cases = [
+            "[file]\nqueue_capacity = 0\n",
+            "[file]\nstorage_limit_bytes = 0\n",
+            "[file]\nmax_duration_seconds = 0\n",
+            "[file]\nmax_upload_bytes = 0\n",
+            "[file]\nffmpeg_timeout_ms = 0\n",
+            "[file]\noutput_socket = \"a/b\"\n",
+            "[file]\noutput_socket = \"\"\n",
+        ];
+        for text in cases {
+            let config: Config = toml::from_str(text).unwrap();
+            assert!(config.validate().is_err(), "应拒绝：{text}");
+        }
+
+        // 边界值合法：各下限取最小正值。
+        let edge: Config = toml::from_str(
+            "[file]\nqueue_capacity = 1\nstorage_limit_bytes = 1\nmax_duration_seconds = 1\n\
+             max_upload_bytes = 1\nffmpeg_timeout_ms = 1\n",
+        )
+        .unwrap();
+        assert!(edge.validate().is_ok());
+    }
+
+    #[test]
+    fn load_from_expands_file_storage_dir() {
+        let dir = std::env::temp_dir().join(format!("mozart-file-cfg-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("mozart.toml");
+        std::fs::write(&path, "[file]\nstorage_dir = \"~/mozart-test/files\"\n").unwrap();
+
+        let home = std::env::var_os("HOME").map(PathBuf::from);
+        let config = Config::load_from(Some(&path)).unwrap();
+        let expected = match &home {
+            Some(home) => home.join("mozart-test/files"),
+            None => PathBuf::from("~/mozart-test/files"),
+        };
+        assert_eq!(config.file_storage_dir(), expected);
+
+        // 未写 [file] 时默认目录同样展开。
+        let default_loaded = Config::load_from(None).unwrap();
+        let expected_default = match &home {
+            Some(home) => home.join(".local/state/mozart/files"),
+            None => PathBuf::from("~/.local/state/mozart/files"),
+        };
+        assert_eq!(default_loaded.file_storage_dir(), expected_default);
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
