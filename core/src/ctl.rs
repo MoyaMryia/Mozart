@@ -370,6 +370,46 @@ impl Seqpacket {
         }
     }
 
+    /// 裸 SEQPACKET 收包（事件面：一条消息一个 JSON，无控制信封）。
+    /// 超时返回 TimedOut，对端关闭返回 UnexpectedEof，超上限消息按坏帧处理。
+    pub fn recv_raw(&self, timeout: Option<Duration>) -> io::Result<Vec<u8>> {
+        self.wait_readable(timeout)?;
+        let mut buf = vec![0u8; MAX_BODY_BYTES + 1];
+        loop {
+            // SAFETY: buf 有效且长度与传入一致。
+            let n = unsafe {
+                libc::recv(
+                    self.fd.as_raw_fd(),
+                    buf.as_mut_ptr().cast(),
+                    buf.len(),
+                    0,
+                )
+            };
+            if n < 0 {
+                let err = io::Error::last_os_error();
+                if err.kind() == io::ErrorKind::Interrupted {
+                    continue;
+                }
+                return Err(err);
+            }
+            let n = n as usize;
+            if n == 0 {
+                return Err(io::Error::new(
+                    io::ErrorKind::UnexpectedEof,
+                    "event peer closed",
+                ));
+            }
+            if n > MAX_BODY_BYTES {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "event message exceeds maximum size",
+                ));
+            }
+            buf.truncate(n);
+            return Ok(buf);
+        }
+    }
+
     pub fn wait_readable(&self, timeout: Option<Duration>) -> io::Result<()> {
         self.wait_ready(libc::POLLIN, timeout)
     }
@@ -574,6 +614,45 @@ mod tests {
         let (_a, b) = socketpair();
         let err = b.recv(Some(Duration::from_millis(10))).unwrap_err();
         assert_eq!(err.kind(), io::ErrorKind::TimedOut);
+    }
+
+    #[test]
+    fn recv_raw_preserves_boundaries_without_envelope() {
+        let (a, b) = socketpair();
+        // SAFETY: a 是测试内创建的 SEQPACKET 套接字；裸 JSON 不带控制信封。
+        let first = br#"{"type":"partial"}"#;
+        let sent = unsafe {
+            libc::send(
+                a.fd.as_raw_fd(),
+                first.as_ptr().cast(),
+                first.len(),
+                libc::MSG_NOSIGNAL,
+            )
+        };
+        assert_eq!(sent as usize, first.len());
+        let second = br#"{"type":"final"}"#;
+        let sent = unsafe {
+            libc::send(
+                a.fd.as_raw_fd(),
+                second.as_ptr().cast(),
+                second.len(),
+                libc::MSG_NOSIGNAL,
+            )
+        };
+        assert_eq!(sent as usize, second.len());
+
+        assert_eq!(b.recv_raw(Some(Duration::from_secs(1))).unwrap(), first);
+        assert_eq!(b.recv_raw(Some(Duration::from_secs(1))).unwrap(), second);
+    }
+
+    #[test]
+    fn recv_raw_timeout_and_peer_close() {
+        let (a, b) = socketpair();
+        let err = b.recv_raw(Some(Duration::from_millis(10))).unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::TimedOut);
+        drop(a);
+        let err = b.recv_raw(Some(Duration::from_secs(1))).unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::UnexpectedEof);
     }
 
     #[test]
