@@ -189,6 +189,7 @@ name = "mozart-asr"
 version = "0.1.0"
 dependencies = [
  "clap",
+ "libc",
  "mozart-core",
  "serde",
  "serde_json",
