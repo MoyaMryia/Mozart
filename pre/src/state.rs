@@ -42,6 +42,8 @@ pub struct Shared {
     frames_played: AtomicU64,
     /// AI 输入帧发送丢弃（含未建链期），处理线程发布绝对值。
     ai_send_dropped: AtomicU64,
+    /// asr 输入帧发送丢弃（含未建链期），处理线程发布绝对值。
+    asr_send_dropped: AtomicU64,
     /// AI 输出帧坏包丢弃，接收线程发布绝对值。
     ai_recv_dropped: AtomicU64,
     /// direct 路由期间丢弃的 rvc 输出帧（旧 skipped_replies），播放线程累加。
@@ -59,6 +61,7 @@ impl Shared {
             frames_captured: AtomicU64::new(0),
             frames_played: AtomicU64::new(0),
             ai_send_dropped: AtomicU64::new(0),
+            asr_send_dropped: AtomicU64::new(0),
             ai_recv_dropped: AtomicU64::new(0),
             ai_skipped: AtomicU64::new(0),
             last_error: Mutex::new(None),
@@ -97,6 +100,11 @@ impl Shared {
         self.ai_send_dropped.store(total, Ordering::Relaxed);
     }
 
+    /// 发布 asr 输入帧发送丢弃的累计绝对值（发送线程调用）。
+    pub fn set_asr_send_dropped(&self, total: u64) {
+        self.asr_send_dropped.store(total, Ordering::Relaxed);
+    }
+
     /// 发布 AI 输出帧坏包丢弃的累计绝对值（接收线程调用）。
     pub fn set_ai_recv_dropped(&self, total: u64) {
         self.ai_recv_dropped.store(total, Ordering::Relaxed);
@@ -118,10 +126,11 @@ impl Shared {
 
     /// 组装 GetStatus 快照：只读原子与队列读数，不阻塞音频线程。
     pub fn status(&self, queue: QueueReadout) -> PreStatus {
-        // consumer_drops 口径（SPEC-02）：
+        // consumer_drops 口径（SPEC-02 / SPEC-05）：
         // - "rvc"：AI 链路异常丢弃 = 输入发送丢弃 + 输出坏包丢弃 + 接收环满；
         // - "rvc.skipped"：direct 路由期间丢弃的输出帧（旧 skipped_replies，
-        //   设计内丢弃，恒发链路在 direct 下必然增长）。
+        //   设计内丢弃，恒发链路在 direct 下必然增长）；
+        // - "asr"：识别支路输入发送丢弃（含未建链期，asr 未起时增长属正常）。
         let mut consumer_drops = BTreeMap::new();
         consumer_drops.insert(
             "rvc".to_string(),
@@ -132,6 +141,10 @@ impl Shared {
         consumer_drops.insert(
             "rvc.skipped".to_string(),
             self.ai_skipped.load(Ordering::Relaxed),
+        );
+        consumer_drops.insert(
+            "asr".to_string(),
+            self.asr_send_dropped.load(Ordering::Relaxed),
         );
         PreStatus {
             state: "running".to_string(),
@@ -194,12 +207,14 @@ mod tests {
 
     #[test]
     fn consumer_drops_aggregate_rvc_path_and_skipped_replies() {
-        // 口径（SPEC-02）："rvc" = 发送丢弃 + 坏包丢弃 + 接收环满（异常）；
-        // "rvc.skipped" = direct 路由丢弃的输出帧（设计内，旧 skipped_replies）。
+        // 口径（SPEC-02 / SPEC-05）："rvc" = 发送丢弃 + 坏包丢弃 + 接收环满（异常）；
+        // "rvc.skipped" = direct 路由丢弃的输出帧（设计内，旧 skipped_replies）；
+        // "asr" = 识别支路输入发送丢弃。
         let shared = Shared::new("cap".to_string(), "play".to_string());
         shared.set_ai_send_dropped(2);
         shared.set_ai_recv_dropped(3);
         shared.add_ai_skipped(4);
+        shared.set_asr_send_dropped(6);
         let status = shared.status(QueueReadout {
             depth: 0,
             dropped: 0,
@@ -207,8 +222,9 @@ mod tests {
         });
         assert_eq!(status.consumer_drops["rvc"], 10, "2+3+5 三源合计");
         assert_eq!(status.consumer_drops["rvc.skipped"], 4);
+        assert_eq!(status.consumer_drops["asr"], 6);
 
-        // 默认零值：两个键恒存在，daemon 可稳定解析。
+        // 默认零值：三个键恒存在，daemon 可稳定解析。
         let status = Shared::new("c".to_string(), "p".to_string()).status(QueueReadout {
             depth: 0,
             dropped: 0,
@@ -216,7 +232,11 @@ mod tests {
         });
         assert_eq!(
             status.consumer_drops,
-            BTreeMap::from([("rvc".to_string(), 0), ("rvc.skipped".to_string(), 0)])
+            BTreeMap::from([
+                ("rvc".to_string(), 0),
+                ("rvc.skipped".to_string(), 0),
+                ("asr".to_string(), 0),
+            ])
         );
     }
 }

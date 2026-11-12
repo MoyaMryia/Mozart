@@ -95,12 +95,14 @@ fn bind_control_socket(path: &Path) -> Result<Seqpacket, String> {
 
 /// 处理线程：采集环 → DSP 全链 → 主干环 + 16 kHz 打包恒定发送。
 /// DSP 在采集环之后、direct 分支之前——direct 取的 48 kHz 主干含 DSP，
-/// 与旧实现一致。发送不随路由停发（旧 main.c L11）。
+/// 与旧实现一致。发送不随路由停发（旧 main.c L11）；同一 InputFrame 恒发到
+/// rvc 与 asr 两条输入支路，各自惰性建链、独立丢弃计数。
 fn process_thread(
     capture_ring: Arc<Ring<RawFrame>>,
     trunk: Arc<Ring<RawFrame>>,
     shared: Arc<Shared>,
     mut ai_sender: ai::Sender,
+    mut asr_sender: ai::AsrSender,
     denoise: bool,
     gate: bool,
     agc: bool,
@@ -114,6 +116,7 @@ fn process_thread(
             let input_frame = dsp.pack_frame(&frame, conf);
             trunk.push(frame);
             ai_sender.send(&input_frame, &shared);
+            asr_sender.send(&input_frame, &shared);
         }
     }
     Ok(())
@@ -245,6 +248,9 @@ fn main() -> ExitCode {
     // AI 支路输入侧：连接 rvc input_socket，对端未就绪时发送丢弃计数
     //（惰性建链，不阻塞启动）。
     let ai_sender = ai::Sender::new(config.rvc_input_socket());
+    // 识别支路输入侧：连接 asr input_socket，与 rvc 同帧恒发；asr 未起时
+    // 发送丢弃计数，不阻塞 pre（SPEC-05）。
+    let asr_sender = ai::AsrSender::new(config.asr_input_socket());
 
     // 设备先就绪，后拉线程（新实现次序：采集设备先于播放；旧实现 main.c
     // 播放设备先就绪，本实现两设备在拉线程前同步打开，次序差异无行为影响）。
@@ -294,7 +300,7 @@ fn main() -> ExitCode {
         let agc = config.pre.dsp.agc;
         let limiter = config.pre.dsp.limiter;
         match spawn_thread("mozart-trunk", move || {
-            process_thread(from, to, shared, ai_sender, denoise, gate, agc, limiter)
+            process_thread(from, to, shared, ai_sender, asr_sender, denoise, gate, agc, limiter)
         }) {
             Ok(handle) => handle,
             Err(err) => return spawn_failure("process", err),

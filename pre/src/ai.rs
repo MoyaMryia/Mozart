@@ -1,5 +1,6 @@
-//! AI 支路数据接线（SPEC-02）：16 kHz InputFrame 恒定发送 + OutputFrame 接收。
-//! 发送侧惰性建链：pre 启动不依赖 rvc 生命周期；对端未绑定 socket 时发送
+//! 数据面接线：16 kHz InputFrame 恒定发送（rvc AI 支路 + asr 识别支路）与
+//! OutputFrame 接收（rvc AI 支路）。
+//! 发送侧惰性建链：pre 启动不依赖对端生命周期；对端未绑定 socket 时发送
 //! 丢弃计数（旧 main.c L840-842「发送失败只计数继续」），对端就绪后下一帧
 //! 自动接通。接收侧小缓冲只吸收送达抖动，满丢最旧计数（SPEC-03：大缓冲与
 //! 欠载补零归 C++ 侧）。
@@ -14,41 +15,70 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
-/// AI 接收环容量与 socket 缓冲帧数：SPEC-02「接收缓冲限制在 4–8 帧」取上沿。
+/// AI 接收环容量：SPEC-02「接收缓冲限制在 4–8 帧」取上沿。
 pub const RVC_QUEUE_FRAMES: usize = 8;
+
+/// 输入支路发送缓冲帧数（SPEC-02 数据面 4–8 帧取上沿）：rvc 与 asr 共用。
+const SEND_BUFFER_FRAMES: usize = 8;
 
 /// 接收线程 recv 轮询步长：超时后检查停止标志，保证秒级内退出。
 const RECV_POLL: Duration = Duration::from_millis(100);
 
-/// 发送端：惰性建链 + 恒定发送。发送不随路由停发（旧 main.c L11「AI 路径
+/// 丢弃计数发布目标：rvc 与 asr 两条输入支路共用同一惰性发送机制，
+/// 只有计数发布位置与错误标签不同。
+#[derive(Clone, Copy)]
+enum SendTarget {
+    Rvc,
+    Asr,
+}
+
+impl SendTarget {
+    fn publish(self, shared: &Shared, total: u64) {
+        match self {
+            SendTarget::Rvc => shared.set_ai_send_dropped(total),
+            SendTarget::Asr => shared.set_asr_send_dropped(total),
+        }
+    }
+
+    fn label(self) -> &'static str {
+        match self {
+            SendTarget::Rvc => "rvc input socket",
+            SendTarget::Asr => "asr input socket",
+        }
+    }
+}
+
+/// 惰性建链 + 恒定发送的共享机制。发送不随路由停发（旧 main.c L11「AI 路径
 /// 永不停」）；丢弃计数以绝对值发布到 Shared，控制线程只读原子。
-pub struct Sender {
-    /// rvc `input_socket` 路径；连接失败可恢复，路径固定。
+struct LazySender {
+    /// 对端 `input_socket` 路径；连接失败可恢复，路径固定。
     path: PathBuf,
     socket: Option<FrameSocket<InputFrame>>,
     /// 未建链期（对端未绑定）与通道弃用后的发送丢弃合计；建链后的过载丢弃
     /// 由 FrameSocket 内部计数，发布时两者相加。
     dropped: u64,
+    target: SendTarget,
 }
 
-impl Sender {
-    pub fn new(path: PathBuf) -> Self {
+impl LazySender {
+    fn new(path: PathBuf, target: SendTarget) -> Self {
         Self {
             path,
             socket: None,
             dropped: 0,
+            target,
         }
     }
 
     /// 恒定发送一帧。对端不在、过载、通道坏：丢弃计数继续，不阻塞不重试。
-    pub fn send(&mut self, frame: &InputFrame, shared: &Shared) {
+    fn send(&mut self, frame: &InputFrame, shared: &Shared) {
         if self.socket.is_none() {
-            match FrameSocket::connect(&self.path, RVC_QUEUE_FRAMES) {
+            match FrameSocket::connect(&self.path, SEND_BUFFER_FRAMES) {
                 Ok(socket) => self.socket = Some(socket),
-                // 对端未绑定 socket（rvc 未起）：计入丢弃，下一帧再试建链。
+                // 对端未绑定 socket（对端未起）：计入丢弃，下一帧再试建链。
                 Err(_) => {
                     self.dropped += 1;
-                    shared.set_ai_send_dropped(self.dropped);
+                    self.target.publish(shared, self.dropped);
                     return;
                 }
             }
@@ -59,17 +89,44 @@ impl Sender {
                 Ok(()) => {
                     let total = self.dropped + socket.stats().send_dropped;
                     self.socket = Some(socket);
-                    shared.set_ai_send_dropped(total);
+                    self.target.publish(shared, total);
                 }
                 Err(err) => {
                     // 未预期错误（超出过载与对端不在的恢复集）：旧语义计数继续，
                     // 原因可经状态查询；内部计数并入后弃用通道。
                     self.dropped += 1 + socket.stats().send_dropped;
-                    shared.set_ai_send_dropped(self.dropped);
-                    shared.set_last_error(&format!("rvc input socket: {err}"));
+                    self.target.publish(shared, self.dropped);
+                    shared.set_last_error(&format!("{}: {err}", self.target.label()));
                 }
             }
         }
+    }
+}
+
+/// rvc AI 支路发送端：连接 rvc `input_socket`，恒定发送 16 kHz InputFrame。
+pub struct Sender(LazySender);
+
+impl Sender {
+    pub fn new(path: PathBuf) -> Self {
+        Self(LazySender::new(path, SendTarget::Rvc))
+    }
+
+    pub fn send(&mut self, frame: &InputFrame, shared: &Shared) {
+        self.0.send(frame, shared);
+    }
+}
+
+/// asr 识别支路发送端：连接 asr `input_socket`，与 rvc 同帧恒发。
+/// asr 未起时建链失败丢弃计数，不阻塞 pre（SPEC-05 识别服务）。
+pub struct AsrSender(LazySender);
+
+impl AsrSender {
+    pub fn new(path: PathBuf) -> Self {
+        Self(LazySender::new(path, SendTarget::Asr))
+    }
+
+    pub fn send(&mut self, frame: &InputFrame, shared: &Shared) {
+        self.0.send(frame, shared);
     }
 }
 
@@ -193,6 +250,41 @@ mod tests {
         assert_eq!(frame_idx, 4);
         let (rvc, _) = consumer_drops(&shared);
         assert_eq!(rvc, 2, "未建链丢弃 1 + 重启窗口丢弃 1");
+        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_dir(&dir);
+    }
+
+    #[test]
+    fn asr_sender_counts_drops_until_peer_binds_then_delivers() {
+        // asr 支路与 rvc 同一惰性建链纪律：对端未起丢弃计数（计入 "asr"），
+        // 对端绑定后送达且计数不再增长；与 rvc 计数互不串扰。
+        let dir = socket_dir("asr");
+        let path = dir.join("asr-in.sock");
+        let shared = Shared::new("cap".to_string(), "play".to_string());
+        let mut sender = AsrSender::new(path.clone());
+
+        for idx in 0..3u32 {
+            sender.send(&sample_frame(idx), &shared);
+        }
+        let status = shared.status(crate::state::QueueReadout {
+            depth: 0,
+            dropped: 0,
+            rvc_dropped: 0,
+        });
+        assert_eq!(status.consumer_drops["asr"], 3, "asr 未绑定：3 帧全部丢弃计数");
+        assert_eq!(status.consumer_drops["rvc"], 0, "asr 丢弃不得串入 rvc 计数");
+
+        let rx = FrameSocket::<InputFrame>::bind(&path, SEND_BUFFER_FRAMES).unwrap();
+        sender.send(&sample_frame(3), &shared);
+        let got = rx.recv(Some(Duration::from_secs(1))).unwrap();
+        let FrameMeta { frame_idx, .. } = got.meta;
+        assert_eq!(frame_idx, 3, "建链后帧必须送达");
+        let status = shared.status(crate::state::QueueReadout {
+            depth: 0,
+            dropped: 0,
+            rvc_dropped: 0,
+        });
+        assert_eq!(status.consumer_drops["asr"], 3, "送达后丢弃计数不再增长");
         let _ = std::fs::remove_file(&path);
         let _ = std::fs::remove_dir(&dir);
     }

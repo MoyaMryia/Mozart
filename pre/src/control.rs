@@ -212,10 +212,10 @@ mod tests {
         assert_eq!(status["frames_captured"], 0);
         assert_eq!(status["frames_dropped"], 0);
         assert_eq!(status["queue_depth"], 0);
-        // consumer_drops 两键恒存在且为零值（SPEC-02 口径）。
+        // consumer_drops 三键恒存在且为零值（SPEC-02 / SPEC-05 口径）。
         assert_eq!(
             status["consumer_drops"],
-            json!({"rvc": 0, "rvc.skipped": 0})
+            json!({"rvc": 0, "rvc.skipped": 0, "asr": 0})
         );
         assert_eq!(status["last_error"], Value::Null);
         assert_eq!(status["version"], VERSION);
