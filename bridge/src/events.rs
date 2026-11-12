@@ -6,6 +6,7 @@
 use crate::state::Shared;
 use mozart_core::ctl::Seqpacket;
 use serde::Deserialize;
+use serde_json::Value;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering::Relaxed};
 use std::sync::mpsc::Sender;
@@ -35,7 +36,8 @@ pub enum EventKind {
     Refined,
 }
 
-/// 事件 JSON 线上契约：必填四字段 + refined 可选字段，其余字段忽略。
+/// 事件 JSON 线上契约：必填四字段 + 旧字幕 schema 所需的可选字段，其余忽略。
+/// 审计字段（asr_numeric_audit 等）当前 ASR 未携带，解析为可空以备后续。
 #[derive(Debug, Deserialize)]
 struct RawEvent {
     #[serde(rename = "type")]
@@ -45,9 +47,43 @@ struct RawEvent {
     text: String,
     #[serde(default)]
     refined_text: Option<String>,
+    #[serde(default)]
+    seq: Option<u64>,
+    #[serde(default)]
+    emitted_at: Option<f64>,
+    #[serde(default)]
+    audio_start_pts_ns: Option<u64>,
+    #[serde(default)]
+    audio_end_pts_ns: Option<u64>,
+    #[serde(default)]
+    text_raw: Option<String>,
+    #[serde(default)]
+    online_text: Option<String>,
+    #[serde(default)]
+    final_engine: Option<String>,
+    #[serde(default)]
+    final_decode_ms: Option<u64>,
+    #[serde(default)]
+    refinement_status: Option<String>,
+    #[serde(default)]
+    refinement_error: Option<String>,
+    #[serde(default)]
+    homophone_fixes: Option<Value>,
+    #[serde(default)]
+    asr_numeric_audit: Option<Value>,
+    #[serde(default)]
+    asr_polarity_audit: Option<Value>,
+    #[serde(default)]
+    translation_source_audit: Option<Value>,
+    #[serde(default)]
+    source_audio: Option<String>,
+    #[serde(default)]
+    source_audio_sha256: Option<String>,
+    #[serde(default)]
+    source_audio_seconds: Option<f64>,
 }
 
-/// 解析后的事件：类型已校验。
+/// 解析后的事件：类型已校验，可选字段透传给字幕记录。
 #[derive(Debug, Clone, PartialEq)]
 pub struct Event {
     pub kind: EventKind,
@@ -55,6 +91,23 @@ pub struct Event {
     pub utterance_id: String,
     pub text: String,
     pub refined_text: Option<String>,
+    pub seq: Option<u64>,
+    pub emitted_at: Option<f64>,
+    pub audio_start_pts_ns: Option<u64>,
+    pub audio_end_pts_ns: Option<u64>,
+    pub text_raw: Option<String>,
+    pub online_text: Option<String>,
+    pub final_engine: Option<String>,
+    pub final_decode_ms: Option<u64>,
+    pub refinement_status: Option<String>,
+    pub refinement_error: Option<String>,
+    pub homophone_fixes: Option<Value>,
+    pub asr_numeric_audit: Option<Value>,
+    pub asr_polarity_audit: Option<Value>,
+    pub translation_source_audit: Option<Value>,
+    pub source_audio: Option<String>,
+    pub source_audio_sha256: Option<String>,
+    pub source_audio_seconds: Option<f64>,
 }
 
 /// 入口校验一次：JSON 结构与必填字段；未知类型返回 Ok(None) 忽略。
@@ -79,6 +132,23 @@ pub fn parse(bytes: &[u8]) -> Result<Option<Event>, String> {
         utterance_id: raw.utterance_id,
         text: raw.text,
         refined_text: raw.refined_text,
+        seq: raw.seq,
+        emitted_at: raw.emitted_at,
+        audio_start_pts_ns: raw.audio_start_pts_ns,
+        audio_end_pts_ns: raw.audio_end_pts_ns,
+        text_raw: raw.text_raw,
+        online_text: raw.online_text,
+        final_engine: raw.final_engine,
+        final_decode_ms: raw.final_decode_ms,
+        refinement_status: raw.refinement_status,
+        refinement_error: raw.refinement_error,
+        homophone_fixes: raw.homophone_fixes,
+        asr_numeric_audit: raw.asr_numeric_audit,
+        asr_polarity_audit: raw.asr_polarity_audit,
+        translation_source_audit: raw.translation_source_audit,
+        source_audio: raw.source_audio,
+        source_audio_sha256: raw.source_audio_sha256,
+        source_audio_seconds: raw.source_audio_seconds,
     }))
 }
 

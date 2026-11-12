@@ -259,20 +259,24 @@ fn subtitles_flow_status_and_sigterm() {
 
     let lines = read_lines(&dir);
     let expected = [
-        ("partial", 0u64, "你"),
-        ("partial", 1, "你好"),
-        ("final", 2, "你好"),
-        ("refined", 3, "你好。"),
+        (false, 0u64, "你", "recognizing"),
+        (false, 1, "你好", "recognizing"),
+        (true, 2, "你好", "pending"),
+        (true, 3, "你好。", "pending"),
     ];
-    for (line, (kind, revision, text)) in lines.iter().zip(expected) {
-        assert_eq!(line["type"], kind);
+    for (line, (is_final, revision, zh, status)) in lines.iter().zip(expected) {
+        assert_eq!(line["final"], is_final);
         assert_eq!(line["revision"], revision);
-        assert_eq!(line["text"], text);
+        assert_eq!(line["zh"], zh);
+        assert_eq!(line["translation_status"], status);
         assert_eq!(line["utterance_id"], "a1b2c3d4:1");
-        assert_eq!(line["startup_id"], "a1b2c3d4");
-        assert!(line["timestamp_ms"].as_u64().unwrap() > 0);
-        assert_eq!(line.as_object().unwrap().len(), 6);
+        assert_eq!(line["seq"], 1);
+        assert_eq!(line["en"], "");
+        assert!(line["received_at"].as_f64().unwrap() > 0.0);
+        // ts 为 HH:MM:SS。
+        assert_eq!(line["ts"].as_str().unwrap().len(), 8);
     }
+    assert_eq!(lines[3]["refinement_status"], "completed");
 
     let hello = call_ok(&control, ctl::BRIDGE_HELLO, 2, b"");
     assert_eq!(hello["version"], env!("CARGO_PKG_VERSION"));
@@ -340,7 +344,7 @@ fn startup_id_filters_stale_and_reconnect_adopts_new() {
     assert_eq!(status["subtitles_published"], 2);
     assert_eq!(status["degraded"], json!([]));
     let lines = read_lines(&dir);
-    assert_eq!(lines[2]["startup_id"], "bbbb");
+    assert_eq!(lines[2]["seq"], 2);
     assert_eq!(lines[2]["utterance_id"], "bbbb:2");
 
     sigterm(&child.0);
@@ -440,7 +444,7 @@ fn toml_baseline_applies_without_state_file() {
     );
     conn.send_event(&event("final", "s", 2, "世界"));
     wait_until("第二句落盘", Duration::from_secs(5), || {
-        read_lines(&dir).len() == 2
+        read_lines(&dir).len() >= 2
     });
     wait_until("翻译失败计数", Duration::from_secs(5), || {
         get_status(&control)["translate_failed"] == 1
@@ -683,12 +687,14 @@ fn translation_and_speech_full_chain() {
         read_lines(&dir).len() == 2
     });
     let lines = read_lines(&dir);
-    assert_eq!(lines[0]["text"], "你好");
-    assert!(lines[0].get("translation").is_none());
-    assert_eq!(lines[1]["text"], "你好");
-    assert_eq!(lines[1]["translation"], "Hello.");
+    assert_eq!(lines[0]["zh"], "你好");
+    assert_eq!(lines[0]["en"], "");
+    assert_eq!(lines[0]["translation_status"], "pending");
+    assert_eq!(lines[1]["zh"], "你好");
+    assert_eq!(lines[1]["en"], "Hello.");
+    assert_eq!(lines[1]["translation_status"], "completed");
     assert_eq!(lines[1]["revision"], 1);
-    assert_eq!(lines[1]["type"], "final");
+    assert_eq!(lines[1]["final"], true);
     assert_eq!(lines[1]["utterance_id"], "a1b2c3d4:1");
 
     wait_until("播报受理计数", Duration::from_secs(5), || {
@@ -794,9 +800,12 @@ fn translation_failure_degrades_then_recovers() {
         .unwrap()
         .iter()
         .any(|d| d.as_str().unwrap().starts_with("translation failed")));
-    // 失败句不投递、不落译文。
+    // 失败句不投递；落 failed 修订（en 仍空）。
     assert!(jobs.lock().unwrap().is_empty());
-    assert_eq!(read_lines(&dir).len(), 1);
+    let lines = read_lines(&dir);
+    assert_eq!(lines.len(), 2);
+    assert_eq!(lines[1]["translation_status"], "failed");
+    assert_eq!(lines[1]["en"], "");
 
     // llama 上线：新句成功，降级解除。
     let llama = MockLlama::bind(&dir.join("llama.sock"));
@@ -839,8 +848,10 @@ fn qc_rejection_blocks_delivery() {
     assert_eq!(status["translated"], 0);
     assert_eq!(status["speech_delivered"], 0);
     assert!(tts.wait_connection(Duration::from_millis(300)).is_none());
-    // 拒绝句不落译文修订。
-    assert_eq!(read_lines(&dir).len(), 1);
+    // 拒绝句落 failed 修订（en 空），不投递。
+    let lines = read_lines(&dir);
+    assert_eq!(lines.len(), 2);
+    assert_eq!(lines[1]["translation_status"], "failed");
 
     sigterm(&child.0);
     assert!(wait_exit(&mut child.0, Duration::from_secs(2)).success());

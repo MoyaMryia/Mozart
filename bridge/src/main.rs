@@ -150,6 +150,7 @@ fn run(cli: Cli) -> Result<(), String> {
     let store = Arc::new(subtitles::SubtitleStore::new(
         writer,
         config.bridge.subtitles_path.clone(),
+        preprocess::builtin_corrections(),
     ));
     let llama = http::LlamaClient::new(config.llama_socket());
     let tts_jobs_path = config.tts_jobs_socket();

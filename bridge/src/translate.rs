@@ -14,7 +14,7 @@ use std::collections::VecDeque;
 use std::sync::atomic::{AtomicBool, Ordering::Relaxed};
 use std::sync::mpsc::RecvTimeoutError;
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 /// 取件轮询步长：让停止标志在宽限期内生效。
 const RECV_POLL: Duration = Duration::from_millis(100);
@@ -43,8 +43,9 @@ pub fn run(
             // 字幕线程已退出（队列随进程销毁）。
             Err(RecvTimeoutError::Disconnected) => break,
         };
-        // 入队后关闭翻译：只保留已发布的原文，不调 llama。
+        // 入队后关闭翻译：只保留已发布的原文，标 skipped，不调 llama。
         if !shared.translate_enabled() {
+            store.publish_translation_skipped(&job.utterance_id, "translate disabled", &shared)?;
             continue;
         }
         process_job(&job, &queues, &shared, &store, &client, retry_max, &glossary, &mut context, stop)?;
@@ -66,7 +67,9 @@ fn process_job(
 ) -> Result<(), String> {
     let text = preprocess::process(&job.text, glossary);
     let stats = shared.translate_stats();
+    let started = Instant::now();
     let mut retries = 0u32;
+    let mut last_reason = String::new();
     // 重试仅针对传输/解析失败（连接、超时、HTTP 状态、坏响应）；
     // 质检拒绝不重试（旧带增强提示词的重试留 FUTURE）。
     let completion = loop {
@@ -80,6 +83,7 @@ fn process_job(
                 if stop.load(Relaxed) {
                     break None;
                 }
+                last_reason = reason.clone();
                 if retries < retry_max {
                     retries += 1;
                     stats.add_retry();
@@ -93,6 +97,10 @@ fn process_job(
         }
     };
     let Some(completion) = completion else {
+        // 停止放弃不标失败；重试耗尽标 failed 并记原因。
+        if !stop.load(Relaxed) {
+            store.publish_translation_failed(&job.utterance_id, &last_reason, shared)?;
+        }
         return Ok(());
     };
     if stop.load(Relaxed) {
@@ -102,10 +110,12 @@ fn process_job(
     if let Err(reason) = quality::check(&job.text, content, completion.finish_reason.as_deref(), context.make_contiguous()) {
         stats.add_qc_rejected();
         eprintln!("mozart-bridge: qc reject {}：{reason}", job.utterance_id);
+        store.publish_translation_failed(&job.utterance_id, &reason, shared)?;
         return Ok(());
     }
     // 先落字幕再投递（SPEC-05：译文存档先于播报）。
-    store.publish_translation(&job.utterance_id, content, shared)?;
+    let translate_ms = started.elapsed().as_millis() as u64;
+    store.publish_translation(&job.utterance_id, content, translate_ms, shared)?;
     stats.add_translated();
     shared.resolve(DEGRADED_TRANSLATE_FAILED);
     // 记入上下文供后续句的重复检查；只保留最近若干句对。
@@ -154,6 +164,7 @@ mod tests {
             let store = Arc::new(SubtitleStore::new(
                 JsonlWriter::open(&path).unwrap(),
                 path,
+                Vec::new(),
             ));
             Self {
                 dir,
@@ -234,7 +245,8 @@ mod tests {
         assert_eq!(job.text, "Hello.");
         let lines = fixture.lines();
         assert_eq!(lines.len(), 2);
-        assert_eq!(lines[1]["translation"], "Hello.");
+        assert_eq!(lines[1]["en"], "Hello.");
+        assert_eq!(lines[1]["translation_status"], "completed");
         assert_eq!(lines[1]["revision"], 1);
         let status = fixture.shared.status(&fixture.queues);
         assert_eq!(status.translated, 1);
@@ -332,9 +344,13 @@ mod tests {
             .degraded
             .iter()
             .any(|d| d.starts_with(DEGRADED_TRANSLATE_FAILED)));
-        // 失败句不投递、不落译文。
+        // 失败句不投递；落 failed 修订（en 仍空，原因可查）。
         assert_eq!(fixture.queues.speech_depth(), 0);
-        assert_eq!(fixture.lines().len(), 1);
+        let lines = fixture.lines();
+        assert_eq!(lines.len(), 2);
+        assert_eq!(lines[1]["translation_status"], "failed");
+        assert_eq!(lines[1]["en"], "");
+        assert!(lines[1]["translation_error"].as_str().unwrap().contains("HTTP 500"));
         let _ = std::fs::remove_dir_all(&fixture.dir);
     }
 
@@ -370,7 +386,9 @@ mod tests {
         assert_eq!(status.qc_rejected, 1);
         assert_eq!(status.translated, 0);
         assert_eq!(fixture.queues.speech_depth(), 0);
-        assert_eq!(fixture.lines().len(), 1);
+        let lines = fixture.lines();
+        assert_eq!(lines.len(), 2);
+        assert_eq!(lines[1]["translation_status"], "failed");
         let _ = std::fs::remove_dir_all(&fixture.dir);
     }
 
@@ -382,6 +400,7 @@ mod tests {
             speech_enabled: true,
         })
         .unwrap();
+        fixture.final_record("s:1", "你好");
         fixture.queues.push_translate(TranslateJob {
             utterance_id: "s:1".to_string(),
             text: "你好".to_string(),
@@ -394,6 +413,9 @@ mod tests {
         let status = fixture.shared.status(&fixture.queues);
         assert_eq!(status.translated, 0);
         assert_eq!(status.translate_failed, 0);
+        // 跳过句落 skipped 修订。
+        let lines = fixture.lines();
+        assert_eq!(lines[1]["translation_status"], "skipped");
         let _ = std::fs::remove_dir_all(&fixture.dir);
     }
 }

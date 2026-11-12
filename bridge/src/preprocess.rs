@@ -3,6 +3,7 @@
 //! 拼音与词频依赖的术语同音索引留接口（SPEC：Rust 复现方式实现时定）。
 //! 数字归一化只处理常见明确模式，成语与单字不改动。
 
+use serde::Serialize;
 use std::collections::HashMap;
 
 /// 显式纠错表：ASR 常见同音误写 → 正确写法。
@@ -58,13 +59,51 @@ pub fn process(text: &str, glossary: &Glossary) -> String {
 
 /// 按显式纠错表替换，长词优先（沿用旧实现 apply_corrections 的顺序语义）。
 pub fn apply_corrections(text: &str, table: &[(&str, &str)]) -> String {
-    let mut entries: Vec<(&str, &str)> = table.to_vec();
+    let owned: Vec<(String, String)> = table
+        .iter()
+        .map(|(from, to)| (from.to_string(), to.to_string()))
+        .collect();
+    correct(text, &owned).0
+}
+
+/// 一条纠错记录（沿用旧 homophone_fixes 形态：from/to/count）。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct CorrectionFix {
+    pub from: String,
+    pub to: String,
+    pub count: usize,
+}
+
+/// 内置纠错表的 owned 形态，供字幕记录与配置加载共用。
+pub fn builtin_corrections() -> Vec<(String, String)> {
+    CORRECTIONS
+        .iter()
+        .map(|(from, to)| (from.to_string(), to.to_string()))
+        .collect()
+}
+
+/// 按显式纠错表替换并记录改动，长词优先（旧 homophones.apply_corrections）。
+/// 返回纠正后文本与替换记录；无命中时记录为空。
+pub fn correct(text: &str, table: &[(String, String)]) -> (String, Vec<CorrectionFix>) {
+    let mut entries: Vec<&(String, String)> = table.iter().collect();
     entries.sort_by(|a, b| b.0.chars().count().cmp(&a.0.chars().count()));
     let mut out = text.to_string();
+    let mut fixes = Vec::new();
     for (from, to) in entries {
-        out = out.replace(from, to);
+        if from.is_empty() {
+            continue;
+        }
+        let count = out.matches(from.as_str()).count();
+        if count > 0 {
+            out = out.replace(from.as_str(), to);
+            fixes.push(CorrectionFix {
+                from: from.clone(),
+                to: to.clone(),
+                count,
+            });
+        }
     }
-    out
+    (out, fixes)
 }
 
 fn digit_value(c: char) -> Option<u64> {
