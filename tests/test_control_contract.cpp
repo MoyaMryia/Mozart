@@ -10,6 +10,7 @@ static_assert(MOZART_CTL_VERSION == 1);
 static_assert(MOZART_CTL_MAX_BODY_BYTES == 65536);
 static_assert(MOZART_CTL_DAEMON_HELLO == 0x0101);
 static_assert(MOZART_CTL_PRE_GET_STATUS == 0x0204);
+static_assert(MOZART_CTL_PRE_SPEECH_STOP == 0x0205);
 static_assert(MOZART_CTL_RVC_GET_STATUS == 0x0306);
 static_assert(MOZART_CTL_ASR_HELLO == 0x0401);
 static_assert(MOZART_CTL_ASR_GET_STATUS == 0x0402);

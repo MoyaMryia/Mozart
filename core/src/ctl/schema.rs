@@ -260,6 +260,9 @@ pub struct TtsStatus {
     pub failed: u64,
     /// 队满拒收（受理 skipped）累计。
     pub skipped: u64,
+    /// TTS_JOB_STOP 取消的任务累计（在途中止 + 在队清空）。旧快照缺此字段按 0 还原。
+    #[serde(default)]
+    pub stopped: u64,
     pub queue_depth: u32,
     pub model_loaded: bool,
     /// 输出帧发送尝试累计（含丢弃）。
@@ -277,6 +280,7 @@ impl Default for TtsStatus {
             synthesized: 0,
             failed: 0,
             skipped: 0,
+            stopped: 0,
             queue_depth: 0,
             model_loaded: false,
             frames_out: 0,

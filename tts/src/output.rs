@@ -4,11 +4,10 @@
 //! 建链：pre 未绑定时发送丢弃计数，不阻塞合成路径，pre 就绪后下一帧自动接通
 //! （与 pre 侧 AsrSender 同一纪律）。
 
-use crate::state::Shared;
+use crate::state::{Abort, Shared};
 use mozart_core::dgram::FrameSocket;
 use mozart_core::{FrameMeta, OutputFrame, FRAME_MS, OUTPUT_SAMPLES};
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicBool, Ordering::Relaxed};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -64,14 +63,14 @@ impl FrameWriter {
     }
 
     /// 发送整句帧：按 FRAME_MS 节拍逐帧投递（合成一段播一段），突发会超出
-    /// 接收方 8 帧缓冲造成丢帧。停止标志置位即放弃剩余帧（SIGTERM 及时退出）。
-    /// 每帧计入 frames_out（含丢弃）；丢弃累计绝对值发布到 output_dropped，
+    /// 接收方 8 帧缓冲造成丢帧。中止判定置真（SIGTERM 或 TTS_JOB_STOP）即放弃
+    /// 剩余帧。每帧计入 frames_out（含丢弃）；丢弃累计绝对值发布到 output_dropped，
     /// 意外错误记录原因后继续，不打断合成路径。
-    pub fn write_utterance(&mut self, pcm: &[f32], stop: &AtomicBool) {
+    pub fn write_utterance(&mut self, pcm: &[f32], abort: &Abort<'_>) {
         let frame_duration = Duration::from_millis(FRAME_MS as u64);
         let mut next = Instant::now();
         for (idx, frame) in pack_utterance(pcm).iter().enumerate() {
-            if stop.load(Relaxed) {
+            if abort.aborted() {
                 break;
             }
             if idx > 0 {
@@ -122,6 +121,7 @@ impl FrameWriter {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::atomic::{AtomicBool, Ordering::Relaxed};
     use std::time::Duration;
 
     fn socket_dir(tag: &str) -> PathBuf {
@@ -181,14 +181,15 @@ mod tests {
         let shared = Arc::new(Shared::new());
         let mut writer = FrameWriter::new(path.clone(), shared.clone());
         let stop = no_stop();
-        writer.write_utterance(&vec![0.25f32; 4800], &stop);
+        let abort = shared.abort(&stop);
+        writer.write_utterance(&vec![0.25f32; 4800], &abort);
         let status = shared.status();
         assert_eq!(status.frames_out, 5);
         assert_eq!(status.output_dropped, 5, "pre 未绑定：5 帧全部丢弃计数");
 
         // pre 绑定后下一句自动接通并送达。
         let rx = FrameSocket::<OutputFrame>::bind(&path, OUTPUT_BUFFER_FRAMES).unwrap();
-        writer.write_utterance(&vec![0.25f32; 960], &stop);
+        writer.write_utterance(&vec![0.25f32; 960], &abort);
         let got = rx.recv(Some(Duration::from_secs(1))).unwrap();
         let FrameMeta { frame_idx, .. } = got.meta;
         assert_eq!(frame_idx, 0);
@@ -208,8 +209,9 @@ mod tests {
         let shared = Arc::new(Shared::new());
         let mut writer = FrameWriter::new(path.clone(), shared.clone());
         let stop = no_stop();
+        let abort = shared.abort(&stop);
         let pcm: Vec<f32> = (0..1920).map(|i| i as f32 * 0.0001).collect();
-        writer.write_utterance(&pcm, &stop);
+        writer.write_utterance(&pcm, &abort);
         for idx in 0..2u32 {
             let got = rx.recv(Some(Duration::from_secs(1))).unwrap();
             let FrameMeta { frame_idx, pts_ns, .. } = got.meta;
@@ -233,18 +235,19 @@ mod tests {
         let shared = Arc::new(Shared::new());
         let mut writer = FrameWriter::new(path.clone(), shared.clone());
         let stop = no_stop();
+        let abort = shared.abort(&stop);
 
         let rx1 = FrameSocket::<OutputFrame>::bind(&path, OUTPUT_BUFFER_FRAMES).unwrap();
-        writer.write_utterance(&vec![0.25f32; 960], &stop);
+        writer.write_utterance(&vec![0.25f32; 960], &abort);
         let FrameMeta { frame_idx, .. } = rx1.recv(None).unwrap().meta;
         assert_eq!(frame_idx, 0);
         drop(rx1); // socket 文件留在原地。
-        writer.write_utterance(&vec![0.25f32; 960], &stop); // 丢弃 + 重连失败。
+        writer.write_utterance(&vec![0.25f32; 960], &abort); // 丢弃 + 重连失败。
         assert_eq!(shared.status().output_dropped, 1, "重启窗口的发送必须计入丢弃");
 
         let rx2 = FrameSocket::<OutputFrame>::bind(&path, OUTPUT_BUFFER_FRAMES).unwrap();
-        writer.write_utterance(&vec![0.25f32; 960], &stop); // 仍走失败分支：丢弃 + 重连成功。
-        writer.write_utterance(&vec![0.25f32; 960], &stop); // 通道已恢复：送达。
+        writer.write_utterance(&vec![0.25f32; 960], &abort); // 仍走失败分支：丢弃 + 重连成功。
+        writer.write_utterance(&vec![0.25f32; 960], &abort); // 通道已恢复：送达。
         let FrameMeta { frame_idx, .. } = rx2.recv(Some(Duration::from_secs(1))).unwrap().meta;
         assert_eq!(frame_idx, 0);
         assert_eq!(shared.status().output_dropped, 2, "重启窗口丢弃 1 + 重绑首帧丢弃 1");
@@ -262,6 +265,7 @@ mod tests {
         let shared = Arc::new(Shared::new());
         let mut writer = FrameWriter::new(path.clone(), shared.clone());
         let stop = no_stop();
+        let abort = shared.abort(&stop);
         let receiver = std::thread::spawn(move || {
             for idx in 0..12u32 {
                 let frame = rx.recv(Some(Duration::from_secs(2))).unwrap();
@@ -272,7 +276,7 @@ mod tests {
         });
         let pcm = vec![0.25f32; OUTPUT_SAMPLES * 12];
         let start = Instant::now();
-        writer.write_utterance(&pcm, &stop);
+        writer.write_utterance(&pcm, &abort);
         let elapsed = start.elapsed();
         receiver.join().unwrap();
         assert!(
@@ -296,6 +300,7 @@ mod tests {
         let shared = Arc::new(Shared::new());
         let mut writer = FrameWriter::new(path.clone(), shared.clone());
         let stop = Arc::new(AtomicBool::new(false));
+        let abort = shared.abort(&stop);
         let stop_rx = stop.clone();
         let receiver = std::thread::spawn(move || {
             for idx in 0..2u32 {
@@ -306,7 +311,7 @@ mod tests {
             }
             stop_rx.store(true, Relaxed);
         });
-        writer.write_utterance(&vec![0.25f32; OUTPUT_SAMPLES * 16], &stop);
+        writer.write_utterance(&vec![0.25f32; OUTPUT_SAMPLES * 16], &abort);
         receiver.join().unwrap();
         let frames_out = shared.status().frames_out;
         assert!(frames_out >= 2, "已送达的 2 帧必须计入：{frames_out}");

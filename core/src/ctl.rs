@@ -35,6 +35,8 @@ pub const PRE_HELLO: u16 = 0x0201;
 pub const PRE_SET_ROUTE: u16 = 0x0202;
 pub const PRE_SET_MUTE: u16 = 0x0203;
 pub const PRE_GET_STATUS: u16 = 0x0204;
+/// 体：{}（空）；清播报环。speech stop 经 daemon 转发（桥→TTS 走 TTS_JOB_STOP）。
+pub const PRE_SPEECH_STOP: u16 = 0x0205;
 
 pub const RVC_HELLO: u16 = 0x0301;
 pub const RVC_LOAD_MODEL: u16 = 0x0302;
@@ -61,7 +63,7 @@ pub const TTS_GET_STATUS: u16 = 0x0602;
 pub const TTS_JOB_SUBMIT: u16 = 0x0610;
 /// 任务面受理应答：体 {"status","utterance_id","reason"?}，status 取 submitted/skipped/failed。
 pub const TTS_JOB_REPLY: u16 = 0x0611;
-/// 任务面停止：体 {}（空）；TTS 清空任务队列并中止在途合成。
+/// 任务面停止：体 {}（空）；TTS 清空任务队列并中止在途合成，应答体 {"stopped":true}。
 pub const TTS_JOB_STOP: u16 = 0x0612;
 
 pub const CODE_OK: &str = "Ok";
@@ -550,6 +552,7 @@ mod tests {
         assert_eq!(DAEMON_TRANSLATE_SET, 0x0106);
         assert_eq!(DAEMON_SPEECH_SET, 0x0107);
         assert_eq!(DAEMON_SPEECH_STOP, 0x0108);
+        assert_eq!(PRE_SPEECH_STOP, 0x0205);
         assert_eq!(ASR_HELLO, 0x0401);
         assert_eq!(ASR_GET_STATUS, 0x0402);
         assert_eq!(BRIDGE_HELLO, 0x0501);

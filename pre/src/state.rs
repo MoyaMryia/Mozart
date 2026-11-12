@@ -64,6 +64,8 @@ pub struct QueueReadout {
     pub dropped: u64,
     /// AI 接收环满丢最旧（帧）。
     pub rvc_dropped: u64,
+    /// 播报接收环满丢最旧（帧）。
+    pub tts_dropped: u64,
 }
 
 pub struct Shared {
@@ -77,6 +79,8 @@ pub struct Shared {
     asr_send_dropped: AtomicU64,
     /// AI 输出帧坏包丢弃，接收线程发布绝对值。
     ai_recv_dropped: AtomicU64,
+    /// TTS 播报帧坏包丢弃，接收线程发布绝对值。
+    tts_recv_dropped: AtomicU64,
     /// direct 路由期间丢弃的 rvc 输出帧（旧 skipped_replies），播放线程累加。
     ai_skipped: AtomicU64,
     /// 扬声器分时状态，播放线程在帧边界写、控制线程只读。
@@ -98,6 +102,7 @@ impl Shared {
             ai_send_dropped: AtomicU64::new(0),
             asr_send_dropped: AtomicU64::new(0),
             ai_recv_dropped: AtomicU64::new(0),
+            tts_recv_dropped: AtomicU64::new(0),
             ai_skipped: AtomicU64::new(0),
             speaker_state: AtomicU8::new(speaker_code(Speaker::Realtime)),
             tts_frames_played: AtomicU64::new(0),
@@ -147,6 +152,11 @@ impl Shared {
         self.ai_recv_dropped.store(total, Ordering::Relaxed);
     }
 
+    /// 发布 TTS 播报帧坏包丢弃的累计绝对值（接收线程调用）。
+    pub fn set_tts_recv_dropped(&self, total: u64) {
+        self.tts_recv_dropped.store(total, Ordering::Relaxed);
+    }
+
     /// direct 路由期间丢弃的 rvc 输出帧计数（播放线程调用）。
     pub fn add_ai_skipped(&self, frames: u64) {
         self.ai_skipped.fetch_add(frames, Ordering::Relaxed);
@@ -182,7 +192,8 @@ impl Shared {
         // - "rvc"：AI 链路异常丢弃 = 输入发送丢弃 + 输出坏包丢弃 + 接收环满；
         // - "rvc.skipped"：direct 路由期间丢弃的输出帧（旧 skipped_replies，
         //   设计内丢弃，恒发链路在 direct 下必然增长）；
-        // - "asr"：识别支路输入发送丢弃（含未建链期，asr 未起时增长属正常）。
+        // - "asr"：识别支路输入发送丢弃（含未建链期，asr 未起时增长属正常）；
+        // - "tts"：播报链路异常丢弃 = 播报帧坏包丢弃 + 播报接收环满。
         let mut consumer_drops = BTreeMap::new();
         consumer_drops.insert(
             "rvc".to_string(),
@@ -197,6 +208,10 @@ impl Shared {
         consumer_drops.insert(
             "asr".to_string(),
             self.asr_send_dropped.load(Ordering::Relaxed),
+        );
+        consumer_drops.insert(
+            "tts".to_string(),
+            self.tts_recv_dropped.load(Ordering::Relaxed) + queue.tts_dropped,
         );
         PreStatus {
             state: "running".to_string(),
@@ -244,13 +259,13 @@ mod tests {
     fn status_reports_speaker_state_and_tts_frames() {
         let shared = Shared::new("cap".to_string(), "play".to_string());
         // 默认实时、零播报帧。
-        let status = shared.status(QueueReadout { depth: 0, dropped: 0, rvc_dropped: 0 });
+        let status = shared.status(QueueReadout { depth: 0, dropped: 0, rvc_dropped: 0, tts_dropped: 0 });
         assert_eq!(status.speaker_state, "realtime");
         assert_eq!(status.tts_frames_played, 0);
 
         shared.set_speaker_state(Speaker::Broadcast);
         shared.add_tts_frames_played(5);
-        let status = shared.status(QueueReadout { depth: 0, dropped: 0, rvc_dropped: 0 });
+        let status = shared.status(QueueReadout { depth: 0, dropped: 0, rvc_dropped: 0, tts_dropped: 0 });
         assert_eq!(status.speaker_state, "broadcast");
         assert_eq!(status.tts_frames_played, 5);
         assert_eq!(shared.speaker_state(), Speaker::Broadcast);
@@ -268,6 +283,7 @@ mod tests {
             depth: 5,
             dropped: 7,
             rvc_dropped: 11,
+            tts_dropped: 0,
         });
         assert_eq!(status.route, Route::Rvc);
         assert!(status.mute);
@@ -286,26 +302,30 @@ mod tests {
     fn consumer_drops_aggregate_rvc_path_and_skipped_replies() {
         // 口径（SPEC-02 / SPEC-05）："rvc" = 发送丢弃 + 坏包丢弃 + 接收环满（异常）；
         // "rvc.skipped" = direct 路由丢弃的输出帧（设计内，旧 skipped_replies）；
-        // "asr" = 识别支路输入发送丢弃。
+        // "asr" = 识别支路输入发送丢弃；"tts" = 播报坏包丢弃 + 播报接收环满。
         let shared = Shared::new("cap".to_string(), "play".to_string());
         shared.set_ai_send_dropped(2);
         shared.set_ai_recv_dropped(3);
         shared.add_ai_skipped(4);
         shared.set_asr_send_dropped(6);
+        shared.set_tts_recv_dropped(7);
         let status = shared.status(QueueReadout {
             depth: 0,
             dropped: 0,
             rvc_dropped: 5,
+            tts_dropped: 8,
         });
         assert_eq!(status.consumer_drops["rvc"], 10, "2+3+5 三源合计");
         assert_eq!(status.consumer_drops["rvc.skipped"], 4);
         assert_eq!(status.consumer_drops["asr"], 6);
+        assert_eq!(status.consumer_drops["tts"], 15, "7+8 坏包与环满合计");
 
-        // 默认零值：三个键恒存在，daemon 可稳定解析。
+        // 默认零值：四个键恒存在，daemon 可稳定解析。
         let status = Shared::new("c".to_string(), "p".to_string()).status(QueueReadout {
             depth: 0,
             dropped: 0,
             rvc_dropped: 0,
+            tts_dropped: 0,
         });
         assert_eq!(
             status.consumer_drops,
@@ -313,6 +333,7 @@ mod tests {
                 ("rvc".to_string(), 0),
                 ("rvc.skipped".to_string(), 0),
                 ("asr".to_string(), 0),
+                ("tts".to_string(), 0),
             ])
         );
     }

@@ -51,6 +51,7 @@ enum {
     MOZART_CTL_PRE_SET_ROUTE  = 0x0202,
     MOZART_CTL_PRE_SET_MUTE   = 0x0203,
     MOZART_CTL_PRE_GET_STATUS = 0x0204,
+    MOZART_CTL_PRE_SPEECH_STOP = 0x0205,  // 体 {}（空）；清播报环，speech stop 经 daemon 转发
 
     MOZART_CTL_RVC_HELLO        = 0x0301,
     MOZART_CTL_RVC_LOAD_MODEL   = 0x0302,
@@ -73,7 +74,7 @@ enum {
     // 任务面（tts-jobs.sock，自有协议复用本信封）：
     MOZART_CTL_TTS_JOB_SUBMIT = 0x0610,  // 桥→TTS，体 {"text","utterance_id","voice_params"?}
     MOZART_CTL_TTS_JOB_REPLY  = 0x0611,  // TTS→桥，体 {"status","utterance_id","reason"?}
-    MOZART_CTL_TTS_JOB_STOP   = 0x0612   // 桥→TTS，体 {}（空）；清队列并中止在途合成
+    MOZART_CTL_TTS_JOB_STOP   = 0x0612   // 桥→TTS，体 {}（空）；清队列并中止在途合成，应答 TTS_JOB_REPLY 体 {"stopped":true}
 };
 
 // ---- 响应体 {"status","code","reason","data"} 的 code 值 -----------------------

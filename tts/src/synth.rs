@@ -150,14 +150,15 @@ pub fn run(
     shared: &Shared,
     stop: &'static AtomicBool,
 ) -> Result<(), String> {
-    let engine = ffi::load(&model_dir, threads, &provider, stop)?;
+    let engine = ffi::load(&model_dir, threads, &provider)?;
     shared.set_model_loaded(true);
     run_with(jobs, engine.as_ref(), reference.as_ref(), writer, shared, stop);
     Ok(())
 }
 
-/// 服务循环（引擎可注入，供测试）。停止标志置位后放弃在途结果与队列剩余，
-/// 帧投递中途同样中断；真实 FFI 的在途生成另经进度回调中止（见 ffi::real）。
+/// 服务循环（引擎可注入，供测试）。进程停止标志置位后放弃在途结果与队列剩余，
+/// 帧投递中途同样中断；TTS_JOB_STOP 推进任务代际，在途合成经 Abort 中止、在队
+/// 任务下一轮清空（真实 FFI 的在途生成另经进度回调中止，见 ffi::real）。
 pub fn run_with(
     jobs: Receiver<Job>,
     engine: &dyn Synthesizer,
@@ -170,7 +171,22 @@ pub fn run_with(
         Some(reference) => (reference.samples.as_slice(), reference.sample_rate),
         None => (&[][..], 0),
     };
+    let mut epoch = shared.job_epoch();
     while !stop.load(Relaxed) {
+        // 任务代际推进（TTS_JOB_STOP）：清空在队任务并计数。队列接收端归本线程
+        // 独占，jobs 线程只推进代际，由这里在下一轮（≤ QUEUE_POLL）排空。
+        let current = shared.job_epoch();
+        if current != epoch {
+            epoch = current;
+            let mut cleared = 0u64;
+            while jobs.try_recv().is_ok() {
+                shared.queue_pop();
+                cleared += 1;
+            }
+            if cleared > 0 {
+                shared.add_stopped(cleared);
+            }
+        }
         let job = match jobs.recv_timeout(QUEUE_POLL) {
             Ok(job) => job,
             Err(RecvTimeoutError::Timeout) => continue,
@@ -180,22 +196,25 @@ pub fn run_with(
         if stop.load(Relaxed) {
             break;
         }
+        let abort = shared.abort(stop);
         shared.set_synthesizing(true);
         let text = precondition(&job.text);
         let result = engine
-            .synthesize(&text, ref_samples, ref_rate)
+            .synthesize(&text, ref_samples, ref_rate, &abort)
             .and_then(|samples| to_48k(samples, engine.sample_rate()));
-        match result {
-            Ok(pcm) => {
-                if !stop.load(Relaxed) {
-                    writer.write_utterance(&pcm, stop);
+        if abort.aborted() {
+            // TTS_JOB_STOP 或 SIGTERM 在途到达：取消本句，不投递、不计失败。
+            shared.add_stopped(1);
+        } else {
+            match result {
+                Ok(pcm) => {
+                    writer.write_utterance(&pcm, &abort);
                     shared.add_synthesized(1);
                 }
-                // 停止标志置位：在途结果丢弃，不投递。
-            }
-            Err(reason) => {
-                shared.add_failed(1);
-                shared.set_last_error(&format!("{}: {reason}", job.utterance_id));
+                Err(reason) => {
+                    shared.add_failed(1);
+                    shared.set_last_error(&format!("{}: {reason}", job.utterance_id));
+                }
             }
         }
         shared.set_synthesizing(false);
@@ -206,6 +225,7 @@ pub fn run_with(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::state::Abort;
     use mozart_core::dgram::FrameSocket;
     use mozart_core::OutputFrame;
     use std::sync::mpsc;
@@ -306,7 +326,7 @@ mod tests {
         fn sample_rate(&self) -> u32 {
             self.rate
         }
-        fn synthesize(&self, _text: &str, _reference: &[f32], _ref_rate: u32) -> Result<Vec<f32>, String> {
+        fn synthesize(&self, _text: &str, _reference: &[f32], _ref_rate: u32, _abort: &Abort<'_>) -> Result<Vec<f32>, String> {
             if let Some(hook) = &self.hook {
                 hook();
             }
@@ -440,6 +460,51 @@ mod tests {
         let status = shared.status();
         assert_eq!(status.synthesized, 0);
         assert_eq!(status.frames_out, 0);
+        cleanup(&path);
+    }
+
+    #[test]
+    fn job_stop_cancels_inflight_and_drains_queue() {
+        // TTS_JOB_STOP 推进代际：在途句取消、在队两句下一轮清空，全部计 stopped。
+        let (path, mut writer, shared, _rx) = writer_fixture("jobstop");
+        let (tx, rx) = mpsc::sync_channel(4);
+        let stop = AtomicBool::new(false);
+        let hook_shared = shared.clone();
+        let engine = FakeEngine {
+            rate: TTS_NATIVE_SAMPLE_RATE,
+            outcome: Ok(vec![0.25; 2400]),
+            hook: Some(Box::new(move || hook_shared.stop_jobs())),
+        };
+        for id in ["a:1", "a:2", "a:3"] {
+            tx.send(job(id)).unwrap();
+            shared.queue_push();
+        }
+        drop(tx);
+        run_with(rx, &engine, None, &mut writer, &shared, &stop);
+        let status = shared.status();
+        assert_eq!(status.synthesized, 0);
+        assert_eq!(status.failed, 0);
+        assert_eq!(status.frames_out, 0);
+        assert_eq!(status.stopped, 3, "在途 1 + 在队 2 全部取消");
+        assert_eq!(status.queue_depth, 0);
+        cleanup(&path);
+    }
+
+    #[test]
+    fn job_stop_then_new_job_synthesizes_normally() {
+        // 停止只取消当时在途/在队任务；代际稳定后新任务正常合成。
+        let (path, mut writer, shared, _rx) = writer_fixture("jobstop-resume");
+        let (tx, rx) = mpsc::sync_channel(4);
+        let stop = AtomicBool::new(false);
+        shared.stop_jobs(); // 先停止（无在途任务）。
+        let engine = FakeEngine { rate: TTS_NATIVE_SAMPLE_RATE, outcome: Ok(vec![0.25; 2400]), hook: None };
+        tx.send(job("a:9")).unwrap();
+        shared.queue_push();
+        drop(tx);
+        run_with(rx, &engine, None, &mut writer, &shared, &stop);
+        let status = shared.status();
+        assert_eq!(status.synthesized, 1, "停止后的新任务必须正常合成");
+        assert_eq!(status.stopped, 0);
         cleanup(&path);
     }
 }

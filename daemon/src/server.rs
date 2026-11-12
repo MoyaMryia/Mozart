@@ -217,7 +217,7 @@ fn handle_request(
                 false,
             ),
         },
-        ctl::DAEMON_SPEECH_STOP => match services::speech_stop(services) {
+        ctl::DAEMON_SPEECH_STOP => match services::speech_stop(state, services) {
             Ok(data) => (schema::ok_body(data), false),
             Err((code, reason)) => (schema::error_body(&code, &reason), false),
         },

@@ -248,6 +248,7 @@ mod tests {
             depth: 0,
             dropped: 0,
             rvc_dropped: 0,
+            tts_dropped: 0,
         });
         assert_eq!(status.consumer_drops["rvc.skipped"], 3);
 
@@ -257,6 +258,7 @@ mod tests {
             depth: 0,
             dropped: 0,
             rvc_dropped: 0,
+            tts_dropped: 0,
         });
         assert_eq!(status.consumer_drops["rvc.skipped"], 3);
     }

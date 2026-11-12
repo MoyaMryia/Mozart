@@ -257,11 +257,16 @@ pub fn speech_set(services: &Services, enabled: bool) -> Result<Value, (String, 
     Ok(response.data)
 }
 
-pub fn speech_stop(services: &Services) -> Result<Value, (String, String)> {
+pub fn speech_stop(state: &Mutex<State>, services: &Services) -> Result<Value, (String, String)> {
     let response = services
         .bridge()
         .call_ok(ctl::BRIDGE_SPEECH_STOP, b"{}")
         .map_err(CallError::into_rejection)?;
+    // 桥已关播报并停新合成（桥向 TTS 下发 TTS_JOB_STOP）；再清 pre 播报环里
+    // 已送达未播的帧。pre 缺席只记降级，不阻断停止（与路由切换同一纪律）。
+    if let Err(err) = services.pre().call_ok(ctl::PRE_SPEECH_STOP, b"{}") {
+        lock_state(state).push_degraded(format!("pre speech stop: {}", err.describe()));
+    }
     Ok(response.data)
 }
 

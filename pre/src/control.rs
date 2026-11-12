@@ -28,6 +28,7 @@ pub fn serve(
     capture_ring: Arc<Ring<RawFrame>>,
     trunk: Arc<Ring<RawFrame>>,
     rvc_ring: Arc<Ring<OutputFrame>>,
+    tts_ring: Arc<Ring<OutputFrame>>,
     stop: &'static AtomicBool,
 ) {
     while !stop.load(Ordering::Relaxed) {
@@ -45,7 +46,7 @@ pub fn serve(
                 continue;
             }
         };
-        serve_connection(&conn, &shared, &capture_ring, &trunk, &rvc_ring, stop);
+        serve_connection(&conn, &shared, &capture_ring, &trunk, &rvc_ring, &tts_ring, stop);
     }
 }
 
@@ -55,6 +56,7 @@ fn serve_connection(
     capture_ring: &Ring<RawFrame>,
     trunk: &Ring<RawFrame>,
     rvc_ring: &Ring<OutputFrame>,
+    tts_ring: &Ring<OutputFrame>,
     stop: &AtomicBool,
 ) {
     let mut idle = Duration::ZERO;
@@ -79,7 +81,7 @@ fn serve_connection(
         idle = Duration::ZERO;
         let type_ = msg.header.type_;
         let request_id = msg.header.request_id;
-        let reply = dispatch(&msg, shared, capture_ring, trunk, rvc_ring);
+        let reply = dispatch(&msg, shared, capture_ring, trunk, rvc_ring, tts_ring);
         if conn.send(type_, request_id, &reply).is_err() {
             return;
         }
@@ -102,6 +104,7 @@ pub fn dispatch(
     capture_ring: &Ring<RawFrame>,
     trunk: &Ring<RawFrame>,
     rvc_ring: &Ring<OutputFrame>,
+    tts_ring: &Ring<OutputFrame>,
 ) -> Vec<u8> {
     let body = match parse_body(&msg.body) {
         Ok(body) => body,
@@ -123,11 +126,21 @@ pub fn dispatch(
             }
             Err(err) => error_body(ctl::CODE_INVALID_ARGUMENT, &err.to_string()),
         },
+        ctl::PRE_SPEECH_STOP => {
+            // speech stop 经 daemon 转发：清播报环，丢弃已送达未播的播报帧。
+            // 播放线程下一帧见环空，holdoff 后恢复实时；计数经应答可查。
+            let mut frames_cleared = 0u64;
+            while tts_ring.pop(Some(Duration::ZERO)).is_some() {
+                frames_cleared += 1;
+            }
+            ok_body(json!({"stopped": true, "frames_cleared": frames_cleared}))
+        }
         ctl::PRE_GET_STATUS => {
             let readout = QueueReadout {
                 depth: capture_ring.depth() as u64,
                 dropped: capture_ring.dropped() + trunk.dropped(),
                 rvc_dropped: rvc_ring.dropped(),
+                tts_dropped: tts_ring.dropped(),
             };
             match serde_json::to_value(shared.status(readout)) {
                 Ok(value) => ok_body(value),
@@ -156,9 +169,11 @@ mod tests {
         Arc<Ring<RawFrame>>,
         Arc<Ring<RawFrame>>,
         Arc<Ring<OutputFrame>>,
+        Arc<Ring<OutputFrame>>,
     ) {
         (
             Arc::new(Shared::new("cap-dev".to_string(), "play-dev".to_string())),
+            Arc::new(Ring::new(2)),
             Arc::new(Ring::new(2)),
             Arc::new(Ring::new(2)),
             Arc::new(Ring::new(2)),
@@ -179,31 +194,32 @@ mod tests {
 
     #[test]
     fn hello_reports_version() {
-        let (shared, cap, trunk, rvc) = context();
-        let reply = dispatch(&message(ctl::PRE_HELLO, b"{}"), &shared, &cap, &trunk, &rvc);
+        let (shared, cap, trunk, rvc, tts) = context();
+        let reply = dispatch(&message(ctl::PRE_HELLO, b"{}"), &shared, &cap, &trunk, &rvc, &tts);
         assert_eq!(data(&reply)["version"], VERSION);
     }
 
     #[test]
     fn hello_accepts_empty_body() {
-        let (shared, cap, trunk, rvc) = context();
-        let reply = dispatch(&message(ctl::PRE_HELLO, b""), &shared, &cap, &trunk, &rvc);
+        let (shared, cap, trunk, rvc, tts) = context();
+        let reply = dispatch(&message(ctl::PRE_HELLO, b""), &shared, &cap, &trunk, &rvc, &tts);
         assert_eq!(data(&reply)["version"], VERSION);
     }
 
     #[test]
     fn set_route_and_status_roundtrip() {
-        let (shared, cap, trunk, rvc) = context();
+        let (shared, cap, trunk, rvc, tts) = context();
         let reply = dispatch(
             &message(ctl::PRE_SET_ROUTE, br#"{"route":"rvc"}"#),
             &shared,
             &cap,
             &trunk,
             &rvc,
+            &tts,
         );
         assert_eq!(data(&reply)["route"], "rvc");
 
-        let reply = dispatch(&message(ctl::PRE_GET_STATUS, b"{}"), &shared, &cap, &trunk, &rvc);
+        let reply = dispatch(&message(ctl::PRE_GET_STATUS, b"{}"), &shared, &cap, &trunk, &rvc, &tts);
         let status = data(&reply);
         assert_eq!(status["route"], "rvc");
         assert_eq!(status["state"], "running");
@@ -212,10 +228,10 @@ mod tests {
         assert_eq!(status["frames_captured"], 0);
         assert_eq!(status["frames_dropped"], 0);
         assert_eq!(status["queue_depth"], 0);
-        // consumer_drops 三键恒存在且为零值（SPEC-02 / SPEC-05 口径）。
+        // consumer_drops 四键恒存在且为零值（SPEC-02 / SPEC-05 口径）。
         assert_eq!(
             status["consumer_drops"],
-            json!({"rvc": 0, "rvc.skipped": 0, "asr": 0})
+            json!({"rvc": 0, "rvc.skipped": 0, "asr": 0, "tts": 0})
         );
         assert_eq!(status["last_error"], Value::Null);
         assert_eq!(status["version"], VERSION);
@@ -223,13 +239,14 @@ mod tests {
 
     #[test]
     fn set_route_rejects_unknown_value() {
-        let (shared, cap, trunk, rvc) = context();
+        let (shared, cap, trunk, rvc, tts) = context();
         let reply = dispatch(
             &message(ctl::PRE_SET_ROUTE, br#"{"route":"bogus"}"#),
             &shared,
             &cap,
             &trunk,
             &rvc,
+            &tts,
         );
         assert_eq!(error_code(&reply), ctl::CODE_INVALID_ARGUMENT);
 
@@ -239,6 +256,7 @@ mod tests {
             &cap,
             &trunk,
             &rvc,
+            &tts,
         );
         assert_eq!(error_code(&reply), ctl::CODE_INVALID_ARGUMENT);
 
@@ -248,6 +266,7 @@ mod tests {
             &cap,
             &trunk,
             &rvc,
+            &tts,
         );
         assert_eq!(error_code(&reply), ctl::CODE_INVALID_ARGUMENT);
 
@@ -258,19 +277,21 @@ mod tests {
             &cap,
             &trunk,
             &rvc,
+            &tts,
         );
         assert_eq!(error_code(&reply), ctl::CODE_INVALID_ARGUMENT);
     }
 
     #[test]
     fn set_mute_roundtrip_and_rejects_bad_body() {
-        let (shared, cap, trunk, rvc) = context();
+        let (shared, cap, trunk, rvc, tts) = context();
         let reply = dispatch(
             &message(ctl::PRE_SET_MUTE, br#"{"mute":true}"#),
             &shared,
             &cap,
             &trunk,
             &rvc,
+            &tts,
         );
         assert_eq!(data(&reply)["mute"], true);
         let reply = dispatch(
@@ -279,6 +300,7 @@ mod tests {
             &cap,
             &trunk,
             &rvc,
+            &tts,
         );
         assert_eq!(data(&reply)["mute"], false);
         let reply = dispatch(
@@ -287,19 +309,21 @@ mod tests {
             &cap,
             &trunk,
             &rvc,
+            &tts,
         );
         assert_eq!(error_code(&reply), ctl::CODE_INVALID_ARGUMENT);
     }
 
     #[test]
     fn unknown_command_is_rejected() {
-        let (shared, cap, trunk, rvc) = context();
+        let (shared, cap, trunk, rvc, tts) = context();
         let reply = dispatch(
             &message(ctl::DAEMON_HELLO, b"{}"),
             &shared,
             &cap,
             &trunk,
             &rvc,
+            &tts,
         );
         assert_eq!(error_code(&reply), ctl::CODE_UNKNOWN_COMMAND);
     }
@@ -312,7 +336,7 @@ mod tests {
         let path: PathBuf = dir.join("pre.sock");
         let _ = std::fs::remove_file(&path);
 
-        let (shared, cap, trunk, rvc) = context();
+        let (shared, cap, trunk, rvc, tts) = context();
         let listener = Seqpacket::bind(&path).unwrap();
         listener.listen(4).unwrap();
         let stop: &'static AtomicBool = Box::leak(Box::new(AtomicBool::new(false)));
@@ -321,7 +345,8 @@ mod tests {
             let cap = cap.clone();
             let trunk = trunk.clone();
             let rvc = rvc.clone();
-            move || serve(listener, shared, cap, trunk, rvc, stop)
+            let tts = tts.clone();
+            move || serve(listener, shared, cap, trunk, rvc, tts, stop)
         });
 
         let conn = Seqpacket::connect(&path).unwrap();
@@ -344,6 +369,26 @@ mod tests {
         conn.send(ctl::PRE_GET_STATUS, 3, b"{}").unwrap();
         let reply = conn.recv(Some(Duration::from_secs(2))).unwrap();
         assert_eq!(data(&reply.body)["route"], "rvc");
+
+        // speech stop 清播报环：先塞两帧，停止后环空、应答计 frames_cleared。
+        tts.push(OutputFrame {
+            meta: mozart_core::FrameMeta {
+                pts_ns: 0, frame_idx: 0, vad_flag: 1, energy_db: 0, conf: 0, segment_id: 0,
+            },
+            pcm: [0.0; mozart_core::OUTPUT_SAMPLES],
+        });
+        tts.push(OutputFrame {
+            meta: mozart_core::FrameMeta {
+                pts_ns: 0, frame_idx: 1, vad_flag: 1, energy_db: 0, conf: 0, segment_id: 0,
+            },
+            pcm: [0.0; mozart_core::OUTPUT_SAMPLES],
+        });
+        conn.send(ctl::PRE_SPEECH_STOP, 4, b"{}").unwrap();
+        let reply = conn.recv(Some(Duration::from_secs(2))).unwrap();
+        let stopped = data(&reply.body);
+        assert_eq!(stopped["stopped"], true);
+        assert_eq!(stopped["frames_cleared"], 2);
+        assert_eq!(tts.depth(), 0, "停止后播报环必须清空");
 
         // 停止标志结束服务循环。
         stop.store(true, Ordering::Relaxed);

@@ -308,7 +308,7 @@ fn main() -> ExitCode {
             Err(err) => return spawn_failure("capture", err),
         }
     };
-    let control_circles = (capture_ring.clone(), trunk.clone(), rvc_ring.clone());
+    let control_circles = (capture_ring.clone(), trunk.clone(), rvc_ring.clone(), tts_ring.clone());
     let process_handle = {
         let from = capture_ring.clone();
         let to = trunk.clone();
@@ -366,9 +366,9 @@ fn main() -> ExitCode {
     };
     let control_handle = {
         let shared = shared.clone();
-        let (capture_ring, trunk, rvc_ring) = control_circles;
+        let (capture_ring, trunk, rvc_ring, tts_ring) = control_circles;
         match spawn_thread("mozart-control", move || {
-            control::serve(listener, shared, capture_ring, trunk, rvc_ring, &STOP);
+            control::serve(listener, shared, capture_ring, trunk, rvc_ring, tts_ring, &STOP);
             Ok(())
         }) {
             Ok(handle) => handle,

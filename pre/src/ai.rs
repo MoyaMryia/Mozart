@@ -176,15 +176,22 @@ pub fn recv_loop(
     )
 }
 
-/// tts 播报支路接收线程：tts-out.sock → 播报接收环。坏包丢弃 v1 不上报状态
-/// （FrameSocket 内部仍计数）；接收环满丢最旧由播放线程消费时自然体现。
+/// tts 播报支路接收线程：tts-out.sock → 播报接收环。坏包丢弃计入 tts_recv_dropped，
+/// 与播报环满丢最旧（控制线程读环）一并经 consumer_drops["tts"] 上报 GetStatus。
 pub fn tts_recv_loop(
     socket: FrameSocket<OutputFrame>,
     ring: Arc<Ring<OutputFrame>>,
     shared: Arc<Shared>,
     stop: &'static AtomicBool,
 ) -> Result<(), String> {
-    recv_loop_inner(socket, ring, shared, stop, "tts output socket", |_, _| {})
+    recv_loop_inner(
+        socket,
+        ring,
+        shared,
+        stop,
+        "tts output socket",
+        Shared::set_tts_recv_dropped,
+    )
 }
 
 #[cfg(test)]
@@ -221,6 +228,7 @@ mod tests {
             depth: 0,
             dropped: 0,
             rvc_dropped: 0,
+            tts_dropped: 0,
         });
         (
             status.consumer_drops["rvc"],
@@ -304,6 +312,7 @@ mod tests {
             depth: 0,
             dropped: 0,
             rvc_dropped: 0,
+            tts_dropped: 0,
         });
         assert_eq!(status.consumer_drops["asr"], 3, "asr 未绑定：3 帧全部丢弃计数");
         assert_eq!(status.consumer_drops["rvc"], 0, "asr 丢弃不得串入 rvc 计数");
@@ -317,6 +326,7 @@ mod tests {
             depth: 0,
             dropped: 0,
             rvc_dropped: 0,
+            tts_dropped: 0,
         });
         assert_eq!(status.consumer_drops["asr"], 3, "送达后丢弃计数不再增长");
         let _ = std::fs::remove_file(&path);

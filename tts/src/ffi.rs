@@ -11,33 +11,37 @@
 //! 生成走 SherpaOnnxOfflineTtsGenerateWithConfig：旧 SherpaOnnxOfflineTtsGenerate
 //! 只带 sid/speed，无法携带 reference_audio 与 num_steps（上游已弃用）。
 
+use crate::state::Abort;
 use std::path::Path;
-use std::sync::atomic::AtomicBool;
 
 /// 离线合成器。synth 线程独占使用，跨线程移动需 Send。
 pub trait Synthesizer: Send {
     /// 引擎原生输出采样率（Hz）。
     fn sample_rate(&self) -> u32;
     /// 合成整句文本，返回原生采样率单声道 f32 PCM（[-1, 1]）。
-    /// reference 为空表示无参考音频。
-    fn synthesize(&self, text: &str, reference: &[f32], ref_rate: u32)
-        -> Result<Vec<f32>, String>;
+    /// reference 为空表示无参考音频。abort 为中止判定：进程停止或 TTS_JOB_STOP
+    /// 推进任务代际时置真，真实 FFI 经生成进度回调据此中止在途合成。
+    fn synthesize(
+        &self,
+        text: &str,
+        reference: &[f32],
+        ref_rate: u32,
+        abort: &Abort<'_>,
+    ) -> Result<Vec<f32>, String>;
 }
 
 /// 加载 PocketTTS 引擎。model_dir 为空或加载失败返回 Err（进程启动路径据此退出）。
-/// stop 供真实 FFI 的生成进度回调读取：置位时中止在途合成（SIGTERM 2 s 宽限）。
 /// 测试注入口：MOZART_TTS_STUB=1 时即使链接了 sherpa 也用 stub（进程级集成
 /// 测试不依赖模型文件）。
 pub fn load(
     model_dir: &Path,
     threads: u32,
     provider: &str,
-    stop: &'static AtomicBool,
 ) -> Result<Box<dyn Synthesizer>, String> {
     if std::env::var("MOZART_TTS_STUB").map(|v| v == "1").unwrap_or(false) {
-        return stub::load(model_dir, threads, provider, stop);
+        return stub::load(model_dir, threads, provider);
     }
-    imp::load(model_dir, threads, provider, stop)
+    imp::load(model_dir, threads, provider)
 }
 
 #[cfg(has_sherpa)]
@@ -196,12 +200,12 @@ mod sys {
 #[cfg(has_sherpa)]
 mod real {
     use super::{sys, Synthesizer};
+    use crate::state::Abort;
     use std::ffi::CString;
     use std::mem;
     use std::os::raw::{c_int, c_void};
     use std::os::unix::ffi::OsStrExt;
     use std::path::Path;
-    use std::sync::atomic::{AtomicBool, Ordering::Relaxed};
 
     /// 生成参数（brief 固定）：flow-matching 步数 5、原速、seed 42 经 extra JSON。
     const NUM_STEPS: i32 = 5;
@@ -219,7 +223,6 @@ mod real {
         model_dir: &Path,
         threads: u32,
         provider: &str,
-        stop: &'static AtomicBool,
     ) -> Result<Box<dyn Synthesizer>, String> {
         if model_dir.as_os_str().is_empty() {
             return Err("tts.model_dir 未配置，无法加载 PocketTTS 模型".to_string());
@@ -257,19 +260,20 @@ mod real {
         if handle.is_null() {
             return Err(format!("加载 PocketTTS 模型失败：{}", model_dir.display()));
         }
-        Ok(Box::new(PocketTts { handle, stop }))
+        Ok(Box::new(PocketTts { handle }))
     }
 
-    /// 生成进度回调：停止标志置位时返回 0，让引擎中止在途合成。
+    /// 生成进度回调：中止判定置真（进程停止或 TTS_JOB_STOP）时返回 0，
+    /// 让引擎中止在途合成。
     extern "C" fn abort_on_stop(
         _samples: *const f32,
         _n: c_int,
         _progress: f32,
         arg: *mut c_void,
     ) -> c_int {
-        // SAFETY: arg 指向进程级 static 停止标志，生成期间始终有效。
-        let stop = unsafe { &*(arg as *const AtomicBool) };
-        if stop.load(Relaxed) {
+        // SAFETY: arg 指向 synthesize 栈上的 Abort，生成调用期间始终有效。
+        let abort = unsafe { &*(arg as *const Abort<'_>) };
+        if abort.aborted() {
             0
         } else {
             1
@@ -278,7 +282,6 @@ mod real {
 
     struct PocketTts {
         handle: *const sys::SherpaOnnxOfflineTts,
-        stop: &'static AtomicBool,
     }
     // SAFETY: 句柄由 synth 线程独占使用；sherpa-onnx 引擎可跨线程移动。
     unsafe impl Send for PocketTts {}
@@ -301,6 +304,7 @@ mod real {
             text: &str,
             reference: &[f32],
             ref_rate: u32,
+            abort: &Abort<'_>,
         ) -> Result<Vec<f32>, String> {
             let text = CString::new(text).map_err(|_| "文本含 NUL 字节".to_string())?;
             let extra = CString::new(EXTRA).unwrap();
@@ -315,14 +319,14 @@ mod real {
                 config.reference_sample_rate = ref_rate as i32;
             }
             // SAFETY: handle 有效；text/config 指向的缓冲在本调用期间存活；
-            // 回调 arg 指向进程级 static 停止标志；结果对象用后释放。
+            // 回调 arg 指向本栈帧的 abort（生成调用期间存活）；结果对象用后释放。
             unsafe {
                 let audio = sys::SherpaOnnxOfflineTtsGenerateWithConfig(
                     self.handle,
                     text.as_ptr(),
                     &config,
                     Some(abort_on_stop),
-                    (self.stop as *const AtomicBool as *mut AtomicBool).cast(),
+                    (abort as *const Abort<'_>).cast::<c_void>().cast_mut(),
                 );
                 if audio.is_null() {
                     return Err("PocketTTS 生成失败".to_string());
@@ -348,8 +352,8 @@ mod real {
 mod stub {
     use super::Synthesizer;
     use crate::resample::TTS_NATIVE_SAMPLE_RATE;
+    use crate::state::Abort;
     use std::path::Path;
-    use std::sync::atomic::AtomicBool;
 
     /// stub 音频长度：0.1 s。
     const STUB_SAMPLES: usize = (TTS_NATIVE_SAMPLE_RATE as usize) / 10;
@@ -360,7 +364,6 @@ mod stub {
         _model_dir: &Path,
         _threads: u32,
         _provider: &str,
-        _stop: &'static AtomicBool,
     ) -> Result<Box<dyn Synthesizer>, String> {
         Ok(Box::new(StubTts))
     }
@@ -377,6 +380,7 @@ mod stub {
             _text: &str,
             _reference: &[f32],
             _ref_rate: u32,
+            _abort: &Abort<'_>,
         ) -> Result<Vec<f32>, String> {
             Ok((0..STUB_SAMPLES)
                 .map(|i| {

@@ -12,12 +12,30 @@ pub struct Shared {
     synthesized: AtomicU64,
     failed: AtomicU64,
     skipped: AtomicU64,
+    stopped: AtomicU64,
     synthesizing: AtomicBool,
     model_loaded: AtomicBool,
     queue_depth: AtomicU64,
     frames_out: AtomicU64,
     output_dropped: AtomicU64,
+    /// 任务代际：TTS_JOB_STOP 推进；在途合成与帧投递据此中止（见 Abort）。
+    job_epoch: AtomicU64,
     last_error: Mutex<Option<String>>,
+}
+
+/// 在途合成的中止判定：进程停止（SIGTERM）或任务代际推进（TTS_JOB_STOP）。
+/// 创建时捕获任务代际；合成与帧投递期间代际变化即视为中止。
+/// 真实 FFI 的生成进度回调跨 C 边界持有它（栈对象，生成调用期间存活）。
+pub struct Abort<'a> {
+    stop: &'a AtomicBool,
+    epoch: &'a AtomicU64,
+    start: u64,
+}
+
+impl Abort<'_> {
+    pub fn aborted(&self) -> bool {
+        self.stop.load(Relaxed) || self.epoch.load(Relaxed) != self.start
+    }
 }
 
 impl Shared {
@@ -26,11 +44,13 @@ impl Shared {
             synthesized: AtomicU64::new(0),
             failed: AtomicU64::new(0),
             skipped: AtomicU64::new(0),
+            stopped: AtomicU64::new(0),
             synthesizing: AtomicBool::new(false),
             model_loaded: AtomicBool::new(false),
             queue_depth: AtomicU64::new(0),
             frames_out: AtomicU64::new(0),
             output_dropped: AtomicU64::new(0),
+            job_epoch: AtomicU64::new(0),
             last_error: Mutex::new(None),
         }
     }
@@ -43,6 +63,26 @@ impl Shared {
     }
     pub fn add_skipped(&self, count: u64) {
         self.skipped.fetch_add(count, Relaxed);
+    }
+    pub fn add_stopped(&self, count: u64) {
+        self.stopped.fetch_add(count, Relaxed);
+    }
+    /// 当前任务代际。合成线程在取任务后捕获，作为中止判定基准。
+    pub fn job_epoch(&self) -> u64 {
+        self.job_epoch.load(Relaxed)
+    }
+    /// TTS_JOB_STOP：推进任务代际，在途合成与帧投递据此中止；
+    /// 在队任务由合成线程在下一轮循环清空（队列接收端归合成线程独占）。
+    pub fn stop_jobs(&self) {
+        self.job_epoch.fetch_add(1, Relaxed);
+    }
+    /// 捕获当前代际的中止判定（进程停止标志 + 任务代际）。
+    pub fn abort<'a>(&'a self, stop: &'a AtomicBool) -> Abort<'a> {
+        Abort {
+            stop,
+            epoch: &self.job_epoch,
+            start: self.job_epoch.load(Relaxed),
+        }
     }
     pub fn set_synthesizing(&self, active: bool) {
         self.synthesizing.store(active, Relaxed);
@@ -86,6 +126,7 @@ impl Shared {
             synthesized: self.synthesized.load(Relaxed),
             failed: self.failed.load(Relaxed),
             skipped: self.skipped.load(Relaxed),
+            stopped: self.stopped.load(Relaxed),
             queue_depth: self.queue_depth.load(Relaxed).min(u32::MAX as u64) as u32,
             model_loaded: self.model_loaded.load(Relaxed),
             frames_out: self.frames_out.load(Relaxed),

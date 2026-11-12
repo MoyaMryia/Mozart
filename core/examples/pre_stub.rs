@@ -26,6 +26,7 @@ fn handle(msg: &Message, state: &mut State) -> Vec<u8> {
         ctl::PRE_SET_ROUTE,
         ctl::PRE_SET_MUTE,
         ctl::PRE_GET_STATUS,
+        ctl::PRE_SPEECH_STOP,
     ];
     if let Err(reply) = expect_known(msg, &known) {
         return reply;
@@ -58,6 +59,7 @@ fn handle(msg: &Message, state: &mut State) -> Vec<u8> {
             state.mute = mute;
             ok(json!({"mute": state.mute}))
         }
+        ctl::PRE_SPEECH_STOP => ok(json!({"stopped": true, "frames_cleared": 0})),
         ctl::PRE_GET_STATUS => ok(json!({
             "state": "ok",
             "route": state.route,
