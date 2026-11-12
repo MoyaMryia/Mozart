@@ -1,8 +1,9 @@
 use clap::{Parser, Subcommand, ValueEnum};
 use mozart_core::config::{ensure_run_dir, Config};
 use mozart_core::ctl::schema::{
-    Activity, FileCancelRequest, FileFetchRequest, FileJob, FileJobState, FileProgress,
-    FileStatusRequest, FileSubmitRequest, ModelEntry, ProcessState, Response, Route, Status,
+    Activity, DeviceEntry, FileCancelRequest, FileFetchRequest, FileJob, FileJobState, FileProgress,
+    FileStatusRequest, FileSubmitRequest, ModelEntry, ProcessState, Response, RestartRequest, Route,
+    Status,
 };
 use mozart_core::ctl::{self, Seqpacket};
 use serde_json::{json, Value};
@@ -69,6 +70,16 @@ enum Action {
     Model {
         #[command(subcommand)]
         action: ModelAction,
+    },
+    /// 重启单个服务（重读配置生效，整栈不动）
+    Restart {
+        #[arg(value_enum)]
+        service: ServiceArg,
+    },
+    /// 音频设备
+    Device {
+        #[command(subcommand)]
+        action: DeviceAction,
     },
 }
 
@@ -144,6 +155,22 @@ enum ModelAction {
     List,
 }
 
+#[derive(Clone, Copy, ValueEnum)]
+enum ServiceArg {
+    Pre,
+    Rvc,
+    Asr,
+    Tts,
+    Bridge,
+    Llama,
+}
+
+#[derive(Subcommand)]
+enum DeviceAction {
+    /// 列出采集/播放设备（ALSA 名、人读标签、方向）
+    List,
+}
+
 struct CliError {
     code: u8,
     message: String,
@@ -189,6 +216,10 @@ fn run(cli: Cli) -> Result<(), CliError> {
         Action::File { action } => file_command(&config, action, cli.json),
         Action::Model { action } => match action {
             ModelAction::List => model_list(&config, cli.json),
+        },
+        Action::Restart { service } => restart(&config, service, cli.json),
+        Action::Device { action } => match action {
+            DeviceAction::List => device_list(&config, cli.json),
         },
     }
 }
@@ -546,6 +577,53 @@ fn call(config: &Config, type_: u16, body: &[u8]) -> Result<Value, CliError> {
     let conn = connect(config)?;
     let response = request(&conn, type_, body, config.daemon.rpc_timeout_ms).map_err(classify_io)?;
     expect_ok(response)
+}
+
+fn restart(config: &Config, service: ServiceArg, json_output: bool) -> Result<(), CliError> {
+    let name = service_name(service);
+    let body = body_json(&RestartRequest {
+        service: name.to_string(),
+    })?;
+    let data = call(config, ctl::DAEMON_RESTART, &body)?;
+    if json_output {
+        println!("{data}");
+    } else {
+        println!("{name}: {}", text_field(&data, "state")?);
+    }
+    Ok(())
+}
+
+fn service_name(service: ServiceArg) -> &'static str {
+    match service {
+        ServiceArg::Pre => "pre",
+        ServiceArg::Rvc => "rvc",
+        ServiceArg::Asr => "asr",
+        ServiceArg::Tts => "tts",
+        ServiceArg::Bridge => "bridge",
+        ServiceArg::Llama => "llama",
+    }
+}
+
+fn device_list(config: &Config, json_output: bool) -> Result<(), CliError> {
+    let data = call(config, ctl::DAEMON_DEVICE_LIST, b"{}")?;
+    if json_output {
+        println!("{data}");
+        return Ok(());
+    }
+    let devices = data
+        .get("devices")
+        .ok_or_else(|| CliError::new(EXIT_ERROR, "invalid device list payload: missing devices"))?;
+    let devices: Vec<DeviceEntry> = serde_json::from_value(devices.clone())
+        .map_err(|err| CliError::new(EXIT_ERROR, format!("invalid device list payload: {err}")))?;
+    if devices.is_empty() {
+        println!("no devices");
+        return Ok(());
+    }
+    println!("{:<24} {:<9} LABEL", "DEVICE", "KIND");
+    for device in &devices {
+        println!("{:<24} {:<9} {}", device.id, device.kind, device.label);
+    }
+    Ok(())
 }
 
 fn body_json<T: serde::Serialize>(value: &T) -> Result<Vec<u8>, CliError> {
@@ -1068,5 +1146,49 @@ mod tests {
         assert!(cli.json);
         assert!(parse(&["model"]).is_err());
         assert!(parse(&["model", "bogus"]).is_err());
+    }
+
+    #[test]
+    fn restart_parses_all_service_names() {
+        assert!(matches!(
+            parse(&["restart", "pre"]).unwrap().command,
+            Action::Restart { service: ServiceArg::Pre }
+        ));
+        assert!(matches!(
+            parse(&["restart", "rvc"]).unwrap().command,
+            Action::Restart { service: ServiceArg::Rvc }
+        ));
+        assert!(matches!(
+            parse(&["restart", "asr"]).unwrap().command,
+            Action::Restart { service: ServiceArg::Asr }
+        ));
+        assert!(matches!(
+            parse(&["restart", "tts"]).unwrap().command,
+            Action::Restart { service: ServiceArg::Tts }
+        ));
+        assert!(matches!(
+            parse(&["restart", "bridge"]).unwrap().command,
+            Action::Restart { service: ServiceArg::Bridge }
+        ));
+        assert!(matches!(
+            parse(&["restart", "llama"]).unwrap().command,
+            Action::Restart { service: ServiceArg::Llama }
+        ));
+        assert!(parse(&["restart", "bogus"]).is_err());
+        assert!(parse(&["restart"]).is_err());
+        let cli = parse(&["restart", "rvc", "--json"]).unwrap();
+        assert!(cli.json);
+    }
+
+    #[test]
+    fn device_list_parses_and_global_flags_apply() {
+        let cli = parse(&["device", "list", "--json"]).unwrap();
+        assert!(cli.json);
+        assert!(matches!(
+            cli.command,
+            Action::Device { action: DeviceAction::List }
+        ));
+        assert!(parse(&["device"]).is_err());
+        assert!(parse(&["device", "bogus"]).is_err());
     }
 }

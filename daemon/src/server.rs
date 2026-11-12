@@ -1,15 +1,17 @@
+use crate::device;
 use crate::file::{worker::FileWorker, FileCoordinator};
 use crate::poller::Poller;
 use crate::services::{self, Services};
 use crate::state::{lock_state, Role, State};
-use crate::supervisor::Supervisor;
+use crate::supervisor::{RestartHandle, Supervisor};
 use mozart_core::config::{ensure_run_dir, Config};
 use mozart_core::ctl::schema::{
     self, FileCancelRequest, FileFetchRequest, FileStatusRequest, FileSubmitRequest, MuteSetRequest,
-    RouteSetRequest, SwitchSetRequest,
+    RestartRequest, RouteSetRequest, SwitchSetRequest,
 };
 use mozart_core::ctl::{self, Message, Seqpacket};
 use serde_json::json;
+use signal_hook::iterator::Signals;
 use std::fs::{File, OpenOptions};
 use std::io;
 use std::path::Path;
@@ -37,6 +39,21 @@ pub fn serve(config: &Config, config_path: Option<&Path>) -> io::Result<()> {
     let state = Arc::new(Mutex::new(State::new()));
     let services = Arc::new(Services::new(&config));
     let running = Arc::new(AtomicBool::new(true));
+    // SIGTERM/SIGINT 与 Shutdown 同一优雅关停（SPEC-04），幂等。
+    // signal-hook 经自管道递送：handler 只写管道（异步信号安全），状态改动
+    // 在下面的迭代线程做。线程与 handler 常驻到进程退出：重复信号只是再次
+    // 置标志；若中途注销 handler，第二发信号会按默认动作直接杀死进程。
+    let mut signals = Signals::new([libc::SIGTERM, libc::SIGINT])
+        .map_err(|err| io::Error::other(format!("signal handler: {err}")))?;
+    let signal_state = state.clone();
+    let signal_running = running.clone();
+    thread::spawn(move || {
+        for signal in signals.forever() {
+            eprintln!("mozart-daemon: received signal {signal}, shutting down");
+            lock_state(&signal_state).begin_shutdown();
+            signal_running.store(false, Ordering::Release);
+        }
+    });
     let supervisors = [
         Role::Pre,
         Role::Rvc,
@@ -56,6 +73,12 @@ pub fn serve(config: &Config, config_path: Option<&Path>) -> io::Result<()> {
         )
     })
     .collect::<io::Result<Vec<_>>>()?;
+    let restarts = Arc::new(
+        supervisors
+            .iter()
+            .map(Supervisor::restart_handle)
+            .collect::<Vec<_>>(),
+    );
     // 文件数据面：解码/喂帧/收帧/编码在独立 worker 线程跑，不占控制面。
     let file = Arc::new(FileCoordinator::new(
         config.clone(),
@@ -72,7 +95,16 @@ pub fn serve(config: &Config, config_path: Option<&Path>) -> io::Result<()> {
         running.clone(),
     )?;
 
-    let outcome = accept_loop(&listener, &state, &services, &file, &config, &running);
+    let outcome = accept_loop(
+        &listener,
+        &state,
+        &services,
+        &file,
+        &config,
+        config_path.as_deref(),
+        &restarts,
+        &running,
+    );
     running.store(false, Ordering::Release);
     for supervisor in supervisors {
         supervisor.join();
@@ -102,6 +134,8 @@ fn accept_loop(
     services: &Arc<Services>,
     file: &Arc<FileCoordinator>,
     config: &Arc<Config>,
+    config_path: Option<&Path>,
+    restarts: &Arc<Vec<RestartHandle>>,
     running: &Arc<AtomicBool>,
 ) -> io::Result<()> {
     while running.load(Ordering::Acquire) {
@@ -112,11 +146,20 @@ fn accept_loop(
                     let services = services.clone();
                     let file = file.clone();
                     let config = config.clone();
+                    let config_path = config_path.map(|path| path.to_path_buf());
+                    let restarts = restarts.clone();
                     let running = running.clone();
                     thread::spawn(move || {
-                        if let Err(err) =
-                            serve_connection(&conn, &state, &services, &file, &config, &running)
-                        {
+                        if let Err(err) = serve_connection(
+                            &conn,
+                            &state,
+                            &services,
+                            &file,
+                            &config,
+                            config_path.as_deref(),
+                            &restarts,
+                            &running,
+                        ) {
                             eprintln!("mozart-daemon: control connection: {err}");
                         }
                     });
@@ -136,6 +179,8 @@ fn serve_connection(
     services: &Services,
     file: &FileCoordinator,
     config: &Config,
+    config_path: Option<&Path>,
+    restarts: &[RestartHandle],
     running: &AtomicBool,
 ) -> io::Result<()> {
     loop {
@@ -149,7 +194,8 @@ fn serve_connection(
             }
             Err(err) => return Err(err),
         };
-        let (reply, shutdown) = handle_request(state, services, file, config, &msg);
+        let (reply, shutdown) =
+            handle_request(state, services, file, config, config_path, restarts, &msg);
         let type_ = msg.header.type_;
         let request_id = msg.header.request_id;
         conn.send_timeout(
@@ -170,6 +216,8 @@ fn handle_request(
     services: &Services,
     file: &FileCoordinator,
     config: &Config,
+    config_path: Option<&Path>,
+    restarts: &[RestartHandle],
     msg: &Message,
 ) -> (Vec<u8>, bool) {
     let type_ = msg.header.type_;
@@ -249,10 +297,46 @@ fn handle_request(
         ctl::DAEMON_MODEL_LIST => file_reply(
             services::list_models(services).map(|models| json!({"models": models})),
         ),
+        ctl::DAEMON_RESTART => match parse_body::<RestartRequest>(&msg.body) {
+            Ok(request) => (restart_service(restarts, config_path, &request.service), false),
+            Err(reply) => (reply, false),
+        },
+        ctl::DAEMON_DEVICE_LIST => match device::list() {
+            Ok(devices) => (schema::ok_body(json!({"devices": devices})), false),
+            Err((code, reason)) => (schema::error_body(&code, &reason), false),
+        },
         _ => (
             schema::error_body(ctl::CODE_UNKNOWN_COMMAND, "unknown command"),
             false,
         ),
+    }
+}
+
+/// 单服务重启（SPEC-04 重启两粒度）：入口重读 TOML，失败拒绝、不动运行进程；
+/// 成功则交监管线程停子进程后以新配置重起，整栈不受影响。
+fn restart_service(
+    restarts: &[RestartHandle],
+    config_path: Option<&Path>,
+    service: &str,
+) -> Vec<u8> {
+    let Some(role) = Role::from_name(service) else {
+        return schema::error_body(
+            ctl::CODE_INVALID_ARGUMENT,
+            &format!("unknown service: {service}"),
+        );
+    };
+    let config = match Config::load_from(config_path) {
+        Ok(config) => config,
+        Err(err) => return schema::error_body(ctl::CODE_INVALID_ARGUMENT, &err.to_string()),
+    };
+    let handle = restarts
+        .iter()
+        .find(|handle| handle.role() == role)
+        .expect("serve 为每个 Role 建了重启句柄");
+    match handle.restart(Arc::new(config)) {
+        Ok(()) => schema::ok_body(json!({"service": service, "state": "restarting"})),
+        // 发送失败仅当监管线程已退出：daemon 正在关停。
+        Err(_) => schema::error_body(ctl::CODE_BUSY, "daemon is shutting down"),
     }
 }
 

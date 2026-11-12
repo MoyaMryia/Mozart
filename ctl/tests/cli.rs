@@ -1,5 +1,5 @@
 use mozart_core::ctl::schema::{
-    error_body, ok_body, FileJob, FileJobState, ModelEntry, ProcessState, Status,
+    error_body, ok_body, DeviceEntry, FileJob, FileJobState, ModelEntry, ProcessState, Status,
 };
 use mozart_core::ctl::{self, Seqpacket};
 use serde_json::{json, Value};
@@ -806,4 +806,136 @@ fn file_commands_round_trip_with_daemon() {
     // 终态再取消 → 拒绝。
     assert_eq!(env.run(&["file", "cancel", &job_id]).status.code(), Some(4));
     assert_success(&env.run(&["file", "resume"]));
+}
+
+// ---- restart / device list：桩 daemon 校验组消息与 --json，真实 daemon 端到端 ----
+
+#[test]
+fn restart_builds_request_and_formats_reply() {
+    let env = CtlEnv::new("restart");
+    let stub = StubDaemon::start(
+        &env.socket(),
+        vec![(
+            ctl::DAEMON_RESTART,
+            ok_body(json!({"service": "rvc", "state": "restarting"})),
+        )],
+    );
+
+    let output = env.run(&["restart", "rvc", "--json"]);
+    assert_eq!(
+        stdout_json(&output),
+        json!({"service": "rvc", "state": "restarting"})
+    );
+    assert_eq!(stub.requests()[0].0, ctl::DAEMON_RESTART);
+    assert_eq!(stub.requests()[0].1, json!({"service": "rvc"}));
+
+    let human = env.run(&["restart", "pre"]);
+    assert_success(&human);
+    let text = String::from_utf8_lossy(&human.stdout);
+    assert!(text.contains("pre: restarting"), "stdout: {text}");
+    assert_eq!(stub.requests()[1].1, json!({"service": "pre"}));
+}
+
+#[test]
+fn device_list_json_and_table() {
+    let env = CtlEnv::new("device-list");
+    let stub = StubDaemon::start(
+        &env.socket(),
+        vec![(
+            ctl::DAEMON_DEVICE_LIST,
+            ok_body(json!({"devices": [
+                {"id": "hw:0,0", "label": "Loopback Capture", "kind": "capture"},
+                {"id": "hw:0,0", "label": "Loopback Playback", "kind": "playback"},
+            ]})),
+        )],
+    );
+
+    let output = env.run(&["device", "list", "--json"]);
+    let data = stdout_json(&output);
+    let devices: Vec<DeviceEntry> = serde_json::from_value(data["devices"].clone()).unwrap();
+    assert_eq!(devices.len(), 2);
+    assert_eq!(devices[0].kind, "capture");
+    assert_eq!(stub.requests()[0].0, ctl::DAEMON_DEVICE_LIST);
+    assert_eq!(stub.requests()[0].1, json!({}));
+
+    let human = env.run(&["device", "list"]);
+    assert_success(&human);
+    let text = String::from_utf8_lossy(&human.stdout);
+    assert!(
+        text.contains("hw:0,0") && text.contains("capture") && text.contains("playback"),
+        "stdout: {text}"
+    );
+    assert!(text.contains("Loopback Capture"), "stdout: {text}");
+}
+
+#[test]
+fn device_list_empty_renders_no_devices() {
+    let env = CtlEnv::new("device-empty");
+    let _stub = StubDaemon::start(
+        &env.socket(),
+        vec![(ctl::DAEMON_DEVICE_LIST, ok_body(json!({"devices": []})))],
+    );
+    let output = env.run(&["device", "list", "--json"]);
+    assert_eq!(stdout_json(&output), json!({"devices": []}));
+    let human = env.run(&["device", "list"]);
+    assert_success(&human);
+    assert!(String::from_utf8_lossy(&human.stdout).contains("no devices"));
+}
+
+#[test]
+fn restart_and_device_unreachable_exit_3() {
+    let env = CtlEnv::new("control-unreachable");
+    for args in [vec!["restart", "rvc"], vec!["device", "list"]] {
+        let output = env.run(&args);
+        assert_eq!(output.status.code(), Some(3), "args: {args:?}");
+    }
+}
+
+#[test]
+fn rejects_unknown_restart_and_device_arguments() {
+    let env = CtlEnv::new("control-usage");
+    for args in [
+        vec!["restart"],
+        vec!["restart", "bogus"],
+        vec!["device"],
+        vec!["device", "bogus"],
+    ] {
+        assert_eq!(env.run(&args).status.code(), Some(2), "args: {args:?}");
+    }
+    assert_success(&env.run(&["restart", "--help"]));
+    assert_success(&env.run(&["device", "list", "--help"]));
+}
+
+#[test]
+fn restart_and_device_round_trip_with_daemon() {
+    let env = CtlEnv::new("control-flow");
+    assert_success(&env.run(&["up"]));
+    let deadline = Instant::now() + Duration::from_secs(5);
+    let old_pid = loop {
+        let status = status_json(&env);
+        if status.rvc.is_some() && status.processes.rvc.state == ProcessState::Running {
+            break status.processes.rvc.pid.unwrap();
+        }
+        assert!(Instant::now() < deadline, "rvc did not become ready");
+        std::thread::sleep(Duration::from_millis(50));
+    };
+
+    let restart = stdout_json(&env.run(&["restart", "rvc", "--json"]));
+    assert_eq!(restart["service"], "rvc");
+    assert_eq!(restart["state"], "restarting");
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        let status = status_json(&env);
+        if status.processes.rvc.state == ProcessState::Running
+            && status.processes.rvc.pid.is_some_and(|pid| pid != old_pid)
+        {
+            break;
+        }
+        assert!(Instant::now() < deadline, "rvc was not restarted");
+        std::thread::sleep(Duration::from_millis(50));
+    }
+
+    // 设备清单来自 daemon 的 ALSA 枚举；主机可能无声卡，容忍空数组。
+    let devices = stdout_json(&env.run(&["device", "list", "--json"]));
+    assert!(devices["devices"].is_array());
 }

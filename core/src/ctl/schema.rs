@@ -474,7 +474,7 @@ pub struct DeviceEntry {
 }
 
 /// DAEMON_RESTART 请求体；service 取进程名（pre/rvc/asr/tts/bridge/llama）。
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct RestartRequest {
     pub service: String,

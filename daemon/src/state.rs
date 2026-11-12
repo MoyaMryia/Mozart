@@ -15,6 +15,32 @@ pub enum Role {
     Llama,
 }
 
+impl Role {
+    pub fn name(self) -> &'static str {
+        match self {
+            Role::Pre => "pre",
+            Role::Rvc => "rvc",
+            Role::Asr => "asr",
+            Role::Tts => "tts",
+            Role::Bridge => "bridge",
+            Role::Llama => "llama",
+        }
+    }
+
+    /// 控制面服务名 → Role；未知名返回 None，由入口拒绝（InvalidArgument）。
+    pub fn from_name(name: &str) -> Option<Self> {
+        match name {
+            "pre" => Some(Role::Pre),
+            "rvc" => Some(Role::Rvc),
+            "asr" => Some(Role::Asr),
+            "tts" => Some(Role::Tts),
+            "bridge" => Some(Role::Bridge),
+            "llama" => Some(Role::Llama),
+            _ => None,
+        }
+    }
+}
+
 pub fn lock_state(state: &Mutex<State>) -> MutexGuard<'_, State> {
     state
         .lock()
