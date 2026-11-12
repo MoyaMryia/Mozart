@@ -1,11 +1,15 @@
 //! 文件转换协调层：队列 + 受管存储 + GPU 仲裁 + 命令入口。
-//! 数据面（解码/喂帧/编码）由 Worker 钩子在 Task 5 实现；本模块只定义钩子
-//! 与占位 worker。worker 在独立线程运行，阻塞 I/O 期间不持 State 锁；
-//! GPU 归属的每次变更都在 Services transition 锁内，与实时路由切换互斥。
+//! 数据面（解码/喂帧/编码）在 worker/decode/encode 子模块，跑在独立 worker
+//! 线程：阻塞 I/O 期间不持 State 锁；GPU 归属的每次变更都在 Services
+//! transition 锁内，与实时路由切换互斥。
 
 pub mod arbitrate;
+mod decode;
+mod encode;
+mod ffmpeg;
 mod queue;
 mod storage;
+pub mod worker;
 
 use crate::services::{self, Services};
 use crate::state::{lock_state, State};
@@ -22,8 +26,10 @@ use std::sync::{Arc, Mutex, MutexGuard};
 use std::thread::{self, JoinHandle};
 use storage::Storage;
 
-/// 文件数据面钩子。Task 5 实现真实 worker（ffmpeg 解码 → 喂帧 → 收帧编码）。
-/// run 在独立 worker 线程调用：阻塞 I/O 期间不得持 State 锁；
+/// 契约帧时间轴步长（20 ms）：数据面合成 pts_ns 用，取 core 的 FRAME_MS。
+pub(crate) const FRAME_NS: u64 = mozart_core::FRAME_MS as u64 * 1_000_000;
+
+/// 文件数据面钩子。run 在独立 worker 线程调用：阻塞 I/O 期间不得持 State 锁；
 /// 各阶段以 ctx.is_cancelled() 作取消检查点，关停时也经它退出。
 pub trait Worker: Send + Sync {
     fn run(&self, ctx: JobContext) -> Outcome;
@@ -31,21 +37,37 @@ pub trait Worker: Send + Sync {
 
 /// worker 收尾结果，协调器据此落终态、清临时、驱逐并释放 GPU。
 pub enum Outcome {
-    #[allow(dead_code)] // Task 5 worker 发布成功后返回；占位 worker 只产出 Failed/Cancelled。
     Completed,
     Failed(String),
     Cancelled,
 }
 
+/// 数据面步骤错误：取消与失败分开表达，收尾据此选 Outcome。
+#[derive(Debug)]
+pub(crate) enum StepError {
+    Cancelled,
+    Failed(String),
+}
+
+impl From<StepError> for Outcome {
+    fn from(err: StepError) -> Self {
+        match err {
+            StepError::Cancelled => Outcome::Cancelled,
+            StepError::Failed(reason) => Outcome::Failed(reason),
+        }
+    }
+}
+
 /// 传给 worker 的句柄集合。协调器在启动任务时快照任务信息，
-/// worker 经 queue 更新进度/查取消，经 services 下发 rvc 控制命令。
-#[allow(dead_code)] // Task 5 数据面消费这些句柄；本任务占位 worker 只用取消检查。
+/// worker 经 queue 更新进度/查取消，经 services 下发 rvc 控制命令，
+/// 经 state 记录可查询的降级原因。
 pub struct JobContext {
     pub job: FileJob,
     pub source: PathBuf,
     pub storage: Arc<Storage>,
     pub queue: Arc<Mutex<FileQueue>>,
     pub services: Arc<Services>,
+    pub state: Arc<Mutex<State>>,
     pub config: Arc<Config>,
     pub running: Arc<AtomicBool>,
 }
@@ -58,24 +80,15 @@ impl JobContext {
     }
 
     /// 阶段进度更新（D5），随队列落盘。
-    #[allow(dead_code)] // Task 5 worker 在阶段边界调用。
     pub fn set_progress(&self, progress: FileProgress) -> Result<(), (String, String)> {
         lock_queue(&self.queue)
             .set_progress(&self.job.job_id, progress)
             .map_err(QueueError::into_rejection)
     }
-}
 
-/// 占位 worker：数据面在 Task 5 落地。此前任务标 failed 带可查询原因
-/// （file status/list 的 error 字段），队列/仲裁/命令链路照常运转。
-pub struct PlaceholderWorker;
-
-impl Worker for PlaceholderWorker {
-    fn run(&self, ctx: JobContext) -> Outcome {
-        if ctx.is_cancelled() {
-            return Outcome::Cancelled;
-        }
-        Outcome::Failed("file data plane not implemented".to_string())
+    /// 非致命降级（停流超时、进度落盘失败等）：记原因，status 可查。
+    pub fn push_degraded(&self, reason: String) {
+        lock_state(&self.state).push_degraded(reason);
     }
 }
 
@@ -95,7 +108,8 @@ pub struct FileCoordinator {
     /// 持此锁，finish 快照保护集合并驱逐时也持此锁。两者互斥，新排队任务的
     /// 源副本不会落在驱逐保护集合之外。不用队列锁，复制期间 list/status 仍可应答。
     submit_lock: Mutex<()>,
-    job_thread: Mutex<Option<JoinHandle<()>>>,
+    /// 在跑任务的 id 与线程句柄：panic 时 finish 不会执行，reap 据 id 落终态。
+    job_thread: Mutex<Option<(String, JoinHandle<()>)>>,
 }
 
 impl FileCoordinator {
@@ -154,13 +168,14 @@ impl FileCoordinator {
 
     /// 关停：running 已置 false，worker 经取消检查点退出；
     /// 任务保持 processing 落盘，重启读回重跑（D3）。
+    /// 此处不落终态，故 join 的 panic 也留给重启重跑，不在关停路径改写状态。
     pub fn shutdown(&self) {
         let handle = self
             .job_thread
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
             .take();
-        if let Some(handle) = handle {
+        if let Some((_, handle)) = handle {
             let _ = handle.join();
         }
     }
@@ -248,7 +263,9 @@ impl FileCoordinator {
                     ))
                 }
             }
-            None => services::rvc_get_status(&self.services)?
+            None => self
+                .services
+                .rvc_status()?
                 .model_id
                 .ok_or_else(|| {
                     (
@@ -289,6 +306,7 @@ impl FileCoordinator {
             storage: self.storage.clone(),
             queue: self.queue.clone(),
             services: self.services.clone(),
+            state: self.state.clone(),
             config: self.config.clone(),
             running: self.running.clone(),
         };
@@ -306,7 +324,8 @@ impl FileCoordinator {
                 *self
                     .job_thread
                     .lock()
-                    .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(handle);
+                    .unwrap_or_else(|poisoned| poisoned.into_inner()) =
+                    Some((job_id.to_string(), handle));
             }
             Err(err) => {
                 lock_state(&self.state).release_gpu_file();
@@ -364,16 +383,46 @@ impl FileCoordinator {
         lock_state(&self.state).push_degraded(format!("file queue {op}: {code}: {reason}"));
     }
 
+    /// 回收已结束的 worker 线程。正常路径 finish 已落终态；worker panic 时
+    /// finish 不会执行，join 拿到 Err，在此落 failed 并释放 GPU——否则任务
+    /// 永远停在 processing、GPU 永远归 File，整个队列被卡死。
     fn reap_job_thread(&self) {
-        let mut slot = self
-            .job_thread
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-        if slot.as_ref().is_some_and(|handle| handle.is_finished()) {
-            if let Some(handle) = slot.take() {
-                let _ = handle.join();
+        let finished = {
+            let mut slot = self
+                .job_thread
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            match slot.as_ref() {
+                Some((_, handle)) if handle.is_finished() => slot.take(),
+                _ => None,
             }
+        };
+        let Some((job_id, handle)) = finished else {
+            return;
+        };
+        if let Err(panic) = handle.join() {
+            self.recover_panicked_job(&job_id, &panic_payload(&panic));
         }
+    }
+
+    /// panic 收尾：落 failed 带原因、清临时、释放 GPU。驱逐仍归 finish
+    /// （下一个任务收尾时执行），此处不复制那份逻辑。
+    fn recover_panicked_job(&self, job_id: &str, reason: &str) {
+        let _transition = self.services.transition();
+        self.settle_failed(job_id, format!("file worker panicked: {reason}"));
+        self.storage.cleanup_temp(job_id);
+        lock_state(&self.state).release_gpu_file();
+    }
+}
+
+/// panic 载荷取可读文本：&str / String 之外的载荷只记未知。
+fn panic_payload(payload: &Box<dyn std::any::Any + Send>) -> String {
+    if let Some(text) = payload.downcast_ref::<&str>() {
+        (*text).to_string()
+    } else if let Some(text) = payload.downcast_ref::<String>() {
+        text.clone()
+    } else {
+        "unknown panic".to_string()
     }
 }
 
@@ -651,6 +700,55 @@ mod tests {
         assert_eq!(job.state, FileJobState::Failed);
         assert!(job.error.unwrap().contains("source"));
         assert_eq!(lock_state(&coordinator.state).gpu_owner(), None);
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// 回归：worker panic 时 finish 不会执行，reap 必须落 failed 并释放 GPU。
+    /// 旧代码忽略 join Err，任务永远停在 processing、GPU 永远归 File，队列卡死。
+    struct PanickingWorker;
+
+    impl Worker for PanickingWorker {
+        fn run(&self, _ctx: JobContext) -> Outcome {
+            panic!("file worker boom");
+        }
+    }
+
+    #[test]
+    fn worker_panic_fails_job_and_releases_gpu() {
+        let dir = temp_dir("worker-panic");
+        let mut config = Config::default();
+        config.file.storage_dir = dir.clone();
+        let config = Arc::new(config);
+        let state = Arc::new(Mutex::new(State::new()));
+        lock_state(&state).set_rvc_status(Some(fake_rvc_status()));
+        let services = Arc::new(Services::new(&config));
+        let running = Arc::new(AtomicBool::new(true));
+        let coordinator = Arc::new(
+            FileCoordinator::new(config, state, services, running, Arc::new(PanickingWorker))
+                .unwrap(),
+        );
+        let job_id = enqueue(&coordinator, "a.wav");
+        // 临时文件残留：panic 收尾也要清掉。
+        fs::write(coordinator.storage.decoded_path(&job_id), b"junk").unwrap();
+        coordinator.tick();
+        assert!(
+            wait_until(Duration::from_secs(2), || {
+                coordinator.tick();
+                lock_queue(&coordinator.queue).state_of(&job_id) == Some(FileJobState::Failed)
+            }),
+            "panic 后 reap 必须落 failed"
+        );
+        let job = lock_queue(&coordinator.queue).status(&job_id).unwrap();
+        assert!(
+            job.error.unwrap().contains("file worker boom"),
+            "panic 原因必须可查询"
+        );
+        assert_eq!(lock_state(&coordinator.state).gpu_owner(), None);
+        assert!(
+            !coordinator.storage.decoded_path(&job_id).exists(),
+            "panic 收尾也要清临时文件"
+        );
+        coordinator.shutdown();
         fs::remove_dir_all(&dir).unwrap();
     }
 

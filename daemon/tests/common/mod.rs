@@ -1,7 +1,8 @@
 #![allow(dead_code)]
 
-use mozart_core::ctl::schema::{Response, Status};
+use mozart_core::ctl::schema::{FileJob, FileJobState, ProcessState, Response, Status};
 use mozart_core::ctl::{self, Seqpacket};
+use serde_json::json;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::time::{Duration, Instant};
@@ -98,6 +99,53 @@ impl DaemonProcess {
         }
     }
 
+    /// 文件链路测试用：`storage` 指向受管目录，`file_extra` 追加 `[file]` 键，
+    /// `extra_env` 传给 daemon（子进程继承，如 rvc 桩的批处理延迟旋钮）。
+    /// `fresh=false` 保留目录，用于重启续转。
+    pub fn start_file(
+        tag: &str,
+        storage: &Path,
+        file_extra: &str,
+        fresh: bool,
+        extra_env: &[(&str, String)],
+    ) -> Self {
+        let dir = std::env::temp_dir().join(format!("mozart-daemon-{}-{tag}", std::process::id()));
+        if fresh {
+            let _ = std::fs::remove_dir_all(&dir);
+        }
+        std::fs::create_dir_all(&dir).unwrap();
+        let config = dir.join("config.toml");
+        let body = format!(
+            "[daemon]\nrpc_timeout_ms = 300\n\n[rvc]\nmodel_id = \"demo\"\n\n[file]\nstorage_dir = \"{}\"\n{file_extra}\n",
+            storage.display()
+        );
+        std::fs::write(&config, body).unwrap();
+        let mut command = Command::new(env!("CARGO_BIN_EXE_mozart-daemon"));
+        command
+            .arg("--config")
+            .arg(&config)
+            .env("MOZART_RUN_DIR", &dir)
+            .env("MOZART_PRE_BIN", example("pre_stub"))
+            .env("MOZART_RVC_BIN", example("rvc_stub"))
+            .env("MOZART_ASR_BIN", example("asr_stub"))
+            .env("MOZART_TTS_BIN", example("tts_stub"))
+            .env("MOZART_BRIDGE_BIN", example("bridge_stub"))
+            .env("MOZART_LLAMA_BIN", example("llama_stub"))
+            .env("MOZART_POLL_INTERVAL_MS", "100")
+            .stdout(Stdio::null())
+            .stderr(Stdio::inherit());
+        for (key, value) in extra_env {
+            command.env(key, value);
+        }
+        let child = command.spawn().unwrap();
+        let socket = dir.join("daemon.sock");
+        Self {
+            child,
+            dir,
+            socket,
+        }
+    }
+
     pub fn connect(&self) -> Seqpacket {
         connect(&self.socket)
     }
@@ -167,4 +215,48 @@ pub fn wait_until(timeout: Duration, mut predicate: impl FnMut() -> bool) -> boo
         }
         std::thread::sleep(Duration::from_millis(20));
     }
+}
+
+/// 等被监管进程起来且 rvc 状态已轮询到（仲裁要求 rvc_ready）。
+pub fn wait_ready(conn: &Seqpacket) {
+    assert!(
+        wait_until(Duration::from_secs(5), || {
+            let status = status(conn);
+            status.processes.pre.state == ProcessState::Running
+                && status.processes.rvc.state == ProcessState::Running
+                && status.rvc.is_some()
+        }),
+        "children did not start"
+    );
+}
+
+pub fn submit_file(conn: &Seqpacket, path: &Path, model: Option<&str>) -> Response {
+    let body = json!({"path": path, "model_id": model});
+    call(conn, ctl::DAEMON_FILE_SUBMIT, body.to_string().as_bytes())
+}
+
+pub fn file_job(conn: &Seqpacket, job_id: &str) -> FileJob {
+    let body = json!({"job_id": job_id});
+    let reply = call(conn, ctl::DAEMON_FILE_STATUS, body.to_string().as_bytes());
+    assert_eq!(reply.status, "ok", "file status: {}", reply.reason);
+    serde_json::from_value(reply.data).unwrap()
+}
+
+pub fn wait_job_state(
+    conn: &Seqpacket,
+    job_id: &str,
+    state: FileJobState,
+    timeout: Duration,
+) -> FileJob {
+    let mut last = None;
+    assert!(
+        wait_until(timeout, || {
+            let job = file_job(conn, job_id);
+            let reached = job.state == state;
+            last = Some(job);
+            reached
+        }),
+        "job {job_id} did not reach {state:?}: {last:?}"
+    );
+    last.unwrap()
 }

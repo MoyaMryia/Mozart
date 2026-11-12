@@ -10,12 +10,17 @@ use std::time::Duration;
 pub struct StubArgs {
     pub name: &'static str,
     pub socket: PathBuf,
+    /// daemon 转交的同一 TOML（--config）。多数桩不读配置（字段对它们无用）；
+    /// 需要数据面 socket 路径的桩（rvc_stub 文件批处理）用它解析。
+    #[allow(dead_code)]
+    pub config: Option<PathBuf>,
     pub exit_after: Option<Duration>,
     pub reply_delay: Duration,
 }
 
 pub fn parse_args(name: &'static str) -> StubArgs {
     let mut socket = None;
+    let mut config = None;
     let mut exit_after = None;
     let mut reply_delay = Duration::ZERO;
     let mut args = std::env::args().skip(1);
@@ -24,9 +29,9 @@ pub fn parse_args(name: &'static str) -> StubArgs {
             "--socket" => {
                 socket = Some(PathBuf::from(args.next().unwrap_or_else(|| usage(name))));
             }
-            // daemon spawn 传同一 TOML（--config）；协议桩不读配置，接受即忽略。
+            // daemon spawn 传同一 TOML（--config）；不读配置的桩接受即忽略。
             "--config" => {
-                let _ = args.next().unwrap_or_else(|| usage(name));
+                config = Some(PathBuf::from(args.next().unwrap_or_else(|| usage(name))));
             }
             "--exit-after-ms" => {
                 let value = args.next().unwrap_or_else(|| usage(name));
@@ -44,6 +49,7 @@ pub fn parse_args(name: &'static str) -> StubArgs {
     StubArgs {
         name,
         socket: socket.unwrap_or_else(|| usage(name)),
+        config,
         exit_after,
         reply_delay,
     }

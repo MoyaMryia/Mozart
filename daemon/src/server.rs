@@ -1,4 +1,4 @@
-use crate::file::{FileCoordinator, PlaceholderWorker};
+use crate::file::{worker::FileWorker, FileCoordinator};
 use crate::poller::Poller;
 use crate::services::{self, Services};
 use crate::state::{lock_state, Role, State};
@@ -56,13 +56,13 @@ pub fn serve(config: &Config, config_path: Option<&Path>) -> io::Result<()> {
         )
     })
     .collect::<io::Result<Vec<_>>>()?;
-    // 文件数据面 worker 在 Task 5 落地；占位 worker 先驱动队列/仲裁链路。
+    // 文件数据面：解码/喂帧/收帧/编码在独立 worker 线程跑，不占控制面。
     let file = Arc::new(FileCoordinator::new(
         config.clone(),
         state.clone(),
         services.clone(),
         running.clone(),
-        Arc::new(PlaceholderWorker),
+        Arc::new(FileWorker),
     )?);
     let poller = Poller::spawn(
         config.clone(),

@@ -10,7 +10,7 @@ use mozart_core::ctl::schema::{
 use mozart_core::ctl::{self, Seqpacket};
 use serde_json::{json, Value};
 use std::io;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::{Mutex, MutexGuard, TryLockError};
 use std::time::Duration;
 
@@ -91,6 +91,86 @@ impl Services {
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
     }
+
+    // ---- rvc 控制入口：实时路由与文件数据面共用一条链路 ----
+    // 文件 worker 在独立线程调用这些入口，不持 transition 锁：GPU 归 File
+    // 期间 route_set 只动意图、reconcile 不碰 rvc（见下），两者天然互斥。
+    // 单次 RPC 仍由 rvc 链路锁与每秒轮询串行。
+
+    /// LoadModel：返回 StartStream 必填的 model_handle。
+    pub fn load_model(&self, model_id: &str) -> Result<u64, (String, String)> {
+        self.load_model_handle(model_id)
+            .map_err(CallError::into_rejection)
+    }
+
+    /// StartStream kind=file（D1/D2）：total_frames 作整段结束信号，
+    /// output_socket 覆盖默认输出 socket（daemon 绑定，绝对路径）。
+    /// 与实时不同，Busy 不吞：已有活动流说明仲裁失守，必须失败带原因。
+    pub fn file_start_stream(
+        &self,
+        config: &Config,
+        model_handle: u64,
+        total_frames: u32,
+        output_socket: &Path,
+    ) -> Result<(), (String, String)> {
+        let mut body = stream_body(config, model_handle);
+        body["kind"] = json!("file");
+        body["total_frames"] = json!(total_frames);
+        body["output_socket"] = json!(output_socket.to_string_lossy());
+        let text = body.to_string();
+        self.rvc()
+            .call_ok(ctl::RVC_START_STREAM, text.as_bytes())
+            .map(|_| ())
+            .map_err(CallError::into_rejection)
+    }
+
+    /// StopStream：实时切回 direct 与文件收尾/取消共用同一命令。
+    /// 文件模式停在下一个推理检查点，可能超过 rpc_timeout_ms；超时按降级
+    /// 处理（C++ 侧仍会停流），调用方不得因此卡住。
+    pub fn stop_stream(&self) -> Result<(), (String, String)> {
+        self.stop_stream_inner().map_err(CallError::into_rejection)
+    }
+
+    /// rvc 状态快照：文件 infer 段读 blocks、提交缺省模型解析与实时切换共用。
+    pub fn rvc_status(&self) -> Result<RvcStatus, (String, String)> {
+        let response = self
+            .rvc()
+            .call_ok(ctl::RVC_GET_STATUS, b"{}")
+            .map_err(CallError::into_rejection)?;
+        serde_json::from_value::<RvcStatus>(response.data)
+            .map_err(|err| (ctl::CODE_INTERNAL.to_string(), err.to_string()))
+    }
+
+    fn load_model_handle(&self, model_id: &str) -> Result<u64, CallError> {
+        let body = json!({"model_id": model_id}).to_string();
+        let response = self.rvc().call_ok(ctl::RVC_LOAD_MODEL, body.as_bytes())?;
+        response
+            .data
+            .get("model_handle")
+            .and_then(|value| value.as_u64())
+            .ok_or_else(|| {
+                CallError::Protocol("LoadModel response missing model_handle".to_string())
+            })
+    }
+
+    fn stop_stream_inner(&self) -> Result<(), CallError> {
+        self.rvc()
+            .call_ok(ctl::RVC_STOP_STREAM, b"{}")
+            .map(|_| ())
+    }
+}
+
+/// StartStream 会话参数（SPEC-03 参数边界表）：实时与文件共用 `[rvc]` 一份。
+/// kind 与文件批处理字段由调用方补齐。
+fn stream_body(config: &Config, model_handle: u64) -> Value {
+    json!({
+        "model_handle": model_handle,
+        "pitch_shift": config.rvc.pitch_shift,
+        "index_rate": config.rvc.index_rate,
+        "rms_mix_rate": config.rvc.rms_mix_rate,
+        "protect": config.rvc.protect,
+        "f0_method": config.rvc.f0_method,
+    })
 }
 
 enum CallError {
@@ -298,16 +378,6 @@ fn switch_direct(state: &Mutex<State>, services: &Services) -> Result<Route, (St
     Ok(Route::Direct)
 }
 
-/// rvc 当前状态快照。文件提交缺省模型解析与实时切换共用。
-pub(crate) fn rvc_get_status(services: &Services) -> Result<RvcStatus, (String, String)> {
-    let response = services
-        .rvc()
-        .call_ok(ctl::RVC_GET_STATUS, b"{}")
-        .map_err(CallError::into_rejection)?;
-    serde_json::from_value::<RvcStatus>(response.data)
-        .map_err(|err| (ctl::CODE_INTERNAL.to_string(), err.to_string()))
-}
-
 /// rvc 模型清单（RVC_LIST_MODELS）。model list 命令与文件提交模型校验共用。
 pub(crate) fn list_models(services: &Services) -> Result<Vec<ModelEntry>, (String, String)> {
     let response = services
@@ -333,10 +403,9 @@ fn switch_rvc(
     services: &Services,
     config: &Config,
 ) -> Result<Route, (String, String)> {
-    let status = rvc_get_status(services)?;
+    let status = services.rvc_status()?;
     let model_id = resolve_model_id(config, &status)?;
-    let model_matches = status.model_id.as_deref() == Some(model_id.as_str());
-    if status.state != "streaming" || !model_matches {
+    if !realtime_stream_matches(&status, &model_id) {
         start_rvc_stream(services, config, &model_id).map_err(CallError::into_rejection)?;
     }
 
@@ -368,33 +437,25 @@ fn resolve_model_id(config: &Config, status: &RvcStatus) -> Result<String, (Stri
     })
 }
 
+/// 实时流是否已按期望跑起来。文件流残留（StopStream 超时等）不算实时流：
+/// 只比 state/model 会把 kind=file 的流误判为可用，pre 切到 rvc 后无输出。
+fn realtime_stream_matches(status: &RvcStatus, model_id: &str) -> bool {
+    status.state == "streaming"
+        && status.stream_kind.as_deref() == Some("realtime")
+        && status.model_id.as_deref() == Some(model_id)
+}
+
 fn start_rvc_stream(
     services: &Services,
     config: &Config,
     model_id: &str,
 ) -> Result<(), CallError> {
-    let handle = {
-        let mut rvc = services.rvc();
-        let body = json!({"model_id": model_id}).to_string();
-        let response = rvc.call_ok(ctl::RVC_LOAD_MODEL, body.as_bytes())?;
-        response
-            .data
-            .get("model_handle")
-            .and_then(|value| value.as_u64())
-            .ok_or_else(|| CallError::Protocol("LoadModel response missing model_handle".to_string()))?
-    };
-    let body = json!({
-        "kind": "realtime",
-        "model_handle": handle,
-        "pitch_shift": config.rvc.pitch_shift,
-        "index_rate": config.rvc.index_rate,
-        "rms_mix_rate": config.rvc.rms_mix_rate,
-        "protect": config.rvc.protect,
-        "f0_method": config.rvc.f0_method,
-    })
-    .to_string();
+    let handle = services.load_model_handle(model_id)?;
+    let mut body = stream_body(config, handle);
+    body["kind"] = json!("realtime");
+    let text = body.to_string();
     let mut rvc = services.rvc();
-    match rvc.call_ok(ctl::RVC_START_STREAM, body.as_bytes()) {
+    match rvc.call_ok(ctl::RVC_START_STREAM, text.as_bytes()) {
         Ok(_) => Ok(()),
         Err(err) => match &err {
             CallError::Remote(response) if response.code == ctl::CODE_BUSY => Ok(()),
@@ -404,10 +465,7 @@ fn start_rvc_stream(
 }
 
 fn stop_rvc_stream(services: &Services) -> Result<(), CallError> {
-    services
-        .rvc()
-        .call_ok(ctl::RVC_STOP_STREAM, b"{}")
-        .map(|_| ())
+    services.stop_stream_inner()
 }
 
 fn set_pre_route(services: &Services, route: Route) -> Result<(), CallError> {
@@ -583,9 +641,7 @@ fn reconcile(
         match active {
             Route::Rvc => match resolve_model_id(config, status) {
                 Ok(model_id) => {
-                    let model_matches =
-                        status.model_id.as_deref() == Some(model_id.as_str());
-                    if status.state != "streaming" || !model_matches {
+                    if !realtime_stream_matches(status, &model_id) {
                         if let Err(err) = start_rvc_stream(services, config, &model_id) {
                             degraded.push(format!("rvc stream apply: {}", err.describe()));
                         }
