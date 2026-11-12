@@ -1,4 +1,5 @@
-//! pre DSP：48 kHz 单声道主干增强 + 16 kHz 契约帧打包（SPEC-02）。
+//! mozart-dsp：48 kHz 单声道主干增强 + 16 kHz 契约帧打包（SPEC-02）。
+//! pre 实时链路与 daemon 离线文件降噪共用本 crate，不做两套实现。
 //! 阶段顺序沿用旧 dsp.c `mozart_dsp_enhance`（L104-121）：FL 取单声道（采集侧
 //! 已完成）→ 80 Hz 高通 → WOLA 谱降噪 → gate/AGC/limiter → 主干。
 //! 禁用降噪时整级跳过：不走旧实现的旁路 WOLA 重建，无切换收敛

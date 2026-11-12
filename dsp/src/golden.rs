@@ -30,7 +30,7 @@ const MAX_RMS_DIFF: f64 = 1e-8;
 /// f32 比较（阈值远离夹具信号的实际取值），按位（整数）断言。
 const ENERGY_TOLERANCE: u8 = 1;
 
-/// 夹具目录：仓库根 tests/fixtures/dsp/（pre/ 上一级）。
+/// 夹具目录：仓库根 tests/fixtures/dsp/（dsp/ 上一级）。
 const FIXTURE_DIR: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/../tests/fixtures/dsp");
 
 fn read_f32(name: &str) -> Vec<f32> {

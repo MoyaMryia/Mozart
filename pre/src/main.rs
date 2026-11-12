@@ -14,7 +14,6 @@ mod ai;
 mod alsa_stream;
 mod capture;
 mod control;
-mod dsp;
 mod playback;
 mod route;
 mod state;
@@ -100,7 +99,7 @@ fn process_thread(
     limiter: bool,
 ) -> Result<(), String> {
     // DSP 状态为定长数组，构造后热路径零分配。
-    let mut dsp = dsp::Dsp::new(denoise, gate, agc, limiter);
+    let mut dsp = mozart_dsp::Dsp::new(denoise, gate, agc, limiter);
     while !STOP.load(Ordering::Relaxed) {
         if let Some(mut frame) = capture_ring.pop(Some(PROCESS_POLL)) {
             let conf = dsp.process_frame(&mut frame);
