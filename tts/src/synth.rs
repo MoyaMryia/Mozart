@@ -1,13 +1,14 @@
 //! 合成工作线程：从任务队列取句 → 文本预处理 → PocketTTS 合成 →
-//! 重采样 16 kHz → 契约帧输出。模型加载失败为致命错误（进程退出由 daemon 重启）；
-//! 单句合成失败计数并记录原因，不影响后续任务。SIGTERM 放弃在途合成与队列剩余。
+//! 重采样 48 kHz → 契约帧输出（v1 不走变声，直接喂 pre 播放）。模型加载失败为
+//! 致命错误（进程退出由 daemon 重启）；单句合成失败计数并记录原因，不影响后续
+//! 任务。SIGTERM 放弃在途合成与队列剩余。
 
 use crate::ffi::{self, Synthesizer};
 use crate::jobs::Job;
 use crate::output::FrameWriter;
-use crate::resample::{resample_24k_to_16k, TTS_NATIVE_SAMPLE_RATE};
+use crate::resample::{resample_24k_to_48k, TTS_NATIVE_SAMPLE_RATE};
 use crate::state::Shared;
-use mozart_core::INPUT_SAMPLE_RATE;
+use mozart_core::OUTPUT_SAMPLE_RATE;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering::Relaxed};
 use std::sync::mpsc::{Receiver, RecvTimeoutError};
@@ -128,11 +129,11 @@ fn parse_wav(bytes: &[u8]) -> Result<ReferenceAudio, String> {
     })
 }
 
-/// 原生采样率 → 16 kHz 契约采样率。24 kHz 线性插值；16 kHz 直通；其余拒绝。
-fn to_16k(samples: Vec<f32>, rate: u32) -> Result<Vec<f32>, String> {
+/// 原生采样率 → 48 kHz 播放采样率。24 kHz 线性插值升采样；48 kHz 直通；其余拒绝。
+fn to_48k(samples: Vec<f32>, rate: u32) -> Result<Vec<f32>, String> {
     match rate {
-        INPUT_SAMPLE_RATE => Ok(samples),
-        TTS_NATIVE_SAMPLE_RATE => Ok(resample_24k_to_16k(&samples)),
+        OUTPUT_SAMPLE_RATE => Ok(samples),
+        TTS_NATIVE_SAMPLE_RATE => Ok(resample_24k_to_48k(&samples)),
         _ => Err(format!("不支持的 TTS 采样率 {rate} Hz")),
     }
 }
@@ -183,7 +184,7 @@ pub fn run_with(
         let text = precondition(&job.text);
         let result = engine
             .synthesize(&text, ref_samples, ref_rate)
-            .and_then(|samples| to_16k(samples, engine.sample_rate()));
+            .and_then(|samples| to_48k(samples, engine.sample_rate()));
         match result {
             Ok(pcm) => {
                 if !stop.load(Relaxed) {
@@ -205,6 +206,8 @@ pub fn run_with(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use mozart_core::dgram::FrameSocket;
+    use mozart_core::OutputFrame;
     use std::sync::mpsc;
     use std::sync::Arc;
 
@@ -311,14 +314,16 @@ mod tests {
         }
     }
 
-    /// 临时输出 socket + writer + shared。
-    fn writer_fixture(tag: &str) -> (PathBuf, FrameWriter, Arc<Shared>) {
+    /// 临时输出 socket + 接收方 + writer + shared。接收方先绑定（模拟 pre），
+    /// writer 惰性建链后逐帧送达；_rx 保持存活到用例结束。
+    fn writer_fixture(tag: &str) -> (PathBuf, FrameWriter, Arc<Shared>, FrameSocket<OutputFrame>) {
         let dir = std::env::temp_dir().join(format!("mozart-tts-synth-{tag}-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join("out.sock");
+        let rx = FrameSocket::<OutputFrame>::bind(&path, 8).unwrap();
         let shared = Arc::new(Shared::new());
-        let writer = FrameWriter::bind(&path, shared.clone()).unwrap();
-        (path, writer, shared)
+        let writer = FrameWriter::new(path.clone(), shared.clone());
+        (path, writer, shared, rx)
     }
 
     fn cleanup(path: &Path) {
@@ -332,7 +337,7 @@ mod tests {
 
     #[test]
     fn worker_synthesizes_resamples_and_outputs() {
-        let (path, mut writer, shared) = writer_fixture("ok");
+        let (path, mut writer, shared, _rx) = writer_fixture("ok");
         let (tx, rx) = mpsc::sync_channel(4);
         let stop = AtomicBool::new(false);
         let engine = FakeEngine { rate: TTS_NATIVE_SAMPLE_RATE, outcome: Ok(vec![0.25; 2400]), hook: None };
@@ -353,7 +358,7 @@ mod tests {
 
     #[test]
     fn worker_failure_counts_and_records_reason() {
-        let (path, mut writer, shared) = writer_fixture("fail");
+        let (path, mut writer, shared, _rx) = writer_fixture("fail");
         let (tx, rx) = mpsc::sync_channel(4);
         let stop = AtomicBool::new(false);
         let engine = FakeEngine { rate: TTS_NATIVE_SAMPLE_RATE, outcome: Err("boom".to_string()), hook: None };
@@ -371,26 +376,26 @@ mod tests {
 
     #[test]
     fn worker_rejects_unsupported_rate() {
-        let (path, mut writer, shared) = writer_fixture("rate");
+        let (path, mut writer, shared, _rx) = writer_fixture("rate");
         let (tx, rx) = mpsc::sync_channel(4);
         let stop = AtomicBool::new(false);
-        let engine = FakeEngine { rate: 48000, outcome: Ok(vec![0.25; 4800]), hook: None };
+        let engine = FakeEngine { rate: 44100, outcome: Ok(vec![0.25; 4410]), hook: None };
         tx.send(job("a:1")).unwrap();
         shared.queue_push();
         drop(tx);
         run_with(rx, &engine, None, &mut writer, &shared, &stop);
         let status = shared.status();
         assert_eq!(status.failed, 1);
-        assert!(status.last_error.unwrap().contains("48000"));
+        assert!(status.last_error.unwrap().contains("44100"));
         cleanup(&path);
     }
 
     #[test]
-    fn worker_passes_through_16k() {
-        let (path, mut writer, shared) = writer_fixture("16k");
+    fn worker_passes_through_48k() {
+        let (path, mut writer, shared, _rx) = writer_fixture("48k");
         let (tx, rx) = mpsc::sync_channel(4);
         let stop = AtomicBool::new(false);
-        let engine = FakeEngine { rate: INPUT_SAMPLE_RATE, outcome: Ok(vec![0.25; 320]), hook: None };
+        let engine = FakeEngine { rate: OUTPUT_SAMPLE_RATE, outcome: Ok(vec![0.25; 960]), hook: None };
         tx.send(job("a:1")).unwrap();
         shared.queue_push();
         drop(tx);
@@ -403,7 +408,7 @@ mod tests {
 
     #[test]
     fn stop_during_synthesis_discards_result() {
-        let (path, mut writer, shared) = writer_fixture("stop");
+        let (path, mut writer, shared, _rx) = writer_fixture("stop");
         let (tx, rx) = mpsc::sync_channel(4);
         let stop = AtomicBool::new(false);
         let engine = FakeEngine {
@@ -424,7 +429,7 @@ mod tests {
 
     #[test]
     fn stop_before_run_abandons_queue() {
-        let (path, mut writer, shared) = writer_fixture("prestop");
+        let (path, mut writer, shared, _rx) = writer_fixture("prestop");
         let (tx, rx) = mpsc::sync_channel(4);
         let stop = AtomicBool::new(true);
         let engine = FakeEngine { rate: TTS_NATIVE_SAMPLE_RATE, outcome: Ok(vec![0.25; 2400]), hook: None };

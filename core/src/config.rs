@@ -204,7 +204,8 @@ pub struct TtsConfig {
     pub socket: String,
     /// 任务面：tts 绑定收合成任务，bridge 连接发送。
     pub jobs_socket: String,
-    /// 数据面：重采样 16 kHz 音频输出 socket（播报喂入 RVC，见 FUTURE）。
+    /// 数据面：48 kHz 播报音频输出 socket（pre 绑定收帧播放，TTS 连接发送；
+    /// v1 不走变声，经变声喂 RVC 见 FUTURE）。
     pub output_socket: String,
     /// PocketTTS 模型目录。
     pub model_dir: PathBuf,

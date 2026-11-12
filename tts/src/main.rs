@@ -1,8 +1,8 @@
 //! mozart-tts：播报合成进程（SPEC-05）。
 //! 线程结构：jobs（tts-jobs.sock SEQPACKET 收任务 → 有界队列）→ synth（PocketTTS
-//! 合成 + 24 kHz→16 kHz 重采样 + 契约帧输出 tts-out.sock）；控制线程独立服务 tts.sock。
-//! 计数全部原子，控制只读。v1 输出侧由 TTS 绑定 tts-out.sock，接收方接 RVC 留 FUTURE，
-//! 无接收方时发送丢弃并计数。
+//! 合成 + 24 kHz→48 kHz 重采样 + 契约帧输出 tts-out.sock）；控制线程独立服务 tts.sock。
+//! 计数全部原子，控制只读。v1 不走变声：pre 绑定 tts-out.sock 收帧播放，TTS 连接
+//! 发送，惰性建链，pre 未就绪时发送丢弃并计数。
 //! 停止：SIGTERM/SIGINT 置停止标志；放弃在途合成与队列剩余，在 daemon 2 s 宽限内退出。
 
 mod control;
@@ -124,8 +124,8 @@ fn run(cli: Cli) -> Result<(), String> {
     jobs_listener
         .listen(4)
         .map_err(|err| format!("listen：{err}"))?;
-    let mut writer = output::FrameWriter::bind(&config.tts_output_socket(), shared.clone())
-        .map_err(|err| format!("绑定 {}：{err}", config.tts_output_socket().display()))?;
+    // 输出侧惰性建链：pre 绑定 tts-out.sock，TTS 连接发送；pre 未就绪不阻塞启动。
+    let mut writer = output::FrameWriter::new(config.tts_output_socket(), shared.clone());
 
     // 参考 WAV 启动时加载；未配置则无参考音频。
     let reference = if config.tts.reference_wav.as_os_str().is_empty() {

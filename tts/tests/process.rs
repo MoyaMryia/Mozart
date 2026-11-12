@@ -1,11 +1,11 @@
 //! 进程级集成测试（stub 模式，无需 sherpa 库）：spawn mozart-tts 二进制，
 //! 控制面 Hello/GetStatus，任务面提交/受理应答，输出帧计数，SIGTERM 收尾。
-//! v1 输出侧 TTS 绑定 tts-out.sock、无接收方：帧发送全部丢弃计数，
-//! 音频内容正确性由 resample/output 单元测试钉住。
+//! v1 输出侧 pre 绑定 tts-out.sock、TTS 连接发送：用例先绑定接收方模拟 pre，
+//! 验证 OutputFrame 逐帧送达；音频内容正确性由 resample/output 单元测试钉住。
 
 use mozart_core::ctl::{self, Seqpacket};
 use mozart_core::dgram::FrameSocket;
-use mozart_core::InputFrame;
+use mozart_core::OutputFrame;
 use serde_json::{json, Value};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, ExitStatus};
@@ -64,12 +64,11 @@ fn wait_until(what: &str, timeout: Duration, pred: impl Fn() -> bool) {
     }
 }
 
-/// 三个 socket 文件就绪（控制面先绑，输出面最后）。
+/// 两个绑定 socket 就绪（控制面 + 任务面）。输出面 tts-out.sock 由接收方
+/// （pre 或本用例）绑定，TTS 惰性连接，不在 TTS 侧创建。
 fn wait_sockets(dir: &Path) {
     wait_until("socket 就绪", Duration::from_secs(5), || {
-        dir.join("tts.sock").exists()
-            && dir.join("tts-jobs.sock").exists()
-            && dir.join("tts-out.sock").exists()
+        dir.join("tts.sock").exists() && dir.join("tts-jobs.sock").exists()
     });
 }
 
@@ -174,6 +173,8 @@ fn stub_process_control_and_clean_exit() {
 #[test]
 fn job_submit_reply_and_output_frames() {
     let dir = run_dir("job");
+    // 接收方先绑定 tts-out.sock（模拟 pre）：TTS 惰性建链后逐帧送达。
+    let rx = FrameSocket::<OutputFrame>::bind(&dir.join("tts-out.sock"), 8).unwrap();
     let mut child = spawn_tts(&dir, "");
     wait_sockets(&dir);
 
@@ -192,7 +193,7 @@ fn job_submit_reply_and_output_frames() {
     assert_eq!(reply["utterance_id"], "ab12cd34:1");
     assert!(reply.get("reason").is_none());
 
-    // stub 合成 0.1 s @ 24 kHz → 1600 samples @ 16 kHz → 恰 5 契约帧。
+    // stub 合成 0.1 s @ 24 kHz → 4800 samples @ 48 kHz → 恰 5 契约帧。
     wait_until("合成完成", Duration::from_secs(5), || {
         get_status(&control)["synthesized"] == 1
     });
@@ -201,12 +202,18 @@ fn job_submit_reply_and_output_frames() {
     assert_eq!(status["queue_depth"], 0);
     assert_eq!(status["state"], "idle");
     assert_eq!(status["frames_out"], 5);
-    // v1 无接收方：绑定侧发送全部丢弃计数。
-    assert_eq!(status["output_dropped"], 5);
+    // 接收方在场：帧全部送达，无丢弃。
+    assert_eq!(status["output_dropped"], 0);
 
-    // 输出 socket 已绑定可连接（接收方接 RVC 留 FUTURE）。
-    let probe = FrameSocket::<InputFrame>::connect(&dir.join("tts-out.sock"), 8).unwrap();
-    drop(probe);
+    // 5 个 OutputFrame 逐帧送达，meta 时序正确（音频内容由单元测试钉住）。
+    for idx in 0..5u32 {
+        let frame = rx.recv(Some(Duration::from_secs(2))).unwrap();
+        // packed 字段经解构按值读取，不能取引用。
+        let mozart_core::FrameMeta { frame_idx, pts_ns, vad_flag, .. } = frame.meta;
+        assert_eq!(frame_idx, idx);
+        assert_eq!(pts_ns, idx as u64 * 20_000_000);
+        assert_eq!(vad_flag, 1);
+    }
 
     sigterm(&child.0);
     let status = wait_exit(&mut child.0, Duration::from_secs(2));
