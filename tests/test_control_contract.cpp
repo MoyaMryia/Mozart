@@ -11,6 +11,15 @@ static_assert(MOZART_CTL_MAX_BODY_BYTES == 65536);
 static_assert(MOZART_CTL_DAEMON_HELLO == 0x0101);
 static_assert(MOZART_CTL_PRE_GET_STATUS == 0x0204);
 static_assert(MOZART_CTL_RVC_GET_STATUS == 0x0306);
+static_assert(MOZART_CTL_ASR_HELLO == 0x0401);
+static_assert(MOZART_CTL_ASR_GET_STATUS == 0x0402);
+static_assert(MOZART_CTL_TTS_HELLO == 0x0501);
+static_assert(MOZART_CTL_TTS_GET_STATUS == 0x0502);
+static_assert(MOZART_CTL_BRIDGE_HELLO == 0x0601);
+static_assert(MOZART_CTL_BRIDGE_GET_STATUS == 0x0602);
+static_assert(MOZART_CTL_BRIDGE_TRANSLATE_SET == 0x0603);
+static_assert(MOZART_CTL_BRIDGE_SPEECH_SET == 0x0604);
+static_assert(MOZART_CTL_BRIDGE_SPEECH_STOP == 0x0605);
 
 int main() {
     const mozart_ctl_header_t header{
