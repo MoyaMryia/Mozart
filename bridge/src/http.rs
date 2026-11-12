@@ -27,6 +27,13 @@ const POLL_STEP: Duration = Duration::from_millis(100);
 /// 响应体上限：翻译输出远小于此，超限按坏响应处理。
 const MAX_RESPONSE_BYTES: usize = 1024 * 1024;
 
+/// 一次推理结果：译文正文与结束原因（质检需要 finish_reason=length 判截断）。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Completion {
+    pub content: String,
+    pub finish_reason: Option<String>,
+}
+
 pub struct LlamaClient {
     socket: PathBuf,
     timeout: Duration,
@@ -48,7 +55,7 @@ impl LlamaClient {
 
     /// 一次翻译请求。失败返回原因（连接、超时、HTTP 状态、响应解析）；
     /// 停止标志置位时尽快返回 Err，由调用方决定是否计数。
-    pub fn translate(&self, text: &str, stop: &AtomicBool) -> Result<String, String> {
+    pub fn translate(&self, text: &str, stop: &AtomicBool) -> Result<Completion, String> {
         let stream = UnixStream::connect(&self.socket)
             .map_err(|err| format!("connect {}：{err}", self.socket.display()))?;
         let raw = exchange(&stream, &build_request(text), self.timeout, stop)?;
@@ -184,8 +191,8 @@ fn response_complete(response: &[u8]) -> Result<bool, String> {
     Ok(false)
 }
 
-/// 解析响应：状态码、分帧（Content-Length/chunked/关闭）、choices[0].message.content。
-pub fn parse_response(raw: &[u8]) -> Result<String, String> {
+/// 解析响应：状态码、分帧（Content-Length/chunked/关闭）、choices[0] 的正文与结束原因。
+pub fn parse_response(raw: &[u8]) -> Result<Completion, String> {
     let head_end = find_subslice(raw, b"\r\n\r\n")
         .ok_or_else(|| "malformed HTTP response: no header terminator".to_string())?;
     let head = std::str::from_utf8(&raw[..head_end])
@@ -215,10 +222,16 @@ pub fn parse_response(raw: &[u8]) -> Result<String, String> {
     };
     let value: Value = serde_json::from_slice(&body)
         .map_err(|err| format!("invalid response JSON: {err}"))?;
-    value["choices"][0]["message"]["content"]
+    let choice = &value["choices"][0];
+    let content = choice["message"]["content"]
         .as_str()
         .map(|content| content.to_string())
-        .ok_or_else(|| "missing choices[0].message.content".to_string())
+        .ok_or_else(|| "missing choices[0].message.content".to_string())?;
+    let finish_reason = choice["finish_reason"].as_str().map(|reason| reason.to_string());
+    Ok(Completion {
+        content,
+        finish_reason,
+    })
 }
 
 /// chunked 解码：尺寸行（十六进制，忽略扩展）+ 数据块，0 块结束（忽略尾部）。
@@ -293,7 +306,7 @@ mod tests {
 
         let client = LlamaClient::new(path);
         let stop = AtomicBool::new(false);
-        assert_eq!(client.translate("你好", &stop).unwrap(), "Hello.");
+        assert_eq!(client.translate("你好", &stop).unwrap().content, "Hello.");
 
         let requests = server.join().unwrap();
         assert_eq!(requests.len(), 1);
@@ -326,8 +339,8 @@ mod tests {
 
         let client = LlamaClient::new(path);
         let stop = AtomicBool::new(false);
-        assert_eq!(client.translate("甲", &stop).unwrap(), "Hi there.");
-        assert_eq!(client.translate("乙", &stop).unwrap(), "Bye.");
+        assert_eq!(client.translate("甲", &stop).unwrap().content, "Hi there.");
+        assert_eq!(client.translate("乙", &stop).unwrap().content, "Bye.");
         server.join().unwrap();
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -405,6 +418,17 @@ mod tests {
         // chunked 坏帧。
         assert!(decode_chunks(b"zz\r\n").is_err());
         assert!(decode_chunks(b"5\r\nabc").is_err());
+    }
+
+    #[test]
+    fn parse_response_reads_finish_reason() {
+        let raw = b"HTTP/1.1 200 OK\r\n\r\n{\"choices\":[{\"message\":{\"content\":\"Hello.\"},\"finish_reason\":\"length\"}]}";
+        let completion = parse_response(raw).unwrap();
+        assert_eq!(completion.content, "Hello.");
+        assert_eq!(completion.finish_reason.as_deref(), Some("length"));
+        // 缺 finish_reason 时为 None（不触发截断判定）。
+        let raw = b"HTTP/1.1 200 OK\r\n\r\n{\"choices\":[{\"message\":{\"content\":\"Hi.\"}}]}";
+        assert_eq!(parse_response(raw).unwrap().finish_reason, None);
     }
 
     #[test]

@@ -860,8 +860,8 @@ fn speech_stop_clears_pending_queue() {
     let control = connect_control(&dir);
     let conn = asr.accept();
 
-    for seq in 1..=3 {
-        conn.send_event(&event("final", "s", seq, &format!("句{seq}")));
+    for (seq, text) in ["甲", "乙", "丙"].into_iter().enumerate() {
+        conn.send_event(&event("final", "s", seq as u64 + 1, text));
     }
     wait_until("待播报队列积压", Duration::from_secs(5), || {
         get_status(&control)["speech_queue_depth"].as_u64().unwrap() >= 1

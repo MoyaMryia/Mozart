@@ -4,11 +4,13 @@
 //! 质检拒绝只计数，不投递播报。translate off 时跳过在队句（原文已发布）。
 //! 写字幕失败与字幕线程同纪律：致命退出，由 daemon 重启。
 
+use crate::checks::ContextItem;
 use crate::http::LlamaClient;
 use crate::preprocess::{self, Glossary};
 use crate::quality;
 use crate::state::{Queues, Shared, SpeechJob, TranslateJob};
 use crate::subtitles::SubtitleStore;
+use std::collections::VecDeque;
 use std::sync::atomic::{AtomicBool, Ordering::Relaxed};
 use std::sync::mpsc::RecvTimeoutError;
 use std::sync::Arc;
@@ -16,6 +18,9 @@ use std::time::Duration;
 
 /// 取件轮询步长：让停止标志在宽限期内生效。
 const RECV_POLL: Duration = Duration::from_millis(100);
+
+/// 上下文重复检查保留的先前句对数（桥侧维护，ASR 事件暂不携带 translation_context）。
+const CONTEXT_HISTORY: usize = 8;
 
 /// 降级原因：翻译重试耗尽（整句成功时解除；具体原因见最近失败原因字段）。
 pub const DEGRADED_TRANSLATE_FAILED: &str = "translation failed";
@@ -30,6 +35,7 @@ pub fn run(
     stop: &AtomicBool,
 ) -> Result<(), String> {
     let glossary = Glossary::empty();
+    let mut context: VecDeque<ContextItem> = VecDeque::new();
     while !stop.load(Relaxed) {
         let job = match queues.recv_translate(RECV_POLL) {
             Ok(job) => job,
@@ -41,7 +47,7 @@ pub fn run(
         if !shared.translate_enabled() {
             continue;
         }
-        process_job(&job, &queues, &shared, &store, &client, retry_max, &glossary, stop)?;
+        process_job(&job, &queues, &shared, &store, &client, retry_max, &glossary, &mut context, stop)?;
     }
     Ok(())
 }
@@ -55,16 +61,19 @@ fn process_job(
     client: &LlamaClient,
     retry_max: u32,
     glossary: &Glossary,
+    context: &mut VecDeque<ContextItem>,
     stop: &AtomicBool,
 ) -> Result<(), String> {
     let text = preprocess::process(&job.text, glossary);
     let stats = shared.translate_stats();
     let mut retries = 0u32;
-    let content = loop {
+    // 重试仅针对传输/解析失败（连接、超时、HTTP 状态、坏响应）；
+    // 质检拒绝不重试（旧带增强提示词的重试留 FUTURE）。
+    let completion = loop {
         match client.translate(&text, stop) {
-            Ok(content) => {
+            Ok(completion) => {
                 stats.attempt_ok();
-                break Some(content);
+                break Some(completion);
             }
             Err(reason) => {
                 stats.attempt_fail(&reason);
@@ -83,14 +92,14 @@ fn process_job(
             }
         }
     };
-    let Some(content) = content else {
+    let Some(completion) = completion else {
         return Ok(());
     };
     if stop.load(Relaxed) {
         return Ok(());
     }
-    let content = content.trim();
-    if let Err(reason) = quality::check(&job.text, content) {
+    let content = completion.content.trim();
+    if let Err(reason) = quality::check(&job.text, content, completion.finish_reason.as_deref(), context.make_contiguous()) {
         stats.add_qc_rejected();
         eprintln!("mozart-bridge: qc reject {}：{reason}", job.utterance_id);
         return Ok(());
@@ -99,6 +108,14 @@ fn process_job(
     store.publish_translation(&job.utterance_id, content, shared)?;
     stats.add_translated();
     shared.resolve(DEGRADED_TRANSLATE_FAILED);
+    // 记入上下文供后续句的重复检查；只保留最近若干句对。
+    context.push_back(ContextItem {
+        source: job.text.clone(),
+        translation: content.to_string(),
+    });
+    while context.len() > CONTEXT_HISTORY {
+        context.pop_front();
+    }
     if shared.speech_enabled() {
         queues.push_speech(SpeechJob {
             utterance_id: job.utterance_id.clone(),
@@ -245,6 +262,7 @@ mod tests {
             text: "你好".to_string(),
         };
         let client = LlamaClient::new(socket);
+        let mut context = VecDeque::new();
         process_job(
             &job,
             &fixture.queues,
@@ -253,6 +271,7 @@ mod tests {
             &client,
             2,
             &Glossary::empty(),
+            &mut context,
             &fixture.stop,
         )
         .unwrap();
@@ -283,6 +302,7 @@ mod tests {
             text: "你好".to_string(),
         };
         let client = LlamaClient::new(socket);
+        let mut context = VecDeque::new();
         process_job(
             &job,
             &fixture.queues,
@@ -291,6 +311,7 @@ mod tests {
             &client,
             2,
             &Glossary::empty(),
+            &mut context,
             &fixture.stop,
         )
         .unwrap();
@@ -330,6 +351,7 @@ mod tests {
             text: "你好".to_string(),
         };
         let client = LlamaClient::new(socket);
+        let mut context = VecDeque::new();
         process_job(
             &job,
             &fixture.queues,
@@ -338,6 +360,7 @@ mod tests {
             &client,
             2,
             &Glossary::empty(),
+            &mut context,
             &fixture.stop,
         )
         .unwrap();

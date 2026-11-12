@@ -8,6 +8,7 @@
 //! 丢弃在途队列，字幕存档已逐行 flush，在 daemon 2 s 宽限内退出。
 
 mod control;
+mod checks;
 mod events;
 mod http;
 mod preprocess;
