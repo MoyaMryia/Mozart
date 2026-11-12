@@ -200,6 +200,7 @@ fn run(cli: Cli) -> Result<(), String> {
         })
         .map_err(|err| format!("启动翻译线程：{err}"))?
     };
+    let control_tts_path = tts_jobs_path.clone();
     let speech_handle = {
         let shared = shared.clone();
         let queues = queues.clone();
@@ -215,7 +216,7 @@ fn run(cli: Cli) -> Result<(), String> {
         let queues = queues.clone();
         spawn_thread("mozart-bridge-control", move || {
             guard_panic(move || {
-                control::serve(listener, shared, queues, &STOP);
+                control::serve(listener, shared, queues, control_tts_path, &STOP);
                 Ok(())
             })
         })

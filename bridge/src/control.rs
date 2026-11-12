@@ -8,6 +8,7 @@ use mozart_core::ctl::{self, Message, Seqpacket};
 use serde::Deserialize;
 use serde_json::json;
 use std::io;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering::Relaxed};
 use std::sync::Arc;
 use std::time::Duration;
@@ -36,6 +37,7 @@ pub fn serve(
     listener: Seqpacket,
     shared: Arc<Shared>,
     queues: Arc<Queues>,
+    tts_jobs_path: PathBuf,
     stop: &'static AtomicBool,
 ) {
     while !stop.load(Relaxed) {
@@ -53,11 +55,17 @@ pub fn serve(
                 continue;
             }
         };
-        serve_connection(&conn, &shared, &queues, stop);
+        serve_connection(&conn, &shared, &queues, &tts_jobs_path, stop);
     }
 }
 
-fn serve_connection(conn: &Seqpacket, shared: &Shared, queues: &Queues, stop: &AtomicBool) {
+fn serve_connection(
+    conn: &Seqpacket,
+    shared: &Shared,
+    queues: &Queues,
+    tts_jobs_path: &Path,
+    stop: &AtomicBool,
+) {
     let mut idle = Duration::ZERO;
     while !stop.load(Relaxed) {
         let msg = match conn.recv(Some(RECV_POLL)) {
@@ -78,7 +86,7 @@ fn serve_connection(conn: &Seqpacket, shared: &Shared, queues: &Queues, stop: &A
         idle = Duration::ZERO;
         let type_ = msg.header.type_;
         let request_id = msg.header.request_id;
-        let reply = dispatch(&msg, shared, queues);
+        let reply = dispatch(&msg, shared, queues, tts_jobs_path);
         if conn.send(type_, request_id, &reply).is_err() {
             return;
         }
@@ -86,7 +94,7 @@ fn serve_connection(conn: &Seqpacket, shared: &Shared, queues: &Queues, stop: &A
 }
 
 /// 命令分发。请求体在入口校验一次；未知命令拒绝。
-pub fn dispatch(msg: &Message, shared: &Shared, queues: &Queues) -> Vec<u8> {
+pub fn dispatch(msg: &Message, shared: &Shared, queues: &Queues, tts_jobs_path: &Path) -> Vec<u8> {
     match msg.header.type_ {
         ctl::BRIDGE_HELLO => ok_body(json!({ "version": VERSION })),
         ctl::BRIDGE_GET_STATUS => {
@@ -117,7 +125,9 @@ pub fn dispatch(msg: &Message, shared: &Shared, queues: &Queues) -> Vec<u8> {
             if let Err(reason) = parse_stop(&msg.body) {
                 return error_body(ctl::CODE_INVALID_ARGUMENT, &reason);
             }
-            // 关播报并清空待播报队列（在途丢弃）；先存档再清队列，失败整体被拒。
+            // 先向 TTS 下发停止（中止在途合成），再关开关、清桥队列。
+            // TTS 缺席只记降级，不阻断桥侧停止。
+            crate::speech::send_stop(tts_jobs_path, shared);
             let switches = Switches {
                 translate_enabled: shared.translate_enabled(),
                 speech_enabled: false,
@@ -193,6 +203,10 @@ mod tests {
                 queues: Queues::new(4, 4),
             }
         }
+
+        fn tts_path(&self) -> PathBuf {
+            self.dir.join("tts-jobs.sock")
+        }
     }
 
     impl Drop for Fixture {
@@ -223,7 +237,7 @@ mod tests {
     #[test]
     fn hello_reports_version() {
         let fixture = Fixture::new("hello");
-        let reply = dispatch(&message(ctl::BRIDGE_HELLO, b""), &fixture.shared, &fixture.queues);
+        let reply = dispatch(&message(ctl::BRIDGE_HELLO, b""), &fixture.shared, &fixture.queues, &fixture.tts_path());
         assert_eq!(data(&reply)["version"], VERSION);
     }
 
@@ -242,7 +256,7 @@ mod tests {
         let reply = dispatch(
             &message(ctl::BRIDGE_GET_STATUS, b""),
             &fixture.shared,
-            &fixture.queues,
+            &fixture.queues, &fixture.tts_path(),
         );
         let status = data(&reply);
         assert_eq!(status["translate_enabled"], true);
@@ -269,7 +283,7 @@ mod tests {
         let reply = dispatch(
             &message(ctl::BRIDGE_GET_STATUS, b""),
             &fixture.shared,
-            &fixture.queues,
+            &fixture.queues, &fixture.tts_path(),
         );
         let status = data(&reply);
         assert_eq!(status["translated"], 1);
@@ -285,7 +299,7 @@ mod tests {
         let reply = dispatch(
             &message(ctl::BRIDGE_TRANSLATE_SET, br#"{"enabled":false}"#),
             &fixture.shared,
-            &fixture.queues,
+            &fixture.queues, &fixture.tts_path(),
         );
         assert_eq!(data(&reply)["translate_enabled"], false);
         assert!(!fixture.shared.translate_enabled());
@@ -303,7 +317,7 @@ mod tests {
         let reply = dispatch(
             &message(ctl::BRIDGE_TRANSLATE_SET, br#"{"enabled":true}"#),
             &fixture.shared,
-            &fixture.queues,
+            &fixture.queues, &fixture.tts_path(),
         );
         assert_eq!(data(&reply)["translate_enabled"], true);
         assert!(fixture.shared.translate_enabled());
@@ -315,7 +329,7 @@ mod tests {
         let reply = dispatch(
             &message(ctl::BRIDGE_SPEECH_SET, br#"{"enabled":false}"#),
             &fixture.shared,
-            &fixture.queues,
+            &fixture.queues, &fixture.tts_path(),
         );
         assert_eq!(data(&reply)["speech_enabled"], false);
         assert!(!fixture.shared.speech_enabled());
@@ -347,7 +361,7 @@ mod tests {
             let reply = dispatch(
                 &message(ctl::BRIDGE_SPEECH_STOP, body),
                 &fixture.shared,
-                &fixture.queues,
+                &fixture.queues, &fixture.tts_path(),
             );
             let result = data(&reply);
             assert_eq!(result["speech_enabled"], false);
@@ -374,7 +388,7 @@ mod tests {
                 br#"{"enabled":true,"x":1}"#,
                 b"not json",
             ] {
-                let reply = dispatch(&message(type_, body), &fixture.shared, &fixture.queues);
+                let reply = dispatch(&message(type_, body), &fixture.shared, &fixture.queues, &fixture.tts_path());
                 assert_eq!(error_code(&reply), ctl::CODE_INVALID_ARGUMENT);
             }
         }
@@ -382,7 +396,7 @@ mod tests {
             let reply = dispatch(
                 &message(ctl::BRIDGE_SPEECH_STOP, body),
                 &fixture.shared,
-                &fixture.queues,
+                &fixture.queues, &fixture.tts_path(),
             );
             assert_eq!(error_code(&reply), ctl::CODE_INVALID_ARGUMENT);
         }
@@ -394,7 +408,50 @@ mod tests {
     #[test]
     fn unknown_command_is_rejected() {
         let fixture = Fixture::new("unknown");
-        let reply = dispatch(&message(ctl::ASR_HELLO, b""), &fixture.shared, &fixture.queues);
+        let reply = dispatch(&message(ctl::ASR_HELLO, b""), &fixture.shared, &fixture.queues, &fixture.tts_path());
         assert_eq!(error_code(&reply), ctl::CODE_UNKNOWN_COMMAND);
+    }
+
+    #[test]
+    fn speech_stop_sends_tts_job_stop() {
+        let fixture = Fixture::new("stop-tts");
+        let path = fixture.tts_path();
+        let listener = Seqpacket::bind(&path).unwrap();
+        listener.listen(1).unwrap();
+        let server = std::thread::spawn(move || {
+            let conn = listener.accept().unwrap();
+            let msg = conn.recv(Some(Duration::from_secs(2))).unwrap();
+            msg.header.type_
+        });
+        let reply = dispatch(
+            &message(ctl::BRIDGE_SPEECH_STOP, b"{}"),
+            &fixture.shared,
+            &fixture.queues,
+            &path,
+        );
+        assert_eq!(data(&reply)["speech_enabled"], false);
+        // 桥侧 speech stop 向 TTS 下发 TTS_JOB_STOP。
+        assert_eq!(server.join().unwrap(), ctl::TTS_JOB_STOP);
+    }
+
+    #[test]
+    fn speech_stop_succeeds_when_tts_absent() {
+        let fixture = Fixture::new("stop-absent");
+        fixture.queues.push_speech(SpeechJob {
+            utterance_id: "s:1".to_string(),
+            text: "hello".to_string(),
+        });
+        // TTS 缺席：停止下发失败只记降级，桥侧仍关开关并清队列。
+        let reply = dispatch(
+            &message(ctl::BRIDGE_SPEECH_STOP, b"{}"),
+            &fixture.shared,
+            &fixture.queues,
+            &fixture.tts_path(),
+        );
+        let result = data(&reply);
+        assert_eq!(result["speech_enabled"], false);
+        assert_eq!(result["queue_cleared"], 1);
+        assert!(!fixture.shared.speech_enabled());
+        assert_eq!(fixture.queues.speech_depth(), 0);
     }
 }

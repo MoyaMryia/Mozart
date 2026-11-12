@@ -8,7 +8,7 @@ use crate::state::{Queues, Shared, SpeechJob};
 use mozart_core::ctl::{self, Seqpacket};
 use serde::Deserialize;
 use serde_json::json;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering::Relaxed};
 use std::sync::mpsc::RecvTimeoutError;
 use std::sync::Arc;
@@ -148,6 +148,21 @@ fn submit(conn: &Seqpacket, request_id: u32, job: &SpeechJob) -> Result<JobStatu
             Ok(JobStatus::Failed)
         }
         other => Err(format!("unknown job status: {other}")),
+    }
+}
+
+/// speech stop：向 TTS 下发 TTS_JOB_STOP（清任务队列并中止在途合成，TTS 侧处理见 Wave 2）。
+/// 尽力而为：TTS 缺席或拒收只记降级，不阻断桥侧关开关与清队列。
+pub fn send_stop(path: &Path, shared: &Shared) {
+    let result = Seqpacket::connect_timeout(path, Some(CONNECT_TIMEOUT))
+        .map_err(|err| format!("connect {}：{err}", path.display()))
+        .and_then(|conn| {
+            conn.send_timeout(ctl::TTS_JOB_STOP, 0, b"", Some(IO_TIMEOUT))
+                .map_err(|err| format!("send：{err}"))
+        });
+    if let Err(reason) = result {
+        shared.degrade(DEGRADED_TTS_JOBS);
+        eprintln!("mozart-bridge: tts stop：{reason}");
     }
 }
 
