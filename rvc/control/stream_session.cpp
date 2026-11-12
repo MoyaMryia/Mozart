@@ -341,8 +341,8 @@ private:
 
 InferenceBackend::InferenceBackend(const InferenceBackendConfig& config)
     : config_(config) {
-    // hubert 传裸路径（RealRVCPipeline 契约），rmvpe/实时资产走 optional
-    // （缺省回落内置引擎），此处不做二次包装。
+    // hubert 传裸路径，rmvpe 与实时资产传 optional（RealRVCPipeline 契约）；
+    // 配置为空保持 nullopt，不在此处二次包装。
     std::optional<std::filesystem::path> rmvpe;
     std::optional<std::filesystem::path> realtime_hubert;
     std::optional<std::filesystem::path> realtime_rmvpe;
