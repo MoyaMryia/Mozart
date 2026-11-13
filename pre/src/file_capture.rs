@@ -411,7 +411,7 @@ mod tests {
         let samples = ramp(RAW_SAMPLES * 2);
         let path = temp_wav("run", &WavBuilder::mono(&samples).bytes());
         let ring = Arc::new(Ring::<RawFrame>::new(8));
-        let shared = Arc::new(Shared::new("cap".to_string(), "play".to_string()));
+        let shared = Arc::new(Shared::new("cap".to_string(), "play".to_string(), "startup".to_string()));
 
         // 计时起点先于线程启动：run 内部起点不早于此，下界断言无竞态。
         let started = Instant::now();
@@ -455,7 +455,7 @@ mod tests {
         static STOP: AtomicBool = AtomicBool::new(false);
         let path = temp_wav("one", &WavBuilder::mono(&[12345]).bytes());
         let ring = Arc::new(Ring::<RawFrame>::new(4));
-        let shared = Arc::new(Shared::new("cap".to_string(), "play".to_string()));
+        let shared = Arc::new(Shared::new("cap".to_string(), "play".to_string(), "startup".to_string()));
         let worker = {
             let ring = ring.clone();
             let shared = shared.clone();
@@ -477,7 +477,7 @@ mod tests {
         let samples = ramp(RAW_SAMPLES + 100);
         let path = temp_wav("wrap", &WavBuilder::mono(&samples).bytes());
         let ring = Arc::new(Ring::<RawFrame>::new(4));
-        let shared = Arc::new(Shared::new("cap".to_string(), "play".to_string()));
+        let shared = Arc::new(Shared::new("cap".to_string(), "play".to_string(), "startup".to_string()));
         let worker = {
             let ring = ring.clone();
             let shared = shared.clone();
@@ -504,7 +504,7 @@ mod tests {
         static STOP: AtomicBool = AtomicBool::new(false);
         let path = temp_wav("bad", b"not a wav at all");
         let ring = Arc::new(Ring::<RawFrame>::new(4));
-        let shared = Arc::new(Shared::new("cap".to_string(), "play".to_string()));
+        let shared = Arc::new(Shared::new("cap".to_string(), "play".to_string(), "startup".to_string()));
         let err = run(&path, ring, shared.clone(), &STOP).expect_err("契约失败必须报错");
         assert!(err.contains("capture file"));
         let status = shared.status(QueueReadout {
@@ -523,7 +523,7 @@ mod tests {
         static STOP: AtomicBool = AtomicBool::new(false);
         let path = temp_wav("stop", &WavBuilder::mono(&ramp(RAW_SAMPLES)).bytes());
         let ring = Arc::new(Ring::<RawFrame>::new(4));
-        let shared = Arc::new(Shared::new("cap".to_string(), "play".to_string()));
+        let shared = Arc::new(Shared::new("cap".to_string(), "play".to_string(), "startup".to_string()));
         let worker = {
             let ring = ring.clone();
             let shared = shared.clone();
