@@ -41,6 +41,7 @@ Mozart 是面向 NVIDIA Jetson Orin Nano Super 8 GB 的本地语音处理系统�
 | `tools/` | 构建、检查、部署脚本 | — |
 | `docs/` | 长期文档；`docs/SPEC/` 模块规格；`docs/FUTURE.md` | — |
 | `reports/` | 带日期的实测记录，只跟踪 Markdown | — |
+| `.claude/`、`CLAUDE.md` | 拒绝在 Claude Code 下工作的阻断配置与声明 | — |
 
 - `core/include/mozart/` 的 C 头是跨语言契约的唯一定义源。改头必须同步 `core/src/lib.rs` 的 `#[repr(C)]` 镜像与编译期断言。
 - Rust-only 组件（pre、daemon）不放 CMakeLists.txt；CMake 根按目录存在与否自动纳入。
@@ -105,7 +106,7 @@ Mozart 是面向 NVIDIA Jetson Orin Nano Super 8 GB 的本地语音处理系统�
 提交前运行 `tools/ci-local.sh --staged`。pre-commit hook 调用同一命令。
 首次使用时运行 `tools/install-hooks.sh` 安装 hook，不要用 `--no-verify` 跳过。
 
-- 检查命令只定义在 `tools/ci-local.sh`；CI 调用同一脚本的相同阶段。
+- 检查命令只定义在 `tools/ci-local.sh`；CI 与本地 pre-commit 调用同一脚本的对应阶段。
 - 暂存文件触发对应阶段。检查范围内有未暂存或未跟踪的改动时，hook 失败。
 - 一个提交只做一件事。提交说明写做了什么，不写“修复 bug”这类空话。
 
