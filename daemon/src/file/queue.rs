@@ -192,6 +192,20 @@ impl FileQueue {
         }
     }
 
+    /// 协调器中止（pre 重启失接管等）：仅 processing → cancelling 并带失败
+    /// 原因；其余状态让位，返回当前态。与用户 cancel 的区别在 settle：
+    /// 带原因落 failed（原因可查），用户取消无原因仍落 cancelled。
+    pub fn abort(&mut self, job_id: &str, reason: String) -> Result<FileJobState, QueueError> {
+        let job = self.find(job_id)?;
+        if job.state != FileJobState::Processing {
+            return Ok(job.state);
+        }
+        job.state = FileJobState::Cancelling;
+        job.error = Some(reason);
+        self.persist().map_err(QueueError::Io)?;
+        Ok(FileJobState::Cancelling)
+    }
+
     pub fn status(&self, job_id: &str) -> Option<FileJob> {
         self.jobs.iter().find(|job| job.job_id == job_id).cloned()
     }
@@ -263,8 +277,9 @@ impl FileQueue {
         self.settle(job_id, FileJobState::Cancelled, None, false)
     }
 
-    /// 终态落盘。任务处于 cancelling 时取消意图获胜，一律落 cancelled；
-    /// 返回实际终态，调用方据此清理源副本。
+    /// 终态落盘。任务处于 cancelling 时取消意图获胜：协调器中止带失败原因
+    /// 落 failed（原因保留可查），用户取消无原因落 cancelled；返回实际终态，
+    /// 调用方据此清理源副本。
     fn settle(
         &mut self,
         job_id: &str,
@@ -273,10 +288,13 @@ impl FileQueue {
         result_ready: bool,
     ) -> Result<FileJobState, QueueError> {
         let job = self.find(job_id)?;
-        let state = if job.state == FileJobState::Cancelling {
-            FileJobState::Cancelled
+        let (state, error) = if job.state == FileJobState::Cancelling {
+            match job.error.take() {
+                Some(reason) => (FileJobState::Failed, Some(reason)),
+                None => (FileJobState::Cancelled, None),
+            }
         } else {
-            state
+            (state, error)
         };
         job.state = state;
         job.error = error;
@@ -487,6 +505,49 @@ mod tests {
         let other = submit(&mut queue, "b.wav");
         queue.cancel(&storage, &other.job_id).unwrap(); // queued → cancelled
         assert!(!queue.mark_processing(&other.job_id).unwrap());
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// 协调器中止（pre 重启失接管）：cancelling 带原因落 failed 且原因可查；
+    /// 用户取消（无原因）仍落 cancelled；非 processing 让位。
+    #[test]
+    fn abort_settles_failed_with_reason_user_cancel_still_wins() {
+        let (dir, mut queue, storage) = setup("abort", 50);
+        let job = submit(&mut queue, "a.wav");
+        queue.mark_processing(&job.job_id).unwrap();
+        assert_eq!(
+            queue.abort(&job.job_id, "handoff lost".to_string()).unwrap(),
+            FileJobState::Cancelling
+        );
+        // 原因在 cancelling 期间即可查。
+        assert_eq!(
+            queue.status(&job.job_id).unwrap().error.as_deref(),
+            Some("handoff lost")
+        );
+        // worker 取消结果晚到：落 failed 带原因，不是 cancelled。
+        assert_eq!(queue.mark_cancelled(&job.job_id).unwrap(), FileJobState::Failed);
+        let settled = queue.status(&job.job_id).unwrap();
+        assert_eq!(settled.state, FileJobState::Failed);
+        assert_eq!(settled.error.as_deref(), Some("handoff lost"));
+        assert!(!settled.result_ready);
+
+        // 用户取消（无原因）仍落 cancelled，晚到的 worker 失败不改写。
+        let other = submit(&mut queue, "b.wav");
+        queue.mark_processing(&other.job_id).unwrap();
+        queue.cancel(&storage, &other.job_id).unwrap();
+        assert_eq!(
+            queue.mark_failed(&other.job_id, "late failure".to_string()).unwrap(),
+            FileJobState::Cancelled
+        );
+        assert!(queue.status(&other.job_id).unwrap().error.is_none());
+
+        // 非 processing 让位：queued 不动、不记原因。
+        let third = submit(&mut queue, "c.wav");
+        assert_eq!(
+            queue.abort(&third.job_id, "handoff lost".to_string()).unwrap(),
+            FileJobState::Queued
+        );
+        assert!(queue.status(&third.job_id).unwrap().error.is_none());
         fs::remove_dir_all(&dir).unwrap();
     }
 

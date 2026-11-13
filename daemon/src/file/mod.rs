@@ -16,7 +16,7 @@ use crate::state::{lock_state, State};
 use mozart_core::config::Config;
 use mozart_core::ctl;
 use mozart_core::ctl::schema::{
-    FileFetchRequest, FileJob, FileJobState, FileProgress, FileSubmitRequest,
+    Activity, FileFetchRequest, FileJob, FileJobState, FileProgress, FileSubmitRequest,
 };
 use queue::{FileQueue, QueueError};
 use serde_json::{json, Value};
@@ -30,6 +30,9 @@ use storage::Storage;
 
 /// 契约帧时间轴步长（20 ms）：数据面合成 pts_ns 用，取 core 的 FRAME_MS。
 pub(crate) const FRAME_NS: u64 = mozart_core::FRAME_MS as u64 * 1_000_000;
+
+/// pre 重启丢失文件交接的失败原因（任务 error 可查）。
+const HANDOFF_LOST_REASON: &str = "pre restarted during file job; handoff lost";
 
 /// 文件数据面钩子。run 在独立 worker 线程调用：阻塞 I/O 期间不得持 State 锁；
 /// 各阶段以 ctx.is_cancelled() 作取消检查点，关停时也经它退出。
@@ -72,6 +75,10 @@ pub struct JobContext {
     pub state: Arc<Mutex<State>>,
     pub config: Arc<Config>,
     pub running: Arc<AtomicBool>,
+    /// 文件交接已建立（PRE_SET_FILE_MODE{active:true} 已应答）：FileHandoff
+    /// begin 成功后置位、finish 起手清除。协调器据此门控失接管检测：
+    /// decode 段尚未暂停、finish 已恢复，file_mode=false 均属合法。
+    pub handoff_active: Arc<AtomicBool>,
 }
 
 impl JobContext {
@@ -112,6 +119,10 @@ pub struct FileCoordinator {
     submit_lock: Mutex<()>,
     /// 在跑任务的 id 与线程句柄：panic 时 finish 不会执行，reap 据 id 落终态。
     job_thread: Mutex<Option<(String, JoinHandle<()>)>>,
+    /// 当前任务的文件交接标志（与 JobContext 共享）：tick 失接管检测用。
+    handoff_active: Arc<AtomicBool>,
+    /// 失接管两轮确认：首轮 false 可能是交接建立前的陈旧 pre 快照。
+    handoff_lost_seen: AtomicBool,
 }
 
 impl FileCoordinator {
@@ -134,12 +145,15 @@ impl FileCoordinator {
             running,
             submit_lock: Mutex::new(()),
             job_thread: Mutex::new(None),
+            handoff_active: Arc::new(AtomicBool::new(false)),
+            handoff_lost_seen: AtomicBool::new(false),
         })
     }
 
     /// poller 每 tick 驱动一次仲裁。
     pub fn tick(self: &Arc<Self>) {
         self.reap_job_thread();
+        self.abort_job_on_lost_handoff();
         let _transition = self.services.transition();
         let (owner, desired, active, rvc_ready) = {
             let state = lock_state(&self.state);
@@ -165,6 +179,46 @@ impl FileCoordinator {
                 }
             }
             arbitrate::Action::Idle => {}
+        }
+    }
+
+    /// pre 重启丢失文件交接：交接已建立期间 pre.file_mode 必为 true，
+    /// 观察到 false 说明 pre 已重启并恢复恒发（实时帧污染整段攒帧、输出
+    /// socket 绑定被孤儿化）。带原因中止任务：worker 经取消检查点退出，
+    /// 守卫停流并恢复 pre，落 failed，GPU 释放、队列继续。
+    ///
+    /// 两轮确认：poll 先读 pre，worker 可能在同一轮内才完成 begin，首轮
+    /// false 可能是交接建立前的陈旧快照；下一轮 poll 必在交接后重读 pre，
+    /// 仍 false 才中止。decode 段（未暂停）与 finish（已恢复）由交接标志
+    /// 门控，不参与判定。
+    fn abort_job_on_lost_handoff(&self) {
+        if !self.handoff_active.load(Ordering::Acquire) {
+            self.handoff_lost_seen.store(false, Ordering::Release);
+            return;
+        }
+        let lost = {
+            let state = lock_state(&self.state);
+            state.gpu_owner() == Some(Activity::File) && state.pre_file_mode() == Some(false)
+        };
+        if !lost {
+            self.handoff_lost_seen.store(false, Ordering::Release);
+            return;
+        }
+        if !self.handoff_lost_seen.swap(true, Ordering::AcqRel) {
+            return;
+        }
+        let job_id = {
+            let slot = self
+                .job_thread
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            match slot.as_ref() {
+                Some((id, _)) => id.clone(),
+                None => return,
+            }
+        };
+        if let Err(err) = lock_queue(&self.queue).abort(&job_id, HANDOFF_LOST_REASON.to_string()) {
+            self.report_queue_error("abort lost handoff", err);
         }
     }
 
@@ -337,6 +391,9 @@ impl FileCoordinator {
             }
         };
         lock_state(&self.state).claim_gpu_file();
+        // 新任务从「未交接」起：decode 段 pre 未暂停属合法。
+        self.handoff_active.store(false, Ordering::Release);
+        self.handoff_lost_seen.store(false, Ordering::Release);
 
         let ctx = JobContext {
             job,
@@ -347,6 +404,7 @@ impl FileCoordinator {
             state: self.state.clone(),
             config: self.config.clone(),
             running: self.running.clone(),
+            handoff_active: self.handoff_active.clone(),
         };
         let worker = self.worker.clone();
         let coordinator = Arc::clone(self);
@@ -486,7 +544,7 @@ pub(crate) mod testutil {
 mod tests {
     use super::*;
     use crate::file::testutil::temp_dir;
-    use mozart_core::ctl::schema::{Activity, Route, RvcStatus};
+    use mozart_core::ctl::schema::{Activity, PreStatus, Route, RvcStatus};
     use std::sync::mpsc;
     use std::time::{Duration, Instant};
 
@@ -535,6 +593,18 @@ mod tests {
             "inference_ms_p95": null,
             "queue_depth": 0,
             "last_error": null
+        }))
+        .unwrap()
+    }
+
+    fn pre_status(file_mode: bool) -> PreStatus {
+        serde_json::from_value(json!({
+            "state": "ok", "route": "direct", "mute": false,
+            "capture_device": "", "playback_device": "",
+            "frames_captured": 0, "frames_played": 0, "frames_dropped": 0,
+            "queue_depth": 0, "consumer_drops": {},
+            "speaker_state": "realtime", "tts_frames_played": 0,
+            "file_mode": file_mode, "last_error": null, "version": "0.1.0"
         }))
         .unwrap()
     }
@@ -851,6 +921,88 @@ mod tests {
         assert!(
             !coordinator.storage.decoded_path(&job_id).exists(),
             "panic 收尾也要清临时文件"
+        );
+        coordinator.shutdown();
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// 回归（Important #2）：pre 在文件任务期间重启丢失交接（file_mode=false
+    /// 且恢复恒发）。旧代码只对账路由/静音，任务楔死在 processing、GPU 恒归
+    /// File、路由等待槽永不应用。修复后 tick 检测并带原因中止：worker 经取消
+    /// 检查点退出，落 failed 带可查原因，GPU 释放。
+    #[test]
+    fn lost_handoff_aborts_job_with_reason_and_frees_gpu() {
+        let (coordinator, started, _release, dir) = setup("lost-handoff");
+        let job_id = enqueue(&coordinator, "a.wav");
+        coordinator.tick();
+        started.recv_timeout(Duration::from_secs(2)).unwrap();
+        // 真实 worker 在 begin 成功后置位；桩 worker 不走数据面，此处代为置位。
+        coordinator.handoff_active.store(true, Ordering::Release);
+        lock_state(&coordinator.state).set_pre_status(Some(pre_status(false)));
+
+        // 首轮 false 只确认不中止（可能是交接建立前的陈旧快照）。
+        coordinator.tick();
+        assert_eq!(
+            lock_queue(&coordinator.queue).state_of(&job_id),
+            Some(FileJobState::Processing)
+        );
+        // 次轮仍 false → 中止。等到 GPU 释放（finish 最后一步）再断言终态。
+        coordinator.tick();
+        assert!(
+            wait_until(Duration::from_secs(2), || {
+                lock_queue(&coordinator.queue).state_of(&job_id) == Some(FileJobState::Failed)
+                    && lock_state(&coordinator.state).gpu_owner().is_none()
+            }),
+            "失接管必须中止任务并释放 GPU（旧代码楔死在 processing）"
+        );
+        let job = lock_queue(&coordinator.queue).status(&job_id).unwrap();
+        assert!(
+            job.error.unwrap().contains("handoff lost"),
+            "失接管原因必须可查询"
+        );
+        coordinator.shutdown();
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// 检测门控不得误伤健康任务：decode 段 pre 尚未暂停（交接标志未置位），
+    /// 以及置位后首轮 false 可能是交接建立前的陈旧快照——两者都不中止。
+    #[test]
+    fn lost_handoff_check_ignores_decode_and_stale_snapshot() {
+        let (coordinator, started, release, dir) = setup("lost-handoff-immune");
+        let job_id = enqueue(&coordinator, "a.wav");
+        coordinator.tick();
+        started.recv_timeout(Duration::from_secs(2)).unwrap();
+        lock_state(&coordinator.state).set_pre_status(Some(pre_status(false)));
+
+        // decode 段（交接未建立）：file_mode=false 合法，多轮也不中止。
+        for _ in 0..3 {
+            coordinator.tick();
+        }
+        assert_eq!(
+            lock_queue(&coordinator.queue).state_of(&job_id),
+            Some(FileJobState::Processing)
+        );
+
+        // 交接建立 + 首轮 false：只确认；次轮 pre 恢复 true 即清除嫌疑。
+        coordinator.handoff_active.store(true, Ordering::Release);
+        coordinator.tick();
+        lock_state(&coordinator.state).set_pre_status(Some(pre_status(true)));
+        coordinator.tick();
+        assert_eq!(
+            lock_queue(&coordinator.queue).state_of(&job_id),
+            Some(FileJobState::Processing)
+        );
+
+        release.send(Outcome::Completed).unwrap();
+        assert!(
+            wait_until(Duration::from_secs(2), || {
+                lock_state(&coordinator.state).gpu_owner().is_none()
+            }),
+            "健康任务应正常收尾"
+        );
+        assert_eq!(
+            lock_queue(&coordinator.queue).state_of(&job_id),
+            Some(FileJobState::Completed)
         );
         coordinator.shutdown();
         fs::remove_dir_all(&dir).unwrap();

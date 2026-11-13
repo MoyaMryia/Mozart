@@ -12,6 +12,12 @@
 板端复测 295 s 与 120 s 均 completed、`frames_in == frames_out`、时长一致（实测）。
 SPEC-08「长文件不会耗尽内存」的内存与完成部分均通过。详见「长文件数据面卡死（已修复）」。
 
+修复方案已演进：本报告记录的初版修复采用独立文件 socket（D2），后经用户否决
+（偏离 SPEC-03 字面交接）回退；现行实现为 Task 9 状态门控交接（`PRE_SET_FILE_MODE`
+令 pre 暂停 rvc 发送并释放输出 socket，daemon 复用同一对 socket），见
+「Task 9 状态门控交接（取代 D2）」与 `docs/plans/file-chain.md` D2。下文 D2 相关
+数值为该历史方案实测，现行方案复测见 Task 9 一节。
+
 ## 配置
 
 | 项 | 值 |
@@ -158,6 +164,9 @@ b 3726.5 MiB、c 3717.1 MiB、e 3700.4 MiB、f 3787.4 MiB、i 4257.4 MiB。
 
 ### 修复（最小，对称于 D2）
 
+> 已取代：本节描述的独立文件 socket（D2）方案已回退，现行实现为 Task 9 状态门控
+> 交接（见「Task 9 状态门控交接（取代 D2）」）。本节保留作历史根因与初版修复记录。
+
 文件输入隔离到独立 `rvc-file-in.sock`，pre 实时路径完全不动（满足 SPEC-02 恒发），
 整段批处理 / 无丢帧 / StopStream 语义不变（SPEC-03），daemon 中间层不变（SPEC-04）。
 与 D2 已隔离的文件输出 socket 同一模式，补上输入侧：
@@ -191,6 +200,33 @@ D2 延伸待确认：D2（独立文件输出 socket）是计划文档标注「�
 取回 WAV 48 kHz 单声道、时长与输入一致（±0.1 s）。修复前 295 s 卡死（>400 s），修复后 144 s 完成；120 s 无回归。
 SPEC-08 内存与完成部分均通过；SPEC-04 的 300 s 时长上限兜底在该区间可用。
 
+## Task 9 状态门控交接（取代 D2）
+
+D2 独立 socket 方案经用户否决回退后，按 SPEC-03 字面「复用帧数据面 / 输出 socket
+由对端绑定 / 切换时交接绑定」实现（提交 `c239fd2`、`0af1118`，分支 `file-chain`）。
+新增 `PRE_SET_FILE_MODE`（0x0206）：`active=true` 令 pre 暂停 rvc AI 发送并释放
+`rvc-out.sock`（接收线程握手确认后才应答），daemon 复用同一对 `rvc-in.sock`/
+`rvc-out.sock` 跑文件数据面；收尾 `active=false` 恢复 pre。asr 字幕支路恒发不受影响。
+长文件死锁根因（pre 恒发实时帧污染整段攒帧）由状态门控消除，不再靠分离 socket。
+设计详见 `docs/plans/file-chain.md` D2。
+
+板端复测（实测，设备与模型同「配置」一节；数据面改为复用 `[rvc]` 默认
+`rvc-in.sock`/`rvc-out.sock`，无独立文件 socket，缓冲 8 帧）：部署
+`tools/deploy-jetson.sh --smoke` 成功（134 s），设备测试门 `cargo test --workspace`
+全绿、ctest（jetson-release）7/7、三进程实时冒烟通过（实时无回归）。
+`tools/jetson-file-test.sh` 长文件场景两轮：
+
+| 任务 | 终态 | frames_in | frames_out | dropped | blocks | inference_ms | 输出时长 | RMS | 峰值 | infer 墙钟 | rvc VmHWM |
+| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
+| 295 s | completed | 14750 | 14750 | 0 | 296 | 135702 | 295.000 s | 0.11597 | 0.3477 | 137.0 s | 4630 MiB |
+| 120 s | completed | 6000 | 6000 | 0 | 121 | 55388 | 120.000 s | 0.11600 | 0.3495 | 55.7 s | 3589 MiB |
+
+两轮均 `result_ready=true`、`frames_in==frames_out`、`frames_dropped=0`，取回 WAV
+48 kHz 单声道时长与输入一致；处理期间 `pre.file_mode=true`（AI 发送暂停）、收尾后
+`false`（恢复）经逐秒采样断言通过。GPU 互斥：文件期间 `route set rvc` 挂等待槽
+（active=direct、owner=file），任务结束后自动切实时。证据留设备
+`/tmp/mozart-file-test-295/`、`/tmp/mozart-file-test-120/`。
+
 ## 适用范围
 
 配置：见「配置」一节。全部数值来自该配置下的板端实测，未跨设备或跨模型外推。
@@ -203,6 +239,8 @@ SPEC-08 内存与完成部分均通过；SPEC-04 的 300 s 时长上限兜底在
   cancel→cancelled 2 s、控制面恢复 4 s 与 9 s，存在轮次波动。
 - 入口拒绝 2 例（不存在模型、坏扩展名），时长上限拒绝 1 例（3453 s）。
 - 120 s 阈值探针修复前后多次均通过；295 s 修复后 144 s 完成。
+- Task 9 状态门控交接复测：295 s/120 s 确定性合成 WAV 各 1 次（见 Task 9 一节，
+  数据面复用 `[rvc]` socket，与上文 D2 独立 socket 轮次不同）。
 - 合成 WAV 为确定性信号（180 Hz 基频加谐波、3 Hz 音节节拍），
   真实语音内容仅来自 m4a 截取样本。听感质量未做主观评估。
 
@@ -226,9 +264,8 @@ SPEC-08 内存与完成部分均通过；SPEC-04 的 300 s 时长上限兜底在
    解除条件：开启后重跑 b/c 场景，验证与 pre 共用 DSP 的降噪结果。
 7. **`c78c85a` 之前的 ctest 偶发超时是否可复现**。阻塞原因：5 次复跑全绿，未能复现。
    解除条件：在高构建负载下重复跑 ctest 若干轮，或延长该用例超时并记录耗时分布。
-8. **D2 输入侧隔离的设计确认**。阻塞原因：文件输入独立 socket 是 D2（独立输出 socket，计划标注待确认）
-   向输入侧的延伸，属设计层偏离 SPEC 字面交接。解除条件：用户确认独立 socket 方案，
-   或改 pre 路由感知绑定走 SPEC 字面交接。功能已板端实测通过。
+8. ~~D2 输入侧隔离的设计确认~~ 已解决：用户否决独立 socket 方案（偏离 SPEC-03 字面），
+   已回退为 Task 9 状态门控交接（`PRE_SET_FILE_MODE`），见「Task 9 状态门控交接（取代 D2）」。
 
 证据文件留在设备 `/tmp/mozart-file-test`，不入库：`config-used.toml`、`env.txt`、
 `models.json`、`submit-*.json`、`job-*.json`、`progress-*.jsonl`、`st-*.json`、

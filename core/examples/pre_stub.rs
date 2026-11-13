@@ -2,6 +2,9 @@
 //! 测试旋钮 `MOZART_PRE_STUB_FLOOD=1`：模拟 pre 恒发支路，向 rvc-in.sock 持续
 //! 发送实时 InputFrame（惰性建链、跟随对端重绑），受 PRE_SET_FILE_MODE 门控——
 //! 文件数据面复用回归用：daemon 暂停 pre 后实时帧不得混入整段攒帧。
+//! 测试旋钮 `MOZART_PRE_STUB_FILE_MODE_DELAY_MS`：PRE_SET_FILE_MODE 先执行
+//! 门控再延迟应答，模拟「命令已生效而应答丢失/超时」（daemon rpc_timeout_ms
+//! 小于该延迟）；缺省 0 不延迟，同 rvc 桩 delay/hang 旋钮性质。
 
 mod stub_common;
 
@@ -20,11 +23,17 @@ struct State {
     route: &'static str,
     mute: bool,
     file_mode: Arc<AtomicBool>,
+    file_mode_delay: Duration,
 }
 
 fn main() {
     let args = parse_args("mozart-pre-stub");
     let file_mode = Arc::new(AtomicBool::new(false));
+    let file_mode_delay = std::env::var("MOZART_PRE_STUB_FILE_MODE_DELAY_MS")
+        .ok()
+        .and_then(|value| value.parse::<u64>().ok())
+        .map(Duration::from_millis)
+        .unwrap_or(Duration::ZERO);
     if std::env::var("MOZART_PRE_STUB_FLOOD").is_ok_and(|value| value == "1") {
         let config = Config::load_from(args.config.as_deref()).unwrap_or_else(|err| {
             eprintln!("mozart-pre-stub: config: {err}");
@@ -38,6 +47,7 @@ fn main() {
         route: "direct",
         mute: false,
         file_mode,
+        file_mode_delay,
     };
     serve(args, move |msg| handle(msg, &mut state));
 }
@@ -120,6 +130,10 @@ fn handle(msg: &Message, state: &mut State) -> Vec<u8> {
             };
             // 桩无数据面绑定，交接握手平凡成立：置门控即应答（恒发支路随即可见）。
             state.file_mode.store(active, Ordering::Relaxed);
+            // 测试旋钮：先执行门控再延迟应答，模拟「命令已生效而应答丢失/超时」。
+            if !state.file_mode_delay.is_zero() {
+                std::thread::sleep(state.file_mode_delay);
+            }
             ok(json!({"active": active}))
         }
         ctl::PRE_SPEECH_STOP => ok(json!({"stopped": true, "frames_cleared": 0})),

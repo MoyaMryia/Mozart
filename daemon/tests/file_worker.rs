@@ -347,6 +347,121 @@ fn realtime_flood_on_shared_input_does_not_wedge_file_job() {
     );
 }
 
+/// 回归（Important #1）：PRE_SET_FILE_MODE{active:true} 已在 pre 生效而应答
+/// 超时（桩延迟 450 ms > rpc 300 ms，且 < 2×rpc，恢复 HELLO 仍赶得上）。
+/// 旧代码失败时不建守卫、无人恢复 → pre.file_mode 悬空 true，实时 AI 发送
+/// 静默死亡。修复后守卫先于 RPC 建立，失败路径 Drop 恢复（active:false 幂等）。
+#[test]
+fn begin_rpc_timeout_restores_pre_and_fails_with_reason() {
+    let h = Harness::new(
+        "worker-begin-timeout",
+        "",
+        &[("MOZART_PRE_STUB_FILE_MODE_DELAY_MS", "450".to_string())],
+    );
+    let (job_id, _pcm) = h.submit("tone.wav", 1, 16000);
+    let job = wait_job_state(&h.conn, &job_id, FileJobState::Failed, JOB_TIMEOUT);
+    let error = job.error.expect("失败必须带可查询原因");
+    assert!(error.contains("pre file mode pause"), "{error}");
+    h.assert_temp_clean(&job_id);
+    h.assert_gpu_free();
+    // 恢复已发出：pre.file_mode 回到 false。begin 失败后 status.pre 可能仍是
+    // 暂停前的陈旧 false 快照，故观察到 false 后再跨一个轮询周期复核：轮询
+    // 重连重读后仍 false 才是真恢复（旧代码悬空 true，刷新后复核失败）。
+    assert!(
+        wait_until(POLL_TIMEOUT, || {
+            status(&h.conn).pre.is_some_and(|pre| !pre.file_mode)
+        }),
+        "begin 失败必须恢复 pre"
+    );
+    std::thread::sleep(Duration::from_millis(300));
+    assert!(
+        status(&h.conn).pre.is_some_and(|pre| !pre.file_mode),
+        "跨轮询周期后 pre 必须保持恢复（旧代码留下悬空暂停，刷新后为 true）"
+    );
+}
+
+/// 回归（Important #1 + #3）：暂停与恢复的应答都超时（桩延迟 800 ms > 2×rpc，
+/// 恢复 HELLO 也赶不上）→ 恢复失败必须留下可查询降级原因，且不被后续轮询抹掉。
+/// 旧代码 push_degraded 写入唯一 vec，下一秒 set_degraded 整体替换即丢失。
+#[test]
+fn begin_restore_failure_reason_survives_polls() {
+    let h = Harness::new(
+        "worker-restore-fail",
+        "",
+        &[("MOZART_PRE_STUB_FILE_MODE_DELAY_MS", "800".to_string())],
+    );
+    let (job_id, _pcm) = h.submit("tone.wav", 1, 16000);
+    let job = wait_job_state(&h.conn, &job_id, FileJobState::Failed, JOB_TIMEOUT);
+    let error = job.error.expect("失败必须带可查询原因");
+    assert!(error.contains("pre file mode pause"), "{error}");
+    h.assert_gpu_free();
+    assert!(
+        wait_until(POLL_TIMEOUT, || {
+            status(&h.conn)
+                .degraded
+                .iter()
+                .any(|reason| reason.contains("pre file mode restore"))
+        }),
+        "恢复失败必须留下可查询降级原因"
+    );
+    // 数轮轮询（100 ms 间隔）后原因仍在：持久通道不被 poll 覆写。
+    std::thread::sleep(Duration::from_millis(400));
+    assert!(
+        status(&h.conn)
+            .degraded
+            .iter()
+            .any(|reason| reason.contains("pre file mode restore")),
+        "恢复失败原因必须跨轮询存活（旧代码下一秒即被抹掉）"
+    );
+}
+
+/// 回归（Important #2）：文件任务期间 kill pre，监管重启后 pre.file_mode=false
+/// 并恢复恒发（FLOOD 旋钮）。旧代码不检测失接管：实时帧污染整段攒帧，任务楔死
+/// 在 feed（板端 295 s 死锁同形态），GPU 恒归 File。修复后 tick 两轮确认失接管
+/// → 带原因中止，worker 经取消检查点收尾，落 failed、GPU 释放、队列继续。
+#[test]
+fn pre_restart_during_file_job_fails_with_reason_and_frees_gpu() {
+    let h = Harness::new(
+        "worker-pre-restart",
+        "",
+        &[
+            ("MOZART_PRE_STUB_FLOOD", "1".to_string()),
+            ("MOZART_RVC_STUB_FILE_FEED_PACE_MS", "2".to_string()),
+            ("MOZART_RVC_STUB_FILE_DELAY_MS", "6000".to_string()),
+        ],
+    );
+    // 20 s = 1000 契约帧，攒帧窗约 2 s：kill 落在 feed 段，失接管后恒发污染可复现。
+    let (job_id, _pcm) = h.submit("tone.wav", 20, 16000);
+    assert!(
+        wait_until(JOB_TIMEOUT, || {
+            let job = file_job(&h.conn, &job_id);
+            job.state == FileJobState::Processing
+                && job.progress.stage == "feed"
+                && status(&h.conn).pre.is_some_and(|pre| pre.file_mode)
+        }),
+        "任务应在 feed 段建立交接（pre.file_mode=true）"
+    );
+    let pre_pid = status(&h.conn).processes.pre.pid.expect("pre 应在运行");
+    let killed = std::process::Command::new("kill")
+        .arg("-9")
+        .arg(pre_pid.to_string())
+        .status()
+        .unwrap();
+    assert!(killed.success(), "kill pre 失败");
+
+    let job = wait_job_state(&h.conn, &job_id, FileJobState::Failed, JOB_TIMEOUT);
+    let error = job.error.expect("失接管必须带可查询原因");
+    assert!(error.contains("handoff lost"), "{error}");
+    h.assert_temp_clean(&job_id);
+    h.assert_gpu_free();
+
+    // 队列继续：下一任务正常建立交接并完成（恒发再次被门控暂停）。
+    let (next_id, _pcm) = h.submit("next.wav", 1, 16000);
+    let next = wait_job_state(&h.conn, &next_id, FileJobState::Completed, JOB_TIMEOUT);
+    assert!(next.result_ready, "后续任务应正常完成");
+    h.assert_gpu_free();
+}
+
 /// 生成 PCM16 单声道正弦 WAV（测试源，留在临时目录不入库），返回样本值。
 fn write_wav(path: &Path, seconds: u32, sample_rate: u32) -> Vec<i16> {
     let count = (seconds * sample_rate) as usize;

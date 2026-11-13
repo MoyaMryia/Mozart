@@ -17,6 +17,7 @@ use mozart_core::{FrameMeta, InputFrame, OutputFrame, OUTPUT_SAMPLES};
 use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::Ordering;
 use std::time::{Duration, Instant};
 
 /// 数据面 socket 缓冲帧数：SPEC-02「接收缓冲 4–8 帧」取上沿。
@@ -299,18 +300,30 @@ struct FileHandoff<'a> {
 
 impl<'a> FileHandoff<'a> {
     /// 暂停 pre 并确认输出 socket 已释放（PRE_SET_FILE_MODE{active:true}）。
-    /// 失败时 pre 未暂停，守卫不建立，无需收尾。
+    /// 意图发出 → 任何出口都恢复：active:true 可能已在 pre 生效而应答丢失/
+    /// 超时（pre 控制线程延迟超过 rpc_timeout_ms），故先建立守卫
+    /// （pre_paused=true）再发 RPC，失败路径由 Drop 尝试恢复（active:false
+    /// 幂等，pre 未收到暂停也无害），与 StartStream 同一纪律。恢复失败记
+    /// 持久降级原因，status 可查。
     fn begin(ctx: &'a JobContext) -> Result<Self, StepError> {
-        ctx.services.pre_set_file_mode(true).map_err(|(code, reason)| {
-            StepError::Failed(format!("pre file mode pause: {code}: {reason}"))
-        })?;
-        Ok(Self {
+        let handoff = Self {
             ctx,
             path: ctx.config.rvc_output_socket(),
             output: None,
             stream_active: false,
             pre_paused: true,
-        })
+        };
+        handoff
+            .ctx
+            .services
+            .pre_set_file_mode(true)
+            .map_err(|(code, reason)| {
+                StepError::Failed(format!("pre file mode pause: {code}: {reason}"))
+            })?;
+        // 交接已建立：此后到 finish 之间 pre.file_mode 必为 true，
+        // 协调器据此检测 pre 重启失接管。
+        handoff.ctx.handoff_active.store(true, Ordering::Release);
+        Ok(handoff)
     }
 
     /// pre 已释放，daemon 绑定同一输出 socket（实时 rvc-out.sock）。
@@ -330,6 +343,8 @@ impl<'a> FileHandoff<'a> {
 
     /// 收尾：停流 → 解绑删 socket 文件 → 恢复 pre。幂等，Drop 兜底复用。
     fn finish(&mut self) {
+        // 先清交接标志：恢复后 pre.file_mode=false 属合法，不得触发失接管检测。
+        self.ctx.handoff_active.store(false, Ordering::Release);
         if self.stream_active {
             self.stream_active = false;
             if let Err((code, reason)) = self.ctx.services.stop_stream() {
@@ -409,6 +424,7 @@ mod tests {
             state: Arc::new(Mutex::new(State::new())),
             config: config.clone(),
             running: running.clone(),
+            handoff_active: Arc::new(AtomicBool::new(false)),
         };
 
         // 对端绑定输入 socket 但永不读帧（推理线程挂死）：缓冲填满后只能等待。

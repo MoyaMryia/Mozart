@@ -61,7 +61,11 @@ pub struct State {
     tts: Option<TtsStatus>,
     bridge: Option<BridgeStatus>,
     hw: Option<HardwareStatus>,
+    /// 轮询来源降级：set_degraded 每轮整体替换。
     degraded: Vec<String>,
+    /// 持久降级：push_degraded 追加去重，跨轮询存活。停流/恢复失败等
+    /// 一次性事件的原因走这里，不被下一秒轮询覆写（AGENTS「降级记可查原因」）。
+    degraded_persistent: Vec<String>,
     shutting_down: bool,
 }
 
@@ -89,6 +93,7 @@ impl State {
             bridge: None,
             hw: None,
             degraded: Vec::new(),
+            degraded_persistent: Vec::new(),
             shutting_down: false,
         }
     }
@@ -118,7 +123,17 @@ impl State {
             tts: self.tts.clone(),
             bridge: self.bridge.clone(),
             hw: self.hw.clone(),
-            degraded: self.degraded.clone(),
+            // 轮询原因在前，持久原因在后；同一原因两边都有时只报一次。
+            degraded: self
+                .degraded
+                .iter()
+                .chain(
+                    self.degraded_persistent
+                        .iter()
+                        .filter(|reason| !self.degraded.contains(reason)),
+                )
+                .cloned()
+                .collect(),
         }
     }
 
@@ -189,6 +204,12 @@ impl State {
         self.pre = status;
     }
 
+    /// 最近一次轮询的 pre 文件接管状态（PreStatus.file_mode）。
+    /// None 表示本轮未取得 pre 状态，不能作为失接管证据。
+    pub fn pre_file_mode(&self) -> Option<bool> {
+        self.pre.as_ref().map(|pre| pre.file_mode)
+    }
+
     pub fn set_rvc_status(&mut self, status: Option<RvcStatus>) {
         self.rvc = status;
     }
@@ -217,13 +238,15 @@ impl State {
         self.shutting_down
     }
 
+    /// 轮询来源降级：每轮整体替换。持久原因（push_degraded）不受影响。
     pub fn set_degraded(&mut self, reasons: Vec<String>) {
         self.degraded = reasons;
     }
 
+    /// 持久降级：追加去重，跨轮询存活，status 恒可查。
     pub fn push_degraded(&mut self, reason: String) {
-        if !self.degraded.contains(&reason) {
-            self.degraded.push(reason);
+        if !self.degraded_persistent.contains(&reason) {
+            self.degraded_persistent.push(reason);
         }
     }
 
@@ -279,4 +302,76 @@ pub fn now_unix_ms() -> u64 {
         .duration_since(UNIX_EPOCH)
         .map(|duration| duration.as_millis() as u64)
         .unwrap_or(0)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    fn pre_status(file_mode: bool) -> PreStatus {
+        serde_json::from_value(json!({
+            "state": "ok", "route": "direct", "mute": false,
+            "capture_device": "", "playback_device": "",
+            "frames_captured": 0, "frames_played": 0, "frames_dropped": 0,
+            "queue_depth": 0, "consumer_drops": {},
+            "speaker_state": "realtime", "tts_frames_played": 0,
+            "file_mode": file_mode, "last_error": null, "version": "0.1.0"
+        }))
+        .unwrap()
+    }
+
+    /// 回归（Important #3）：持久降级原因必须跨轮询存活。
+    /// 旧实现 set_degraded 整体替换唯一 vec，push_degraded 的恢复/停流失败
+    /// 原因下一秒即被轮询抹掉，Completed 任务上的恢复失败无可查原因。
+    #[test]
+    fn persistent_degraded_survives_poll_overwrite() {
+        let mut state = State::new();
+        state.push_degraded("pre file mode restore: NotReady: timed out".to_string());
+        state.set_degraded(vec!["pre status: connection refused".to_string()]);
+        let degraded = state.status().degraded;
+        assert!(
+            degraded.iter().any(|reason| reason.contains("pre file mode restore")),
+            "持久原因必须与轮询原因并存：{degraded:?}"
+        );
+        assert!(degraded.iter().any(|reason| reason.contains("pre status")));
+
+        // 后续轮询（含空轮询）只替换轮询来源，持久原因仍在。
+        state.set_degraded(Vec::new());
+        let degraded = state.status().degraded;
+        assert!(
+            degraded.iter().any(|reason| reason.contains("pre file mode restore")),
+            "空轮询不得抹掉持久原因：{degraded:?}"
+        );
+        assert!(!degraded.iter().any(|reason| reason.contains("pre status")));
+    }
+
+    #[test]
+    fn push_degraded_dedups_and_poll_reasons_replace() {
+        let mut state = State::new();
+        state.push_degraded("file stop stream: Busy: stream active".to_string());
+        state.push_degraded("file stop stream: Busy: stream active".to_string());
+        state.set_degraded(vec!["rvc status: old".to_string()]);
+        state.set_degraded(vec!["rvc status: new".to_string()]);
+        let degraded = state.status().degraded;
+        assert_eq!(
+            degraded.iter().filter(|reason| reason.contains("file stop stream")).count(),
+            1,
+            "同一持久原因只报一次：{degraded:?}"
+        );
+        assert!(degraded.iter().any(|reason| reason.contains("rvc status: new")));
+        assert!(!degraded.iter().any(|reason| reason.contains("rvc status: old")));
+    }
+
+    #[test]
+    fn pre_file_mode_reads_latest_poll() {
+        let mut state = State::new();
+        assert_eq!(state.pre_file_mode(), None, "未取得 pre 状态时不可判定");
+        state.set_pre_status(Some(pre_status(true)));
+        assert_eq!(state.pre_file_mode(), Some(true));
+        state.set_pre_status(Some(pre_status(false)));
+        assert_eq!(state.pre_file_mode(), Some(false));
+        state.set_pre_status(None);
+        assert_eq!(state.pre_file_mode(), None);
+    }
 }
