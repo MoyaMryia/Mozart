@@ -5,19 +5,15 @@
       "Bash",
       "BashOutput",
       "KillShell",
-      "Read",
       "Edit",
       "Write",
-      "MultiEdit",
       "NotebookEdit",
       "Glob",
       "Grep",
-      "LS",
       "WebFetch",
       "WebSearch",
       "Task",
-      "TodoWrite",
-      "SlashCommand"
+      "TodoWrite"
     ]
   },
   "hooks": {
