@@ -48,7 +48,7 @@
 - 文件任务状态与进度：字段 `job_id` / `name` / `model_id` / `state` / `progress` / `error`，state 六态（queued / processing / cancelling / completed / failed / cancelled），completed 附结果可取标记（fetch 提示）；不带模式枚举（mode 派生）。进度 = 粗阶段（解码/喂入/推理/发布）+ 推理段用 rvc `GetStatus` 块/窗计数细化（daemon 每秒轮询已有）；依赖 rvc 文件模式给出有意义块计数，缺则退回粗阶段。CLI `file status <job_id>` 查单个、`file list` 看队列。
 - 文件转换入口（v1）：CLI `file submit <path>` 提交本地路径；daemon 复制文件到受管存储目录后入队，队列只引用副本，原文件变动不影响排队任务。入口校验：扩展名白名单 `.wav` / `.mp3` / `.m4a` / `.aac` / `.flac` / `.ogg`，100 MiB 大小预检；300 s 时长上限在解码后检查。HTTP 上传归 web 适配器，流式写盘后经同一入队契约提交。
 - 监控归 daemon，不独立进程：进程存活与崩溃重启；每秒轮询各服务 `GetStatus` 汇总业务指标与降级原因；收集子进程日志。
-- 音频设备识别归 daemon（硬件发现，与 hwmon 一类）：用 ALSA API（`snd_device_name_hint`）枚举采集/播放设备，不 shell `arecord`/`aplay`；按需查询不缓存（USB 插拔）；返回设备 id（ALSA 名，配置用）+ 人读标签。CLI `device list`。配置/切换设备时对照当前清单校验存在。pre 只打开配置的设备（使用）、不做枚举；换设备仍由 daemon 重启 pre，热切换见 [FUTURE.md](../FUTURE.md)。
+- 音频设备识别归 daemon（硬件发现，与 hwmon 一类）：用 ALSA API（`snd_device_name_hint`）枚举采集/播放设备，不 shell `arecord`/`aplay`；按需查询不缓存（USB 插拔）；返回设备 id（ALSA 名，配置用）+ 人读标签。CLI `device list` 缺省只列配置首选（`plughw:` 与 `default`），`--all` 返回完整 ALSA 别名清单。配置/切换设备时对照当前清单校验存在。pre 只打开配置的设备（使用）、不做枚举；换设备仍由 daemon 重启 pre，热切换见 [FUTURE.md](../FUTURE.md)。
 - 语言服务（识别、桥、TTS）各绑控制 socket，daemon 连接并每秒轮询，接法与 pre/rvc 一致。llama-server 不说控制协议：daemon 只管其进程存活与重启，业务可达性由桥的 `GetStatus` 带报。
 - 监管退避：崩溃后从 500 ms 起倍增，上限 10 s；连续稳定运行 30 s 后重置。子进程日志追加到 `run_dir/logs/<name>.log`，daemon 退出前先停止子进程。
 - 路由执行顺序：切到 rvc 先 `LoadModel` / `StartStream` 再让 pre `SetRoute(rvc)`，失败回滚停流；切回 direct 先 pre `SetRoute(direct)` 再 `StopStream` 并释放 GPU。轮询发现实际状态偏离期望时按同一顺序对账。

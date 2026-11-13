@@ -486,6 +486,15 @@ pub struct DeviceEntry {
     pub kind: String,
 }
 
+/// DAEMON_DEVICE_LIST 请求体。缺省只列配置首选（plughw 与 default）；
+/// all=true 返回完整 ALSA 别名清单。
+#[derive(Debug, Default, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct DeviceListRequest {
+    #[serde(default)]
+    pub all: bool,
+}
+
 /// DAEMON_RESTART 请求体；service 取进程名（pre/rvc/asr/tts/bridge/llama）。
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]

@@ -1,9 +1,9 @@
 use clap::{Parser, Subcommand, ValueEnum};
 use mozart_core::config::{ensure_run_dir, Config};
 use mozart_core::ctl::schema::{
-    Activity, DeviceEntry, FileCancelRequest, FileFetchRequest, FileJob, FileJobState, FileProgress,
-    FileStatusRequest, FileSubmitRequest, ModelEntry, ProcessState, Response, RestartRequest, Route,
-    Status,
+    Activity, DeviceEntry, DeviceListRequest, FileCancelRequest, FileFetchRequest, FileJob,
+    FileJobState, FileProgress, FileStatusRequest, FileSubmitRequest, ModelEntry, ProcessState,
+    Response, RestartRequest, Route, Status,
 };
 use mozart_core::ctl::{self, Seqpacket};
 use serde_json::{json, Value};
@@ -168,7 +168,11 @@ enum ServiceArg {
 #[derive(Subcommand)]
 enum DeviceAction {
     /// 列出采集/播放设备（ALSA 名、人读标签、方向）
-    List,
+    List {
+        /// 列出完整 ALSA 别名清单；缺省只列配置首选（plughw 与 default）
+        #[arg(long)]
+        all: bool,
+    },
 }
 
 struct CliError {
@@ -219,7 +223,7 @@ fn run(cli: Cli) -> Result<(), CliError> {
         },
         Action::Restart { service } => restart(&config, service, cli.json),
         Action::Device { action } => match action {
-            DeviceAction::List => device_list(&config, cli.json),
+            DeviceAction::List { all } => device_list(&config, cli.json, all),
         },
     }
 }
@@ -604,8 +608,9 @@ fn service_name(service: ServiceArg) -> &'static str {
     }
 }
 
-fn device_list(config: &Config, json_output: bool) -> Result<(), CliError> {
-    let data = call(config, ctl::DAEMON_DEVICE_LIST, b"{}")?;
+fn device_list(config: &Config, json_output: bool, all: bool) -> Result<(), CliError> {
+    let body = body_json(&DeviceListRequest { all })?;
+    let data = call(config, ctl::DAEMON_DEVICE_LIST, &body)?;
     if json_output {
         println!("{data}");
         return Ok(());
@@ -1217,7 +1222,12 @@ mod tests {
         assert!(cli.json);
         assert!(matches!(
             cli.command,
-            Action::Device { action: DeviceAction::List }
+            Action::Device { action: DeviceAction::List { all: false } }
+        ));
+        let cli = parse(&["device", "list", "--all"]).unwrap();
+        assert!(matches!(
+            cli.command,
+            Action::Device { action: DeviceAction::List { all: true } }
         ));
         assert!(parse(&["device"]).is_err());
         assert!(parse(&["device", "bogus"]).is_err());

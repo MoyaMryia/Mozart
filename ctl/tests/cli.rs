@@ -887,7 +887,7 @@ fn device_list_json_and_table() {
     assert_eq!(devices.len(), 2);
     assert_eq!(devices[0].kind, "capture");
     assert_eq!(stub.requests()[0].0, ctl::DAEMON_DEVICE_LIST);
-    assert_eq!(stub.requests()[0].1, json!({}));
+    assert_eq!(stub.requests()[0].1, json!({"all": false}));
 
     let human = env.run(&["device", "list"]);
     assert_success(&human);
@@ -897,6 +897,17 @@ fn device_list_json_and_table() {
         "stdout: {text}"
     );
     assert!(text.contains("Loopback Capture"), "stdout: {text}");
+}
+
+#[test]
+fn device_list_all_flag_forwarded() {
+    let env = CtlEnv::new("device-all");
+    let stub = StubDaemon::start(
+        &env.socket(),
+        vec![(ctl::DAEMON_DEVICE_LIST, ok_body(json!({"devices": []})))],
+    );
+    assert_success(&env.run(&["device", "list", "--all", "--json"]));
+    assert_eq!(stub.requests()[0].1, json!({"all": true}));
 }
 
 #[test]

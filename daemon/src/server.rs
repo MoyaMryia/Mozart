@@ -6,8 +6,8 @@ use crate::state::{lock_state, Role, State};
 use crate::supervisor::{RestartHandle, Supervisor};
 use mozart_core::config::{ensure_run_dir, Config};
 use mozart_core::ctl::schema::{
-    self, FileCancelRequest, FileFetchRequest, FileStatusRequest, FileSubmitRequest, MuteSetRequest,
-    RestartRequest, RouteSetRequest, SwitchSetRequest,
+    self, DeviceListRequest, FileCancelRequest, FileFetchRequest, FileStatusRequest, FileSubmitRequest,
+    MuteSetRequest, RestartRequest, RouteSetRequest, SwitchSetRequest,
 };
 use mozart_core::ctl::{self, Message, Seqpacket};
 use serde_json::json;
@@ -301,9 +301,9 @@ fn handle_request(
             Ok(request) => (restart_service(restarts, config_path, &request.service), false),
             Err(reply) => (reply, false),
         },
-        ctl::DAEMON_DEVICE_LIST => match device::list() {
-            Ok(devices) => (schema::ok_body(json!({"devices": devices})), false),
-            Err((code, reason)) => (schema::error_body(&code, &reason), false),
+        ctl::DAEMON_DEVICE_LIST => match parse_body::<DeviceListRequest>(&msg.body) {
+            Ok(request) => device::list_reply(request.all, device::list),
+            Err(reply) => (reply, false),
         },
         _ => (
             schema::error_body(ctl::CODE_UNKNOWN_COMMAND, "unknown command"),
