@@ -1,292 +1,183 @@
-# Mozart 配置与使用手册
+# Mozart 配置与使用指南
 
-## 1 完整目录结构
+## 一、目录结构
 
-一个能运行全部功能的部署目录：
+集中放在 `~/mozart/`，**所有 `mozart-*` 二进制必须放在同一个 `bin/` 目录**：
 
-```
+```text
 ~/mozart/
-├── bin/                              ← 全部二进制，daemon 按同目录找子进程
-│   ├── mozart-ctl                    ← CLI 入口，你只跟它打交道
-│   ├── mozart-daemon                 ← 控制面，up 时自动拉起
+├── mozart.toml                       ← 配置文件
+├── bin/                              ← 全部可执行文件放同一目录
+│   ├── mozart-ctl                    ← CLI 入口
+│   ├── mozart-daemon                 ← 守护总管
 │   ├── mozart-pre                    ← 音频采集 / DSP / 播放
-│   ├── mozart-rvc                    ← 变声推理（C++）
-│   ├── mozart-asr                    ← 语音识别
-│   ├── mozart-tts                    ← 语音合成
-│   └── mozart-bridge                 ← 字幕 / 翻译 / 播报编排
-├── mozart.toml                       ← 配置文件，放这里自动识别
-└── assets/                           ← 仓外资产（模型、共享库）
-    ├── lib/
-    │   └── libsherpa-onnx-c-api.so   ← ASR/TTS 推理库
-    ├── llama/
-    │   ├── llama-server              ← 翻译推理服务
-    │   └── *.so                      ← 它的共享库
+│   ├── mozart-rvc                    ← 变声推理（CMake 产物）
+│   ├── mozart-asr                    ← 语音识别（可选）
+│   ├── mozart-tts                    ← 语音合成（可选）
+│   └── mozart-bridge                 ← 字幕 / 翻译 / 播报（可选）
+└── assets/                           ← 模型与共享库（按需放置）
+    ├── lib/libsherpa-onnx-c-api.so
+    ├── llama/                        ← llama-server 及其 .so
     └── models/
-        ├── rvc/qiqi-zh-run/          ← 变声模型
-        │   ├── qiqi-zh.onnx
-        │   ├── qiqi-zh-front.onnx
-        │   ├── qiqi-zh-decoder.onnx
-        │   ├── qiqi-zh.index
-        │   ├── config.json
-        │   ├── hubert_base_dynamic.onnx
-        │   ├── rmvpe_dynamic.onnx
-        │   ├── hubert-realtime.onnx
-        │   └── rmvpe-realtime.onnx
-        ├── asr/zipformer-zh-14M/
+        ├── rvc/<模型目录>/           ← .onnx / -front.onnx / -decoder.onnx / hubert / rmvpe
+        ├── asr/<zipformer>/
         ├── asr-review/<sense-voice>/
         ├── tts/<pocket-tts>/
-        │   └── test_wavs/bria.wav    ← 播报参考音色
         └── llm/<model>.gguf
 ```
 
-运行时自动产生，不用手动建：
+从仓库复制构建产物（debug 为例）：
 
-```
-<run_dir>/                            ← TOML 里 [daemon].run_dir 指定
-├── *.sock                            ← 进程间通信
-├── daemon.lock
-└── logs/*.log                        ← 各进程日志
-
-~/.local/state/mozart/
-├── subtitles.jsonl                   ← 字幕输出
-├── bridge-state.json                 ← 翻译/播报开关持久化
-└── files/                            ← 文件转换的源副本与结果
+```bash
+mkdir -p ~/mozart/bin ~/mozart/assets
+cp target/debug/mozart-{ctl,daemon,pre,asr,tts,bridge} ~/mozart/bin/
+cp build/jetson-release/rvc/mozart-rvc ~/mozart/bin/   # 本机为 build/host-debug/rvc/mozart-rvc
 ```
 
-二进制来源：Cargo 产出 mozart-ctl/daemon/pre/asr/tts/bridge，CMake 产出 mozart-rvc。
-把 mozart-rvc 复制到 bin/ 即可。llama-server 从 llama.cpp 编译，放 assets/llama/。
+运行时自动生成：`run_dir`（socket 与 `logs/*.log`）、`~/.local/state/mozart/`（字幕 `subtitles.jsonl`、开关状态、文件缓存）。
 
-## 2 配置：什么功能依赖什么
+---
 
-配置文件是 `mozart.toml`。不写的段 → 对应进程不启动。按需组合：
+## 二、配置文件（`mozart.toml`）
 
-| 功能 | 需要的配置段 | 需要的资产 |
+- **加载顺序**：`--config <路径>` > `MOZART_CONFIG` > `./mozart.toml` > 内置默认
+- **规则**：所有路径写绝对路径；同名 `[段名]` 只写一次（`[[models]]` 可写多块），不用的功能删掉对应段
+
+| 功能 | 需要的配置段 | 额外依赖 |
 | --- | --- | --- |
-| 直出（降噪→播放） | `[daemon]` `[process].pre_bin` `[pre]` | 无 |
-| 实时变声 | 上面 + `[process].rvc_bin` `[rvc]` | RVC 模型目录 |
-| 文件转换 | 实时变声 + `[file]` | 同上 + ffmpeg |
-| 字幕+翻译+播报 | 直出 + `[process]` 全部 + `[asr]` `[tts]` `[bridge]` | sherpa 库、ASR/TTS/LLM 模型、llama-server |
-
-### 2.1 最小配置（仅直出）
+| 基础直出（降噪 → 播放） | `[daemon]` `[process]` `[pre]`（`[pre.dsp]` 可选） | 无 |
+| 实时变声 | 上面 + `[[models]]` `[rvc]` | RVC 模型目录 |
+| 离线文件变声 | 实时变声 + `[file]` | 同上 + `ffmpeg` |
+| 字幕 + 翻译 + 播报 | 基础直出 + `[process.env]` `[asr]` `[tts]` `[bridge]` | sherpa 库、ASR/TTS/LLM 模型、`llama-server` |
 
 ```toml
 [daemon]
-run_dir = "/tmp/mozart-run"
+run_dir = "/tmp/mozart-run"          # socket 与日志目录
 
 [process]
-pre_bin = "mozart-pre"
+pre_bin = "mozart-pre"               # 音频预处理进程（同目录写裸名即可）
+rvc_bin = "mozart-rvc"               # 变声推理进程
+asr_bin = "mozart-asr"               # 语音识别进程
+tts_bin = "mozart-tts"               # 语音合成进程
+bridge_bin = "mozart-bridge"         # 字幕与翻译调度进程
+llama_bin = "/home/<user>/mozart/assets/llama/llama-server"   # 翻译服务绝对路径
+
+[process.env]                        # 仅语言链需要，启动子进程时注入
+LD_LIBRARY_PATH = "/home/<user>/mozart/assets/lib:/home/<user>/mozart/assets/llama"
 
 [pre]
-capture_device = "default"
-playback_device = "default"
-```
+capture_device = "default"           # 麦克风 ALSA 名，启动后用 device list 查到 plughw 再改
+playback_device = "default"          # 扬声器 ALSA 名
 
-### 2.2 加变声
+[pre.dsp]
+denoise = true                       # 降噪
+gate = false                         # 噪声门
+agc = false                          # 自动增益
+limiter = false                      # 峰值限幅
 
-追加：
+# ---- 模型注册表（可写多个 [[models]]；留空时 rvc 回退扫描 models_dir 子目录）----
+[[models]]
+id = "qiqi-zh"                       # 模型标识（rvc.model_id / model list / file submit --model 引用）
+type = "rvc"                         # 模型类型：rvc / asr / tts / llm
+path = "/home/<user>/mozart/assets/models/rvc/qiqi-zh-run"   # 目录绝对路径（llm 为 .gguf 文件路径）
 
-```toml
-[process]
-rvc_bin = "mozart-rvc"
+[rvc]                                # 不用变声可整段删除；hubert/rmvpe 默认从 models_dir 自动发现
+model_id = "qiqi-zh"                 # 默认加载的模型 id（对应上面 [[models]].id）
+models_dir = "/home/<user>/mozart/assets/models/rvc/qiqi-zh-run"  # 特征引擎目录 & 回退扫描目录
+device = "cuda"                      # 推理设备：cuda 或 cpu
+pitch_shift = 0                      # 升降调（半音）：-12..=12
+index_rate = 0.0                     # 音色索引权重：0.0..=1.0
+rms_mix_rate = 1.0                   # 音量包络融合：0.0..=1.0
+protect = 0.33                       # 清辅音保护：0.0..=0.5
 
-[rvc]
-model_id = "qiqi-zh"
-models_dir = "/home/<user>/mozart/assets/models/rvc/qiqi-zh-run"
-device = "cuda"
-hubert_path = "/home/<user>/mozart/assets/models/rvc/qiqi-zh-run/hubert_base_dynamic.onnx"
-rmvpe_path = "/home/<user>/mozart/assets/models/rvc/qiqi-zh-run/rmvpe_dynamic.onnx"
-realtime_hubert_path = "/home/<user>/mozart/assets/models/rvc/qiqi-zh-run/hubert-realtime.onnx"
-realtime_rmvpe_path = "/home/<user>/mozart/assets/models/rvc/qiqi-zh-run/rmvpe-realtime.onnx"
-```
+[file]                               # 不用文件转换可整段删除
+storage_dir = "/home/<user>/.local/state/mozart/files"   # 任务与输出 WAV 缓存目录
+max_duration_seconds = 300           # 单文件最长时长（秒）
+max_upload_bytes = 104857600         # 单文件大小上限（100 MiB）
+ffmpeg_path = "ffmpeg"               # ffmpeg 命令名或绝对路径
 
-`[rvc]` 里四个引擎路径必须指向实际文件。实时变声要求 `-front.onnx` 和 `-decoder.onnx` 齐全。
-同目录有 `.engine` 文件时优先走 TensorRT，加载失败删掉即回退 ONNX Runtime。
-
-### 2.3 加文件转换
-
-追加：
-
-```toml
-[file]
-storage_dir = "~/.local/state/mozart/files/"
-max_duration_seconds = 300
-ffmpeg_path = "ffmpeg"
-```
-
-文件数据面复用 `[rvc]` 的 socket，不需要额外 socket 配置。
-
-### 2.4 加语言链
-
-追加：
-
-```toml
-[process]
-asr_bin = "mozart-asr"
-tts_bin = "mozart-tts"
-bridge_bin = "mozart-bridge"
-llama_bin = "/home/<user>/mozart/assets/llama/llama-server"
-
-[asr]
-model_dir = "/home/<user>/mozart/assets/models/asr/zipformer-zh-14M"
-review_model_dir = "/home/<user>/mozart/assets/models/asr-review/sherpa-onnx-sense-voice-zh-en-ja-ko-yue-int8-2024-07-17"
+[asr]                                # 不用语言链可删 [asr] [tts] [bridge]
+model_dir = "/home/<user>/mozart/assets/models/asr/zipformer-zh-14M"   # 流式识别模型目录
+review_model_dir = "/home/<user>/mozart/assets/models/asr-review/sherpa-onnx-sense-voice-zh-en-ja-ko-yue-int8-2024-07-17"   # 复核模型目录（留空关闭）
 
 [tts]
-model_dir = "/home/<user>/mozart/assets/models/tts/sherpa-onnx-pocket-tts-int8-2026-01-26"
-reference_wav = "/home/<user>/mozart/assets/models/tts/sherpa-onnx-pocket-tts-int8-2026-01-26/test_wavs/bria.wav"
-provider = "cpu"
+model_dir = "/home/<user>/mozart/assets/models/tts/sherpa-onnx-pocket-tts-int8-2026-01-26"           # 语音合成模型目录
+reference_wav = "/home/<user>/mozart/assets/models/tts/sherpa-onnx-pocket-tts-int8-2026-01-26/test_wavs/bria.wav"   # 播报参考音色
+provider = "cpu"                     # 推理后端：cpu 或 cuda
 
 [bridge]
-subtitles_path = "~/.local/state/mozart/subtitles.jsonl"
-llama_model = "/home/<user>/mozart/assets/models/llm/qwen35-0.8b-text-Q4_K_M.gguf"
-translate_enabled = true
-speech_enabled = true
+subtitles_path = "/home/<user>/.local/state/mozart/subtitles.jsonl"    # 字幕 JSONL 输出路径
+llama_model = "/home/<user>/mozart/assets/models/llm/qwen35-0.8b-text-Q4_K_M.gguf"   # 翻译 GGUF 模型
+translate_enabled = true             # 启动时默认开启翻译
+speech_enabled = true                # 启动时默认开启语音播报
 ```
 
-语言链不需要真变声模型。`rvc_bin` 可指向 `examples/rvc_stub`。
+---
 
-### 2.5 音频设备
-
-`[pre]` 的 `capture_device` / `playback_device` 填 ALSA 设备名。
-查看可用设备：`mozart-ctl device list`（启动后）或 `arecord -l` / `aplay -l`。
-
-用 `plughw:` 前缀（ALSA 自动转换格式），不用 `hw:`（pre 固定要 48 kHz / 2ch / S16_LE，设备不支持会退出）。
-无物理设备时加载 `snd-aloop` 内核模块，设备名形如 `plughw:CARD=Loopback,DEV=1,SUBDEV=2`。
-
-换设备：改 TOML 后 `mozart-ctl restart pre`，断流 1–2 s。
-
-## 3 启动与操作
-
-### 3.1 启动
+## 三、操作命令
 
 ```bash
-cd ~/mozart/bin
-mozart-ctl up
+cd ~/mozart
+export PATH="$PWD/bin:$PATH"
 ```
 
-一条命令拉起整个栈。daemon 自动 spawn 配置里写了的所有子进程。
-不需要手动启动 pre、rvc、asr 等。`up` 幂等，已运行返回 already-running。
-
-### 3.2 查看状态
+### 1. 启停与状态
 
 ```bash
-mozart-ctl status            # 人读
-mozart-ctl status --json     # 机器可读
+mozart-ctl up               # 启动（幂等）
+mozart-ctl status           # 查看状态（加 --json 输出 JSON）
+mozart-ctl down             # 关停
 ```
 
-### 3.3 实时变声
+### 2. 首次配置声卡
 
 ```bash
-mozart-ctl route set rvc     # 切到变声
-mozart-ctl route set direct  # 切回直出
-mozart-ctl mute on           # 静音
-mozart-ctl mute off          # 取消静音
+mozart-ctl device list                                       # 列出推荐设备（plughw / default）
+mozart-ctl device list --all                                 # 列出全部 ALSA 别名
+mozart-ctl config set pre.capture_device "plughw:CARD=..."   # 设置麦克风
+mozart-ctl config set pre.playback_device "plughw:CARD=..."  # 设置扬声器
+mozart-ctl restart pre                                       # 重启 pre 生效（断流 1–2 s）
 ```
 
-对麦克风说话，扬声器输出目标音色。切换有 10 ms 淡变，无爆音。
+> 选 `plughw:`（自动转换采样率/格式），不要选 `hw:`。无物理声卡时可 `sudo modprobe snd-aloop` 后用 `device list` 查看。
 
-### 3.4 文件转换
+### 3. 实时变声
 
 ```bash
-mozart-ctl file submit /path/to/audio.wav --model qiqi-zh
-mozart-ctl file status <job_id>
-mozart-ctl file fetch <job_id> -o result.wav
-mozart-ctl file cancel <job_id>
+mozart-ctl route set rvc      # 切到变声
+mozart-ctl route set direct   # 切回直出
+mozart-ctl mute on / off      # 静音 / 取消静音
+```
+
+### 4. 文件变声
+
+支持 `.wav/.mp3/.m4a/.aac/.flac/.ogg`（≤ 100 MiB，≤ 300 s），输出 48 kHz 单声道 WAV。与实时变声共用 GPU，开着实时变声时提交会排队，切回 `direct` 后自动执行。
+
+```bash
+mozart-ctl file submit /path/to/audio.mp3 [--model qiqi-zh]
 mozart-ctl file list
-mozart-ctl file pause        # 暂停队列
-mozart-ctl file resume       # 恢复队列
+mozart-ctl file status <job_id>
+mozart-ctl file fetch <job_id> -o out.wav
+mozart-ctl file cancel <job_id>
+mozart-ctl file pause / resume
 ```
 
-输出固定 WAV（pcm_f32le / 48 kHz / 单声道）。
-入口限制：`.wav/.mp3/.m4a/.aac/.flac/.ogg`，≤ 100 MiB，≤ 300 s。
-文件转换与实时变声互斥（GPU 单资源），正在变声时文件排队，切 direct 后自动开始。
-
-### 3.5 字幕 / 翻译 / 播报
-
-配置了语言链段后，`up` 即自动运行。对麦克风说话：
-
-- 字幕写入 `subtitles_path`（JSONL，每行一句，含原文和译文）
-- 播报从扬声器输出参考音色译文
-
-运行时开关：
+### 5. 字幕 / 翻译 / 播报
 
 ```bash
-mozart-ctl translate on / off    # 翻译
-mozart-ctl speech on / off       # 播报
-mozart-ctl speech stop           # 停当前播报
+mozart-ctl translate on / off   # 翻译开关（持久化）
+mozart-ctl speech on / off      # 播报开关（持久化；播报时自动静音实时输出）
+mozart-ctl speech stop          # 急停并清空待播队列
 ```
 
-开关持久化，重启后恢复。播报时实时输出自动静音（分时），播完恢复。
-
-### 3.6 管理
+### 6. 管理与排障
 
 ```bash
-mozart-ctl model list                  # 可用模型
-mozart-ctl device list [--all]         # 音频设备
-mozart-ctl restart <pre|rvc|asr|tts|bridge|llama>   # 重启单个服务
-mozart-ctl config get [key]            # 读配置
-mozart-ctl config set <key> <value>    # 改配置（v1 仅设备键）
-mozart-ctl down                        # 关停整个栈
+mozart-ctl model list                                 # 查看已注册模型与加载状态
+mozart-ctl config get [key]                           # 读取配置（config set 仅支持设备键）
+mozart-ctl restart <pre|rvc|asr|tts|bridge|llama>     # 重启单个服务使 TOML 改动生效
 ```
 
-退出码：0 成功 / 1 其他 / 2 参数错 / 3 daemon 不可达 / 4 被拒 / 5 超时。
-
-### 3.7 日志
-
-`<run_dir>/logs/` 下按进程名分文件。出问题先看对应日志。
-
-## 4 运行时环境
-
-语言链需要两个环境变量（直出和变声不需要）：
-
-```bash
-export LD_LIBRARY_PATH=~/mozart/assets/lib:~/mozart/assets/llama
-```
-
-- `assets/lib`：让 mozart-asr / mozart-tts 找到 libsherpa-onnx-c-api.so
-- `assets/llama`：让 llama-server 找到自身的 libggml*.so
-
-构建时如果没设 `SHERPA_ONNX_LIB_DIR`，asr/tts 会编译为 stub（空输出）。
-确认方法：`ldd bin/mozart-asr | grep sherpa`，有输出且不是 "not found" 才是真链接。
-
-## 5 配置文件加载机制
-
-不需要每次加 `--config`。解析顺序（`core/src/config.rs`）：
-
-1. `--config <path>`（显式指定）
-2. `MOZART_CONFIG` 环境变量
-3. **当前目录下的 `mozart.toml`**（自动检测）
-4. 内置默认
-
-把 `mozart.toml` 放在你运行命令的目录下，直接 `mozart-ctl up` 即可。
-或者设一次环境变量：
-
-```bash
-export MOZART_CONFIG=~/mozart/mozart.toml
-```
-
-之后在任何目录都不用加参数。daemon 启动后把解析出的绝对路径传给子进程，子进程不需要自己找。
-
-## 6 运行时依赖
-
-Mozart 进程本身依赖的系统库：
-
-| 依赖 | 用途 | 必需场景 |
-| --- | --- | --- |
-| libasound2（ALSA） | 音频采集/播放 | 全部 |
-| libonnxruntime / libnvinfer | 推理后端 | 变声（板端 JetPack 自带） |
-| libsherpa-onnx-c-api.so | ASR/TTS 推理 | 语言链（仓外资产） |
-| ffmpeg | 文件解码/编码 | 文件转换 |
-| llama-server + 其 .so | 翻译推理 | 语言链（仓外资产） |
-
-**不依赖** aplay、arecord、Python、PyTorch。
-aplay/arecord 是 ALSA 工具包里的调试命令，不是 Mozart 的运行时组件。
-pre 通过 ALSA C API 直接操作声卡，不 shell 外部命令。
-
-## 7 已知限制
-
-- 换设备需重启 pre，断流 1–2 s，热切换未实现。
-- `config set` v1 仅支持设备键，其余键手改 TOML 后重启。
-- `config save`、`logs` 命令未实现。
-- HTTP/SSE 接口和 web 前端未实现，v1 只有 CLI。
-- 播报与实时是分时（播报时静音），不是混音。
-- 文件结果是有限缓存（默认 1000 MiB），超限驱逐旧结果，需及时 fetch。
+- **日志**：`<run_dir>/logs/<进程名>.log`。
+- **检查语言链非 stub**：`ldd ~/mozart/bin/mozart-asr | grep sherpa` 有输出且无 `not found`。
+- **退出码**：`0` 成功 / `1` 一般错误 / `2` 参数错 / `3` 连不上 daemon / `4` 被拒绝 / `5` 超时。
