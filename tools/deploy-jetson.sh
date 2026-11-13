@@ -196,6 +196,15 @@ set -euo pipefail
 cd "$HOME/Mozart"
 . "$HOME/.cargo/env"
 
+# 语言链路仓外资产在 ~/mozart-assets（sherpa 库、llama-server 及其 .so）。
+# 存在即启用：构建期链接 sherpa；运行期子进程经 LD_LIBRARY_PATH 加载共享库。
+# 缺失时保持 stub 构建与默认 llama 缺省，便于首次引导。
+ASSETS_DIR=${MOZART_ASSETS_DIR:-$HOME/mozart-assets}
+if [ -e "$ASSETS_DIR/lib/libsherpa-onnx-c-api.so" ]; then
+  export SHERPA_ONNX_LIB_DIR="$ASSETS_DIR/lib"
+fi
+export LD_LIBRARY_PATH="$ASSETS_DIR/lib:$ASSETS_DIR/llama${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
+
 echo '== 3/7 cargo build --workspace --bins --examples（debug）=='
 cargo build --workspace --bins --examples
 

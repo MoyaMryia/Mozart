@@ -9,7 +9,7 @@
 #   GPU 互斥与路由等待槽 / 重启续转 / 入口拒绝 / 时长上限。
 # 证据留在 $SMOKE_DIR：配置、样本、各阶段 status 与逐秒 progress-*.jsonl、
 #   取回 WAV、audio stats、measure.json、summary.tsv。
-#   MODELS_DIR   模型资产目录（默认 $HOME/Mozart-Old/rvc-golden/qiqi-zh-run）
+#   MODELS_DIR   模型资产目录（默认 $HOME/mozart-assets/models/rvc/qiqi-zh-run）
 #   BIN_DIR      部署二进制目录（默认 $HOME/Mozart/target/debug）
 #   SMOKE_DIR    产物目录（默认 /tmp/mozart-file-test）
 #   MODEL_ID     转换模型（默认 qiqi-zh）
@@ -19,7 +19,7 @@
 #   LONG_BUDGET_S  近时长上限的长文件秒数，>0 时追加内存兜底场景（默认 0＝跳过）
 set -u
 
-MODELS_DIR=${MODELS_DIR:-$HOME/Mozart-Old/rvc-golden/qiqi-zh-run}
+MODELS_DIR=${MODELS_DIR:-$HOME/mozart-assets/models/rvc/qiqi-zh-run}
 BIN_DIR=${BIN_DIR:-$HOME/Mozart/target/debug}
 SMOKE_DIR=${SMOKE_DIR:-/tmp/mozart-file-test}
 CAP_SUB=${CAP_SUB:-2}

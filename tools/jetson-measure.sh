@@ -14,13 +14,13 @@
 #       heal pre 在 pre 重启后重启测试信号源：snd-aloop 的采集端随 pre 死亡断缆，
 #       旧信号缆位失同步（重开的 pre 只能采到静默），受控信号下才能验证恢复链。
 # 环境变量：
-#   MODELS_DIR  模型资产目录（默认 $HOME/Mozart-Old/rvc-golden/qiqi-zh-run）
+#   MODELS_DIR  模型资产目录（默认 $HOME/mozart-assets/models/rvc/qiqi-zh-run）
 #   BIN_DIR     部署二进制目录（默认 $HOME/Mozart/target/release）
 #   M_ROOT      产物根目录（默认 $HOME/mozart-t7）
 #   CAP_SUB/PB_SUB  loopback 子设备号（默认 2/3，避开被占用的 0/1）
 set -u
 
-MODELS_DIR=${MODELS_DIR:-$HOME/Mozart-Old/rvc-golden/qiqi-zh-run}
+MODELS_DIR=${MODELS_DIR:-$HOME/mozart-assets/models/rvc/qiqi-zh-run}
 BIN_DIR=${BIN_DIR:-$HOME/Mozart/target/release}
 M_ROOT=${M_ROOT:-$HOME/mozart-t7}
 CAP_SUB=${CAP_SUB:-2}
