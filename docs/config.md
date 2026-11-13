@@ -71,6 +71,30 @@ LD_LIBRARY_PATH = "/home/user/mozart/assets/lib:/home/user/mozart/assets/llama"
 | agc | bool | false | — | R |
 | limiter | bool | false | — | R |
 
+### [[models]]
+
+顶层数组，每项声明一个可用模型。`LoadModel`、`file submit --model`、`model list` 引用此注册表。
+
+| 键 | 类型 | 必需 | 说明 |
+| --- | --- | --- | --- |
+| id | string | 是 | 模型标识，同一 type 内唯一 |
+| type | string | 是 | rvc / asr / tts / llm |
+| path | string | 是 | 模型目录绝对路径（rvc/asr/tts）或模型文件路径（llm） |
+
+```toml
+[[models]]
+id = "qiqi-zh"
+type = "rvc"
+path = "/home/user/mozart/assets/models/rvc/qiqi-zh-run"
+
+[[models]]
+id = "zipformer-zh"
+type = "asr"
+path = "/home/user/mozart/assets/models/asr/zipformer-zh-14M"
+```
+
+注册表为空时回退现有行为：rvc 扫描 `[rvc].models_dir` 子目录。类别 S。
+
 ### [rvc]
 
 | 键 | 类型 | 默认 | 范围 | 类别 |
@@ -82,11 +106,13 @@ LD_LIBRARY_PATH = "/home/user/mozart/assets/lib:/home/user/mozart/assets/llama"
 | index_rate | float | 0.0 | 0..=1 | R |
 | rms_mix_rate | float | 1.0 | 0..=1 | R |
 | protect | float | 0.33 | 0..=0.5 | R |
-| models_dir | string | 空 | — | S |
+| models_dir | string | 空 | 注册表为空时的回退扫描目录 | S |
 | device | string | cuda | — | S |
 | half | bool | false | — | S |
 | cache_limit | int | 2 | — | S |
-| hubert_path / rmvpe_path / realtime_hubert_path / realtime_rmvpe_path | string | 空 | — | S |
+| hubert_path / rmvpe_path / realtime_hubert_path / realtime_rmvpe_path | string | 空（自动发现） | 可选，显式配置优先 | S |
+
+特征引擎自动发现：四个路径为空时，从 `models_dir` 按约定文件名查找（`hubert_base_dynamic.onnx`、`rmvpe_dynamic.onnx`、`hubert-realtime.onnx`、`rmvpe-realtime.onnx`）。找到即用，找不到报错。
 
 ### [asr]
 

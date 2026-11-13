@@ -18,6 +18,16 @@ pub struct Config {
     pub tts: TtsConfig,
     pub bridge: BridgeConfig,
     pub file: FileConfig,
+    pub models: Vec<ModelEntry>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ModelEntry {
+    pub id: String,
+    #[serde(rename = "type")]
+    pub model_type: String,
+    pub path: PathBuf,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -330,6 +340,7 @@ impl Default for Config {
             tts: TtsConfig::default(),
             bridge: BridgeConfig::default(),
             file: FileConfig::default(),
+            models: Vec::new(),
         }
     }
 }
@@ -686,7 +697,42 @@ impl Config {
                 "process.llama_bin must not be empty".to_string(),
             ));
         }
+        let mut seen = std::collections::HashSet::new();
+        for entry in &self.models {
+            if entry.id.is_empty() {
+                return Err(ConfigError::Invalid(
+                    "[[models]].id must not be empty".to_string(),
+                ));
+            }
+            match entry.model_type.as_str() {
+                "rvc" | "asr" | "tts" | "llm" => {}
+                other => {
+                    return Err(ConfigError::Invalid(format!(
+                        "[[models]].type must be rvc/asr/tts/llm, got '{other}'"
+                    )));
+                }
+            }
+            if entry.path.as_os_str().is_empty() {
+                return Err(ConfigError::Invalid(format!(
+                    "[[models]] id='{}': path must not be empty",
+                    entry.id
+                )));
+            }
+            if !seen.insert((&entry.id, &entry.model_type)) {
+                return Err(ConfigError::Invalid(format!(
+                    "[[models]] duplicate id='{}' type='{}'",
+                    entry.id, entry.model_type
+                )));
+            }
+        }
         Ok(())
+    }
+
+    pub fn model_path(&self, id: &str, model_type: &str) -> Option<&Path> {
+        self.models
+            .iter()
+            .find(|m| m.id == id && m.model_type == model_type)
+            .map(|m| m.path.as_path())
     }
 }
 

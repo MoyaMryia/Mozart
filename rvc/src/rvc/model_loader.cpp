@@ -208,29 +208,43 @@ ModelManager::ModelManager(
     const std::filesystem::path& models_dir,
     const std::string& device,
     bool half,
-    size_t cache_limit
-) : models_dir_(models_dir), device_(device), half_(half), cache_limit_(std::max(size_t{1}, cache_limit))
+    size_t cache_limit,
+    std::vector<ModelEntry> registry
+) : models_dir_(models_dir), registry_(std::move(registry)), device_(device), half_(half), cache_limit_(std::max(size_t{1}, cache_limit))
 {
-    std::filesystem::create_directories(models_dir_);
+    if (!models_dir_.empty()) {
+        std::filesystem::create_directories(models_dir_);
+    }
 }
 
 std::vector<std::map<std::string, std::string>> ModelManager::list_models() const {
     std::lock_guard<std::mutex> lock(mutex_);
     std::vector<std::map<std::string, std::string>> result;
-    if (!std::filesystem::exists(models_dir_)) return result;
 
-    for (const auto& entry : std::filesystem::directory_iterator(models_dir_)) {
-        if (!entry.is_directory()) continue;
-
-        auto model = std::make_shared<RVCModel>(
-            entry.path().filename().string(), entry.path()
-        );
-        result.push_back({
-            {"id", model->id()},
-            {"exists", model->exists() ? "true" : "false"},
-            {"loaded", models_.count(model->id()) && models_.at(model->id())->loaded() ? "true" : "false"},
-            {"current", (model->id() == current_model_id_) ? "true" : "false"},
-        });
+    if (!registry_.empty()) {
+        for (const auto& entry : registry_) {
+            auto model = std::make_shared<RVCModel>(entry.id, entry.path);
+            result.push_back({
+                {"id", entry.id},
+                {"exists", model->exists() ? "true" : "false"},
+                {"loaded", models_.count(entry.id) && models_.at(entry.id)->loaded() ? "true" : "false"},
+                {"current", (entry.id == current_model_id_) ? "true" : "false"},
+            });
+        }
+    } else {
+        if (!std::filesystem::exists(models_dir_)) return result;
+        for (const auto& entry : std::filesystem::directory_iterator(models_dir_)) {
+            if (!entry.is_directory()) continue;
+            auto model = std::make_shared<RVCModel>(
+                entry.path().filename().string(), entry.path()
+            );
+            result.push_back({
+                {"id", model->id()},
+                {"exists", model->exists() ? "true" : "false"},
+                {"loaded", models_.count(model->id()) && models_.at(model->id())->loaded() ? "true" : "false"},
+                {"current", (model->id() == current_model_id_) ? "true" : "false"},
+            });
+        }
     }
     std::sort(result.begin(), result.end(), [](const auto& left, const auto& right) {
         return left.at("id") < right.at("id");
@@ -245,22 +259,36 @@ std::shared_ptr<RVCModel> ModelManager::get_model_locked(const std::string& mode
         return it->second;
     }
 
-    const auto model_dir = models_dir_ / model_id;
-    std::error_code error;
-    if (!std::filesystem::is_directory(model_dir, error)) return nullptr;
+    // Registry-first: resolve path from [[models]] entries.
+    std::filesystem::path model_dir;
+    for (const auto& entry : registry_) {
+        if (entry.id == model_id) {
+            model_dir = entry.path;
+            break;
+        }
+    }
 
-    // 防御路径穿越：解析后必须仍位于 models_dir_ 之下。
-    const auto root = std::filesystem::weakly_canonical(models_dir_, error);
-    if (error) return nullptr;
-    const auto resolved = std::filesystem::weakly_canonical(model_dir, error);
-    if (error) return nullptr;
-    const std::string root_text = root.generic_string();
-    const std::string resolved_text = resolved.generic_string();
-    if (resolved_text.compare(0, root_text.size(), root_text) != 0
-        || (resolved_text.size() > root_text.size()
-            && resolved_text[root_text.size()] != '/')) {
-        spdlog::warn("Rejected model id outside models directory: {}", model_id);
-        return nullptr;
+    if (model_dir.empty()) {
+        // Fallback: models_dir / model_id with path-traversal guard.
+        if (models_dir_.empty()) return nullptr;
+        model_dir = models_dir_ / model_id;
+        std::error_code error;
+        if (!std::filesystem::is_directory(model_dir, error)) return nullptr;
+        const auto root = std::filesystem::weakly_canonical(models_dir_, error);
+        if (error) return nullptr;
+        const auto resolved = std::filesystem::weakly_canonical(model_dir, error);
+        if (error) return nullptr;
+        const std::string root_text = root.generic_string();
+        const std::string resolved_text = resolved.generic_string();
+        if (resolved_text.compare(0, root_text.size(), root_text) != 0
+            || (resolved_text.size() > root_text.size()
+                && resolved_text[root_text.size()] != '/')) {
+            spdlog::warn("Rejected model id outside models directory: {}", model_id);
+            return nullptr;
+        }
+    } else {
+        std::error_code error;
+        if (!std::filesystem::is_directory(model_dir, error)) return nullptr;
     }
 
     auto model = std::make_shared<RVCModel>(model_id, model_dir);

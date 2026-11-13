@@ -9,16 +9,25 @@
 #include <cstdint>
 #include <filesystem>
 #include <string>
+#include <vector>
 
 namespace rvc {
 
+struct ModelEntry {
+    std::string id;
+    std::string type;
+    std::filesystem::path path;
+};
+
 struct RvcStartupConfig {
-    // 模型根目录；空表示未配置（LoadModel 会拒绝而非崩溃）。
+    // 模型注册表（[[models]] 中 type=rvc 的条目）；空时回退 models_dir 扫描。
+    std::vector<ModelEntry> models;
+    // 模型根目录；注册表为空时用于扫描和特征引擎自动发现。
     std::filesystem::path models_dir;
     std::string device = "cuda";
     bool half = false;
     size_t cache_limit = 2;
-    // 特征引擎与实时资产路径；空表示不配置。
+    // 特征引擎路径；空时从 models_dir 按约定文件名自动发现。
     std::filesystem::path hubert_path;
     std::filesystem::path rmvpe_path;
     std::filesystem::path realtime_hubert_path;

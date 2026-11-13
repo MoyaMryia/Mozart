@@ -420,7 +420,8 @@ InferenceBackend::InferenceBackend(const InferenceBackendConfig& config)
     if (!config_.realtime_rmvpe_path.empty()) realtime_rmvpe = config_.realtime_rmvpe_path;
 
     models_ = std::make_shared<ModelManager>(
-        config_.models_dir, config_.device, config_.half, config_.cache_limit);
+        config_.models_dir, config_.device, config_.half, config_.cache_limit,
+        config_.models);
     pipeline_ = std::make_unique<RealRVCPipeline>(
         models_, config_.hubert_path, rmvpe,
         MOZART_INPUT_SAMPLE_RATE, MOZART_OUTPUT_SAMPLE_RATE,

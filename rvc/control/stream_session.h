@@ -153,6 +153,7 @@ private:
 // ---- 生产后端：组合 ModelManager + RealRVCPipeline + Unix DGRAM 数据面 ----
 
 struct InferenceBackendConfig {
+    std::vector<ModelEntry> models;
     std::filesystem::path models_dir;
     std::string device = "cuda";
     bool half = false;
