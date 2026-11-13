@@ -27,13 +27,15 @@ pub(super) struct ContractFrame {
 
 /// 解码源文件并打包为契约帧。`dest` 是裸流临时文件，调用方负责清理。
 /// `percent` 报告 decode 阶段内进度（0..100），`cancel` 是取消检查点。
+/// 返回 (契约帧, 真实有效采样数)：尾帧补零前的 16 kHz 样本数，供推理侧裁掉
+/// 补帧零尾（plain 即解码采样数；denoise 经 DSP 不做裁剪，返回满帧采样数）。
 pub(super) fn decode(
     config: &Config,
     source: &Path,
     dest: &Path,
     cancel: &dyn Fn() -> bool,
     percent: &mut dyn FnMut(u8),
-) -> Result<Vec<ContractFrame>, StepError> {
+) -> Result<(Vec<ContractFrame>, u64), StepError> {
     let denoise = config.file.denoise;
     let sample_rate = if denoise {
         RAW_SAMPLE_RATE
@@ -77,7 +79,13 @@ pub(super) fn decode(
         )));
     }
     percent(FFMPEG_PERCENT);
-    pack(dest, bytes, denoise, cancel, percent)
+    let frames = pack(dest, bytes, denoise, cancel, percent)?;
+    let total_samples = if denoise {
+        frames.len() as u64 * INPUT_SAMPLES as u64
+    } else {
+        bytes / 4
+    };
+    Ok((frames, total_samples))
 }
 
 /// 裸流逐块打包：plain 直接切 320 样本，denoise 按 960 样本主干帧过 DSP。

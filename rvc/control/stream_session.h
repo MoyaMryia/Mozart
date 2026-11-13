@@ -85,6 +85,7 @@ struct ModelListing {
 // StartStream 入口校验一次，内部信任。
 struct FileBatchOptions {
     uint32_t total_frames = 0;              // 攒帧总数，正整数
+    uint64_t total_samples = 0;             // 真实采样数（裁补帧零尾）；0=不裁，向后兼容
 };
 
 // 推理后端 seam。错误用 reason 表达，不跨线程抛异常。

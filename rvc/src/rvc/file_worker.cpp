@@ -83,6 +83,13 @@ void FileWorker::batch_loop() {
             return;
         }
 
+        // ---- 裁掉尾帧补零，恢复真实音频长度 ----
+        // 解码按 320 样本契约帧向上取整补零；这点零尾经 HuBERT 全局注意力会
+        // 污染整段特征。total_samples 为解码真实采样数（0=不裁，向后兼容）。
+        if (config_.total_samples > 0 && config_.total_samples < audio.size()) {
+            audio.resize(static_cast<size_t>(config_.total_samples));
+        }
+
         // ---- 整段离线推理一次（现有离线路径，检查点响应取消）----
         const auto began = std::chrono::steady_clock::now();
         auto output = pipeline_.process_cancellable(audio, cancelled_);

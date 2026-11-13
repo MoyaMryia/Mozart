@@ -212,6 +212,22 @@ std::vector<uint8_t> StreamSession::handle_start_stream(
         }
         file_options.total_frames =
             static_cast<uint32_t>(body.at("total_frames").get<uint64_t>());
+        // total_samples 可选（缺省 0=不裁，向后兼容）：解码真实采样数，
+        // 须为正且不超过满帧采样数，供 file worker 裁掉尾帧补零。
+        if (body.contains("total_samples")) {
+            if (!body.at("total_samples").is_number_unsigned()) {
+                return error_body(MOZART_CTL_CODE_INVALID_ARGUMENT,
+                                  "total_samples must be an unsigned integer");
+            }
+            const uint64_t total_samples = body.at("total_samples").get<uint64_t>();
+            if (total_samples == 0
+                || total_samples > static_cast<uint64_t>(file_options.total_frames)
+                                       * MOZART_INPUT_SAMPLES) {
+                return error_body(MOZART_CTL_CODE_INVALID_ARGUMENT,
+                                  "total_samples must be in (0, total_frames*320]");
+            }
+            file_options.total_samples = total_samples;
+        }
     }
     RvcParameters parameters;
     parameters.f0_method = body.at("f0_method").get<std::string>();
@@ -508,6 +524,7 @@ std::unique_ptr<StreamWorker> InferenceBackend::start_worker(
         if (!realtime) {
             FileWorker::Config worker_config;
             worker_config.total_frames = file_options.total_frames;
+            worker_config.total_samples = file_options.total_samples;
             auto worker = std::make_unique<FileWorker>(*stream, *pipeline_,
                                                        worker_config);
             worker->start();

@@ -34,6 +34,8 @@ public:
     struct Config {
         // 攒帧总数；StartStream 入口已校验为正整数（u32），此处信任。
         uint32_t total_frames = 0;
+        // 真实采样数（尾帧补零前）；StartStream 入口已校验，0=不裁，此处信任。
+        uint64_t total_samples = 0;
     };
 
     // 批处理快照，供 StreamSession 合并发布（GetStatus）。

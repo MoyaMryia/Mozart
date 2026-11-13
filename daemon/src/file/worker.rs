@@ -72,7 +72,7 @@ fn process(ctx: &JobContext) -> Result<(), StepError> {
 
     // ---- decode：ffmpeg 解码 + 时长校验 + 打包 16 kHz 契约帧 ----
     progress.stage("decode", 0);
-    let frames = decode::decode(
+    let (frames, total_samples) = decode::decode(
         config,
         &ctx.source,
         &ctx.storage.decoded_path(job_id),
@@ -104,7 +104,7 @@ fn process(ctx: &JobContext) -> Result<(), StepError> {
     // 不停会留下一个等帧的文件流，下一个任务撞 Busy。
     handoff.stream_active = true;
     ctx.services
-        .file_start_stream(config, handle, total_frames)
+        .file_start_stream(config, handle, total_frames, total_samples)
         .map_err(|(code, reason)| StepError::Failed(format!("start file stream: {code}: {reason}")))?;
 
     let input_path = config.rvc_input_socket();

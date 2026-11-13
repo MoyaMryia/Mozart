@@ -108,15 +108,18 @@ impl Services {
     /// 交接）：调用前必须先经 pre_set_file_mode(true) 让 pre 停发并释放
     /// 输出 socket，daemon 再绑定同一输出 socket。
     /// 与实时不同，Busy 不吞：已有活动流说明仲裁失守，必须失败带原因。
+    /// total_samples 为解码真实采样数（尾帧补零前），rvc 攒帧后据此裁掉零尾。
     pub fn file_start_stream(
         &self,
         config: &Config,
         model_handle: u64,
         total_frames: u32,
+        total_samples: u64,
     ) -> Result<(), (String, String)> {
         let mut body = stream_body(config, model_handle);
         body["kind"] = json!("file");
         body["total_frames"] = json!(total_frames);
+        body["total_samples"] = json!(total_samples);
         let text = body.to_string();
         self.rvc()
             .call_ok(ctl::RVC_START_STREAM, text.as_bytes())
