@@ -72,7 +72,7 @@ tools/install-hooks.sh
 
 ```bash
 tools/ci-local.sh repo      # 仓库卫生：体积上限、索引与忽略规则一致
-tools/ci-local.sh lint      # 新增行的行尾空白、报告“适用范围”一节
+tools/ci-local.sh lint      # 暂存区的行尾空白、报告“适用范围”一节
 tools/ci-local.sh native    # 配置、构建与 CTest
 tools/ci-local.sh rust      # cargo check 与 cargo test
 tools/ci-local.sh web       # 前端测试与构建
