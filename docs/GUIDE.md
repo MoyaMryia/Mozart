@@ -40,8 +40,8 @@ cp build/jetson-release/rvc/mozart-rvc ~/mozart/bin/   # 本机为 build/host-de
 
 ## 二、配置文件（`mozart.toml`）
 
-- **加载顺序**：`--config <路径>` > `MOZART_CONFIG` > `./mozart.toml` > 内置默认
-- **规则**：所有路径写绝对路径；同名 `[段名]` 只写一次（`[[models]]` 可写多块），不用的功能删掉对应段
+- **加载优先级**：`CLI内 --config <路径>` > `环境变量 MOZART_CONFIG` > `./mozart.toml` > 内置默认
+- **规则**：所有路径写**绝对路径**；同名 `[段名]` 只写一次（`[[models]]` 可写多块），不用的功能删掉对应段
 
 | 功能 | 需要的配置段 | 额外依赖 |
 | --- | --- | --- |
