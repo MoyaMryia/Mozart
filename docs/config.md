@@ -44,6 +44,7 @@
 | --- | --- | --- | --- | --- |
 | socket | string | pre.sock | 纯文件名 | S |
 | capture_device | string | default | 非空、无 NUL | S |
+| capture_file | path | 空 | WAV PCM16、48000 Hz、至少 1 声道；设置后替代 ALSA 采集 | S |
 | playback_device | string | default | 非空、无 NUL | S |
 | capture_queue_frames | int | 8 | 1..=1024 | S |
 
