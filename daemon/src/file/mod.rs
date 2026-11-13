@@ -672,9 +672,12 @@ mod tests {
 
         let reply = coordinator.cancel(&job_id).unwrap();
         assert_eq!(reply["state"], "cancelling");
+        // 等到 GPU 释放（finish 的最后一步）再断言收尾后置条件：finish 先置
+        // cancelled 态、后删源副本/释放 GPU，只等终态会抢在删源之前断言（竞态）。
         assert!(
             wait_until(Duration::from_secs(2), || {
                 lock_queue(&coordinator.queue).state_of(&job_id) == Some(FileJobState::Cancelled)
+                    && lock_state(&coordinator.state).gpu_owner().is_none()
             }),
             "worker 应观察 cancelling 并收尾"
         );
@@ -829,10 +832,13 @@ mod tests {
         // 临时文件残留：panic 收尾也要清掉。
         fs::write(coordinator.storage.decoded_path(&job_id), b"junk").unwrap();
         coordinator.tick();
+        // 等到 GPU 释放（reap 收尾的最后一步）再断言：reap 先落 failed 态、
+        // 后清临时/释放 GPU，只等终态会抢在清理之前断言（竞态）。
         assert!(
             wait_until(Duration::from_secs(2), || {
                 coordinator.tick();
                 lock_queue(&coordinator.queue).state_of(&job_id) == Some(FileJobState::Failed)
+                    && lock_state(&coordinator.state).gpu_owner().is_none()
             }),
             "panic 后 reap 必须落 failed"
         );
