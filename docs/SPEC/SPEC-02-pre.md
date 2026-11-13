@@ -4,7 +4,7 @@
 
 ## 边界
 
-- 采集：只做设备 I/O。
+- 采集：只做设备 I/O 或测试文件注入。
 - 预处理：DSP 与降采样到 16 kHz。
 - 播放与路由：直出、变声、翻译播报共用扬声器。
 
@@ -17,7 +17,8 @@
 - DSP 用 Rust 重写，逐阶段与旧输出对拍。第一版覆盖全部阶段：80 Hz 高通、WOLA 谱降噪、gate、AGC、limiter、FIR 3:1 降采样与 VAD；对拍夹具由旧 C 核心离线生成，小型 PCM 放 `tests/fixtures/` 并在 `.gitignore` 白名单。
 - DSP 抽成独立共享 crate：pre 实时链路与 daemon 离线文件降噪共用同一实现，不做两套；逐阶段对拍口径不变。
 - 采集与播放设备名、数据面 socket 路径等部署配置经 `--config` 读取；daemon 拉起 pre 时传同一配置路径。
-- `[pre]` 配置段键：`capture_device`、`playback_device`（默认 `default`）、`capture_queue_frames`（采集→DSP 环容量，默认 8，1..=1024）。
+- `[pre]` 配置段键：`capture_device`、`playback_device`（默认 `default`）、`capture_queue_frames`（采集→DSP 环容量，默认 8，1..=1024）、`capture_file`（测试采集文件路径，默认不设置）。
+- 文件采集源（测试注入）：`capture_file` 设置后，采集线程读 WAV 文件替代 ALSA 采集，播放仍走 ALSA；用于无麦克风环境的离线对拍，下游 DSP 与分发链路不变。文件契约：PCM16（format tag 1，不含 WAVE_FORMAT_EXTENSIBLE）、48000 Hz、至少 1 声道，取首声道（与设备采集取 FL 一致）；启动时入口校验一次，不合契约报错退出，由 daemon 退避重启。按实时节拍每 20 ms 发射一帧，文件播完循环；`frame_idx` 与 `pts_ns` 语义与设备采集一致。`GetStatus` 的采集设备名报告文件路径。换文件与换设备一样由重启生效，不做在线命令。
 - `[pre.dsp]` 配置段键：`denoise`（WOLA 谱降噪开关，默认 true，沿用旧 main.c 代码默认）、`gate`、`agc`、`limiter`（整形级开关，默认 false，沿用旧 main.c 代码默认）。禁用降噪时该级全部计算跳过：不走旧实现的旁路 WOLA 重建，无切换收敛期、无发射延迟，置信度恒 0；禁用整形级时逐位恒等跳过。
 - WOLA 谱降噪流式合同（旧实现实测口径）：960 样本定块首块发射 896、其后每块 960；发射流滞后输入流 64 样本，处理级对首块缺口补零保持 20 ms 帧节拍（旧 dsp.c wrapper 语义）。旧注释的“192 样本发射延迟”指 64 样本 hop 的完整重建跨度（frame 128 + hop 64）。
 - 整形级作用于 WOLA 发射样本（旧 dsp.c enhance 次序：NS 发射后、补零前）；参数固定为旧实现出厂默认，无配置键。

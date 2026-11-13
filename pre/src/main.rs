@@ -1,5 +1,5 @@
 //! mozart-pre：音频前端进程（SPEC-02 / SPEC-05）。
-//! 线程结构：采集（ALSA 攒块→环）→ 处理（DSP 全链：80 Hz 高通 + WOLA 谱降噪
+//! 线程结构：采集（ALSA 或测试文件攒块→环）→ 处理（DSP 全链：80 Hz 高通 + WOLA 谱降噪
 //! + gate/AGC/limiter → 主干环；主干同帧打包 16 kHz InputFrame 恒定发送到
 //! rvc 与 asr input_socket）→ 播放（扬声器分时：播报优先，空窗 holdoff 恢复
 //! 实时；实时按路由/静音状态机→淡变→ALSA 写，rvc 路由取 AI 接收环，direct
@@ -18,6 +18,7 @@ mod ai;
 mod alsa_stream;
 mod capture;
 mod control;
+mod file_capture;
 mod playback;
 mod route;
 mod state;
@@ -181,8 +182,13 @@ fn main() -> ExitCode {
 
     install_signal_handlers();
 
+    // 文件采集源时状态报告文件路径（SPEC-02），否则报告 ALSA 设备名。
+    let capture_label = match &config.pre.capture_file {
+        Some(path) => path.display().to_string(),
+        None => config.pre.capture_device.clone(),
+    };
     let shared = Arc::new(Shared::new(
-        config.pre.capture_device.clone(),
+        capture_label,
         config.pre.playback_device.clone(),
         new_startup_id(),
     ));
@@ -232,15 +238,8 @@ fn main() -> ExitCode {
         }
     };
 
-    // 设备先就绪，后拉线程（新实现次序：采集设备先于播放；旧实现 main.c
-    // 播放设备先就绪，本实现两设备在拉线程前同步打开，次序差异无行为影响）。
-    let capture_pcm = match alsa_stream::open(&config.pre.capture_device, Direction::Capture) {
-        Ok(pcm) => pcm,
-        Err(message) => {
-            eprintln!("mozart-pre: capture open: {message}");
-            return ExitCode::FAILURE;
-        }
-    };
+    // 播放设备先就绪，后拉线程；采集源二选一：测试文件（SPEC-02 文件采集源）
+    // 或 ALSA 设备。文件契约在采集线程启动时入口校验，失败走致命错误传播。
     let playback_pcm = match alsa_stream::open(&config.pre.playback_device, Direction::Playback) {
         Ok(pcm) => pcm,
         Err(message) => {
@@ -248,7 +247,6 @@ fn main() -> ExitCode {
             return ExitCode::FAILURE;
         }
     };
-    log_stream_setup("capture", &config.pre.capture_device, &capture_pcm);
     log_stream_setup("playback", &config.pre.playback_device, &playback_pcm);
     eprintln!(
         "mozart-pre: ai link out={}",
@@ -257,7 +255,27 @@ fn main() -> ExitCode {
 
     // 采集与处理线程；播放线程持有状态机；接收线程独立收 rvc 输出帧；
     // 控制线程独立服务。
-    let capture_handle = {
+    let capture_handle = if let Some(path) = config.pre.capture_file.clone() {
+        let ring = capture_ring.clone();
+        let shared = shared.clone();
+        match spawn_thread("mozart-capture", move || {
+            stop_on_fatal(
+                &STOP,
+                guard_panic(move || file_capture::run(&path, ring, shared, &STOP)),
+            )
+        }) {
+            Ok(handle) => handle,
+            Err(err) => return spawn_failure("capture", err),
+        }
+    } else {
+        let capture_pcm = match alsa_stream::open(&config.pre.capture_device, Direction::Capture) {
+            Ok(pcm) => pcm,
+            Err(message) => {
+                eprintln!("mozart-pre: capture open: {message}");
+                return ExitCode::FAILURE;
+            }
+        };
+        log_stream_setup("capture", &config.pre.capture_device, &capture_pcm);
         let ring = capture_ring.clone();
         let shared = shared.clone();
         match spawn_thread("mozart-capture", move || {

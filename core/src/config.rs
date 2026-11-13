@@ -61,6 +61,9 @@ pub struct PreConfig {
     pub socket: String,
     /// ALSA 采集设备名（SPEC-02：部署配置经 --config 读取）。
     pub capture_device: String,
+    /// 测试采集文件（SPEC-02 文件采集源）：设置后替代 ALSA 采集。
+    /// 文件契约由 pre 启动时入口校验，配置层只承载路径。
+    pub capture_file: Option<PathBuf>,
     /// ALSA 播放设备名。
     pub playback_device: String,
     /// 采集 → DSP 环形队列容量（帧），1..=1024。
@@ -101,6 +104,7 @@ impl Default for PreConfig {
         Self {
             socket: "pre.sock".to_string(),
             capture_device: "default".to_string(),
+            capture_file: None,
             playback_device: "default".to_string(),
             capture_queue_frames: 8,
             dsp: PreDspConfig::default(),
