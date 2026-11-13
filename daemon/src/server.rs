@@ -4,10 +4,11 @@ use crate::poller::Poller;
 use crate::services::{self, Services};
 use crate::state::{lock_state, Role, State};
 use crate::supervisor::{RestartHandle, Supervisor};
-use mozart_core::config::{ensure_run_dir, Config};
+use mozart_core::config::{device_key_kind, ensure_run_dir, get_key, set_key, Config};
 use mozart_core::ctl::schema::{
-    self, FileCancelRequest, FileFetchRequest, FileStatusRequest, FileSubmitRequest, MuteSetRequest,
-    RestartRequest, RouteSetRequest, SwitchSetRequest,
+    self, ConfigGetRequest, ConfigSetRequest, DeviceListRequest, FileCancelRequest, FileFetchRequest,
+    FileStatusRequest, FileSubmitRequest, MuteSetRequest, RestartRequest, RouteSetRequest,
+    SwitchSetRequest,
 };
 use mozart_core::ctl::{self, Message, Seqpacket};
 use serde_json::json;
@@ -301,9 +302,20 @@ fn handle_request(
             Ok(request) => (restart_service(restarts, config_path, &request.service), false),
             Err(reply) => (reply, false),
         },
-        ctl::DAEMON_DEVICE_LIST => match device::list() {
-            Ok(devices) => (schema::ok_body(json!({"devices": devices})), false),
-            Err((code, reason)) => (schema::error_body(&code, &reason), false),
+        ctl::DAEMON_DEVICE_LIST => match parse_body::<DeviceListRequest>(&msg.body) {
+            Ok(request) => device::list_reply(request.all, device::list),
+            Err(reply) => (reply, false),
+        },
+        ctl::DAEMON_CONFIG_SET => match parse_body::<ConfigSetRequest>(&msg.body) {
+            Ok(request) => (config_set_reply(config_path, &request), false),
+            Err(reply) => (reply, false),
+        },
+        ctl::DAEMON_CONFIG_GET => match parse_body::<ConfigGetRequest>(&msg.body) {
+            Ok(request) => match get_key(config_path, request.key.as_deref()) {
+                Ok(value) => (schema::ok_body(json!({"value": value})), false),
+                Err(err) => (schema::error_body(ctl::CODE_INVALID_ARGUMENT, &err.to_string()), false),
+            },
+            Err(reply) => (reply, false),
         },
         _ => (
             schema::error_body(ctl::CODE_UNKNOWN_COMMAND, "unknown command"),
@@ -350,5 +362,34 @@ fn file_reply(result: Result<serde_json::Value, (String, String)>) -> (Vec<u8>, 
     match result {
         Ok(data) => (schema::ok_body(data), false),
         Err((code, reason)) => (schema::error_body(&code, &reason), false),
+    }
+}
+
+/// config set（SPEC-04）：设备键先对照当前清单校验存在（防呆），再原子写基线，
+/// 回重启提示契约 restart_required + affected。其余键由 core::set_key 分类拒绝。
+fn config_set_reply(config_path: Option<&Path>, request: &ConfigSetRequest) -> Vec<u8> {
+    if let Some(kind) = device_key_kind(&request.key) {
+        match device::exists(&request.value, kind) {
+            Ok(true) => {}
+            Ok(false) => {
+                return schema::error_body(
+                    ctl::CODE_INVALID_ARGUMENT,
+                    &format!(
+                        "设备不存在：{}（{kind}；用 device list 查看可用设备）",
+                        request.value
+                    ),
+                );
+            }
+            Err((code, reason)) => return schema::error_body(&code, &reason),
+        }
+    }
+    match set_key(config_path, &request.key, &request.value) {
+        Ok(effect) => schema::ok_body(json!({
+            "key": request.key,
+            "value": request.value,
+            "restart_required": effect.restart_required,
+            "affected": effect.affected,
+        })),
+        Err(err) => schema::error_body(ctl::CODE_INVALID_ARGUMENT, &err.to_string()),
     }
 }

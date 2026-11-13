@@ -217,3 +217,43 @@ fn device_list_returns_entries() {
         assert!(kind == "capture" || kind == "playback", "非法方向：{kind}");
     }
 }
+
+#[test]
+fn config_set_validates_and_get_reads_baseline() {
+    let daemon = DaemonProcess::start_with_config(
+        "config-set",
+        &example("pre_stub"),
+        &example("rvc_stub"),
+        "[daemon]\nrpc_timeout_ms = 300\n\n[pre]\ncapture_device = \"default\"\n\n[rvc]\nmodel_id = \"demo\"\n",
+    );
+    let conn = daemon.connect();
+
+    // 不支持的键：core 分类拒绝。
+    let reply = call(
+        &conn,
+        ctl::DAEMON_CONFIG_SET,
+        br#"{"key":"rvc.pitch_shift","value":"3"}"#,
+    );
+    assert_eq!(reply.status, "error", "reason: {}", reply.reason);
+
+    // 不存在的设备：防呆拒绝（对照当前清单）。
+    let reply = call(
+        &conn,
+        ctl::DAEMON_CONFIG_SET,
+        br#"{"key":"pre.capture_device","value":"plughw:CARD=NoSuchCard,DEV=99"}"#,
+    );
+    assert_eq!(reply.status, "error", "reason: {}", reply.reason);
+
+    // config get 读基线值。
+    let reply = call(
+        &conn,
+        ctl::DAEMON_CONFIG_GET,
+        br#"{"key":"pre.capture_device"}"#,
+    );
+    assert_eq!(reply.status, "ok", "reason: {}", reply.reason);
+    assert_eq!(reply.data["value"].as_str(), Some("default"));
+
+    // 被拒绝的 set 未改动基线。
+    let config = std::fs::read_to_string(daemon.dir.join("config.toml")).unwrap();
+    assert!(config.contains("capture_device = \"default\""), "config: {config}");
+}
