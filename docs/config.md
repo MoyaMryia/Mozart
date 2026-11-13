@@ -38,6 +38,21 @@
 | --- | --- | --- | --- | --- |
 | pre_bin / rvc_bin / asr_bin / tts_bin / bridge_bin / llama_bin | path | 各裸名 | 非空 | S |
 
+### [process.env]
+
+任意键值对，daemon spawn 子进程时注入为环境变量。所有子进程（含 llama-server）继承同一份。典型用途：`LD_LIBRARY_PATH` 指向仓外共享库目录。
+
+```toml
+[process.env]
+LD_LIBRARY_PATH = "/home/user/mozart/assets/lib:/home/user/mozart/assets/llama"
+```
+
+| 键 | 类型 | 默认 | 范围 | 类别 |
+| --- | --- | --- | --- | --- |
+| （任意） | string | 空表 | 键非空 | S |
+
+注入发生在 spawn 时，修改后需重启对应服务生效。已存在的环境变量会被覆盖。
+
 ### [pre]
 
 | 键 | 类型 | 默认 | 范围 | 类别 |

@@ -1,6 +1,7 @@
 //! daemon 与 ctl 共用的运行配置：TOML 文件 + 环境变量覆盖 + 入口校验。
 
 use serde::Deserialize;
+use std::collections::HashMap;
 use std::fmt;
 use std::io;
 use std::os::unix::fs::PermissionsExt;
@@ -41,6 +42,7 @@ pub struct ProcessConfig {
     pub tts_bin: PathBuf,
     pub bridge_bin: PathBuf,
     pub llama_bin: PathBuf,
+    pub env: HashMap<String, String>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -156,6 +158,7 @@ impl Default for ProcessConfig {
             tts_bin: PathBuf::from("mozart-tts"),
             bridge_bin: PathBuf::from("mozart-bridge"),
             llama_bin: PathBuf::from("llama-server"),
+            env: HashMap::new(),
         }
     }
 }

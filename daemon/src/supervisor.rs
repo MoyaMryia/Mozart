@@ -264,6 +264,9 @@ fn start_child(
             command.arg("--config").arg(config_path);
         }
     }
+    for (key, value) in &config.process.env {
+        command.env(key, value);
+    }
     command
         .stdin(Stdio::null())
         .stdout(Stdio::from(log))
