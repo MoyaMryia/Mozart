@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # 本地与 CI 共用的检查命令。依赖安装留在 workflow 中。
-#   tools/ci-local.sh <repo|lint|native|web>          运行一个阶段
+#   tools/ci-local.sh <repo|lint|native|rust|web>     运行一个阶段
 #   tools/ci-local.sh --staged                        提交前检查，pre-commit hook 调用
 #   tools/ci-local.sh all                             依次运行全部阶段
 set -euo pipefail

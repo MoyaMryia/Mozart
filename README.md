@@ -45,7 +45,7 @@
 | --- | --- |
 | 语言 | Rust（edition 2021，`core`、`pre`、`daemon`）与 C++20（`rvc`） |
 | 编译标准 | C++20，关闭编译器扩展 |
-| 构建系统 | CMake ≥ 3.22 + Ninja + CTest |
+| 构建系统 | Rust：Cargo workspace；C++：CMake ≥ 3.22 + Ninja + CTest |
 | 编译器缓存 | ccache，检测到即自动启用 |
 | 预设 | `host-debug`、`host-asan`、`host-tsan`、`jetson-release` |
 
