@@ -2,6 +2,7 @@
 // 搬运自 Mozart-Old/rvc-backend/src/rvc/inferencer.cpp，改动：裁掉 filter_radius
 //（只保存未参与计算的死参数，SPEC-03 v1 不暴露）。
 #include "rvc/profile.hpp"
+#include "mozart/frame.h"
 #include <future>
 #include <cstdlib>
 #include <spdlog/spdlog.h>
@@ -19,6 +20,9 @@ constexpr size_t kHop16k = 160;
 constexpr size_t kWindow16k = 32000;
 constexpr size_t kPad16k = 16000;
 constexpr size_t kGeneratorFrames = 200;
+// 文件按 320 样本契约帧攒段，解码向上取整最多补一帧，折算到 160 样本 hop 至多 2 帧。
+// 整段单次路径容忍这点补帧余量，避免“帧数严格相等”被解码补帧绊倒而误退分窗。
+constexpr size_t kFullLengthFrameSlack = MOZART_INPUT_SAMPLES / kHop16k;
 constexpr size_t kRealtimePitchCacheFrames = 1024;
 
 std::vector<float> reflect_pad(const std::vector<float>& audio, size_t pad) {
@@ -294,7 +298,10 @@ std::vector<float> RVCInferencer::infer(
     // A statically exported full-length Generator can follow the Golden
     // pipeline directly. This avoids changing the model's sequence semantics
     // through 2-second chunking when a matching fixed-length export exists.
-    if (generator_frames != kGeneratorFrames && generator_frames == full_frames) {
+    // 按引擎形状选整段路径：输入帧数落在引擎容量加补帧余量内即可，特征由
+    // synthesize_window 补/裁到引擎帧数；不要求与输入帧数严格相等。
+    if (generator_frames != kGeneratorFrames && full_frames >= generator_frames
+        && full_frames <= generator_frames + kFullLengthFrameSlack) {
         auto pitchf = slice_or_pad(pitchf_full, 0, generator_frames);
         auto pitch = std::vector<int64_t>(generator_frames, 1);
         for (size_t t = 0; t < generator_frames; ++t) pitch[t] = pitch_full[t];
@@ -310,6 +317,10 @@ std::vector<float> RVCInferencer::infer(
             converted = resample(converted, model_sr, output_sample_rate_);
         }
         limit_peak(converted, 0.99f);
+        // 整段生成器输出长度由固定帧数决定，可能比输入短若干毫秒；补零到与输入
+        // 等长，满足文件数据面“输出帧数=输入帧数”契约，避免停滞看门狗误判。
+        const size_t target_out = audio_16k.size() * output_sample_rate_ / 16000;
+        converted.resize(target_out, 0.0f);
         return converted;
     }
 
