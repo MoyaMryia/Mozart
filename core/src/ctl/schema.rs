@@ -495,6 +495,22 @@ pub struct DeviceListRequest {
     pub all: bool,
 }
 
+/// DAEMON_CONFIG_SET 请求体（SPEC-04）：改单个键的持久基线。
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ConfigSetRequest {
+    pub key: String,
+    pub value: String,
+}
+
+/// DAEMON_CONFIG_GET 请求体：key 缺省读整份基线。
+#[derive(Debug, Default, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ConfigGetRequest {
+    #[serde(default)]
+    pub key: Option<String>,
+}
+
 /// DAEMON_RESTART 请求体；service 取进程名（pre/rvc/asr/tts/bridge/llama）。
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]

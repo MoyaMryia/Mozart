@@ -1,9 +1,9 @@
 use clap::{Parser, Subcommand, ValueEnum};
 use mozart_core::config::{ensure_run_dir, Config};
 use mozart_core::ctl::schema::{
-    Activity, DeviceEntry, DeviceListRequest, FileCancelRequest, FileFetchRequest, FileJob,
-    FileJobState, FileProgress, FileStatusRequest, FileSubmitRequest, ModelEntry, ProcessState,
-    Response, RestartRequest, Route, Status,
+    Activity, ConfigGetRequest, ConfigSetRequest, DeviceEntry, DeviceListRequest, FileCancelRequest,
+    FileFetchRequest, FileJob, FileJobState, FileProgress, FileStatusRequest, FileSubmitRequest,
+    ModelEntry, ProcessState, Response, RestartRequest, Route, Status,
 };
 use mozart_core::ctl::{self, Seqpacket};
 use serde_json::{json, Value};
@@ -80,6 +80,11 @@ enum Action {
     Device {
         #[command(subcommand)]
         action: DeviceAction,
+    },
+    /// 配置持久基线（SPEC-04）
+    Config {
+        #[command(subcommand)]
+        action: ConfigAction,
     },
 }
 
@@ -175,6 +180,22 @@ enum DeviceAction {
     },
 }
 
+#[derive(Subcommand)]
+enum ConfigAction {
+    /// 改单个键的持久基线；重启键返回需重启提示
+    Set {
+        /// 配置键，如 pre.capture_device
+        key: String,
+        /// 新值
+        value: String,
+    },
+    /// 读配置基线；缺省键读整份
+    Get {
+        /// 配置键；缺省读整份
+        key: Option<String>,
+    },
+}
+
 struct CliError {
     code: u8,
     message: String,
@@ -224,6 +245,10 @@ fn run(cli: Cli) -> Result<(), CliError> {
         Action::Restart { service } => restart(&config, service, cli.json),
         Action::Device { action } => match action {
             DeviceAction::List { all } => device_list(&config, cli.json, all),
+        },
+        Action::Config { action } => match action {
+            ConfigAction::Set { key, value } => config_set(&config, &key, &value, cli.json),
+            ConfigAction::Get { key } => config_get(&config, key.as_deref(), cli.json),
         },
     }
 }
@@ -628,6 +653,52 @@ fn device_list(config: &Config, json_output: bool, all: bool) -> Result<(), CliE
     for device in &devices {
         println!("{:<24} {:<9} {}", device.id, device.kind, device.label);
     }
+    Ok(())
+}
+
+fn config_set(config: &Config, key: &str, value: &str, json_output: bool) -> Result<(), CliError> {
+    let body = body_json(&ConfigSetRequest {
+        key: key.to_string(),
+        value: value.to_string(),
+    })?;
+    let data = call(config, ctl::DAEMON_CONFIG_SET, &body)?;
+    if json_output {
+        println!("{data}");
+        return Ok(());
+    }
+    println!("{key} = {value}");
+    let restart_required = data["restart_required"].as_bool().ok_or_else(|| {
+        CliError::new(EXIT_ERROR, "invalid config set payload: missing restart_required")
+    })?;
+    if restart_required {
+        let affected = data["affected"].as_array().ok_or_else(|| {
+            CliError::new(EXIT_ERROR, "invalid config set payload: missing affected")
+        })?;
+        let services = affected
+            .iter()
+            .filter_map(|service| service.as_str())
+            .collect::<Vec<_>>()
+            .join(" ");
+        println!("需重启生效：mozart-ctl restart {services}");
+    }
+    Ok(())
+}
+
+fn config_get(config: &Config, key: Option<&str>, json_output: bool) -> Result<(), CliError> {
+    let body = body_json(&ConfigGetRequest {
+        key: key.map(str::to_string),
+    })?;
+    let data = call(config, ctl::DAEMON_CONFIG_GET, &body)?;
+    if json_output {
+        println!("{data}");
+        return Ok(());
+    }
+    let value = data
+        .get("value")
+        .ok_or_else(|| CliError::new(EXIT_ERROR, "invalid config get payload: missing value"))?;
+    let text = serde_json::to_string_pretty(value)
+        .map_err(|err| CliError::new(EXIT_ERROR, err.to_string()))?;
+    println!("{text}");
     Ok(())
 }
 
@@ -1231,5 +1302,26 @@ mod tests {
         ));
         assert!(parse(&["device"]).is_err());
         assert!(parse(&["device", "bogus"]).is_err());
+    }
+
+    #[test]
+    fn config_set_get_parse() {
+        let cli = parse(&["config", "set", "pre.capture_device", "plughw:CARD=X,DEV=0"]).unwrap();
+        match cli.command {
+            Action::Config {
+                action: ConfigAction::Set { key, value },
+            } => {
+                assert_eq!(key, "pre.capture_device");
+                assert_eq!(value, "plughw:CARD=X,DEV=0");
+            }
+            _ => panic!("expected config set"),
+        }
+        let cli = parse(&["config", "get"]).unwrap();
+        assert!(matches!(
+            cli.command,
+            Action::Config { action: ConfigAction::Get { key: None } }
+        ));
+        assert!(parse(&["config"]).is_err());
+        assert!(parse(&["config", "set", "onlykey"]).is_err());
     }
 }

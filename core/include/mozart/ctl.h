@@ -58,7 +58,9 @@ enum {
     MOZART_CTL_DAEMON_FILE_LIST   = 0x0116,  // 体 {}（空），data {"jobs":[FileJob],"paused"}
     MOZART_CTL_DAEMON_MODEL_LIST  = 0x0117,  // 体 {}（空），data {"models":[{"id","exists","loaded"}]}
     MOZART_CTL_DAEMON_RESTART     = 0x0118,  // 体 {"service"}
-    MOZART_CTL_DAEMON_DEVICE_LIST = 0x0119,  // 体 {}（空），data {"devices":[{"id","label","kind"}]}
+    MOZART_CTL_DAEMON_DEVICE_LIST = 0x0119,  // 体 {"all"?}，data {"devices":[{"id","label","kind"}]}
+    MOZART_CTL_DAEMON_CONFIG_SET  = 0x011A,  // 体 {"key","value"}，data {"key","value","restart_required","affected"}
+    MOZART_CTL_DAEMON_CONFIG_GET  = 0x011B,  // 体 {"key"?}，data {"value"}（缺省 key 回整份基线）
 
     MOZART_CTL_PRE_HELLO      = 0x0201,
     MOZART_CTL_PRE_SET_ROUTE  = 0x0202,

@@ -349,6 +349,7 @@ impl Default for DaemonConfig {
 #[derive(Debug)]
 pub enum ConfigError {
     Read { path: PathBuf, source: io::Error },
+    Write { path: PathBuf, source: io::Error },
     Parse { path: PathBuf, source: toml::de::Error },
     Invalid(String),
 }
@@ -358,6 +359,9 @@ impl fmt::Display for ConfigError {
         match self {
             ConfigError::Read { path, source } => {
                 write!(f, "read config {}: {source}", path.display())
+            }
+            ConfigError::Write { path, source } => {
+                write!(f, "write config {}: {source}", path.display())
             }
             ConfigError::Parse { path, source } => {
                 write!(f, "parse config {}: {source}", path.display())
@@ -725,9 +729,186 @@ pub fn ensure_run_dir(dir: &Path) -> io::Result<()> {
     Ok(())
 }
 
+/// 设备键 → 方向（SPEC-04 设备存在性校验用）；非设备键返回 None。
+/// 设备键分类的唯一定义源，daemon 与 set_key 共用。
+pub fn device_key_kind(key: &str) -> Option<&'static str> {
+    match key {
+        "pre.capture_device" => Some("capture"),
+        "pre.playback_device" => Some("playback"),
+        _ => None,
+    }
+}
+
+/// config set 的结果（SPEC-04 重启提示契约：restart_required + affected）。
+pub struct KeyEffect {
+    pub restart_required: bool,
+    pub affected: Vec<String>,
+}
+
+/// 写单个键的持久基线（SPEC-04 模型甲，原子写）。当前支持重启类设备键，
+/// 其余键返回明确错误。设备存在性校验由 daemon 在调用前做（需 ALSA 枚举）。
+pub fn set_key(path: Option<&Path>, key: &str, value: &str) -> Result<KeyEffect, ConfigError> {
+    if device_key_kind(key).is_some() {
+        validate_device_name(value, key)?;
+        write_toml_key(path, key, value)?;
+        return Ok(KeyEffect {
+            restart_required: true,
+            affected: vec!["pre".to_string()],
+        });
+    }
+    Err(ConfigError::Invalid(format!(
+        "config set 暂不支持键 {key}（当前支持 pre.capture_device / pre.playback_device）"
+    )))
+}
+
+/// 原子写 TOML 单键：toml_edit 保留注释与排版，临时文件 + rename。
+fn write_toml_key(path: Option<&Path>, key: &str, value: &str) -> Result<(), ConfigError> {
+    let path = path.ok_or_else(|| {
+        ConfigError::Invalid(
+            "config set 需要配置文件基线；daemon 当前以内置默认启动（无配置文件），请以配置文件重启 daemon"
+                .to_string(),
+        )
+    })?;
+    let text = match std::fs::read_to_string(path) {
+        Ok(text) => text,
+        Err(err) if err.kind() == io::ErrorKind::NotFound => String::new(),
+        Err(source) => {
+            return Err(ConfigError::Read {
+                path: path.to_path_buf(),
+                source,
+            })
+        }
+    };
+    let mut doc = text.parse::<toml_edit::DocumentMut>().map_err(|err| {
+        ConfigError::Invalid(format!("parse config {}: {err}", path.display()))
+    })?;
+    let mut parts: Vec<&str> = key.split('.').collect();
+    let leaf = parts.pop().expect("设备键非空（set_key 已分类）");
+    let mut table = doc.as_table_mut();
+    for part in parts {
+        let item = table
+            .entry(part)
+            .or_insert_with(|| toml_edit::Item::Table(toml_edit::Table::new()));
+        table = item
+            .as_table_mut()
+            .ok_or_else(|| ConfigError::Invalid(format!("键 {key} 的路径 {part} 不是表")))?;
+    }
+    table[leaf] = toml_edit::value(value);
+    atomic_write(path, &doc.to_string())
+}
+
+/// 临时文件名含进程号与序号，避免并发写回撞名；rename 原子替换基线。
+fn atomic_write(path: &Path, text: &str) -> Result<(), ConfigError> {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static SEQ: AtomicU64 = AtomicU64::new(0);
+    let dir = path.parent().unwrap_or_else(|| Path::new("."));
+    let tmp = dir.join(format!(
+        ".mozart-config-{}-{}.tmp",
+        std::process::id(),
+        SEQ.fetch_add(1, Ordering::Relaxed)
+    ));
+    std::fs::write(&tmp, text).map_err(|source| ConfigError::Write {
+        path: tmp.clone(),
+        source,
+    })?;
+    std::fs::rename(&tmp, path).map_err(|source| ConfigError::Write {
+        path: path.to_path_buf(),
+        source,
+    })?;
+    Ok(())
+}
+
+/// 读持久基线的键值（config get）。缺省返回整份 TOML；无配置文件返回空表。
+/// 读的是 TOML 基线，不含环境变量覆盖与运行时状态（生效值恢复见 SPEC-04）。
+pub fn get_key(path: Option<&Path>, key: Option<&str>) -> Result<toml::Value, ConfigError> {
+    let value = match path {
+        Some(path) => {
+            let text = std::fs::read_to_string(path).map_err(|source| ConfigError::Read {
+                path: path.to_path_buf(),
+                source,
+            })?;
+            toml::from_str::<toml::Value>(&text).map_err(|source| ConfigError::Parse {
+                path: path.to_path_buf(),
+                source,
+            })?
+        }
+        None => toml::Value::Table(toml::map::Map::new()),
+    };
+    let Some(key) = key else {
+        return Ok(value);
+    };
+    let mut cur = &value;
+    for part in key.split('.') {
+        cur = cur
+            .get(part)
+            .ok_or_else(|| ConfigError::Invalid(format!("键 {key} 不存在")))?;
+    }
+    Ok(cur.clone())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn temp_config_dir(tag: &str) -> PathBuf {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static SEQ: AtomicU64 = AtomicU64::new(0);
+        let dir = std::env::temp_dir().join(format!(
+            "mozart-cfg-{tag}-{}-{}",
+            std::process::id(),
+            SEQ.fetch_add(1, Ordering::Relaxed)
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    #[test]
+    fn device_key_kind_classification() {
+        assert_eq!(device_key_kind("pre.capture_device"), Some("capture"));
+        assert_eq!(device_key_kind("pre.playback_device"), Some("playback"));
+        assert_eq!(device_key_kind("rvc.pitch_shift"), None);
+        assert_eq!(device_key_kind(""), None);
+    }
+
+    #[test]
+    fn set_key_writes_device_and_preserves_comments() {
+        let dir = temp_config_dir("set");
+        let path = dir.join("mozart.toml");
+        std::fs::write(&path, "# 基线注释\n[pre]\ncapture_device = \"default\"\n").unwrap();
+        let effect = set_key(Some(&path), "pre.capture_device", "plughw:CARD=X,DEV=0").unwrap();
+        assert!(effect.restart_required);
+        assert_eq!(effect.affected, vec!["pre".to_string()]);
+        let text = std::fs::read_to_string(&path).unwrap();
+        assert!(text.contains("# 基线注释"), "原子写回应保留注释：{text}");
+        let config = Config::load_from(Some(&path)).unwrap();
+        assert_eq!(config.pre.capture_device, "plughw:CARD=X,DEV=0");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn set_key_rejects_unsupported_key_and_invalid_device() {
+        let dir = temp_config_dir("reject");
+        let path = dir.join("mozart.toml");
+        std::fs::write(&path, "[pre]\n").unwrap();
+        assert!(set_key(Some(&path), "rvc.pitch_shift", "3").is_err());
+        assert!(set_key(Some(&path), "pre.capture_device", "").is_err());
+        assert!(set_key(Some(&path), "pre.capture_device", "a\0b").is_err());
+        assert!(set_key(None, "pre.capture_device", "default").is_err());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn get_key_reads_baseline_value() {
+        let dir = temp_config_dir("get");
+        let path = dir.join("mozart.toml");
+        std::fs::write(&path, "[pre]\ncapture_device = \"default\"\n").unwrap();
+        let value = get_key(Some(&path), Some("pre.capture_device")).unwrap();
+        assert_eq!(value.as_str(), Some("default"));
+        let whole = get_key(Some(&path), None).unwrap();
+        assert!(whole.get("pre").is_some());
+        assert!(get_key(Some(&path), Some("pre.nope")).is_err());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 
     #[test]
     fn defaults_match_confirmed_paths() {

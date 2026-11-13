@@ -27,6 +27,7 @@
 - 配置持久化（模型甲）：TOML 是持久基线，运行时改动不自动写 TOML；只有显式写回动作（`config set` / `config save`）写 TOML，原子写。用户手改 TOML 随意，不做防冲突保护；手改在重启时被读取。
 - 运行时状态文件：daemon 在持久数据目录（默认 `~/.local/state/mozart/`）维护运行时状态文件，记录运行时改动（字幕开关，将来 RVC 会话参数）。每次改动原子写（临时文件 + rename），崩溃也保留。启动时读 TOML 基线叠加运行时状态，得到生效配置再拉起服务下发。运行时状态文件是存档快照，不是第二份活权威；活权威在各服务，启动恢复一次，运行时不对账。
 - 配置写回动作（均经 daemon，原子写 TOML）：`config set <键> <值>` 改单个键的持久基线；`config save` 把状态文件的全部运行时覆盖批量写进 TOML 成基线，随后清空状态文件覆盖。`config save` 不改生效值，无需重启。
+- config set 实现范围（v1 第一步）：先落地重启类设备键 `pre.capture_device` / `pre.playback_device`——原子写基线（toml_edit 保留注释）、对照当前设备清单校验存在（防呆，设备级；子设备号范围由 pre 打开时验证）、回 `restart_required` + `affected`；设备键分类单一来源 `core::config::device_key_kind`。其余键的运行时即时下发、`config save`、运行时状态文件，以及写重启键后 `status` 的待重启显示，后续实现。`config get` 读 TOML 基线（不含环境变量覆盖与运行时状态）。
 - 配置键分类按机制 + 切换成本，能即时生效就归运行时：键值每次操作才读（阈值/上限/开关/超时）或 owning 服务有运行中应用命令 → 运行时；启动时固化进长活结构（打开的设备、绑定的 socket、预分配的环、加载的模型、spawn 的二进制、存储目录）→ 重启。`config set` 运行时键：写 TOML 基线、清该键状态覆盖、立即下发生效；重启键：只写 TOML、不动运行进程、返回需重启提示。逐键分类与机制依据见 [docs/config.md](../config.md)。
 - RVC 会话参数运行时生效经 `StopStream`→`StartStream` 带新参：实时在跑立刻用新参（短暂打断）；文件任务在跑则当前任务用旧参跑完、新参下一任务生效，不中途废弃文件任务。干净的块边界 `SetParams` 仍见 [FUTURE.md](../FUTURE.md)。
 - 重启提示契约：`config set` 重启生效键的响应带稳定字段 `restart_required` 与 `affected`（受影响服务）；daemon 判定，CLI 与以后 HTTP 适配器读同一字段提示，不各自实现。写了重启键后 TOML 与运行值分歧，`status` 显示该服务待重启。

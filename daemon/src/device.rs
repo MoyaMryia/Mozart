@@ -73,6 +73,31 @@ pub fn list_reply(
     }
 }
 
+/// 设备存在性校验（SPEC-04 配置/切换设备时对照当前清单）：id 归一化去掉
+/// SUBDEV 后缀后按方向匹配枚举清单。枚举失败带原因返回。
+pub fn exists(id: &str, kind: &str) -> Result<bool, (String, String)> {
+    let normalized = strip_subdevice(id);
+    let devices = list()?;
+    Ok(devices.iter().any(|d| d.id == normalized && d.kind == kind))
+}
+
+/// 去掉 ALSA 名尾部的 ",SUBDEV=<数字>"：枚举清单按设备（无子设备号），
+/// 配置可带子设备号（如 snd-aloop 指定 SUBDEV）。非数字后缀不剥离。
+fn strip_subdevice(id: &str) -> &str {
+    const SUFFIX: &str = ",SUBDEV=";
+    match id.rfind(SUFFIX) {
+        Some(pos) => {
+            let tail = &id[pos + SUFFIX.len()..];
+            if !tail.is_empty() && tail.bytes().all(|b| b.is_ascii_digit()) {
+                &id[..pos]
+            } else {
+                id
+            }
+        }
+        None => id,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -138,5 +163,22 @@ mod tests {
         let value: serde_json::Value = serde_json::from_slice(&body).unwrap();
         assert_eq!(value["status"], "error");
         assert_eq!(value["reason"], "boom");
+    }
+
+    #[test]
+    fn strip_subdevice_removes_only_numeric_suffix() {
+        assert_eq!(
+            strip_subdevice("plughw:CARD=Loopback,DEV=1,SUBDEV=2"),
+            "plughw:CARD=Loopback,DEV=1"
+        );
+        assert_eq!(
+            strip_subdevice("plughw:CARD=Loopback,DEV=1"),
+            "plughw:CARD=Loopback,DEV=1"
+        );
+        assert_eq!(strip_subdevice("default"), "default");
+        assert_eq!(
+            strip_subdevice("plughw:CARD=X,DEV=0,SUBDEV=abc"),
+            "plughw:CARD=X,DEV=0,SUBDEV=abc"
+        );
     }
 }

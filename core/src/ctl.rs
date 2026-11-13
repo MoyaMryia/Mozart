@@ -53,6 +53,11 @@ pub const DAEMON_MODEL_LIST: u16 = 0x0117;
 pub const DAEMON_RESTART: u16 = 0x0118;
 /// 体：{}（空）；data {"devices":[schema::DeviceEntry]}。
 pub const DAEMON_DEVICE_LIST: u16 = 0x0119;
+/// 体：schema::ConfigSetRequest {"key","value"}；
+/// data {"key","value","restart_required","affected"}（SPEC-04 重启提示契约）。
+pub const DAEMON_CONFIG_SET: u16 = 0x011A;
+/// 体：schema::ConfigGetRequest {"key"?}；data {"value"}（缺省 key 回整份基线）。
+pub const DAEMON_CONFIG_GET: u16 = 0x011B;
 
 pub const PRE_HELLO: u16 = 0x0201;
 pub const PRE_SET_ROUTE: u16 = 0x0202;
@@ -615,6 +620,8 @@ mod tests {
         assert_eq!(DAEMON_MODEL_LIST, 0x0117);
         assert_eq!(DAEMON_RESTART, 0x0118);
         assert_eq!(DAEMON_DEVICE_LIST, 0x0119);
+        assert_eq!(DAEMON_CONFIG_SET, 0x011A);
+        assert_eq!(DAEMON_CONFIG_GET, 0x011B);
         assert_eq!(RVC_LIST_MODELS, 0x0307);
         assert_eq!(PRE_SET_FILE_MODE, 0x0206);
     }
@@ -639,6 +646,8 @@ mod tests {
         ("DAEMON_MODEL_LIST", DAEMON_MODEL_LIST),
         ("DAEMON_RESTART", DAEMON_RESTART),
         ("DAEMON_DEVICE_LIST", DAEMON_DEVICE_LIST),
+        ("DAEMON_CONFIG_SET", DAEMON_CONFIG_SET),
+        ("DAEMON_CONFIG_GET", DAEMON_CONFIG_GET),
         ("PRE_HELLO", PRE_HELLO),
         ("PRE_SET_ROUTE", PRE_SET_ROUTE),
         ("PRE_SET_MUTE", PRE_SET_MUTE),

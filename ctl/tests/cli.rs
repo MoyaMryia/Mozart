@@ -911,6 +911,49 @@ fn device_list_all_flag_forwarded() {
 }
 
 #[test]
+fn config_set_builds_request_and_restart_hint() {
+    let env = CtlEnv::new("config-set");
+    let stub = StubDaemon::start(
+        &env.socket(),
+        vec![(
+            ctl::DAEMON_CONFIG_SET,
+            ok_body(json!({
+                "key": "pre.capture_device",
+                "value": "plughw:CARD=X,DEV=0",
+                "restart_required": true,
+                "affected": ["pre"],
+            })),
+        )],
+    );
+    let output = env.run(&[
+        "config", "set", "pre.capture_device", "plughw:CARD=X,DEV=0", "--json",
+    ]);
+    assert_eq!(stdout_json(&output)["restart_required"], json!(true));
+    assert_eq!(stub.requests()[0].0, ctl::DAEMON_CONFIG_SET);
+    assert_eq!(
+        stub.requests()[0].1,
+        json!({"key": "pre.capture_device", "value": "plughw:CARD=X,DEV=0"})
+    );
+
+    let human = env.run(&["config", "set", "pre.capture_device", "plughw:CARD=X,DEV=0"]);
+    assert_success(&human);
+    let text = String::from_utf8_lossy(&human.stdout);
+    assert!(text.contains("restart pre"), "stdout: {text}");
+}
+
+#[test]
+fn config_get_builds_request() {
+    let env = CtlEnv::new("config-get");
+    let stub = StubDaemon::start(
+        &env.socket(),
+        vec![(ctl::DAEMON_CONFIG_GET, ok_body(json!({"value": "default"})))],
+    );
+    let output = env.run(&["config", "get", "pre.capture_device", "--json"]);
+    assert_eq!(stdout_json(&output)["value"], json!("default"));
+    assert_eq!(stub.requests()[0].1, json!({"key": "pre.capture_device"}));
+}
+
+#[test]
 fn device_list_empty_renders_no_devices() {
     let env = CtlEnv::new("device-empty");
     let _stub = StubDaemon::start(
