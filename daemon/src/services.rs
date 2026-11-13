@@ -495,7 +495,7 @@ fn set_pre_mute(services: &Services, mute: bool) -> Result<(), CallError> {
         .map(|_| ())
 }
 
-pub fn poll(state: &Mutex<State>, services: &Services, config: &Config) {
+pub fn poll(state: &Mutex<State>, services: &Services, config: &Config, pre_handoff_active: bool) {
     let mut degraded = Vec::new();
     let pre_status = poll_pre(services, &mut degraded);
     let rvc_status = poll_rvc(services, &mut degraded);
@@ -512,6 +512,7 @@ pub fn poll(state: &Mutex<State>, services: &Services, config: &Config) {
         }
     };
     if let Some(_transition) = transition {
+        reconcile_pre_mode(state, services, pre_status.as_ref(), pre_handoff_active, &mut degraded);
         reconcile(
             state,
             services,
@@ -614,6 +615,38 @@ fn poll_bridge(services: &Services, degraded: &mut Vec<String>) -> Option<Bridge
             None
         }
     }
+}
+
+/// 权威对账 pre 数据面模式（SPEC-04 单一权威）：pre 的 rvc AI 支路仅在 daemon
+/// 断言实时态时活跃，pre 启动/重启后不单边 reclaim，等 daemon 断言。daemon 每轮
+/// 把 pre 模式收敛到权威态（gpu_owner==File → 文件接管），并在 pre 重启（startup_id
+/// 变化）或尚未断言时重新断言。文件交接窗口内让位给 FileHandoff，避免争用。
+fn reconcile_pre_mode(
+    state: &Mutex<State>,
+    services: &Services,
+    pre_status: Option<&PreStatus>,
+    handoff_active: bool,
+    degraded: &mut Vec<String>,
+) {
+    let Some(pre) = pre_status else {
+        return;
+    };
+    // 交接建立期间 pre 模式由 FileHandoff 起停流直接管理，对账不介入。
+    if handoff_active {
+        return;
+    }
+    let expected_file = lock_state(state).gpu_owner() == Some(Activity::File);
+    let restarted = {
+        let state = lock_state(state);
+        state.pre_startup_id() != Some(pre.startup_id.as_str())
+    };
+    let needs_assert = restarted || !pre.mode_asserted || pre.file_mode != expected_file;
+    if needs_assert {
+        if let Err((code, reason)) = services.pre_set_file_mode(expected_file) {
+            degraded.push(format!("pre mode assert: {code}: {reason}"));
+        }
+    }
+    lock_state(state).set_pre_startup_id(Some(pre.startup_id.clone()));
 }
 
 fn reconcile(

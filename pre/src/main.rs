@@ -6,8 +6,10 @@
 //! 路由排空计数）；接收线程独立收 rvc 输出帧入 AI 环、TTS 播报帧入播报环；
 //! 控制线程独立服务 SEQPACKET。
 //! 发送恒定不停（旧 main.c L11「AI 路径永不停」）：路由只决定播放源，
-//! 不停发输入帧。唯一例外是文件接管（SPEC-03 状态门控交接）：file_mode
-//! 期间 rvc 支路停发、输出 socket 释放给 daemon，asr 支路不受影响。
+//! 不停发输入帧。rvc AI 支路受 daemon 单一权威门控（SPEC-04）：仅 daemon
+//! 断言实时态（mode_asserted && !file_mode）才发 input_socket、绑 output_socket；
+//! 启动/重启静默等断言，不单边 reclaim。文件接管（SPEC-03 状态门控交接）期间
+//! rvc 支路停发、输出 socket 释放给 daemon。asr 字幕支路与主干直出恒跑不受门控。
 //! 发送侧惰性建链，pre 启动不依赖 rvc/asr 生命周期。
 //! 停止：SIGTERM/SIGINT 置停止标志，各线程在时限内退出；设备打开失败立即退出，
 //! daemon 按退避重启（SPEC-02：换设备不做在线命令，由重启代替）。
@@ -27,12 +29,13 @@ use mozart_core::ring::Ring;
 use mozart_core::thread::{bind_socket as bind_control_socket, guard_panic, spawn_thread};
 use mozart_core::{OutputFrame, RawFrame};
 use state::Shared;
+use std::io::Read;
 use std::path::PathBuf;
 use std::process::ExitCode;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::thread::JoinHandle;
-use std::time::Duration;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 /// 主干环（处理 → 播放）容量：8 帧，与采集环默认同量级；未配置化（YAGNI，Task 3/4 复核）。
 const TRUNK_QUEUE_FRAMES: usize = 8;
@@ -53,6 +56,25 @@ fn install_signal_handlers() {
         libc::signal(libc::SIGTERM, on_signal as *const () as libc::sighandler_t);
         libc::signal(libc::SIGINT, on_signal as *const () as libc::sighandler_t);
     }
+}
+
+/// 生成 8 位十六进制启动号：优先 /dev/urandom，失败兜底时间+pid。
+/// 每次进程启动唯一，GetStatus 上报供 daemon 识别 pre 重启并重新断言模式
+/// （SPEC-04 单一权威对账，与 asr 启动号同一纪律）。
+fn new_startup_id() -> String {
+    let mut bytes = [0u8; 4];
+    if std::fs::File::open("/dev/urandom")
+        .and_then(|mut file| file.read_exact(&mut bytes))
+        .is_ok()
+    {
+        return bytes.iter().map(|b| format!("{b:02x}")).collect();
+    }
+    let nanos = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_nanos() as u64;
+    let mixed = nanos ^ ((std::process::id() as u64) << 32);
+    format!("{:08x}", mixed as u32)
 }
 
 struct Args {
@@ -89,8 +111,9 @@ fn parse_args() -> Result<Args, String> {
 /// DSP 在采集环之后、direct 分支之前——direct 取的 48 kHz 主干含 DSP，
 /// 与旧实现一致。发送不随路由停发（旧 main.c L11）；同一 InputFrame 恒发到
 /// rvc 与 asr 两条输入支路，各自惰性建链、独立丢弃计数。
-/// 文件接管例外（SPEC-03 状态门控交接）：file_mode 期间只停 rvc 支路，
-/// asr 字幕支路与主干直出不受影响。
+/// rvc 支路例外（SPEC-04 单一权威 + SPEC-03 状态门控交接）：仅 daemon 已断言
+/// 实时态（mode_asserted && !file_mode）才发；未断言（启动/重启）或文件接管
+/// 期间停发。asr 字幕支路与主干直出恒跑，不受断言与文件接管影响。
 fn process_thread(
     capture_ring: Arc<Ring<RawFrame>>,
     trunk: Arc<Ring<RawFrame>>,
@@ -109,9 +132,10 @@ fn process_thread(
             let conf = dsp.process_frame(&mut frame);
             let input_frame = dsp.pack_frame(&frame, conf);
             trunk.push(frame);
-            // 文件接管期间 rvc 数据面归 daemon：停发避免实时帧污染整段攒帧。
-            // 只读原子，不分配不阻塞；asr 支路恒发不受影响。
-            if !shared.file_mode() {
+            // rvc AI 支路仅在 daemon 已断言实时态时发送（SPEC-04 单一权威）：
+            // 未断言（启动/重启）或文件接管期间停发——避免实时帧污染整段攒帧，
+            // 也避免 pre 单边 reclaim。只读原子，不分配不阻塞；asr 支路恒发不受影响。
+            if shared.rvc_ai_active() {
                 ai_sender.send(&input_frame, &shared);
             }
             asr_sender.send(&input_frame, &shared);
@@ -160,6 +184,7 @@ fn main() -> ExitCode {
     let shared = Arc::new(Shared::new(
         config.pre.capture_device.clone(),
         config.pre.playback_device.clone(),
+        new_startup_id(),
     ));
     // 容量已由配置校验保证 ≥ 1；Ring::new 对 0 会 panic。
     let capture_ring = Arc::new(Ring::<RawFrame>::new(
@@ -181,23 +206,11 @@ fn main() -> ExitCode {
         return ExitCode::FAILURE;
     }
 
-    // AI 支路输出侧：pre 绑定 output_socket 收 rvc 输出帧（SPEC-02 方向约定）。
-    // 绑定失败（run_dir 缺失等）立即退出：部署路径属配置错误。
-    let rvc_out_socket = match FrameSocket::<OutputFrame>::bind(
-        &config.rvc_output_socket(),
-        ai::RVC_QUEUE_FRAMES,
-    ) {
-        Ok(socket) => socket,
-        Err(err) => {
-            eprintln!(
-                "mozart-pre: bind {}: {err}",
-                config.rvc_output_socket().display()
-            );
-            return ExitCode::FAILURE;
-        }
-    };
+    // AI 支路输出侧（SPEC-04 单一权威）：pre 启动不绑定 output_socket——
+    // rvc 接收线程在 daemon 断言实时态后才惰性绑定（见 ai::recv_loop）。
+    // 杜绝启动/重启无条件 reclaim 孤儿化 daemon 的文件数据面绑定。
     // AI 支路输入侧：连接 rvc input_socket，对端未就绪时发送丢弃计数
-    //（惰性建链，不阻塞启动）。
+    //（惰性建链，不阻塞启动）；发送受 rvc_ai_active 门控。
     let ai_sender = ai::Sender::new(config.rvc_input_socket());
     // 识别支路输入侧：连接 asr input_socket，与 rvc 同帧恒发；asr 未起时
     // 发送丢弃计数，不阻塞 pre（SPEC-05）。
@@ -280,7 +293,7 @@ fn main() -> ExitCode {
         match spawn_thread("mozart-rvc-recv", move || {
             stop_on_fatal(
                 &STOP,
-                guard_panic(move || ai::recv_loop(rvc_out_socket, path, ring, shared, &STOP)),
+                guard_panic(move || ai::recv_loop(path, ring, shared, &STOP)),
             )
         }) {
             Ok(handle) => handle,
@@ -450,8 +463,9 @@ mod tests {
         STOP.store(false, Ordering::Relaxed);
     }
 
-    /// 文件接管门控（SPEC-03 状态门控交接）：file_mode=true 时处理线程停发
-    /// rvc 支路，asr 字幕支路恒发不受影响；交还后 rvc 恢复发送。
+    /// 文件接管门控（SPEC-03 状态门控交接 + SPEC-04 单一权威）：daemon 已断言
+    /// 实时态后，file_mode=true 时处理线程停发 rvc 支路，asr 字幕支路恒发不受
+    /// 影响；交还后 rvc 恢复发送。
     #[test]
     fn file_mode_gates_rvc_send_but_not_asr() {
         let _guard = STOP_TEST_MUTEX
@@ -467,7 +481,9 @@ mod tests {
         let rvc_rx = FrameSocket::<mozart_core::InputFrame>::bind(&rvc_path, 8).unwrap();
         let asr_rx = FrameSocket::<mozart_core::InputFrame>::bind(&asr_path, 8).unwrap();
 
-        let shared = Arc::new(Shared::new("cap".to_string(), "play".to_string()));
+        let shared = Arc::new(Shared::new("cap".to_string(), "play".to_string(), "startup".to_string()));
+        // daemon 断言实时态：rvc AI 支路激活。
+        shared.set_mode_asserted(true);
         let capture = Arc::new(Ring::<RawFrame>::new(8));
         let trunk = Arc::new(Ring::<RawFrame>::new(8));
         let worker = {

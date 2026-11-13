@@ -415,12 +415,12 @@ fn begin_restore_failure_reason_survives_polls() {
     );
 }
 
-/// 回归（Important #2）：文件任务期间 kill pre，监管重启后 pre.file_mode=false
-/// 并恢复恒发（FLOOD 旋钮）。旧代码不检测失接管：实时帧污染整段攒帧，任务楔死
-/// 在 feed（板端 295 s 死锁同形态），GPU 恒归 File。修复后 tick 两轮确认失接管
-/// → 带原因中止，worker 经取消检查点收尾，落 failed、GPU 释放、队列继续。
+/// 根因治愈（SPEC-04 单一权威）：文件任务期间 kill pre，监管重启后 pre 处于
+/// 未断言静默态（启动门控：不恒发污染整段攒帧、不 reclaim 输出 socket）。
+/// daemon 检测失接管重新断言恢复交接，任务继续完成（不再误中止）；GPU 收尾
+/// 释放、队列继续。旧代码 pre 重启无条件恒发→污染→楔死，本用例验证治愈。
 #[test]
-fn pre_restart_during_file_job_fails_with_reason_and_frees_gpu() {
+fn pre_restart_during_file_job_recovers_and_completes() {
     let h = Harness::new(
         "worker-pre-restart",
         "",
@@ -430,7 +430,7 @@ fn pre_restart_during_file_job_fails_with_reason_and_frees_gpu() {
             ("MOZART_RVC_STUB_FILE_DELAY_MS", "6000".to_string()),
         ],
     );
-    // 20 s = 1000 契约帧，攒帧窗约 2 s：kill 落在 feed 段，失接管后恒发污染可复现。
+    // 20 s = 1000 契约帧，攒帧窗约 2 s：kill 落在 feed 段。
     let (job_id, _pcm) = h.submit("tone.wav", 20, 16000);
     assert!(
         wait_until(JOB_TIMEOUT, || {
@@ -449,9 +449,9 @@ fn pre_restart_during_file_job_fails_with_reason_and_frees_gpu() {
         .unwrap();
     assert!(killed.success(), "kill pre 失败");
 
-    let job = wait_job_state(&h.conn, &job_id, FileJobState::Failed, JOB_TIMEOUT);
-    let error = job.error.expect("失接管必须带可查询原因");
-    assert!(error.contains("handoff lost"), "{error}");
+    // 根因治愈：pre 重启静默不污染，daemon 重断言恢复交接，任务继续完成。
+    let job = wait_job_state(&h.conn, &job_id, FileJobState::Completed, JOB_TIMEOUT);
+    assert!(job.result_ready, "pre 重启后任务应恢复并完成（旧代码楔死/误中止）");
     h.assert_temp_clean(&job_id);
     h.assert_gpu_free();
 

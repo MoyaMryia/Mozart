@@ -41,6 +41,7 @@
 - 文件队列暂停/恢复保留：`file pause` 置暂停标志，不再启动新任务，正在执行的任务跑完；`file resume` 清除标志继续。暂停是队列级布尔标志，独立于 GPU 仲裁。
 - 文件任务按任务选模型保留：`file submit <path> [--model <id>]`，不带 `--model` 用当前已加载模型。rvc 增 `ListModels` 查询；daemon 入队时经它校验模型存在，不存在当场拒收（沿用旧行为）。执行时 `LoadModel` 仍可能失败（如模型损坏），失败标 failed 带原因、队列继续。
 - 文件转换数据面中间层归 daemon（Rust）：解码文件为 16 kHz 帧喂给 rvc、收 48 kHz 输出帧编码为结果文件；文件期间 daemon 绑定输出 socket 作数据面对端。此路径离线，不在实时音频路径上，不影响实时延迟。
+- 数据面所有权归 daemon 单一权威（根治共享 socket 约定式所有权竞态）：pre 的 rvc AI 支路（发 `input_socket` + 绑 `output_socket`）仅在 daemon 断言实时态时活跃，pre 启动/重启后静默待断言、不单边 reclaim。daemon 每轮对账 pre 模式到权威态（`gpu_owner==File` → 文件接管），并按 pre 上报的 `startup_id` 识别重启重新断言；文件交接窗口内对账让位给交接守卫。文件任务期间 pre 重启不再丢失交接：pre 静默不污染攒帧、不孤儿化输出绑定，daemon 重断言恢复交接、任务继续；仅 pre 持续不可达才带原因中止。
 - 文件降噪保留（旧 `file_denoise`，默认关）：daemon 离线调用与 pre 同一套共享 DSP（SPEC-02）对文件先降噪再喂 rvc；实时链路降噪不受影响。
 - 文件任务取消由 daemon 编排：排队中→移出队列、标 cancelled、删源副本；执行中→发 `StopStream` 给 rvc、停后标 cancelled。临时文件（解码裸音频、半成品输出）归 daemon 清理：取消/失败删除，成功改名发布；C++ 不碰文件。CLI `file cancel <job_id>`。
 - 文件存储与结果生命周期：源副本与结果同放一个受管存储目录，默认 `~/.local/state/mozart/files/`（持久存储，不放 /run tmpfs），TOML 可配。结果原子发布：先写 `.part`、成功再 rename。驱逐沿用旧策略：每任务后目录总大小超上限（默认 1000 MiB，TOML 键）按时间戳从旧到新删至 80%，未完成任务的源/结果受保护，已完成结果可被删——结果是有限缓存，需及时取走。

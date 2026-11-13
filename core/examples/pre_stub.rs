@@ -23,12 +23,18 @@ struct State {
     route: &'static str,
     mute: bool,
     file_mode: Arc<AtomicBool>,
+    /// daemon 权威断言标志（SPEC-04 单一权威）：启动 false，恒发支路静默，
+    /// 首个 PRE_SET_FILE_MODE 置 true。重启同理，不单边 reclaim。
+    mode_asserted: Arc<AtomicBool>,
+    startup_id: String,
     file_mode_delay: Duration,
 }
 
 fn main() {
     let args = parse_args("mozart-pre-stub");
     let file_mode = Arc::new(AtomicBool::new(false));
+    let mode_asserted = Arc::new(AtomicBool::new(false));
+    let startup_id = format!("stub-{}", std::process::id());
     let file_mode_delay = std::env::var("MOZART_PRE_STUB_FILE_MODE_DELAY_MS")
         .ok()
         .and_then(|value| value.parse::<u64>().ok())
@@ -41,24 +47,29 @@ fn main() {
         });
         let path = config.rvc_input_socket();
         let gate = file_mode.clone();
-        std::thread::spawn(move || flood(path, gate));
+        let asserted = mode_asserted.clone();
+        std::thread::spawn(move || flood(path, gate, asserted));
     }
     let mut state = State {
         route: "direct",
         mute: false,
         file_mode,
+        mode_asserted,
+        startup_id,
         file_mode_delay,
     };
     serve(args, move |msg| handle(msg, &mut state));
 }
 
 /// 模拟 pre 惰性恒发（ai.rs LazySender）：非阻塞发送，满则丢弃；发送失败弃用
-/// 通道下一帧重建链（跟随 rvc 重绑）。file_mode=true 时停发（状态门控交接）。
-fn flood(path: PathBuf, gate: Arc<AtomicBool>) {
+/// 通道下一帧重建链（跟随 rvc 重绑）。单一权威门控（SPEC-04）：仅当 daemon 已
+/// 断言实时态（mode_asserted && !file_mode）才发；启动/重启未断言则静默，
+/// 文件接管（file_mode=true）停发。与真 pre rvc_ai_active 同口径。
+fn flood(path: PathBuf, gate: Arc<AtomicBool>, asserted: Arc<AtomicBool>) {
     let mut socket: Option<FrameSocket<InputFrame>> = None;
     let mut idx = 0u32;
     loop {
-        if !gate.load(Ordering::Relaxed) {
+        if asserted.load(Ordering::Relaxed) && !gate.load(Ordering::Relaxed) {
             if socket.is_none() {
                 socket = FrameSocket::<InputFrame>::connect(&path, 8).ok();
             }
@@ -129,7 +140,10 @@ fn handle(msg: &Message, state: &mut State) -> Vec<u8> {
                 return fail(ctl::CODE_INVALID_ARGUMENT, "active must be a boolean");
             };
             // 桩无数据面绑定，交接握手平凡成立：置门控即应答（恒发支路随即可见）。
+            // daemon 权威断言（SPEC-04）：先置 file_mode 再置 mode_asserted，
+            // 杜绝「mode_asserted 先 true、file_mode 尚 false」窗口抢发实时帧。
             state.file_mode.store(active, Ordering::Relaxed);
+            state.mode_asserted.store(true, Ordering::Relaxed);
             // 测试旋钮：先执行门控再延迟应答，模拟「命令已生效而应答丢失/超时」。
             if !state.file_mode_delay.is_zero() {
                 std::thread::sleep(state.file_mode_delay);
@@ -151,6 +165,8 @@ fn handle(msg: &Message, state: &mut State) -> Vec<u8> {
             "speaker_state": "realtime",
             "tts_frames_played": 0,
             "file_mode": state.file_mode.load(Ordering::Relaxed),
+            "mode_asserted": state.mode_asserted.load(Ordering::Relaxed),
+            "startup_id": state.startup_id,
             "last_error": null,
             "version": "0.1.0"
         })),

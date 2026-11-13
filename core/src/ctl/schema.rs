@@ -147,6 +147,16 @@ pub struct PreStatus {
     /// output_socket 已释放给 daemon。旧快照缺此字段按 false 还原。
     #[serde(default)]
     pub file_mode: bool,
+    /// daemon 是否已权威断言模式（SPEC-04 单一权威）：pre 启动为 false，
+    /// rvc AI 支路（发 input_socket + 绑 output_socket）静默；收到首个
+    /// PRE_SET_FILE_MODE 置 true。daemon 据此与 startup_id 对账、重启重断言。
+    /// 旧快照缺此字段按 false 还原。
+    #[serde(default)]
+    pub mode_asserted: bool,
+    /// 每次进程启动随机生成，供 daemon 识别 pre 重启并重新断言模式。
+    /// 旧快照缺此字段按空串还原。
+    #[serde(default)]
+    pub startup_id: String,
     pub last_error: Option<String>,
     pub version: String,
 }

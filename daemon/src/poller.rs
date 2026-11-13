@@ -31,7 +31,7 @@ impl Poller {
             .spawn(move || {
                 let mut monitor = Monitor::new();
                 while running.load(Ordering::Acquire) {
-                    services::poll(&state, &services, &config);
+                    services::poll(&state, &services, &config, file.handoff_active());
                     file.tick();
                     let hw = monitor.sample();
                     lock_state(&state).set_hw(Some(hw));

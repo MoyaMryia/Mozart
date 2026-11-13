@@ -56,6 +56,9 @@ pub struct State {
     gpu_owner: Option<Activity>,
     processes: Processes,
     pre: Option<PreStatus>,
+    /// 最近一次对账见过的 pre 启动号；变化即 pre 重启，须重新断言模式
+    /// （SPEC-04 单一权威：pre 不单边 reclaim，daemon 据 startup_id 重断言）。
+    pre_startup_id: Option<String>,
     rvc: Option<RvcStatus>,
     asr: Option<AsrStatus>,
     tts: Option<TtsStatus>,
@@ -78,6 +81,7 @@ impl State {
             route_since_unix_ms: now_unix_ms(),
             mute: false,
             gpu_owner: None,
+            pre_startup_id: None,
             processes: Processes {
                 pre: ProcessInfo::stopped(),
                 rvc: ProcessInfo::stopped(),
@@ -208,6 +212,16 @@ impl State {
     /// None 表示本轮未取得 pre 状态，不能作为失接管证据。
     pub fn pre_file_mode(&self) -> Option<bool> {
         self.pre.as_ref().map(|pre| pre.file_mode)
+    }
+
+    /// 最近一次对账见过的 pre 启动号（None 表示尚未见过 pre）。
+    pub fn pre_startup_id(&self) -> Option<&str> {
+        self.pre_startup_id.as_deref()
+    }
+
+    /// 记录本轮见到的 pre 启动号，供下一轮识别重启。
+    pub fn set_pre_startup_id(&mut self, startup_id: Option<String>) {
+        self.pre_startup_id = startup_id;
     }
 
     pub fn set_rvc_status(&mut self, status: Option<RvcStatus>) {

@@ -44,6 +44,15 @@ asr 字幕支路恒发不受影响。早期曾改用独立 `rvc-file-in.sock`/`r
 污染整段攒帧）改由状态门控消除。`[file]` 不再有 socket 键，`StartStream` kind=file
 不再携带 socket 覆盖（Task 1/3/5 中相关描述以本决策为准）。
 
+D2 后续根因治愈（SPEC-04 单一权威）：状态门控交接仍残留共享所有权竞态——pre 重启
+无条件 reclaim 输出 socket、清理误删 pre 已重绑的 socket。根治把数据面所有权收归
+daemon 单一权威：pre 的 rvc AI 支路（发送 + 绑定）启动/重启后静默，等 daemon 首个
+`PRE_SET_FILE_MODE` 断言才激活，不单边 reclaim；daemon 每轮对账 pre 模式到权威态
+（`gpu_owner==File`），按 pre 上报 `startup_id` 识别重启重断言，交接窗口内让位守卫。
+断言先置 `file_mode` 再置断言标志，杜绝激活窗口抢发实时帧。pre 重启不再丢交接：
+静默不污染、不孤儿化绑定，daemon 重断言恢复、任务继续，仅 pre 持续不可达才中止。
+板端复测：实时冒烟通过、文件 10 场景全过、295 s 长文件 14750 帧进/出完成。
+
 D3. **队列持久化**：SPEC-04 定稿落盘续转。队列快照写 `<storage_dir>/queue.json`，
 每次变更原子写（临时文件 + rename）。重启读回 queued/processing 任务，processing 重置为
 queued 从头重跑（推理状态不保留），源副本已在受管目录。暂停标志一并持久化。

@@ -128,11 +128,14 @@ pub fn dispatch(
         ctl::PRE_SET_FILE_MODE => match serde_json::from_value::<FileModeSetRequest>(body) {
             Ok(request) => {
                 if request.active {
-                    // 文件接管：先置门控（处理线程停发 rvc），再等接收线程
-                    // 释放输出 socket 的握手完成才应答——daemon 收到 ok 后
-                    // 才绑定同一 socket，次序保证不撞绑。本等待在控制线程，
-                    // 不阻塞音频线程。
+                    // 文件接管：先置 file_mode 停发（rvc_ai_active 立即为 false），
+                    // 再置 mode_asserted——次序保证断言激活前恒发已停，杜绝
+                    // 「mode_asserted 先 true、file_mode 尚 false」窗口抢发实时帧
+                    // 污染整段攒帧。随后等接收线程释放输出 socket 的握手完成才
+                    // 应答——daemon 收到 ok 后才绑定同一 socket，次序保证不撞绑。
+                    // 本等待在控制线程，不阻塞音频线程。
                     shared.set_file_mode(true);
+                    shared.set_mode_asserted(true);
                     let deadline = Instant::now() + FILE_HANDOFF_TIMEOUT;
                     while !shared.output_released() {
                         if Instant::now() >= deadline {
@@ -149,8 +152,10 @@ pub fn dispatch(
                     ok_body(json!({"active": true}))
                 } else {
                     // 交还：daemon 已先解绑输出 socket；接收线程在下一节拍
-                    // 重绑并恢复接收，处理线程恢复 rvc 发送。
+                    // 重绑并恢复接收，处理线程恢复 rvc 发送。先置 file_mode 再
+                    // 断言，实时恒发随断言激活（此支路实时帧属预期，非污染）。
                     shared.set_file_mode(false);
+                    shared.set_mode_asserted(true);
                     ok_body(json!({"active": false}))
                 }
             }
@@ -202,7 +207,7 @@ mod tests {
         Arc<Ring<OutputFrame>>,
     ) {
         (
-            Arc::new(Shared::new("cap-dev".to_string(), "play-dev".to_string())),
+            Arc::new(Shared::new("cap-dev".to_string(), "play-dev".to_string(), "test".to_string())),
             Arc::new(Ring::new(2)),
             Arc::new(Ring::new(2)),
             Arc::new(Ring::new(2)),

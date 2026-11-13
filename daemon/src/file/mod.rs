@@ -150,10 +150,16 @@ impl FileCoordinator {
         })
     }
 
+    /// 文件交接是否已建立（FileHandoff begin 已应答、finish 未恢复）。
+    /// 权威对账在此窗口内让位给 FileHandoff，避免与起停流争用 pre 模式。
+    pub fn handoff_active(&self) -> bool {
+        self.handoff_active.load(Ordering::Acquire)
+    }
+
     /// poller 每 tick 驱动一次仲裁。
     pub fn tick(self: &Arc<Self>) {
         self.reap_job_thread();
-        self.abort_job_on_lost_handoff();
+        self.restore_handoff_on_pre_restart();
         let _transition = self.services.transition();
         let (owner, desired, active, rvc_ready) = {
             let state = lock_state(&self.state);
@@ -182,16 +188,16 @@ impl FileCoordinator {
         }
     }
 
-    /// pre 重启丢失文件交接：交接已建立期间 pre.file_mode 必为 true，
-    /// 观察到 false 说明 pre 已重启并恢复恒发（实时帧污染整段攒帧、输出
-    /// socket 绑定被孤儿化）。带原因中止任务：worker 经取消检查点退出，
-    /// 守卫停流并恢复 pre，落 failed，GPU 释放、队列继续。
+    /// pre 重启后恢复文件交接（SPEC-04 单一权威根因治愈）：pre 启动门控后重启
+    /// 处于未断言静默态——不 reclaim 输出 socket、不恒发污染输入，文件数据面
+    /// （daemon↔rvc）不受影响。检测到 pre.file_mode=false（重启丢失断言）时重新
+    /// 断言文件接管态恢复一致，任务继续；仅 pre 持续不可达（重断言失败）才两轮
+    /// 确认后带原因中止。
     ///
     /// 两轮确认：poll 先读 pre，worker 可能在同一轮内才完成 begin，首轮
-    /// false 可能是交接建立前的陈旧快照；下一轮 poll 必在交接后重读 pre，
-    /// 仍 false 才中止。decode 段（未暂停）与 finish（已恢复）由交接标志
-    /// 门控，不参与判定。
-    fn abort_job_on_lost_handoff(&self) {
+    /// false 可能是交接建立前的陈旧快照；decode 段（未暂停）与 finish（已恢复）
+    /// 由交接标志门控，不参与判定。
+    fn restore_handoff_on_pre_restart(&self) {
         if !self.handoff_active.load(Ordering::Acquire) {
             self.handoff_lost_seen.store(false, Ordering::Release);
             return;
@@ -204,6 +210,12 @@ impl FileCoordinator {
             self.handoff_lost_seen.store(false, Ordering::Release);
             return;
         }
+        // 重新断言文件接管态：pre 可达即恢复交接，任务继续（根因治愈）。
+        if self.services.pre_set_file_mode(true).is_ok() {
+            self.handoff_lost_seen.store(false, Ordering::Release);
+            return;
+        }
+        // pre 不可达：两轮确认后中止（首轮可能是陈旧快照或瞬时不可达）。
         if !self.handoff_lost_seen.swap(true, Ordering::AcqRel) {
             return;
         }
@@ -926,10 +938,10 @@ mod tests {
         fs::remove_dir_all(&dir).unwrap();
     }
 
-    /// 回归（Important #2）：pre 在文件任务期间重启丢失交接（file_mode=false
-    /// 且恢复恒发）。旧代码只对账路由/静音，任务楔死在 processing、GPU 恒归
-    /// File、路由等待槽永不应用。修复后 tick 检测并带原因中止：worker 经取消
-    /// 检查点退出，落 failed 带可查原因，GPU 释放。
+    /// 安全网（pre 持续不可达）：本用例桩 services 无真 pre，失接管重断言
+    /// 必然失败 → 两轮确认后带原因中止，worker 经取消检查点退出，落 failed
+    /// 带可查原因、GPU 释放。pre 可达时走重断言恢复（见集成用例
+    /// pre_restart_during_file_job_recovers_and_completes），不中止。
     #[test]
     fn lost_handoff_aborts_job_with_reason_and_frees_gpu() {
         let (coordinator, started, _release, dir) = setup("lost-handoff");

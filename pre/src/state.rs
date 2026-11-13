@@ -74,6 +74,10 @@ pub struct Shared {
     /// 文件接管状态（SPEC-03 状态门控交接）：控制线程写，处理线程与
     /// rvc 接收线程只读。true 时 rvc AI 发送暂停、output_socket 释放给 daemon。
     file_mode: AtomicBool,
+    /// daemon 权威断言标志（SPEC-04 单一权威）：启动为 false，rvc AI 支路
+    /// （发 input_socket + 绑 output_socket）静默，等 daemon 首个 PRE_SET_FILE_MODE
+    /// 断言才激活。控制线程写，处理线程与 rvc 接收线程只读。pre 不单边 reclaim。
+    mode_asserted: AtomicBool,
     /// 输出 socket 交接握手：rvc 接收线程解绑后置 true、重绑后清 false；
     /// 控制线程在 PRE_SET_FILE_MODE{active:true} 应答前等它置位。
     output_released: AtomicBool,
@@ -96,14 +100,17 @@ pub struct Shared {
     last_error: Mutex<Option<String>>,
     capture_device: String,
     playback_device: String,
+    /// 进程启动号：每次启动随机生成，GetStatus 上报供 daemon 识别重启。
+    startup_id: String,
 }
 
 impl Shared {
-    pub fn new(capture_device: String, playback_device: String) -> Self {
+    pub fn new(capture_device: String, playback_device: String, startup_id: String) -> Self {
         Self {
             route_target: AtomicU8::new(route_code(Route::Direct)),
             mute_target: AtomicBool::new(false),
             file_mode: AtomicBool::new(false),
+            mode_asserted: AtomicBool::new(false),
             output_released: AtomicBool::new(false),
             frames_captured: AtomicU64::new(0),
             frames_played: AtomicU64::new(0),
@@ -117,6 +124,7 @@ impl Shared {
             last_error: Mutex::new(None),
             capture_device,
             playback_device,
+            startup_id,
         }
     }
 
@@ -144,6 +152,22 @@ impl Shared {
 
     pub fn set_file_mode(&self, active: bool) {
         self.file_mode.store(active, Ordering::Relaxed);
+    }
+
+    /// daemon 是否已权威断言模式；启动为 false，首个 PRE_SET_FILE_MODE 置 true。
+    pub fn mode_asserted(&self) -> bool {
+        self.mode_asserted.load(Ordering::Relaxed)
+    }
+
+    pub fn set_mode_asserted(&self, asserted: bool) {
+        self.mode_asserted.store(asserted, Ordering::Relaxed);
+    }
+
+    /// rvc AI 支路是否活跃（SPEC-04 单一权威不变量）：仅当 daemon 已断言
+    /// 且非文件接管时为 true。处理线程据此门控发送、接收线程据此门控绑定。
+    /// 只读两个原子，实时热路径不分配不阻塞。asr 支路与主干直出不受此门控。
+    pub fn rvc_ai_active(&self) -> bool {
+        self.mode_asserted() && !self.file_mode()
     }
 
     /// 输出 socket 已释放（接收线程解绑后置位，重绑后清零）。
@@ -254,6 +278,8 @@ impl Shared {
             speaker_state: speaker_name(self.speaker_state()).to_string(),
             tts_frames_played: self.tts_frames_played.load(Ordering::Relaxed),
             file_mode: self.file_mode(),
+            mode_asserted: self.mode_asserted(),
+            startup_id: self.startup_id.clone(),
             last_error: self
                 .last_error
                 .lock()
@@ -284,7 +310,7 @@ mod tests {
 
     #[test]
     fn status_reports_speaker_state_and_tts_frames() {
-        let shared = Shared::new("cap".to_string(), "play".to_string());
+        let shared = Shared::new("cap".to_string(), "play".to_string(), "startup".to_string());
         // 默认实时、零播报帧。
         let status = shared.status(QueueReadout { depth: 0, dropped: 0, rvc_dropped: 0, tts_dropped: 0 });
         assert_eq!(status.speaker_state, "realtime");
@@ -300,7 +326,7 @@ mod tests {
 
     #[test]
     fn status_reports_targets_and_counters() {
-        let shared = Shared::new("cap".to_string(), "play".to_string());
+        let shared = Shared::new("cap".to_string(), "play".to_string(), "startup".to_string());
         shared.set_route_target(Route::Rvc);
         shared.set_mute_target(true);
         shared.add_captured(3);
@@ -325,12 +351,40 @@ mod tests {
         assert_eq!(status.version, VERSION);
     }
 
+    /// 启动门控不变量（SPEC-04 单一权威）：未断言时 rvc AI 支路静默；
+    /// daemon 断言实时态后激活；文件接管断言后释放；startup_id 随快照上报。
+    #[test]
+    fn rvc_ai_active_gated_by_assertion_and_file_mode() {
+        let shared = Shared::new("cap".to_string(), "play".to_string(), "boot-1".to_string());
+        let readout = QueueReadout { depth: 0, dropped: 0, rvc_dropped: 0, tts_dropped: 0 };
+        // 启动：未断言，AI 支路静默（即便 file_mode=false）。
+        assert!(!shared.mode_asserted());
+        assert!(!shared.rvc_ai_active(), "未断言不得激活 rvc AI 支路");
+        let status = shared.status(readout);
+        assert!(!status.mode_asserted);
+        assert_eq!(status.startup_id, "boot-1");
+
+        // daemon 断言实时态（active:false）：激活。
+        shared.set_mode_asserted(true);
+        shared.set_file_mode(false);
+        assert!(shared.rvc_ai_active(), "断言实时态后必须激活");
+
+        // 文件接管断言（active:true）：释放，但 mode_asserted 仍为 true。
+        shared.set_file_mode(true);
+        assert!(!shared.rvc_ai_active(), "文件接管期间必须释放");
+        assert!(shared.mode_asserted());
+
+        // 交还：恢复激活。
+        shared.set_file_mode(false);
+        assert!(shared.rvc_ai_active());
+    }
+
     #[test]
     fn consumer_drops_aggregate_rvc_path_and_skipped_replies() {
         // 口径（SPEC-02 / SPEC-05）："rvc" = 发送丢弃 + 坏包丢弃 + 接收环满（异常）；
         // "rvc.skipped" = direct 路由丢弃的输出帧（设计内，旧 skipped_replies）；
         // "asr" = 识别支路输入发送丢弃；"tts" = 播报坏包丢弃 + 播报接收环满。
-        let shared = Shared::new("cap".to_string(), "play".to_string());
+        let shared = Shared::new("cap".to_string(), "play".to_string(), "startup".to_string());
         shared.set_ai_send_dropped(2);
         shared.set_ai_recv_dropped(3);
         shared.add_ai_skipped(4);
@@ -348,7 +402,7 @@ mod tests {
         assert_eq!(status.consumer_drops["tts"], 15, "7+8 坏包与环满合计");
 
         // 默认零值：四个键恒存在，daemon 可稳定解析。
-        let status = Shared::new("c".to_string(), "p".to_string()).status(QueueReadout {
+        let status = Shared::new("c".to_string(), "p".to_string(), "startup".to_string()).status(QueueReadout {
             depth: 0,
             dropped: 0,
             rvc_dropped: 0,

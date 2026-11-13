@@ -10,8 +10,11 @@ fn wait_running(conn: &Seqpacket) -> Status {
     let deadline = Instant::now() + Duration::from_secs(5);
     loop {
         let status = status(conn);
+        // 控制面就绪：route set 直接向 rvc 发 GetStatus，进程 Running 不代表桩
+        // 已绑定控制 socket；语言进程启动竞争会放大这段窗口。
         if status.processes.pre.state == ProcessState::Running
             && status.processes.rvc.state == ProcessState::Running
+            && status.rvc.is_some()
         {
             return status;
         }
@@ -70,6 +73,49 @@ fn reapplies_route_and_stream_after_restart() {
                 && status.pre.as_ref().map(|pre| pre.route) == Some(Route::Rvc)
         }),
         "pre route was not reapplied after restart"
+    );
+}
+
+/// 权威对账（SPEC-04 单一权威根因治愈）：daemon 启动即断言 pre 实时态
+/// （mode_asserted=true、非文件接管）；pre 重启后 startup_id 变化，daemon 据此
+/// 重新断言，pre 恢复实时态。旧代码 pre 启动单边绑定/恒发、重启无条件 reclaim；
+/// 治愈后 pre 启动/重启均静默等 daemon 断言，不单边行动。
+#[test]
+fn reasserts_pre_mode_after_restart() {
+    let daemon = DaemonProcess::start(
+        "pre-mode-reassert",
+        &example("pre_stub"),
+        &example("rvc_stub"),
+    );
+    let conn = daemon.connect();
+    wait_running(&conn);
+
+    // 启动断言：daemon 首轮对账即置 pre 实时态（pre 启动静默，等断言才激活）。
+    assert!(
+        wait_until(Duration::from_secs(5), || {
+            status(&conn)
+                .pre
+                .is_some_and(|pre| pre.mode_asserted && !pre.file_mode)
+        }),
+        "daemon 应在启动后断言 pre 实时态"
+    );
+    let first_startup_id = status(&conn).pre.unwrap().startup_id;
+    assert!(!first_startup_id.is_empty(), "pre 应上报启动号供重启识别");
+
+    // kill pre → 监管重启 → startup_id 变化 → daemon 重新断言实时态。
+    let pre_pid = status(&conn).processes.pre.pid.unwrap();
+    kill(pre_pid);
+    assert!(
+        wait_until(Duration::from_secs(5), || {
+            let status = status(&conn);
+            let new_pid = status.processes.pre.pid;
+            new_pid.is_some()
+                && new_pid != Some(pre_pid)
+                && status.pre.as_ref().is_some_and(|pre| {
+                    pre.mode_asserted && !pre.file_mode && pre.startup_id != first_startup_id
+                })
+        }),
+        "pre 重启后 daemon 应据 startup_id 重新断言实时态"
     );
 }
 

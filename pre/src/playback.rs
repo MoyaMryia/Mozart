@@ -227,7 +227,7 @@ mod tests {
     #[test]
     fn direct_route_drains_rvc_ring_into_skipped_counter() {
         // direct 路由下 AI 环逐帧排空、按帧计数、环归零（旧 skipped_replies）。
-        let shared = Shared::new("cap".to_string(), "play".to_string());
+        let shared = Shared::new("cap".to_string(), "play".to_string(), "test".to_string());
         let rvc = Ring::<OutputFrame>::new(4);
         for idx in 0..3u32 {
             rvc.push(OutputFrame {
