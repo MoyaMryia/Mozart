@@ -82,7 +82,7 @@ pub fn load_wav(path: &Path) -> Result<Vec<i16>, String> {
         return Err(fail("sample width must be 16-bit"));
     }
     if rate != RAW_SAMPLE_RATE {
-        return Err(fail("sample rate must be 48000 Hz"));
+        return Err(fail(&format!("sample rate must be {RAW_SAMPLE_RATE} Hz")));
     }
     if channels == 0 {
         return Err(fail("channel count must be at least 1"));
@@ -535,8 +535,10 @@ mod tests {
         STOP.store(true, Ordering::Relaxed);
         worker.join().unwrap().unwrap();
         let _ = std::fs::remove_dir_all(path.parent().unwrap());
+        // 上界取 3 倍睡眠步长（< 帧周期）：去掉内层停止检查、睡满整节拍
+        // 的实现会超过此界，断言才守得住「步长量级响应」。
         assert!(
-            marked.elapsed() < Duration::from_millis(50),
+            marked.elapsed() < SLEEP_STEP * 3,
             "停止响应必须有界：{:?}",
             marked.elapsed()
         );
