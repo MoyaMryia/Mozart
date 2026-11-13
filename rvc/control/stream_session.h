@@ -11,10 +11,10 @@
 //               线程；loaded 按当前模型 id 判定。
 //   StartStream 参数此时固定（kind/model_handle/pitch_shift/index_rate/
 //               rms_mix_rate/protect/f0_method）；kind=file 另需 total_frames
-//               （正整数 u32），可选 output_socket（绝对路径，覆盖默认输出
-//               socket）；realtime 忽略这两字段。已有活动流返回 Busy；
-//               未加载返回 NotLoaded；句柄过期返回 InvalidArgument；
-//               缺实时资产返回 Unsupported，不静默降级。
+//               （正整数 u32）；realtime 忽略该字段。数据面复用配置默认
+//               input_socket/output_socket（SPEC-03 状态门控交接）。
+//               已有活动流返回 Busy；未加载返回 NotLoaded；句柄过期返回
+//               InvalidArgument；缺实时资产返回 Unsupported，不静默降级。
 //   StopStream  停收新帧，等当前推理块结束（实时约 240 ms，文件停在下一个
 //               检查点）后返回；幂等。
 //   ResetStream 断续重置：清环、清淡化尾并恢复启动缓冲；无流时空操作。
@@ -79,14 +79,12 @@ struct ModelListing {
     bool exists = false;
 };
 
-// kind=file 批处理选项（计划 D1/D2）；realtime 忽略。
+// kind=file 批处理选项（计划 D1）；realtime 忽略。
+// 数据面复用配置默认 input_socket/output_socket（SPEC-03 状态门控交接：
+// 文件期间 pre 暂停发送并释放输出 socket，daemon 接管同一对 socket）。
 // StartStream 入口校验一次，内部信任。
 struct FileBatchOptions {
     uint32_t total_frames = 0;              // 攒帧总数，正整数
-    std::filesystem::path output_socket;    // 空 = 用配置默认输出 socket
-    std::filesystem::path input_socket;     // 空 = 用配置默认输入 socket；
-                                            // file 覆盖为独立 socket，隔离 pre
-                                            // 恒发的实时帧（SPEC-02），避免污染攒帧
 };
 
 // 推理后端 seam。错误用 reason 表达，不跨线程抛异常。
@@ -164,8 +162,8 @@ struct InferenceBackendConfig {
     std::filesystem::path realtime_hubert_path;
     std::filesystem::path realtime_rmvpe_path;
     std::filesystem::path input_socket;           // rvc 绑定收输入帧
-    std::filesystem::path output_socket;          // connect 发输出帧（实时默认，pre 绑定；
-                                                  // file 可被 StartStream output_socket 覆盖）
+    std::filesystem::path output_socket;          // connect 发输出帧（实时 pre 绑定；
+                                                  // 文件期间 pre 释放、daemon 接管同一 socket）
     size_t queue_frames = 8;                      // 数据面内核缓冲帧数
 };
 

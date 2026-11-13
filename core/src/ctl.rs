@@ -60,6 +60,10 @@ pub const PRE_SET_MUTE: u16 = 0x0203;
 pub const PRE_GET_STATUS: u16 = 0x0204;
 /// 体：{}（空）；清播报环。speech stop 经 daemon 转发（桥→TTS 走 TTS_JOB_STOP）。
 pub const PRE_SPEECH_STOP: u16 = 0x0205;
+/// 体：schema::FileModeSetRequest {"active": bool}；文件任务接管实时数据面
+/// （SPEC-03 复用 + 状态门控交接）。active=true：pre 暂停 rvc AI 发送并释放
+/// output_socket，应答前确认释放完成；active=false：恢复发送并重绑。asr 不受影响。
+pub const PRE_SET_FILE_MODE: u16 = 0x0206;
 
 pub const RVC_HELLO: u16 = 0x0301;
 pub const RVC_LOAD_MODEL: u16 = 0x0302;
@@ -612,6 +616,7 @@ mod tests {
         assert_eq!(DAEMON_RESTART, 0x0118);
         assert_eq!(DAEMON_DEVICE_LIST, 0x0119);
         assert_eq!(RVC_LIST_MODELS, 0x0307);
+        assert_eq!(PRE_SET_FILE_MODE, 0x0206);
     }
 
     /// 全部命令号清单：唯一性与分段检查用，新增命令必须登记。
@@ -639,6 +644,7 @@ mod tests {
         ("PRE_SET_MUTE", PRE_SET_MUTE),
         ("PRE_GET_STATUS", PRE_GET_STATUS),
         ("PRE_SPEECH_STOP", PRE_SPEECH_STOP),
+        ("PRE_SET_FILE_MODE", PRE_SET_FILE_MODE),
         ("RVC_HELLO", RVC_HELLO),
         ("RVC_LOAD_MODEL", RVC_LOAD_MODEL),
         ("RVC_START_STREAM", RVC_START_STREAM),

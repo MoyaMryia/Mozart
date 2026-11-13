@@ -6,7 +6,9 @@
 //! 路由排空计数）；接收线程独立收 rvc 输出帧入 AI 环、TTS 播报帧入播报环；
 //! 控制线程独立服务 SEQPACKET。
 //! 发送恒定不停（旧 main.c L11「AI 路径永不停」）：路由只决定播放源，
-//! 不停发输入帧。发送侧惰性建链，pre 启动不依赖 rvc/asr 生命周期。
+//! 不停发输入帧。唯一例外是文件接管（SPEC-03 状态门控交接）：file_mode
+//! 期间 rvc 支路停发、输出 socket 释放给 daemon，asr 支路不受影响。
+//! 发送侧惰性建链，pre 启动不依赖 rvc/asr 生命周期。
 //! 停止：SIGTERM/SIGINT 置停止标志，各线程在时限内退出；设备打开失败立即退出，
 //! daemon 按退避重启（SPEC-02：换设备不做在线命令，由重启代替）。
 
@@ -87,6 +89,8 @@ fn parse_args() -> Result<Args, String> {
 /// DSP 在采集环之后、direct 分支之前——direct 取的 48 kHz 主干含 DSP，
 /// 与旧实现一致。发送不随路由停发（旧 main.c L11）；同一 InputFrame 恒发到
 /// rvc 与 asr 两条输入支路，各自惰性建链、独立丢弃计数。
+/// 文件接管例外（SPEC-03 状态门控交接）：file_mode 期间只停 rvc 支路，
+/// asr 字幕支路与主干直出不受影响。
 fn process_thread(
     capture_ring: Arc<Ring<RawFrame>>,
     trunk: Arc<Ring<RawFrame>>,
@@ -105,7 +109,11 @@ fn process_thread(
             let conf = dsp.process_frame(&mut frame);
             let input_frame = dsp.pack_frame(&frame, conf);
             trunk.push(frame);
-            ai_sender.send(&input_frame, &shared);
+            // 文件接管期间 rvc 数据面归 daemon：停发避免实时帧污染整段攒帧。
+            // 只读原子，不分配不阻塞；asr 支路恒发不受影响。
+            if !shared.file_mode() {
+                ai_sender.send(&input_frame, &shared);
+            }
             asr_sender.send(&input_frame, &shared);
         }
     }
@@ -268,10 +276,11 @@ fn main() -> ExitCode {
     let rvc_recv_handle = {
         let shared = shared.clone();
         let ring = rvc_ring.clone();
+        let path = config.rvc_output_socket();
         match spawn_thread("mozart-rvc-recv", move || {
             stop_on_fatal(
                 &STOP,
-                guard_panic(move || ai::recv_loop(rvc_out_socket, ring, shared, &STOP)),
+                guard_panic(move || ai::recv_loop(rvc_out_socket, path, ring, shared, &STOP)),
             )
         }) {
             Ok(handle) => handle,
@@ -439,5 +448,69 @@ mod tests {
         assert_eq!(join_threads(vec![("opaque", handle)]), Some("opaque: panicked".to_string()));
         assert!(STOP.load(Ordering::Relaxed));
         STOP.store(false, Ordering::Relaxed);
+    }
+
+    /// 文件接管门控（SPEC-03 状态门控交接）：file_mode=true 时处理线程停发
+    /// rvc 支路，asr 字幕支路恒发不受影响；交还后 rvc 恢复发送。
+    #[test]
+    fn file_mode_gates_rvc_send_but_not_asr() {
+        let _guard = STOP_TEST_MUTEX
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        STOP.store(false, Ordering::Relaxed);
+
+        let dir = std::env::temp_dir().join(format!("mozart-pre-gate-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let rvc_path = dir.join("rvc-in.sock");
+        let asr_path = dir.join("asr-in.sock");
+        let rvc_rx = FrameSocket::<mozart_core::InputFrame>::bind(&rvc_path, 8).unwrap();
+        let asr_rx = FrameSocket::<mozart_core::InputFrame>::bind(&asr_path, 8).unwrap();
+
+        let shared = Arc::new(Shared::new("cap".to_string(), "play".to_string()));
+        let capture = Arc::new(Ring::<RawFrame>::new(8));
+        let trunk = Arc::new(Ring::<RawFrame>::new(8));
+        let worker = {
+            let capture = capture.clone();
+            let trunk = trunk.clone();
+            let shared = shared.clone();
+            let ai_sender = ai::Sender::new(rvc_path.clone());
+            let asr_sender = ai::AsrSender::new(asr_path.clone());
+            std::thread::spawn(move || {
+                process_thread(capture, trunk, shared, ai_sender, asr_sender, false, false, false, false)
+            })
+        };
+        let raw = RawFrame {
+            meta: mozart_core::FrameMeta {
+                pts_ns: 0, frame_idx: 0, vad_flag: 1, energy_db: 0, conf: 0, segment_id: 0,
+            },
+            pcm: [0.0; mozart_core::RAW_SAMPLES],
+        };
+        let recv_timeout = Duration::from_secs(2);
+
+        // 实时态：两条支路都送达。
+        capture.push(raw);
+        assert!(rvc_rx.recv(Some(recv_timeout)).is_ok(), "实时态 rvc 支路必须送达");
+        assert!(asr_rx.recv(Some(recv_timeout)).is_ok(), "实时态 asr 支路必须送达");
+
+        // 文件接管：rvc 停发，asr 恒发。asr 送达证明该帧确已被处理。
+        shared.set_file_mode(true);
+        capture.push(raw);
+        assert!(asr_rx.recv(Some(recv_timeout)).is_ok(), "接管期间 asr 支路必须恒发");
+        assert!(
+            rvc_rx.recv(Some(Duration::from_millis(300))).is_err(),
+            "接管期间 rvc 支路必须停发"
+        );
+
+        // 交还：rvc 恢复发送。
+        shared.set_file_mode(false);
+        capture.push(raw);
+        assert!(rvc_rx.recv(Some(recv_timeout)).is_ok(), "交还后 rvc 支路必须恢复");
+        assert!(asr_rx.recv(Some(recv_timeout)).is_ok());
+
+        STOP.store(true, Ordering::Relaxed);
+        worker.join().unwrap().unwrap();
+        STOP.store(false, Ordering::Relaxed);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

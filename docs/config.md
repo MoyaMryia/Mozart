@@ -121,8 +121,8 @@
 | max_upload_bytes | int | 104857600（100 MiB） | >0 | R |
 | ffmpeg_path | string | ffmpeg | — | R |
 | ffmpeg_timeout_ms | int | 120000 | >0 | R |
-| output_socket | string | rvc-file-out.sock | 纯文件名 | S |
-| input_socket | string | rvc-file-in.sock | 纯文件名 | S |
+
+文件数据面复用 `[rvc].input_socket` / `[rvc].output_socket`（SPEC-03 状态门控交接），`[file]` 不再有独立 socket 键。
 
 ## 特殊机制说明
 

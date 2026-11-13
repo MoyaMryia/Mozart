@@ -2,19 +2,21 @@
 //! 协调器为每个任务起独立线程跑 `run`：离线，不在实时路径上，阻塞 I/O 期间
 //! 不持 State 锁。GPU 已由协调器 claim File，终态/驱逐/释放由 finish 收尾。
 //!
+//! 数据面复用实时 socket（SPEC-03「复用 + 状态门控交接」）：起流前先经
+//! PRE_SET_FILE_MODE 让 pre 暂停 rvc AI 发送并释放 rvc-out.sock，daemon 再
+//! 绑定同一输出 socket、喂帧到 rvc-in.sock；收尾先停流、解绑，再恢复 pre。
+//!
 //! 取消与失败次序：各阶段以 `ctx.is_cancelled()` 为检查点；起流后的任何出口
-//! 都先 StopStream 再解绑输出 socket，最后统一清临时文件。
+//! 都经 FileHandoff 守卫按「停流 → 解绑 → 恢复 pre」收尾（Drop 兜底 panic）。
 
 use super::decode::{self, ContractFrame};
 use super::{encode, JobContext, Outcome, StepError, Worker, FRAME_NS};
-use crate::services::Services;
 use mozart_core::ctl::schema::FileProgress;
 use mozart_core::dgram::FrameSocket;
 use mozart_core::{FrameMeta, InputFrame, OutputFrame, OUTPUT_SAMPLES};
 use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 /// 数据面 socket 缓冲帧数：SPEC-02「接收缓冲 4–8 帧」取上沿。
@@ -86,31 +88,30 @@ fn process(ctx: &JobContext) -> Result<(), StepError> {
         ))
     })?;
 
-    // ---- feed：绑定输出 socket → LoadModel → StartStream(kind=file) ----
+    // ---- feed：pre 交接 → 绑定输出 socket → LoadModel → StartStream(kind=file) ----
     progress.stage("feed", FEED_START);
-    let output_path = config.file_output_socket();
-    let input_path = config.file_input_socket();
-    let output = FrameSocket::<OutputFrame>::bind(&output_path, QUEUE_FRAMES)
-        .map_err(|err| StepError::Failed(format!("bind file output socket: {err}")))?;
-    let mut stream = FileStream::new(ctx.services.clone(), output, output_path.clone());
+    // SPEC-03 状态门控交接：先让 pre 暂停 rvc AI 发送并释放 rvc-out.sock
+    // （pre 确认释放完成才应答），daemon 再绑定同一 socket。次序不能反，
+    // 否则撞绑；实时帧若未停发会污染整段攒帧（长文件死锁根因）。
+    let mut handoff = FileHandoff::begin(ctx)?;
+    handoff.bind_output()?;
     let handle = ctx
         .services
         .load_model(&ctx.job.model_id)
         .map_err(|(code, reason)| StepError::Failed(format!("load model: {code}: {reason}")))?;
     // 起流意图发出后任何出口都停流：StartStream 可能已在 C++ 生效而应答超时，
     // 不停会留下一个等帧的文件流，下一个任务撞 Busy。
-    stream.active = true;
+    handoff.stream_active = true;
     ctx.services
-        .file_start_stream(config, handle, total_frames, &output_path, &input_path)
+        .file_start_stream(config, handle, total_frames)
         .map_err(|(code, reason)| StepError::Failed(format!("start file stream: {code}: {reason}")))?;
 
+    let input_path = config.rvc_input_socket();
     let exchanged = feed(&frames, &input_path, &mut progress, &cancel)
-        .and_then(|()| receive(ctx, &stream.output, total, &mut progress, &cancel));
-    // 起流后的唯一停流点：正常收尾、取消、失败都经此，先停流再解绑。
-    if let Err((code, reason)) = stream.stop() {
-        ctx.push_degraded(format!("file stop stream: {code}: {reason}"));
-    }
-    drop(stream);
+        .and_then(|()| receive(ctx, handoff.output(), total, &mut progress, &cancel));
+    // 收尾：停流 → 解绑输出 socket → 恢复 pre。失败/取消/panic 由 Drop 兜底
+    // 同一顺序；降级原因经 status 可查。
+    handoff.finish();
     let samples = exchanged?;
 
     // ---- publish：48 kHz 裸流 → WAV → 原子改名 ----
@@ -128,7 +129,8 @@ fn process(ctx: &JobContext) -> Result<(), StepError> {
 /// 喂帧：阻塞发送不丢（SPEC-03 文件帧），逐帧查取消。
 /// 对端活着但停止读帧时缓冲会填满，阻塞等待由同一个取消谓词打断
 /// （用户取消或 daemon 关停），不会把本线程楔死在内核里。
-/// 连接独立文件输入 socket（rvc 绑定），不走 pre 恒发的 rvc-in.sock。
+/// 连接实时输入 socket rvc-in.sock（rvc 绑定）：pre 的 rvc AI 发送已被
+/// PRE_SET_FILE_MODE 门控暂停，实时帧不会混入整段攒帧（SPEC-03 复用）。
 /// meta 序号从 0 顺序，pts_ns 按 20 ms 节拍合成，vad_flag 取解码结果。
 fn feed(
     frames: &[ContractFrame],
@@ -282,43 +284,77 @@ impl<'a> Reporter<'a> {
     }
 }
 
-/// 文件流句柄：持有输出 socket 绑定。析构先 StopStream 再解绑删 socket 文件
-/// （C++ 停流前可能仍在回帧，顺序不能反）。起流意图发出前 active=false，
-/// 析构只解绑；发出后任何出口都停流。显式 `stop` 后析构不再重复停流。
-struct FileStream {
-    services: Arc<Services>,
-    output: FrameSocket<OutputFrame>,
+/// 文件数据面交接守卫（SPEC-03「复用 + 状态门控交接」）：持有 pre 暂停状态
+/// 与输出 socket 绑定。收尾顺序固定为「停流 → 解绑删 socket 文件 → 恢复 pre」：
+/// 停流先于解绑（C++ 停流前可能仍在回帧），解绑先于恢复（pre 重绑同一 socket，
+/// 顺序反了会撞绑）。显式 `finish` 后 Drop 不再重复；早退路径（含 panic 展开）
+/// 由 Drop 兜底同一顺序，降级原因经 status 可查。
+struct FileHandoff<'a> {
+    ctx: &'a JobContext,
     path: PathBuf,
-    active: bool,
+    output: Option<FrameSocket<OutputFrame>>,
+    stream_active: bool,
+    pre_paused: bool,
 }
 
-impl FileStream {
-    fn new(services: Arc<Services>, output: FrameSocket<OutputFrame>, path: PathBuf) -> Self {
-        Self {
-            services,
-            output,
-            path,
-            active: false,
-        }
+impl<'a> FileHandoff<'a> {
+    /// 暂停 pre 并确认输出 socket 已释放（PRE_SET_FILE_MODE{active:true}）。
+    /// 失败时 pre 未暂停，守卫不建立，无需收尾。
+    fn begin(ctx: &'a JobContext) -> Result<Self, StepError> {
+        ctx.services.pre_set_file_mode(true).map_err(|(code, reason)| {
+            StepError::Failed(format!("pre file mode pause: {code}: {reason}"))
+        })?;
+        Ok(Self {
+            ctx,
+            path: ctx.config.rvc_output_socket(),
+            output: None,
+            stream_active: false,
+            pre_paused: true,
+        })
     }
 
-    fn stop(&mut self) -> Result<(), (String, String)> {
-        if !self.active {
-            return Ok(());
+    /// pre 已释放，daemon 绑定同一输出 socket（实时 rvc-out.sock）。
+    fn bind_output(&mut self) -> Result<(), StepError> {
+        let socket = FrameSocket::<OutputFrame>::bind(&self.path, QUEUE_FRAMES)
+            .map_err(|err| StepError::Failed(format!("bind rvc output socket: {err}")))?;
+        self.output = Some(socket);
+        Ok(())
+    }
+
+    /// 数据面收帧用输出 socket；bind_output 先于 feed/receive，调用方保证已绑定。
+    fn output(&self) -> &FrameSocket<OutputFrame> {
+        self.output
+            .as_ref()
+            .expect("output socket bound before data plane")
+    }
+
+    /// 收尾：停流 → 解绑删 socket 文件 → 恢复 pre。幂等，Drop 兜底复用。
+    fn finish(&mut self) {
+        if self.stream_active {
+            self.stream_active = false;
+            if let Err((code, reason)) = self.ctx.services.stop_stream() {
+                self.ctx
+                    .push_degraded(format!("file stop stream: {code}: {reason}"));
+            }
         }
-        self.active = false;
-        self.services.stop_stream()
+        // 解绑先于恢复 pre：pre 重绑同一 socket，顺序反了会撞绑。
+        if let Some(socket) = self.output.take() {
+            drop(socket);
+            let _ = fs::remove_file(&self.path);
+        }
+        if self.pre_paused {
+            self.pre_paused = false;
+            if let Err((code, reason)) = self.ctx.services.pre_set_file_mode(false) {
+                self.ctx
+                    .push_degraded(format!("pre file mode restore: {code}: {reason}"));
+            }
+        }
     }
 }
 
-impl Drop for FileStream {
+impl Drop for FileHandoff<'_> {
     fn drop(&mut self) {
-        if self.active {
-            // 早退路径（含 panic 展开）兜底停流；可查询原因由显式 stop 的调用方记录。
-            let _ = self.services.stop_stream();
-        }
-        // output 字段在本 body 之后析构：停流先于解绑。
-        let _ = fs::remove_file(&self.path);
+        self.finish();
     }
 }
 
@@ -329,11 +365,12 @@ mod tests {
     use crate::file::queue::FileQueue;
     use crate::file::storage::Storage;
     use crate::file::testutil::temp_dir;
+    use crate::services::Services;
     use crate::state::State;
     use mozart_core::config::Config;
     use mozart_core::INPUT_SAMPLES;
     use std::sync::atomic::{AtomicBool, Ordering};
-    use std::sync::{mpsc, Mutex};
+    use std::sync::{mpsc, Arc, Mutex};
     use std::thread;
 
     /// 喂帧停住的观察窗：大于进度节流间隔 PROGRESS_INTERVAL，
@@ -374,8 +411,8 @@ mod tests {
             running: running.clone(),
         };
 
-        // 对端绑定文件输入 socket 但永不读帧（推理线程挂死）：缓冲填满后只能等待。
-        let input_path = config.file_input_socket();
+        // 对端绑定输入 socket 但永不读帧（推理线程挂死）：缓冲填满后只能等待。
+        let input_path = config.rvc_input_socket();
         let peer = FrameSocket::<InputFrame>::bind(&input_path, 1).unwrap();
         // 帧数远多于缓冲容量：不打断就送不完。
         let frames: Vec<ContractFrame> = (0..200)

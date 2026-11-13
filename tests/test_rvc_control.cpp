@@ -444,34 +444,24 @@ int main() {
         body = file_body(1);
         body["total_frames"] = 4'294'967'296ull;   // u32 契约上限之外
         rejected(body, "total_frames beyond u32 is rejected");
-        body = file_body(1);
-        body["output_socket"] = "relative.sock";
-        rejected(body, "relative output_socket is rejected");
-        body = file_body(1);
-        body["output_socket"] = 42;
-        rejected(body, "non-string output_socket is rejected");
 
         body = file_body(1);
-        body["output_socket"] = "/tmp/mozart-rvc-file-out.sock";
         const Reply ok = parse_reply(session->handle(make_message(
             MOZART_CTL_RVC_START_STREAM, body)));
         CHECK(ok.status == "ok" && ok.data.at("stream_kind") == "file",
               "valid file start returns the stream kind");
         CHECK(!backend->last_realtime
-              && backend->last_file_options.total_frames == 10
-              && backend->last_file_options.output_socket
-                     == "/tmp/mozart-rvc-file-out.sock",
-              "backend receives total_frames and the output socket override");
+              && backend->last_file_options.total_frames == 10,
+              "backend receives total_frames");
         parse_reply(session->handle(make_message(
             MOZART_CTL_RVC_STOP_STREAM, nlohmann::json::object())));
 
         // realtime 忽略 file 字段：即使值非法也不校验。
         body = start_body(1);
         body["total_frames"] = "bogus";
-        body["output_socket"] = "relative.sock";
         CHECK(parse_reply(session->handle(make_message(
                   MOZART_CTL_RVC_START_STREAM, body))).status == "ok",
-              "realtime ignores total_frames and output_socket");
+              "realtime ignores total_frames");
     }
 
     std::printf("test_get_status_snapshot\n");

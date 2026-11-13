@@ -10,7 +10,7 @@ use mozart_core::ctl::schema::{
 use mozart_core::ctl::{self, Seqpacket};
 use serde_json::{json, Value};
 use std::io;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::sync::{Mutex, MutexGuard, TryLockError};
 use std::time::Duration;
 
@@ -103,27 +103,34 @@ impl Services {
             .map_err(CallError::into_rejection)
     }
 
-    /// StartStream kind=file（D1/D2）：total_frames 作整段结束信号，
-    /// output_socket 覆盖默认输出 socket（daemon 绑定，绝对路径），
-    /// input_socket 覆盖默认输入 socket（rvc 绑定，绝对路径）——独立于
-    /// pre 恒发的 rvc-in.sock，避免实时帧污染整段攒帧。
+    /// StartStream kind=file（D1）：total_frames 作整段结束信号。
+    /// 数据面复用 [rvc] 默认 input_socket/output_socket（SPEC-03 状态门控
+    /// 交接）：调用前必须先经 pre_set_file_mode(true) 让 pre 停发并释放
+    /// 输出 socket，daemon 再绑定同一输出 socket。
     /// 与实时不同，Busy 不吞：已有活动流说明仲裁失守，必须失败带原因。
     pub fn file_start_stream(
         &self,
         config: &Config,
         model_handle: u64,
         total_frames: u32,
-        output_socket: &Path,
-        input_socket: &Path,
     ) -> Result<(), (String, String)> {
         let mut body = stream_body(config, model_handle);
         body["kind"] = json!("file");
         body["total_frames"] = json!(total_frames);
-        body["output_socket"] = json!(output_socket.to_string_lossy());
-        body["input_socket"] = json!(input_socket.to_string_lossy());
         let text = body.to_string();
         self.rvc()
             .call_ok(ctl::RVC_START_STREAM, text.as_bytes())
+            .map(|_| ())
+            .map_err(CallError::into_rejection)
+    }
+
+    /// 文件接管开关（PRE_SET_FILE_MODE）：active=true 让 pre 暂停 rvc AI
+    /// 发送并释放输出 socket（pre 确认交接完成才应答）；active=false 恢复。
+    /// 文件 worker 在起流前/收尾后调用，与实时路由切换经 transition 锁互斥。
+    pub fn pre_set_file_mode(&self, active: bool) -> Result<(), (String, String)> {
+        let body = json!({"active": active}).to_string();
+        self.pre()
+            .call_ok(ctl::PRE_SET_FILE_MODE, body.as_bytes())
             .map(|_| ())
             .map_err(CallError::into_rejection)
     }

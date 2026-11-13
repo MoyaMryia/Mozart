@@ -275,8 +275,10 @@ impl Default for BridgeConfig {
     }
 }
 
-/// 文件转换链路配置（[file]，SPEC-04）：队列、受管存储、ffmpeg 解码与输出 socket。
-/// v1 仅启动读取；键分类见 config.md（storage_dir/output_socket 为 S，其余 R）。
+/// 文件转换链路配置（[file]，SPEC-04）：队列、受管存储与 ffmpeg 解码。
+/// 数据面复用 [rvc] 的 input_socket/output_socket（SPEC-03 状态门控交接），
+/// 本段不再有独立 socket 键。v1 仅启动读取；键分类见 config.md
+/// （storage_dir 为 S，其余 R）。
 #[derive(Debug, Clone, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct FileConfig {
@@ -297,13 +299,6 @@ pub struct FileConfig {
     pub ffmpeg_path: String,
     /// 单次 ffmpeg 调用超时，超时杀进程。
     pub ffmpeg_timeout_ms: u64,
-    /// 数据面：daemon 绑定收文件输出帧，rvc 连接发送；
-    /// 独立于实时 rvc-out.sock，实时路径不参与交接。
-    pub output_socket: String,
-    /// 数据面：rvc 绑定收文件输入帧，daemon 连接发送；
-    /// 独立于实时 rvc-in.sock——pre 恒发实时帧到 rvc-in.sock（SPEC-02），
-    /// 共享会污染整段攒帧。文件喂帧只走本 socket。
-    pub input_socket: String,
 }
 
 impl Default for FileConfig {
@@ -317,8 +312,6 @@ impl Default for FileConfig {
             max_upload_bytes: 104_857_600,
             ffmpeg_path: "ffmpeg".to_string(),
             ffmpeg_timeout_ms: 120_000,
-            output_socket: "rvc-file-out.sock".to_string(),
-            input_socket: "rvc-file-in.sock".to_string(),
         }
     }
 }
@@ -473,14 +466,6 @@ impl Config {
     /// 受管文件目录；`load_from` 已展开开头的 `~`（同 subtitles_path）。
     pub fn file_storage_dir(&self) -> PathBuf {
         self.file.storage_dir.clone()
-    }
-
-    pub fn file_output_socket(&self) -> PathBuf {
-        self.daemon.run_dir.join(&self.file.output_socket)
-    }
-
-    pub fn file_input_socket(&self) -> PathBuf {
-        self.daemon.run_dir.join(&self.file.input_socket)
     }
 
     pub fn log_dir(&self) -> PathBuf {
@@ -664,8 +649,6 @@ impl Config {
                 "file.ffmpeg_timeout_ms must be greater than zero".to_string(),
             ));
         }
-        validate_socket_name(&self.file.output_socket, "file.output_socket")?;
-        validate_socket_name(&self.file.input_socket, "file.input_socket")?;
         if self.process.pre_bin.as_os_str().is_empty() {
             return Err(ConfigError::Invalid(
                 "process.pre_bin must not be empty".to_string(),
@@ -1158,11 +1141,6 @@ mod tests {
         assert_eq!(config.file.max_upload_bytes, 104_857_600);
         assert_eq!(config.file.ffmpeg_path, "ffmpeg");
         assert_eq!(config.file.ffmpeg_timeout_ms, 120_000);
-        assert_eq!(config.file.output_socket, "rvc-file-out.sock");
-        assert_eq!(
-            config.file_output_socket(),
-            PathBuf::from("/run/mozart/rvc-file-out.sock")
-        );
         assert!(config.validate().is_ok());
     }
 
@@ -1171,7 +1149,6 @@ mod tests {
         // 旧 TOML 不含 [file]：沿用默认，可解析、可校验。
         let legacy: Config = toml::from_str("[daemon]\npoll_interval_ms = 250\n").unwrap();
         assert_eq!(legacy.file.queue_capacity, 50);
-        assert_eq!(legacy.file.output_socket, "rvc-file-out.sock");
         assert!(legacy.validate().is_ok());
 
         let config: Config = toml::from_str(
@@ -1185,7 +1162,6 @@ mod tests {
             max_upload_bytes = 4096
             ffmpeg_path = "/usr/bin/ffmpeg"
             ffmpeg_timeout_ms = 5000
-            output_socket = "file-out.sock"
             "#,
         )
         .unwrap();
@@ -1200,14 +1176,17 @@ mod tests {
         assert_eq!(config.file.max_upload_bytes, 4096);
         assert_eq!(config.file.ffmpeg_path, "/usr/bin/ffmpeg");
         assert_eq!(config.file.ffmpeg_timeout_ms, 5000);
-        assert_eq!(
-            config.file_output_socket(),
-            PathBuf::from("/run/mozart/file-out.sock")
-        );
         assert!(config.validate().is_ok());
 
         let unknown: Result<Config, _> = toml::from_str("[file]\nunknown_key = 1\n");
         assert!(unknown.is_err());
+        // D2 独立 socket 键已回退：数据面复用 [rvc]，旧键拒收。
+        let legacy_socket: Result<Config, _> =
+            toml::from_str("[file]\noutput_socket = \"rvc-file-out.sock\"\n");
+        assert!(legacy_socket.is_err());
+        let legacy_input: Result<Config, _> =
+            toml::from_str("[file]\ninput_socket = \"rvc-file-in.sock\"\n");
+        assert!(legacy_input.is_err());
     }
 
     #[test]
@@ -1218,8 +1197,6 @@ mod tests {
             "[file]\nmax_duration_seconds = 0\n",
             "[file]\nmax_upload_bytes = 0\n",
             "[file]\nffmpeg_timeout_ms = 0\n",
-            "[file]\noutput_socket = \"a/b\"\n",
-            "[file]\noutput_socket = \"\"\n",
         ];
         for text in cases {
             let config: Config = toml::from_str(text).unwrap();

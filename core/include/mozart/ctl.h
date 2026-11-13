@@ -65,6 +65,10 @@ enum {
     MOZART_CTL_PRE_SET_MUTE   = 0x0203,
     MOZART_CTL_PRE_GET_STATUS = 0x0204,
     MOZART_CTL_PRE_SPEECH_STOP = 0x0205,  // 体 {}（空）；清播报环，speech stop 经 daemon 转发
+    // 体 {"active": bool}；文件任务接管实时数据面（SPEC-03 复用 + 状态门控交接）：
+    // active=true 暂停 rvc AI 发送并释放 output_socket（应答前确认释放完成），
+    // active=false 恢复发送并重绑 output_socket。asr 支路不受影响。
+    MOZART_CTL_PRE_SET_FILE_MODE = 0x0206,
 
     MOZART_CTL_RVC_HELLO        = 0x0301,
     MOZART_CTL_RVC_LOAD_MODEL   = 0x0302,

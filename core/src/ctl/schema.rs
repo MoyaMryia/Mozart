@@ -143,6 +143,10 @@ pub struct PreStatus {
     /// 播报帧播放累计。旧快照缺此字段按 0 还原。
     #[serde(default)]
     pub tts_frames_played: u64,
+    /// 文件接管状态（PRE_SET_FILE_MODE）：true 时 rvc AI 发送暂停、
+    /// output_socket 已释放给 daemon。旧快照缺此字段按 false 还原。
+    #[serde(default)]
+    pub file_mode: bool,
     pub last_error: Option<String>,
     pub version: String,
 }
@@ -375,6 +379,15 @@ pub struct RouteSetRequest {
 #[serde(deny_unknown_fields)]
 pub struct MuteSetRequest {
     pub mute: bool,
+}
+
+/// 文件接管开关请求体（PRE_SET_FILE_MODE）：{"active": bool}。
+/// active=true：pre 暂停 rvc AI 发送并释放 output_socket（交接给 daemon）；
+/// active=false：恢复实时。asr 支路不受影响（SPEC-02 / SPEC-03 状态门控交接）。
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct FileModeSetRequest {
+    pub active: bool,
 }
 
 /// 字幕链路开关请求体（DAEMON_TRANSLATE_SET / DAEMON_SPEECH_SET）：{"enabled": bool}。
@@ -668,17 +681,37 @@ mod tests {
         let status: PreStatus = serde_json::from_value(old).unwrap();
         assert_eq!(status.speaker_state, "realtime");
         assert_eq!(status.tts_frames_played, 0);
+        assert!(!status.file_mode, "旧快照缺 file_mode 按 false 还原");
 
         // 新快照往返稳定。
         let mut populated = status;
         populated.speaker_state = "broadcast".to_string();
         populated.tts_frames_played = 7;
+        populated.file_mode = true;
         let json = serde_json::to_value(&populated).unwrap();
         assert_eq!(json["speaker_state"], "broadcast");
         assert_eq!(json["tts_frames_played"], 7);
+        assert_eq!(json["file_mode"], true);
         let back: PreStatus = serde_json::from_value(json).unwrap();
         assert_eq!(back.speaker_state, "broadcast");
         assert_eq!(back.tts_frames_played, 7);
+        assert!(back.file_mode);
+    }
+
+    #[test]
+    fn file_mode_set_request_parses_active_and_rejects_extras() {
+        let on: FileModeSetRequest = serde_json::from_str(r#"{"active":true}"#).unwrap();
+        assert!(on.active);
+        let off: FileModeSetRequest = serde_json::from_str(r#"{"active":false}"#).unwrap();
+        assert!(!off.active);
+        for bad in [
+            "{}",
+            r#"{"active":"yes"}"#,
+            r#"{"active":true,"x":1}"#,
+            "not json",
+        ] {
+            assert!(serde_json::from_str::<FileModeSetRequest>(bad).is_err(), "应拒绝：{bad}");
+        }
     }
 
     #[test]

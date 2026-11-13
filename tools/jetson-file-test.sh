@@ -204,6 +204,7 @@ line = {
     "daemon_pid": daemon.get("pid"), "daemon_mem": mem(daemon.get("pid")),
     "rvc_mem": mem(((st.get("processes") or {}).get("rvc") or {}).get("pid")),
     "hw_used_bytes": ((st.get("hw") or {}).get("memory") or {}).get("used_bytes"),
+    "pre_file_mode": (st.get("pre") or {}).get("file_mode"),
     "degraded": st.get("degraded") or [],
 }
 with open(out_p, "a") as f:
@@ -333,7 +334,6 @@ max_duration_seconds = 300
 max_upload_bytes = 104857600
 ffmpeg_path = "/usr/bin/ffmpeg"
 ffmpeg_timeout_ms = 120000
-output_socket = "rvc-file-out.sock"
 EOF
 cp "$CFG" "$SMOKE_DIR/config-used.toml"
 {
@@ -623,6 +623,15 @@ if [ "$LONG_BUDGET_S" -gt 0 ]; then
       ok "submit→completed 墙钟 ${I_WALL} s（1 s 采样粒度）"
       ctl status --json > "$SMOKE_DIR/st-i-after.json" 2>/dev/null
       assert_eq "GPU 已释放" "$(jget "$SMOKE_DIR/st-i-after.json" path arbiter.gpu.owner)" ""
+      # pre 接管证据（SPEC-03 状态门控交接）：处理期间 pre.file_mode=true
+      # （rvc AI 发送暂停、输出 socket 释放），收尾后恢复 false。
+      PAUSED=$(python3 -c '
+import json, sys
+rows = [json.loads(l) for l in open(sys.argv[1]) if l.strip()]
+print("yes" if any(r.get("pre_file_mode") is True for r in rows) else "no")
+' "$SMOKE_DIR/progress-i.jsonl")
+      assert_eq "处理期间 pre 已暂停（file_mode）" "$PAUSED" "yes"
+      assert_eq "收尾后 pre 已恢复" "$(jget "$SMOKE_DIR/st-i-after.json" path pre.file_mode)" "false"
     fi
   fi
   end_scenario "out-i.wav stats-i.json progress-i.jsonl"
@@ -712,7 +721,7 @@ if pgrep -f "mozart-(daemon|pre|rvc)" > /dev/null; then
 else
   ok "无 mozart 进程残留"
 fi
-for f in daemon.sock pre.sock rvc.sock rvc-in.sock rvc-out.sock rvc-file-out.sock; do
+for f in daemon.sock pre.sock rvc.sock rvc-in.sock rvc-out.sock; do
   if [ -S "$RUN/$f" ]; then
     LIVE=$(python3 - "$RUN/$f" <<'PY'
 import socket, sys

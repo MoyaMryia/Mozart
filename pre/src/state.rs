@@ -71,6 +71,12 @@ pub struct QueueReadout {
 pub struct Shared {
     route_target: AtomicU8,
     mute_target: AtomicBool,
+    /// 文件接管状态（SPEC-03 状态门控交接）：控制线程写，处理线程与
+    /// rvc 接收线程只读。true 时 rvc AI 发送暂停、output_socket 释放给 daemon。
+    file_mode: AtomicBool,
+    /// 输出 socket 交接握手：rvc 接收线程解绑后置 true、重绑后清 false；
+    /// 控制线程在 PRE_SET_FILE_MODE{active:true} 应答前等它置位。
+    output_released: AtomicBool,
     frames_captured: AtomicU64,
     frames_played: AtomicU64,
     /// AI 输入帧发送丢弃（含未建链期），处理线程发布绝对值。
@@ -97,6 +103,8 @@ impl Shared {
         Self {
             route_target: AtomicU8::new(route_code(Route::Direct)),
             mute_target: AtomicBool::new(false),
+            file_mode: AtomicBool::new(false),
+            output_released: AtomicBool::new(false),
             frames_captured: AtomicU64::new(0),
             frames_played: AtomicU64::new(0),
             ai_send_dropped: AtomicU64::new(0),
@@ -127,6 +135,24 @@ impl Shared {
 
     pub fn set_mute_target(&self, mute: bool) {
         self.mute_target.store(mute, Ordering::Relaxed);
+    }
+
+    /// 文件接管状态；处理线程据此门控 rvc AI 发送，接收线程据此交接绑定。
+    pub fn file_mode(&self) -> bool {
+        self.file_mode.load(Ordering::Relaxed)
+    }
+
+    pub fn set_file_mode(&self, active: bool) {
+        self.file_mode.store(active, Ordering::Relaxed);
+    }
+
+    /// 输出 socket 已释放（接收线程解绑后置位，重绑后清零）。
+    pub fn output_released(&self) -> bool {
+        self.output_released.load(Ordering::Relaxed)
+    }
+
+    pub fn set_output_released(&self, released: bool) {
+        self.output_released.store(released, Ordering::Relaxed);
     }
 
     pub fn add_captured(&self, frames: u64) {
@@ -227,6 +253,7 @@ impl Shared {
             consumer_drops,
             speaker_state: speaker_name(self.speaker_state()).to_string(),
             tts_frames_played: self.tts_frames_played.load(Ordering::Relaxed),
+            file_mode: self.file_mode(),
             last_error: self
                 .last_error
                 .lock()

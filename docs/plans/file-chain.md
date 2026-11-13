@@ -34,16 +34,15 @@ D1. **文件批处理输入结束信号**：`StartStream`（kind=file）新增�
 C++ 攒满 `total_frames` 帧后跑整段离线推理，再回输出帧。SPEC-03 未定义结束信号，
 此为最小契约扩展（不新增控制动词，符合粗粒度边界）。取消仍走 `StopStream` 检查点。
 
-D2. **文件数据面 socket 隔离（偏离 SPEC 字面）**：输出——SPEC-03 字面要求复用 `rvc-out.sock`
-并在 pre/daemon 间交接绑定。但 pre 现在启动即绑定 `rvc-out.sock` 且终身持有
-（`pre/src/main.rs:179`），交接需改动已板端验收的实时路径，风险高。
-本计划改用**独立文件输出 socket**：daemon 绑定 `rvc-file-out.sock`，`StartStream`
-（kind=file）携带 `output_socket`（绝对路径）覆盖默认；C++ 按对端无感知原则连接该路径。
-pre 实时路径完全不动。仍满足 SPEC 核心意图（C++ 只收发帧、对端无感知、文件不丢、
-实时/文件互斥）。**输出偏离需用户确认**；若坚持字面交接，改为 pre 路由感知绑定（后续局部改动）。
-输入对称隔离到独立 `rvc-file-in.sock`（`[file].input_socket`，rvc 绑定），`StartStream` 携带
-`input_socket`：pre 恒发实时帧到 `rvc-in.sock`（SPEC-02），共享会污染整段攒帧并楔死数据面，
-已隔离并板端复测（见 reports/file-chain-20261113/RESULTS.md）。
+D2. **文件数据面复用 + 状态门控交接（取代早期独立 socket 方案）**：按 SPEC-03 字面
+复用 `rvc-in.sock`/`rvc-out.sock`，实时/文件互斥由状态机保证，切换时交接绑定。
+daemon 起流前经 `PRE_SET_FILE_MODE{active:true}`（0x0206）让 pre 暂停 rvc AI 发送
+并释放 `rvc-out.sock`（接收线程握手确认后才应答），再绑定同一输出 socket、喂帧到
+`rvc-in.sock`；收尾先停流、解绑，再 `active:false` 恢复 pre（重绑 + 恢复发送）。
+asr 字幕支路恒发不受影响。早期曾改用独立 `rvc-file-in.sock`/`rvc-file-out.sock`
+隔离以不动实时路径，经用户否决为偏离 SPEC，已回退；长文件死锁根因（pre 恒发实时帧
+污染整段攒帧）改由状态门控消除。`[file]` 不再有 socket 键，`StartStream` kind=file
+不再携带 socket 覆盖（Task 1/3/5 中相关描述以本决策为准）。
 
 D3. **队列持久化**：SPEC-04 定稿落盘续转。队列快照写 `<storage_dir>/queue.json`，
 每次变更原子写（临时文件 + rename）。重启读回 queued/processing 任务，processing 重置为
@@ -65,7 +64,7 @@ D6. **GPU 仲裁**：`gpu_owner: Option<Activity>`（Realtime/File）。文件�
 
 ## Global Constraints
 
-- 按 SPEC-02/03/04 与 config.md 实现，不虚捏；偏离只 D2 一处且须标注。
+- 按 SPEC-02/03/04 与 config.md 实现，不虚捏；D2 已回退为 SPEC-03 字面的复用 + 状态门控交接，无偏离。
 - C 头 `core/include/mozart/` 是跨语言契约唯一定义源；改头同步 `core/src/ctl.rs` 镜像与编译期断言。
 - 控制面：16 B LE 信封 + JSON 体，SEQPACKET；命令号 daemon `0x01xx` / rvc `0x03xx`。
   响应体固定 `status`/`code`/`reason`/`data`。错误码沿用 `core/src/ctl.rs` 常量。
@@ -277,7 +276,7 @@ D6. **GPU 仲裁**：`gpu_owner: Option<Activity>`（Realtime/File）。文件�
 
 ## 待用户确认的开口
 
-1. **D2 文件输出 socket**：独立 `rvc-file-out.sock`（本计划默认，不动实时路径）vs SPEC 字面
-   `rvc-out.sock` 交接（需改 pre 路由感知绑定）。默认前者。
+1. **D2 文件数据面**：已定案——复用 `rvc-in.sock`/`rvc-out.sock` + 状态门控交接
+   （`PRE_SET_FILE_MODE`），独立 socket 方案已回退。
 2. **范围**：`config get/set/save` + daemon 统一运行时状态文件本计划推迟，是否认可。
 3. **D1 total_frames**：作为文件批处理结束信号是否认可（替代新增 FinishStream 动词）。

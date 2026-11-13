@@ -1,6 +1,7 @@
 //! 推理进程协议桩：实现 SPEC-03 控制面，不加载模型、不推理。
-//! kind=file 时另跑整段批处理数据面（D1/D2）：攒满 total_frames 帧 →
-//! 零阶保持 3:1 上采样 → 阻塞回 total_frames 帧到 output_socket。
+//! kind=file 时另跑整段批处理数据面（D1）：攒满 total_frames 帧 →
+//! 零阶保持 3:1 上采样 → 阻塞回 total_frames 帧到配置默认 output_socket。
+//! 数据面复用 [rvc] 默认 socket（SPEC-03 状态门控交接，无独立文件 socket）。
 //! kind=realtime 仍只应答控制面（实时数据面回显见 rvc_echo.rs）。
 //!
 //! 测试旋钮 `MOZART_RVC_STUB_FILE_DELAY_MS`：攒满帧后模拟整段推理的等待，
@@ -50,6 +51,7 @@ struct State {
     kind: Option<String>,
     batch: Option<Batch>,
     input_socket: PathBuf,
+    output_socket: PathBuf,
     delay: Duration,
     hang: bool,
     feed_pace: Duration,
@@ -80,6 +82,7 @@ fn main() {
         kind: None,
         batch: None,
         input_socket: config.rvc_input_socket(),
+        output_socket: config.rvc_output_socket(),
         delay,
         hang,
         feed_pace,
@@ -206,9 +209,10 @@ fn handle(msg: &Message, state: &mut State) -> Vec<u8> {
     }
 }
 
-/// kind=file 入口校验一次（同 C++ StreamSession）：total_frames 正整数（u32）、
-/// output_socket / input_socket 绝对路径；随后绑定输入 socket 并起批处理线程。
-/// input_socket 缺省回退实时 rvc-in.sock；文件链路传独立 socket，隔离 pre 恒发帧。
+/// kind=file 入口校验一次（同 C++ StreamSession）：total_frames 正整数（u32）；
+/// 随后绑定配置默认输入 socket 并起批处理线程。数据面复用 [rvc] 默认 socket
+/// （SPEC-03 状态门控交接）：文件期间 pre 经 PRE_SET_FILE_MODE 暂停发送，
+/// 实时帧不会混入攒帧。
 fn start_file_batch(state: &mut State, body: &Value) -> Result<(), Vec<u8>> {
     let total = body
         .get("total_frames")
@@ -220,24 +224,7 @@ fn start_file_batch(state: &mut State, body: &Value) -> Result<(), Vec<u8>> {
             "total_frames must be a positive integer (u32)",
         ));
     };
-    let output = body
-        .get("output_socket")
-        .and_then(Value::as_str)
-        .map(PathBuf::from)
-        .filter(|path| path.is_absolute());
-    let Some(output) = output else {
-        return Err(fail(
-            ctl::CODE_INVALID_ARGUMENT,
-            "output_socket must be an absolute path string",
-        ));
-    };
-    let input = body
-        .get("input_socket")
-        .and_then(Value::as_str)
-        .map(PathBuf::from)
-        .filter(|path| path.is_absolute())
-        .unwrap_or_else(|| state.input_socket.clone());
-    let rx = FrameSocket::<InputFrame>::bind(&input, QUEUE_FRAMES)
+    let rx = FrameSocket::<InputFrame>::bind(&state.input_socket, QUEUE_FRAMES)
         .map_err(|err| fail(ctl::CODE_INTERNAL, &format!("bind input socket: {err}")))?;
     let batch = Batch {
         cancel: Arc::new(AtomicBool::new(false)),
@@ -245,7 +232,7 @@ fn start_file_batch(state: &mut State, body: &Value) -> Result<(), Vec<u8>> {
     };
     spawn_batch(
         rx,
-        output,
+        state.output_socket.clone(),
         total as usize,
         batch.cancel.clone(),
         batch.counters.clone(),
