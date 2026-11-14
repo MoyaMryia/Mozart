@@ -20,6 +20,9 @@ constexpr size_t kHop16k = 160;
 constexpr size_t kWindow16k = 32000;
 constexpr size_t kPad16k = 16000;
 constexpr size_t kGeneratorFrames = 200;
+// 分窗/单窗几何的设计基准：流式契约生成器 T=398（窗 2 s、pad 1 s、hop 1 s）。
+// 其它定长引擎按 T/398 同比缩放窗与 pad；T=398 时因子为 1，文件分窗路径逐位不变。
+constexpr size_t kWindowReferenceFrames = 398;
 // 文件按 320 样本契约帧攒段，解码向上取整最多补一帧，折算到 160 样本 hop 至多 2 帧。
 // 整段单次路径容忍这点补帧余量，避免“帧数严格相等”被解码补帧绊倒而误退分窗。
 constexpr size_t kFullLengthFrameSlack = MOZART_INPUT_SAMPLES / kHop16k;
@@ -232,8 +235,7 @@ std::vector<float> RVCInferencer::infer(
     const auto profile_preprocessed = profile::Clock::now();
 
     const uint32_t model_sr = model_->config().sample_rate;
-    const size_t hop_out = (kWindow16k / 2) * model_sr / 16000;
-    const size_t window_out = kWindow16k * model_sr / 16000;
+    // 外层 pad（整段边界）固定 kPad16k，F0 按它提取；分窗内层几何另随 T 缩放。
     const size_t pad_out = kPad16k * model_sr / 16000;
 
     size_t generator_frames = kGeneratorFrames;
@@ -260,7 +262,7 @@ std::vector<float> RVCInferencer::infer(
         || full_frames <= static_cast<size_t>(maximum_shape[1]);
     if (dynamic_generator && !full_shape_supported) {
         // 超过整段 profile 时沿用固定窗口装配，避免截断输入或越界分配。
-        generator_frames = 398;
+        generator_frames = kWindowReferenceFrames;
     }
 
     // The correctness-first dynamic contract follows the original RVC path:
@@ -324,30 +326,45 @@ std::vector<float> RVCInferencer::infer(
         return converted;
     }
 
-    if (audio_16k.size() <= kWindow16k) {
+    // 分窗/单窗内层几何随生成器 T 同比缩放（基准 T=398），并对齐到一个 HuBERT
+    // 帧（2*kHop16k 样本）避免分数帧。T=398 时各量与旧常量逐位相等。
+    const auto scale_window_len = [&](size_t base) {
+        return (base * generator_frames / kWindowReferenceFrames / (2 * kHop16k)) * (2 * kHop16k);
+    };
+    const size_t win_16k = scale_window_len(kWindow16k);
+    // 内层 pad 封顶到外层 kPad16k（F0 上下文边界），防更大 T 退分窗时单窗
+    // 音高偏移 (kPad16k-pad_16k) 下溢；T=200/398 不触发封顶。
+    const size_t pad_16k = std::min(scale_window_len(kPad16k), kPad16k);
+    const size_t pad_tgt = pad_16k * model_sr / 16000;
+    const size_t window_out = win_16k * model_sr / 16000;
+    const size_t hop_in = win_16k / 2;
+    const size_t hop_out = hop_in * model_sr / 16000;
+
+    if (audio_16k.size() <= win_16k) {
         // Golden-aligned: feed the reflect-padded window to HuBERT (matching
         // RVC pipeline.vc which pads by t_pad before HuBERT) and run the
-        // generator at the engine's native T (398 for the streaming contract).
-        // Crop the generator output by t_pad_tgt on each side like RVC's
-        // [t_pad_tgt:-t_pad_tgt], then pad to the block contract so the
+        // generator at the engine's native T. Crop by pad_tgt each side like
+        // RVC's [t_pad_tgt:-t_pad_tgt], then pad to the block contract so the
         // streaming pipeline's out_block_/emit_out_ assumptions hold.
         const size_t T = generator_frames;
-        auto pitchf = slice_or_pad(pitchf_full, 0, T);
+        // F0 按外层 kPad16k 提取，单窗内层 pad 缩到 pad_16k，音高索引补两者
+        // 之差对齐（T=398 时差 0，与旧行为逐位一致）。
+        const size_t pitch_offset = (kPad16k - pad_16k) / kHop16k;
+        auto pitchf = slice_or_pad(pitchf_full, pitch_offset, T);
         std::vector<int64_t> pitch(T, 1);
         for (size_t t = 0; t < T; ++t) {
-            const size_t source = std::min(t, pitch_full.size() - 1);
+            const size_t source = std::min(pitch_offset + t, pitch_full.size() - 1);
             pitch[t] = pitch_full[source];
         }
-        auto converted = infer_window(padded, pitchf, pitch, cancelled);
-        const size_t pad_tgt = kPad16k * model_sr / 16000;
+        auto hubert_input = reflect_pad(audio_16k, pad_16k);
+        auto converted = infer_window(hubert_input, pitchf, pitch, cancelled);
         if (converted.size() > 2 * pad_tgt) {
             converted = std::vector<float>(
                 converted.begin() + static_cast<std::ptrdiff_t>(pad_tgt),
                 converted.end() - static_cast<std::ptrdiff_t>(pad_tgt));
         }
-        const size_t contract = kWindow16k * model_sr / 16000;
-        if (converted.size() < contract) {
-            converted.resize(contract, 0.0f);
+        if (converted.size() < window_out) {
+            converted.resize(window_out, 0.0f);
         }
         converted = apply_rms_mix(audio_16k, std::move(converted));
         if (model_sr != output_sample_rate_) {
@@ -357,17 +374,15 @@ std::vector<float> RVCInferencer::infer(
         return converted;
     }
 
-    const size_t hop_in = kWindow16k / 2;
-    const size_t pad_tgt = kPad16k * model_sr / 16000;
     std::vector<float> assembled;
     assembled.reserve((padded.size() * model_sr / 16000) + window_out);
     size_t windows = 0;
     for (size_t start = 0; start < padded.size(); start += hop_in) {
         check_cancelled(cancelled);
-        auto window = slice_or_pad(padded, start, kWindow16k);
-        // Golden-aligned per window: reflect-pad the 2 s window to 4 s before
-        // HuBERT (matching RVC pipeline.vc) and run at the engine's native T.
-        auto hubert_input = reflect_pad(window, kPad16k);
+        auto window = slice_or_pad(padded, start, win_16k);
+        // Golden-aligned per window: reflect-pad the window before HuBERT
+        // (matching RVC pipeline.vc) and run at the engine's native T.
+        auto hubert_input = reflect_pad(window, pad_16k);
         const size_t f0_start = start / kHop16k;
         std::vector<float> pitchf(generator_frames, 0.0f);
         std::vector<int64_t> pitch(generator_frames, 1);
@@ -398,7 +413,7 @@ std::vector<float> RVCInferencer::infer(
                              converted.begin() + static_cast<std::ptrdiff_t>(window_out));
         }
         ++windows;
-        if (start + kWindow16k >= padded.size()) break;
+        if (start + win_16k >= padded.size()) break;
     }
 
     if (assembled.size() > pad_out) {
