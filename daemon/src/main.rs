@@ -1,3 +1,5 @@
+mod device;
+mod file;
 mod hwmon;
 mod poller;
 mod server;

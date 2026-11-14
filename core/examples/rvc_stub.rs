@@ -1,21 +1,92 @@
-//! 推理进程协议桩：只实现 SPEC-03 控制面，不加载模型、不推理。
+//! 推理进程协议桩：实现 SPEC-03 控制面，不加载模型、不推理。
+//! kind=file 时另跑整段批处理数据面（D1）：攒满 total_frames 帧 →
+//! 零阶保持 3:1 上采样 → 阻塞回 total_frames 帧到配置默认 output_socket。
+//! 数据面复用 [rvc] 默认 socket（SPEC-03 状态门控交接，无独立文件 socket）。
+//! kind=realtime 仍只应答控制面（实时数据面回显见 rvc_echo.rs）。
+//!
+//! 测试旋钮 `MOZART_RVC_STUB_FILE_DELAY_MS`：攒满帧后模拟整段推理的等待，
+//! 让取消用例稳定停在 infer 段；等待可被 StopStream 打断。
+//! 测试旋钮 `MOZART_RVC_STUB_FILE_HANG=1`：绑定输入 socket 但永不读帧，
+//! 模拟推理线程挂死（进程活着），让喂帧方填满缓冲后阻塞。
 
 mod stub_common;
 
+use mozart_core::config::Config;
 use mozart_core::ctl::{self, Message};
-use serde_json::json;
+use mozart_core::dgram::FrameSocket;
+use mozart_core::{FrameMeta, InputFrame, OutputFrame, FRAME_MS, INPUT_SAMPLES, OUTPUT_SAMPLES};
+use serde_json::{json, Value};
+use std::io::ErrorKind;
+use std::path::PathBuf;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::Arc;
+use std::time::{Duration, Instant};
 use stub_common::{body, expect_known, fail, ok, parse_args, serve};
 
+/// 数据面 socket 缓冲帧数：SPEC-02「接收缓冲 4–8 帧」取上沿。
+const QUEUE_FRAMES: usize = 8;
+
+/// 攒帧与模拟推理期间的取消检查间隔。
+const POLL: Duration = Duration::from_millis(20);
+
+/// 48 kHz 输出 = 16 kHz 输入逐样本复制三份（零阶保持上采样，同 rvc_echo）。
+const _: () = assert!(OUTPUT_SAMPLES == INPUT_SAMPLES * 3);
+
+/// 批处理计数：停流后保留，供 GetStatus 查最终计数（同 C++ final_stats）。
 #[derive(Default)]
+struct Counters {
+    frames_in: AtomicU64,
+    frames_out: AtomicU64,
+    blocks: AtomicU64,
+}
+
+struct Batch {
+    cancel: Arc<AtomicBool>,
+    counters: Arc<Counters>,
+}
+
 struct State {
     model: Option<String>,
     streaming: bool,
     kind: Option<String>,
+    batch: Option<Batch>,
+    input_socket: PathBuf,
+    output_socket: PathBuf,
+    delay: Duration,
+    hang: bool,
+    feed_pace: Duration,
 }
 
 fn main() {
     let args = parse_args("mozart-rvc-stub");
-    let mut state = State::default();
+    // 数据面 socket 路径与 daemon 读同一 TOML（含 MOZART_RUN_DIR 覆盖）。
+    let config = Config::load_from(args.config.as_deref()).unwrap_or_else(|err| {
+        eprintln!("mozart-rvc-stub: config: {err}");
+        std::process::exit(1);
+    });
+    let delay = std::env::var("MOZART_RVC_STUB_FILE_DELAY_MS")
+        .ok()
+        .and_then(|value| value.parse::<u64>().ok())
+        .map(Duration::from_millis)
+        .unwrap_or(Duration::ZERO);
+    let hang = std::env::var("MOZART_RVC_STUB_FILE_HANG").is_ok_and(|value| value == "1");
+    // 攒帧逐帧节流：拉宽攒帧窗，让共享输入 socket 上的实时帧污染可复现（回归用）。
+    let feed_pace = std::env::var("MOZART_RVC_STUB_FILE_FEED_PACE_MS")
+        .ok()
+        .and_then(|value| value.parse::<u64>().ok())
+        .map(Duration::from_millis)
+        .unwrap_or(Duration::ZERO);
+    let mut state = State {
+        model: None,
+        streaming: false,
+        kind: None,
+        batch: None,
+        input_socket: config.rvc_input_socket(),
+        output_socket: config.rvc_output_socket(),
+        delay,
+        hang,
+        feed_pace,
+    };
     serve(args, move |msg| handle(msg, &mut state));
 }
 
@@ -27,6 +98,7 @@ fn handle(msg: &Message, state: &mut State) -> Vec<u8> {
         ctl::RVC_STOP_STREAM,
         ctl::RVC_RESET_STREAM,
         ctl::RVC_GET_STATUS,
+        ctl::RVC_LIST_MODELS,
     ];
     if let Err(reply) = expect_known(msg, &known) {
         return reply;
@@ -48,7 +120,7 @@ fn handle(msg: &Message, state: &mut State) -> Vec<u8> {
                 "model_id": model_id,
                 "model_version": "stub",
                 "model_handle": 1,
-                "capabilities": ["realtime"]
+                "capabilities": ["realtime", "file"]
             }))
         }
         ctl::RVC_START_STREAM => {
@@ -65,12 +137,23 @@ fn handle(msg: &Message, state: &mut State) -> Vec<u8> {
             if kind != "realtime" && kind != "file" {
                 return fail(ctl::CODE_INVALID_ARGUMENT, "kind must be realtime or file");
             }
+            if kind == "file" {
+                if let Err(reply) = start_file_batch(state, &body) {
+                    return reply;
+                }
+            }
             state.streaming = true;
             state.kind = Some(kind.to_string());
             ok(json!({"stream_kind": kind}))
         }
         ctl::RVC_STOP_STREAM | ctl::RVC_RESET_STREAM => {
+            // 只置取消：批处理线程在下一个检查点退出，控制面不等它
+            // （回帧可能正阻塞在对端缓冲上，join 会与对端互等）。
+            if let Some(batch) = state.batch.as_ref() {
+                batch.cancel.store(true, Ordering::Release);
+            }
             state.streaming = false;
+            state.kind = None;
             ok(json!({}))
         }
         ctl::RVC_GET_STATUS => {
@@ -81,16 +164,23 @@ fn handle(msg: &Message, state: &mut State) -> Vec<u8> {
             } else {
                 "idle"
             };
+            let counters = state.batch.as_ref().map(|batch| batch.counters.clone());
+            let count = |get: fn(&Counters) -> &AtomicU64| {
+                counters
+                    .as_ref()
+                    .map(|counters| get(counters).load(Ordering::Relaxed))
+                    .unwrap_or(0)
+            };
             ok(json!({
                 "state": state_name,
                 "model_id": state.model.as_ref(),
                 "model_version": state.model.as_ref().map(|_| "stub"),
-                "capabilities": ["realtime"],
+                "capabilities": ["realtime", "file"],
                 "stream_kind": state.kind.as_ref(),
-                "frames_in": 0,
-                "frames_out": 0,
+                "frames_in": count(|c| &c.frames_in),
+                "frames_out": count(|c| &c.frames_out),
                 "frames_dropped": 0,
-                "blocks": 0,
+                "blocks": count(|c| &c.blocks),
                 "inference_ms_last": null,
                 "inference_ms_avg": null,
                 "inference_ms_p95": null,
@@ -98,6 +188,136 @@ fn handle(msg: &Message, state: &mut State) -> Vec<u8> {
                 "last_error": null
             }))
         }
+        ctl::RVC_LIST_MODELS => {
+            // 桩模型目录固定一个 demo；已加载的其他模型一并列出。
+            let mut ids = vec!["demo".to_string()];
+            if let Some(model) = state.model.as_ref() {
+                if model != "demo" {
+                    ids.push(model.clone());
+                }
+            }
+            let models: Vec<_> = ids
+                .into_iter()
+                .map(|id| {
+                    let loaded = state.model.as_deref() == Some(id.as_str());
+                    json!({"id": id, "exists": true, "loaded": loaded})
+                })
+                .collect();
+            ok(json!({"models": models}))
+        }
         _ => unreachable!("expect_known covers all commands"),
     }
+}
+
+/// kind=file 入口校验一次（同 C++ StreamSession）：total_frames 正整数（u32）；
+/// 随后绑定配置默认输入 socket 并起批处理线程。数据面复用 [rvc] 默认 socket
+/// （SPEC-03 状态门控交接）：文件期间 pre 经 PRE_SET_FILE_MODE 暂停发送，
+/// 实时帧不会混入攒帧。
+fn start_file_batch(state: &mut State, body: &Value) -> Result<(), Vec<u8>> {
+    let total = body
+        .get("total_frames")
+        .and_then(Value::as_u64)
+        .filter(|total| *total > 0 && *total <= u64::from(u32::MAX));
+    let Some(total) = total else {
+        return Err(fail(
+            ctl::CODE_INVALID_ARGUMENT,
+            "total_frames must be a positive integer (u32)",
+        ));
+    };
+    let rx = FrameSocket::<InputFrame>::bind(&state.input_socket, QUEUE_FRAMES)
+        .map_err(|err| fail(ctl::CODE_INTERNAL, &format!("bind input socket: {err}")))?;
+    let batch = Batch {
+        cancel: Arc::new(AtomicBool::new(false)),
+        counters: Arc::new(Counters::default()),
+    };
+    spawn_batch(
+        rx,
+        state.output_socket.clone(),
+        total as usize,
+        batch.cancel.clone(),
+        batch.counters.clone(),
+        state.delay,
+        state.hang,
+        state.feed_pace,
+    );
+    state.batch = Some(batch);
+    Ok(())
+}
+
+fn spawn_batch(
+    rx: FrameSocket<InputFrame>,
+    output: PathBuf,
+    total: usize,
+    cancel: Arc<AtomicBool>,
+    counters: Arc<Counters>,
+    delay: Duration,
+    hang: bool,
+    feed_pace: Duration,
+) {
+    std::thread::spawn(move || {
+        // 挂死对端：持有输入 socket 绑定但永不读帧，直到停流置取消。
+        if hang {
+            while !cancel.load(Ordering::Acquire) {
+                std::thread::sleep(POLL);
+            }
+            return;
+        }
+        // ---- 攒帧：total_frames 个 320 样本输入帧 ----
+        let mut audio: Vec<[f32; INPUT_SAMPLES]> = Vec::with_capacity(total);
+        while audio.len() < total {
+            if cancel.load(Ordering::Acquire) {
+                return;
+            }
+            match rx.recv(Some(POLL)) {
+                Ok(frame) => {
+                    audio.push(frame.pcm);
+                    counters.frames_in.fetch_add(1, Ordering::Relaxed);
+                    // 攒帧节流（回归旋钮）：拉宽攒帧窗，复现共享 socket 实时帧污染。
+                    if !feed_pace.is_zero() {
+                        std::thread::sleep(feed_pace);
+                    }
+                }
+                Err(err) if err.kind() == ErrorKind::TimedOut => continue,
+                Err(_) => return,
+            }
+        }
+        // ---- 模拟整段推理：可取消的等待，整段一次过计 1 窗 ----
+        let deadline = Instant::now() + delay;
+        while Instant::now() < deadline {
+            if cancel.load(Ordering::Acquire) {
+                return;
+            }
+            std::thread::sleep(deadline.saturating_duration_since(Instant::now()).min(POLL));
+        }
+        counters.blocks.store(1, Ordering::Relaxed);
+        // ---- 回帧：48 kHz 整段切 960 样本，阻塞逐帧发，不丢 ----
+        let tx = match FrameSocket::<OutputFrame>::connect(&output, QUEUE_FRAMES) {
+            Ok(tx) => tx,
+            Err(_) => return,
+        };
+        for (idx, pcm) in audio.iter().enumerate() {
+            if cancel.load(Ordering::Acquire) {
+                return;
+            }
+            let mut upsampled = [0f32; OUTPUT_SAMPLES];
+            for (i, slot) in upsampled.iter_mut().enumerate() {
+                *slot = pcm[i / 3];
+            }
+            let frame = OutputFrame {
+                meta: FrameMeta {
+                    pts_ns: idx as u64 * u64::from(FRAME_MS) * 1_000_000,
+                    frame_idx: idx as u32,
+                    vad_flag: 1,
+                    energy_db: 0,
+                    conf: 0,
+                    segment_id: 0,
+                },
+                pcm: upsampled,
+            };
+            if tx.send_blocking(&frame).is_err() {
+                return;
+            }
+            counters.frames_out.fetch_add(1, Ordering::Relaxed);
+        }
+    });
 }

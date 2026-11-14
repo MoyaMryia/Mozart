@@ -6,6 +6,7 @@ license.workspace = true
 
 [dependencies]
 mozart-core = { path = "../core" }
+mozart-dsp = { path = "../dsp" }
 alsa = "0.9"
 libc = "0.2"
 serde_json = "1"

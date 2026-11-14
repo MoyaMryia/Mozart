@@ -196,11 +196,24 @@ set -euo pipefail
 cd "$HOME/Mozart"
 . "$HOME/.cargo/env"
 
+# 语言链路仓外资产在 ~/mozart-assets（sherpa 库、llama-server 及其 .so）。
+# 存在即启用：构建期链接 sherpa；运行期子进程经 LD_LIBRARY_PATH 加载共享库。
+# 缺失时保持 stub 构建与默认 llama 缺省，便于首次引导。
+ASSETS_DIR=${MOZART_ASSETS_DIR:-$HOME/mozart-assets}
+if [ -e "$ASSETS_DIR/lib/libsherpa-onnx-c-api.so" ]; then
+  export SHERPA_ONNX_LIB_DIR="$ASSETS_DIR/lib"
+fi
+export LD_LIBRARY_PATH="$ASSETS_DIR/lib:$ASSETS_DIR/llama${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
+
 echo '== 3/7 cargo build --workspace --bins --examples（debug）=='
 cargo build --workspace --bins --examples
 
 echo '== 4/7 cmake jetson-release =='
-cmake --preset jetson-release
+# 已填充的 FetchContent 依赖跳过 update 步骤：每次部署都前拨 mtime 触发
+# 重新 configure，update 会按 GIT_REPOSITORY 联网 git fetch，即使源码已在
+# pinned tag 上（实测 Jetson 到上游 TLS 间歇中断，连续两次部署因此失败回滚）。
+# 该开关只跳过“已填充依赖的更新”，首次填充仍照常下载，不改变构建产物。
+cmake --preset jetson-release -DFETCHCONTENT_UPDATES_DISCONNECTED=ON
 cmake --build --preset jetson-release --parallel 2
 
 echo '== 4/7 rvc 产物对齐 target/debug（SPEC-04 部署布局）=='

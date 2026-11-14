@@ -101,6 +101,7 @@ int main(int argc, char** argv) {
     std::signal(SIGINT, on_signal);
 
     rvc::InferenceBackendConfig backend_config;
+    backend_config.models = startup.models;
     backend_config.models_dir = startup.models_dir;
     backend_config.device = startup.device;
     backend_config.half = startup.half;

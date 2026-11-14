@@ -44,6 +44,23 @@ std::vector<float> MockRVCPipeline::process(const std::vector<float>& audio) {
     return upsample_linear(audio, ratio);
 }
 
+std::vector<float> MockRVCPipeline::process_cancellable(
+    const std::vector<float>& audio, const std::atomic<bool>& cancelled
+) {
+    auto output = RVCPipelineBase::process_cancellable(audio, cancelled);
+    // mock 无 Generator 窗：整段一次过计 1（与真实路径同口径）。
+    window_count_.fetch_add(1, std::memory_order_relaxed);
+    return output;
+}
+
+uint64_t MockRVCPipeline::offline_window_count() const {
+    return window_count_.load(std::memory_order_relaxed);
+}
+
+void MockRVCPipeline::reset_offline_window_count() {
+    window_count_.store(0, std::memory_order_relaxed);
+}
+
 std::vector<float> MockRVCPipeline::upsample_linear(
     const std::vector<float>& audio, float ratio
 ) {
@@ -237,6 +254,16 @@ std::vector<float> RealRVCPipeline::process_realtime(
 void RealRVCPipeline::reset_realtime() {
     const auto inferencer = current_inferencer();
     if (inferencer) inferencer->reset_realtime();
+}
+
+uint64_t RealRVCPipeline::offline_window_count() const {
+    const auto inferencer = current_inferencer();
+    return inferencer ? inferencer->generator_window_count() : 0;
+}
+
+void RealRVCPipeline::reset_offline_window_count() {
+    const auto inferencer = current_inferencer();
+    if (inferencer) inferencer->reset_generator_window_count();
 }
 
 RvcParameters RealRVCPipeline::parameters() const {

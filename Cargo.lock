@@ -163,6 +163,16 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "00d174d5400e5e8fd687ad1049e2f578285fa914201b1af7e8b112a4546bd826"
 
 [[package]]
+name = "errno"
+version = "0.3.15"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "e35d6e78f4cebb90e51d543db8fe41528851d6deeef6ef21ebd4bfdc1e784776"
+dependencies = [
+ "libc",
+ "windows-sys",
+]
+
+[[package]]
 name = "fancy-regex"
 version = "0.20.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -251,6 +261,7 @@ dependencies = [
  "serde",
  "serde_json",
  "toml",
+ "toml_edit",
 ]
 
 [[package]]
@@ -260,6 +271,7 @@ dependencies = [
  "clap",
  "libc",
  "mozart-core",
+ "serde",
  "serde_json",
 ]
 
@@ -267,9 +279,20 @@ dependencies = [
 name = "mozart-daemon"
 version = "0.1.0"
 dependencies = [
+ "alsa",
  "libc",
  "mozart-core",
+ "mozart-dsp",
+ "serde",
  "serde_json",
+ "signal-hook",
+]
+
+[[package]]
+name = "mozart-dsp"
+version = "0.1.0"
+dependencies = [
+ "mozart-core",
 ]
 
 [[package]]
@@ -279,6 +302,7 @@ dependencies = [
  "alsa",
  "libc",
  "mozart-core",
+ "mozart-dsp",
  "serde_json",
 ]
 
@@ -390,6 +414,26 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "bf41e0cfaf7226dca15e8197172c295a782857fcb97fad1808a166870dee75a3"
 dependencies = [
  "serde",
+]
+
+[[package]]
+name = "signal-hook"
+version = "0.3.18"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "d881a16cf4426aa584979d30bd82cb33429027e42122b169753d6ef1085ed6e2"
+dependencies = [
+ "libc",
+ "signal-hook-registry",
+]
+
+[[package]]
+name = "signal-hook-registry"
+version = "1.4.8"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "c4db69cba1110affc0e9f7bcd48bbf87b3f4fc7c61fc9155afd4c469eb3d6c1b"
+dependencies = [
+ "errno",
+ "libc",
 ]
 
 [[package]]

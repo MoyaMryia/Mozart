@@ -22,6 +22,12 @@ target_link_libraries(t_rvc_pump PRIVATE mozart_rvc_runtime mozart_warnings)
 add_test(NAME rvc_pump COMMAND t_rvc_pump)
 set_tests_properties(rvc_pump PROPERTIES LABELS "unit" TIMEOUT 60)
 
+# rvc 文件整段批处理：FileWorker × 阻塞数据面（mock 管线，无 GPU 依赖）。
+add_executable(t_rvc_file test_rvc_file.cpp)
+target_link_libraries(t_rvc_file PRIVATE mozart_rvc_runtime mozart_warnings)
+add_test(NAME rvc_file COMMAND t_rvc_file)
+set_tests_properties(rvc_file PROPERTIES LABELS "unit" TIMEOUT 60)
+
 # StreamSession 六命令控制面语义（桩后端，无 GPU 依赖）。
 add_executable(t_rvc_control test_rvc_control.cpp)
 target_link_libraries(t_rvc_control PRIVATE mozart_rvc_runtime mozart_warnings)

@@ -19,10 +19,13 @@ pub fn now_ns() -> u64 {
     ts.tv_sec as u64 * 1_000_000_000 + ts.tv_nsec as u64
 }
 
+/// S16 → f32 归一化除数；设备采集与文件采集源共用。
+pub const S16_NORM: f32 = 32768.0;
+
 /// 交错立体声 S16 → 单声道 f32：取 FL（左声道），除以 32768。
 pub fn fl_to_mono(stereo: &[i16], out: &mut [f32]) {
     for (slot, pair) in out.iter_mut().zip(stereo.chunks_exact(2)) {
-        *slot = pair[0] as f32 / 32768.0;
+        *slot = pair[0] as f32 / S16_NORM;
     }
 }
 

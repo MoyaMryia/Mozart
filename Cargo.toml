@@ -1,6 +1,6 @@
 [workspace]
 resolver = "2"
-members = ["core", "pre", "daemon", "ctl", "asr", "tts", "bridge"]
+members = ["core", "dsp", "pre", "daemon", "ctl", "asr", "tts", "bridge"]
 
 [workspace.package]
 version = "0.1.0"

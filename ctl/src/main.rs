@@ -1,8 +1,13 @@
 use clap::{Parser, Subcommand, ValueEnum};
 use mozart_core::config::{ensure_run_dir, Config};
-use mozart_core::ctl::schema::{Activity, ProcessState, Response, Route, Status};
+use mozart_core::ctl::schema::{
+    Activity, ConfigGetRequest, ConfigSetRequest, DeviceEntry, DeviceListRequest, FileCancelRequest,
+    FileFetchRequest, FileJob, FileJobState, FileProgress, FileStatusRequest, FileSubmitRequest,
+    ModelEntry, ProcessState, Response, RestartRequest, Route, Status,
+};
 use mozart_core::ctl::{self, Seqpacket};
 use serde_json::{json, Value};
+use std::fs;
 use std::fs::OpenOptions;
 use std::io;
 use std::os::unix::process::CommandExt;
@@ -56,6 +61,31 @@ enum Action {
         #[command(subcommand)]
         action: SpeechAction,
     },
+    /// 文件转换任务
+    File {
+        #[command(subcommand)]
+        action: FileAction,
+    },
+    /// 模型清单
+    Model {
+        #[command(subcommand)]
+        action: ModelAction,
+    },
+    /// 重启单个服务（重读配置生效，整栈不动）
+    Restart {
+        #[arg(value_enum)]
+        service: ServiceArg,
+    },
+    /// 音频设备
+    Device {
+        #[command(subcommand)]
+        action: DeviceAction,
+    },
+    /// 配置持久基线（SPEC-04）
+    Config {
+        #[command(subcommand)]
+        action: ConfigAction,
+    },
 }
 
 #[derive(Subcommand)]
@@ -86,6 +116,84 @@ enum SpeechAction {
     Off,
     /// 关播报并清空待播报队列（在途丢弃）
     Stop,
+}
+
+#[derive(Subcommand)]
+enum FileAction {
+    /// 提交本地文件入队（daemon 复制到受管存储）
+    Submit {
+        /// 源文件路径
+        path: PathBuf,
+        /// 模型 id；缺省用当前已加载模型
+        #[arg(long, value_name = "ID")]
+        model: Option<String>,
+    },
+    /// 暂停队列：不再启动新任务，在跑任务跑完
+    Pause,
+    /// 恢复队列：继续启动排队任务
+    Resume,
+    /// 取消任务
+    Cancel {
+        /// 任务 id
+        job_id: String,
+    },
+    /// 查询任务状态与进度
+    Status {
+        /// 任务 id
+        job_id: String,
+    },
+    /// 列出队列任务
+    List,
+    /// 取回结果文件（复制到本地）
+    Fetch {
+        /// 任务 id
+        job_id: String,
+        /// 目标路径；缺省当前目录下原文件名主干 + .wav
+        #[arg(short, long, value_name = "PATH")]
+        output: Option<PathBuf>,
+    },
+}
+
+#[derive(Subcommand)]
+enum ModelAction {
+    /// 列出模型（id、是否存在、是否已加载）
+    List,
+}
+
+#[derive(Clone, Copy, ValueEnum)]
+enum ServiceArg {
+    Pre,
+    Rvc,
+    Asr,
+    Tts,
+    Bridge,
+    Llama,
+}
+
+#[derive(Subcommand)]
+enum DeviceAction {
+    /// 列出采集/播放设备（ALSA 名、人读标签、方向）
+    List {
+        /// 列出完整 ALSA 别名清单；缺省只列配置首选（plughw 与 default）
+        #[arg(long)]
+        all: bool,
+    },
+}
+
+#[derive(Subcommand)]
+enum ConfigAction {
+    /// 改单个键的持久基线；重启键返回需重启提示
+    Set {
+        /// 配置键，如 pre.capture_device
+        key: String,
+        /// 新值
+        value: String,
+    },
+    /// 读配置基线；缺省键读整份
+    Get {
+        /// 配置键；缺省读整份
+        key: Option<String>,
+    },
 }
 
 struct CliError {
@@ -130,6 +238,18 @@ fn run(cli: Cli) -> Result<(), CliError> {
             translate(&config, matches!(state, OnOff::On), cli.json)
         }
         Action::Speech { action } => speech(&config, action, cli.json),
+        Action::File { action } => file_command(&config, action, cli.json),
+        Action::Model { action } => match action {
+            ModelAction::List => model_list(&config, cli.json),
+        },
+        Action::Restart { service } => restart(&config, service, cli.json),
+        Action::Device { action } => match action {
+            DeviceAction::List { all } => device_list(&config, cli.json, all),
+        },
+        Action::Config { action } => match action {
+            ConfigAction::Set { key, value } => config_set(&config, &key, &value, cli.json),
+            ConfigAction::Get { key } => config_get(&config, key.as_deref(), cli.json),
+        },
     }
 }
 
@@ -334,6 +454,403 @@ fn speech(config: &Config, action: SpeechAction, json_output: bool) -> Result<()
         println!("{human}");
     }
     Ok(())
+}
+
+fn file_command(config: &Config, action: FileAction, json_output: bool) -> Result<(), CliError> {
+    match action {
+        FileAction::Submit { path, model } => file_submit(config, path, model, json_output),
+        FileAction::Pause => file_pause_resume(config, ctl::DAEMON_FILE_PAUSE, json_output),
+        FileAction::Resume => file_pause_resume(config, ctl::DAEMON_FILE_RESUME, json_output),
+        FileAction::Cancel { job_id } => file_cancel(config, &job_id, json_output),
+        FileAction::Status { job_id } => file_status(config, &job_id, json_output),
+        FileAction::List => file_list(config, json_output),
+        FileAction::Fetch { job_id, output } => file_fetch(config, &job_id, output, json_output),
+    }
+}
+
+fn file_submit(
+    config: &Config,
+    path: PathBuf,
+    model: Option<String>,
+    json_output: bool,
+) -> Result<(), CliError> {
+    // 路径按原样交给 daemon：存在性/扩展名/大小由 daemon 入口校验。
+    let body = body_json(&FileSubmitRequest {
+        path: path.to_string_lossy().into_owned(),
+        model_id: model,
+    })?;
+    let data = call(config, ctl::DAEMON_FILE_SUBMIT, &body)?;
+    if json_output {
+        println!("{data}");
+    } else {
+        print_job_ack(&data)?;
+    }
+    Ok(())
+}
+
+fn file_pause_resume(config: &Config, type_: u16, json_output: bool) -> Result<(), CliError> {
+    let data = call(config, type_, b"{}")?;
+    if json_output {
+        println!("{data}");
+    } else {
+        let paused = bool_field(&data, "paused")?;
+        println!("file queue: {}", if paused { "paused" } else { "running" });
+    }
+    Ok(())
+}
+
+fn file_cancel(config: &Config, job_id: &str, json_output: bool) -> Result<(), CliError> {
+    let body = body_json(&FileCancelRequest {
+        job_id: job_id.to_string(),
+    })?;
+    let data = call(config, ctl::DAEMON_FILE_CANCEL, &body)?;
+    if json_output {
+        println!("{data}");
+    } else {
+        print_job_ack(&data)?;
+    }
+    Ok(())
+}
+
+fn file_status(config: &Config, job_id: &str, json_output: bool) -> Result<(), CliError> {
+    let body = body_json(&FileStatusRequest {
+        job_id: job_id.to_string(),
+    })?;
+    let data = call(config, ctl::DAEMON_FILE_STATUS, &body)?;
+    if json_output {
+        println!("{data}");
+    } else {
+        let job: FileJob = serde_json::from_value(data)
+            .map_err(|err| CliError::new(EXIT_ERROR, format!("invalid file job payload: {err}")))?;
+        print_file_job(&job);
+    }
+    Ok(())
+}
+
+fn file_list(config: &Config, json_output: bool) -> Result<(), CliError> {
+    let data = call(config, ctl::DAEMON_FILE_LIST, b"{}")?;
+    if json_output {
+        println!("{data}");
+        return Ok(());
+    }
+    let jobs = data
+        .get("jobs")
+        .ok_or_else(|| CliError::new(EXIT_ERROR, "invalid file list payload: missing jobs"))?;
+    let jobs: Vec<FileJob> = serde_json::from_value(jobs.clone())
+        .map_err(|err| CliError::new(EXIT_ERROR, format!("invalid file list payload: {err}")))?;
+    let paused = bool_field(&data, "paused")?;
+    print_file_table(&jobs, paused);
+    Ok(())
+}
+
+fn file_fetch(
+    config: &Config,
+    job_id: &str,
+    output: Option<PathBuf>,
+    json_output: bool,
+) -> Result<(), CliError> {
+    let body = body_json(&FileFetchRequest {
+        job_id: job_id.to_string(),
+        output: output
+            .as_ref()
+            .map(|path| path.to_string_lossy().into_owned()),
+    })?;
+    let data = call(config, ctl::DAEMON_FILE_FETCH, &body)?;
+    // v1 同机：daemon 回受管结果绝对路径与缺省名，CLI 复制到目标。
+    let source = PathBuf::from(text_field(&data, "output_path")?);
+    let dest = match output {
+        Some(path) => path,
+        None => PathBuf::from(text_field(&data, "name")?),
+    };
+    copy_result(&source, &dest)?;
+    if json_output {
+        println!(
+            "{}",
+            json!({"job_id": job_id, "output_path": dest.to_string_lossy()})
+        );
+    } else {
+        println!("fetched: {}", dest.display());
+    }
+    Ok(())
+}
+
+fn model_list(config: &Config, json_output: bool) -> Result<(), CliError> {
+    let data = call(config, ctl::DAEMON_MODEL_LIST, b"{}")?;
+    if json_output {
+        println!("{data}");
+        return Ok(());
+    }
+    let models = data
+        .get("models")
+        .ok_or_else(|| CliError::new(EXIT_ERROR, "invalid model list payload: missing models"))?;
+    let models: Vec<ModelEntry> = serde_json::from_value(models.clone())
+        .map_err(|err| CliError::new(EXIT_ERROR, format!("invalid model list payload: {err}")))?;
+    if models.is_empty() {
+        println!("no models");
+        return Ok(());
+    }
+    println!("{:<24} {:<7} LOADED", "MODEL", "EXISTS");
+    for model in &models {
+        println!(
+            "{:<24} {:<7} {}",
+            model.id,
+            yes_no(model.exists),
+            yes_no(model.loaded)
+        );
+    }
+    Ok(())
+}
+
+/// 文件/模型命令共用：连接 → 发命令 → 收应答 → ok 取 data。
+fn call(config: &Config, type_: u16, body: &[u8]) -> Result<Value, CliError> {
+    let conn = connect(config)?;
+    let response = request(&conn, type_, body, config.daemon.rpc_timeout_ms).map_err(classify_io)?;
+    expect_ok(response)
+}
+
+fn restart(config: &Config, service: ServiceArg, json_output: bool) -> Result<(), CliError> {
+    let name = service_name(service);
+    let body = body_json(&RestartRequest {
+        service: name.to_string(),
+    })?;
+    let data = call(config, ctl::DAEMON_RESTART, &body)?;
+    if json_output {
+        println!("{data}");
+    } else {
+        println!("{name}: {}", text_field(&data, "state")?);
+    }
+    Ok(())
+}
+
+fn service_name(service: ServiceArg) -> &'static str {
+    match service {
+        ServiceArg::Pre => "pre",
+        ServiceArg::Rvc => "rvc",
+        ServiceArg::Asr => "asr",
+        ServiceArg::Tts => "tts",
+        ServiceArg::Bridge => "bridge",
+        ServiceArg::Llama => "llama",
+    }
+}
+
+fn device_list(config: &Config, json_output: bool, all: bool) -> Result<(), CliError> {
+    let body = body_json(&DeviceListRequest { all })?;
+    let data = call(config, ctl::DAEMON_DEVICE_LIST, &body)?;
+    if json_output {
+        println!("{data}");
+        return Ok(());
+    }
+    let devices = data
+        .get("devices")
+        .ok_or_else(|| CliError::new(EXIT_ERROR, "invalid device list payload: missing devices"))?;
+    let devices: Vec<DeviceEntry> = serde_json::from_value(devices.clone())
+        .map_err(|err| CliError::new(EXIT_ERROR, format!("invalid device list payload: {err}")))?;
+    if devices.is_empty() {
+        println!("no devices");
+        return Ok(());
+    }
+    println!("{:<24} {:<9} LABEL", "DEVICE", "KIND");
+    for device in &devices {
+        println!("{:<24} {:<9} {}", device.id, device.kind, device.label);
+    }
+    Ok(())
+}
+
+fn config_set(config: &Config, key: &str, value: &str, json_output: bool) -> Result<(), CliError> {
+    let body = body_json(&ConfigSetRequest {
+        key: key.to_string(),
+        value: value.to_string(),
+    })?;
+    let data = call(config, ctl::DAEMON_CONFIG_SET, &body)?;
+    if json_output {
+        println!("{data}");
+        return Ok(());
+    }
+    println!("{key} = {value}");
+    let restart_required = data["restart_required"].as_bool().ok_or_else(|| {
+        CliError::new(EXIT_ERROR, "invalid config set payload: missing restart_required")
+    })?;
+    if restart_required {
+        let affected = data["affected"].as_array().ok_or_else(|| {
+            CliError::new(EXIT_ERROR, "invalid config set payload: missing affected")
+        })?;
+        let services = affected
+            .iter()
+            .filter_map(|service| service.as_str())
+            .collect::<Vec<_>>()
+            .join(" ");
+        println!("需重启生效：mozart-ctl restart {services}");
+    }
+    Ok(())
+}
+
+fn config_get(config: &Config, key: Option<&str>, json_output: bool) -> Result<(), CliError> {
+    let body = body_json(&ConfigGetRequest {
+        key: key.map(str::to_string),
+    })?;
+    let data = call(config, ctl::DAEMON_CONFIG_GET, &body)?;
+    if json_output {
+        println!("{data}");
+        return Ok(());
+    }
+    let value = data
+        .get("value")
+        .ok_or_else(|| CliError::new(EXIT_ERROR, "invalid config get payload: missing value"))?;
+    let text = serde_json::to_string_pretty(value)
+        .map_err(|err| CliError::new(EXIT_ERROR, err.to_string()))?;
+    println!("{text}");
+    Ok(())
+}
+
+fn body_json<T: serde::Serialize>(value: &T) -> Result<Vec<u8>, CliError> {
+    serde_json::to_vec(value).map_err(|err| CliError::new(EXIT_ERROR, err.to_string()))
+}
+
+fn text_field<'a>(data: &'a Value, key: &str) -> Result<&'a str, CliError> {
+    data.get(key)
+        .and_then(Value::as_str)
+        .ok_or_else(|| CliError::new(EXIT_ERROR, format!("invalid payload: missing {key}")))
+}
+
+fn bool_field(data: &Value, key: &str) -> Result<bool, CliError> {
+    data.get(key)
+        .and_then(Value::as_bool)
+        .ok_or_else(|| CliError::new(EXIT_ERROR, format!("invalid payload: missing {key}")))
+}
+
+/// submit/cancel 应答的人读行：job_id 与 state。
+fn print_job_ack(data: &Value) -> Result<(), CliError> {
+    let job_id = text_field(data, "job_id")?;
+    let state = text_field(data, "state")?;
+    println!("job: {job_id} ({state})");
+    Ok(())
+}
+
+fn print_file_job(job: &FileJob) {
+    println!(
+        "job      {} name={} model={}",
+        job.job_id, job.name, job.model_id
+    );
+    println!("state    {}", file_state_name(job.state));
+    println!("progress {}", progress_text(&job.progress));
+    println!("result   {}", if job.result_ready { "ready" } else { "-" });
+    if let Some(error) = &job.error {
+        println!("error    {error}");
+    }
+}
+
+fn print_file_table(jobs: &[FileJob], paused: bool) {
+    if paused {
+        println!("queue paused");
+    }
+    if jobs.is_empty() {
+        println!("no jobs");
+        return;
+    }
+    println!(
+        "{:<22} {:<20} {:<12} {:<10} PROGRESS",
+        "JOB", "NAME", "MODEL", "STATE"
+    );
+    for job in jobs {
+        println!(
+            "{:<22} {:<20} {:<12} {:<10} {}",
+            job.job_id,
+            job.name,
+            job.model_id,
+            file_state_name(job.state),
+            progress_text(&job.progress)
+        );
+    }
+}
+
+fn progress_text(progress: &FileProgress) -> String {
+    let blocks = match (progress.blocks_done, progress.blocks_total) {
+        (Some(done), Some(total)) => format!(" blocks={done}/{total}"),
+        _ => String::new(),
+    };
+    format!("{} {}%{blocks}", progress.stage, progress.percent)
+}
+
+fn file_state_name(state: FileJobState) -> &'static str {
+    match state {
+        FileJobState::Queued => "queued",
+        FileJobState::Processing => "processing",
+        FileJobState::Cancelling => "cancelling",
+        FileJobState::Completed => "completed",
+        FileJobState::Failed => "failed",
+        FileJobState::Cancelled => "cancelled",
+    }
+}
+
+fn yes_no(value: bool) -> &'static str {
+    if value {
+        "yes"
+    } else {
+        "no"
+    }
+}
+
+/// 复制结果到目标。目标已存在时不覆盖：同一文件（含硬链接/符号链接）视为
+/// 已取回，幂等成功；不同文件报错退出，不静默清掉用户数据。
+/// 用 symlink_metadata 判定已存在（不跟随符号链接，悬空链接也拒绝，避免写穿）。
+/// 复制先写目标目录下的临时文件再原子改名：中途失败（ENOSPC、源被驱逐）只清
+/// 临时文件，不留半成品目标挡住后续重试。
+fn copy_result(source: &Path, dest: &Path) -> Result<(), CliError> {
+    if fs::symlink_metadata(dest).is_ok() {
+        let same = same_file(source, dest).map_err(|err| {
+            CliError::new(EXIT_ERROR, format!("fetch {}: {err}", source.display()))
+        })?;
+        if same {
+            return Ok(());
+        }
+        return Err(CliError::new(
+            EXIT_ERROR,
+            format!("destination exists: {}", dest.display()),
+        ));
+    }
+    let dir = dest
+        .parent()
+        .filter(|path| !path.as_os_str().is_empty())
+        .unwrap_or(Path::new("."));
+    let name = dest
+        .file_name()
+        .map(|name| name.to_string_lossy().into_owned())
+        .unwrap_or_else(|| "result".to_string());
+    let stamp = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|elapsed| elapsed.as_nanos())
+        .unwrap_or(0);
+    let tmp = dir.join(format!(".{name}.fetch-{}-{stamp}.tmp", std::process::id()));
+    let copied = (|| -> io::Result<()> {
+        let mut out = OpenOptions::new().write(true).create_new(true).open(&tmp)?;
+        let mut input = fs::File::open(source)?;
+        io::copy(&mut input, &mut out)?;
+        out.sync_all()?;
+        fs::rename(&tmp, dest)
+    })();
+    if copied.is_err() {
+        let _ = fs::remove_file(&tmp);
+    }
+    copied.map_err(|err| {
+        CliError::new(
+            EXIT_ERROR,
+            format!("copy {} -> {}: {err}", source.display(), dest.display()),
+        )
+    })?;
+    Ok(())
+}
+
+/// 同一文件判定：设备号 + inode（metadata 跟随符号链接，硬链接也算同一文件）。
+/// b 为悬空符号链接时 metadata 失败，视为不同文件：调用方按已存在拒绝，不写穿。
+fn same_file(a: &Path, b: &Path) -> io::Result<bool> {
+    use std::os::unix::fs::MetadataExt;
+    let a = fs::metadata(a)?;
+    let b = match fs::metadata(b) {
+        Ok(meta) => meta,
+        Err(err) if err.kind() == io::ErrorKind::NotFound => return Ok(false),
+        Err(err) => return Err(err),
+    };
+    Ok(a.dev() == b.dev() && a.ino() == b.ino())
 }
 
 fn probe(config: &Config) -> io::Result<Response> {
@@ -644,5 +1161,167 @@ mod tests {
         let cli = parse(&["speech", "stop", "--json"]).unwrap();
         assert!(cli.json);
         assert!(matches!(cli.command, Action::Speech { action: SpeechAction::Stop }));
+    }
+
+    #[test]
+    fn file_submit_parses_path_and_optional_model() {
+        let cli = parse(&["file", "submit", "/tmp/a.wav"]).unwrap();
+        match cli.command {
+            Action::File {
+                action: FileAction::Submit { path, model },
+            } => {
+                assert_eq!(path, PathBuf::from("/tmp/a.wav"));
+                assert_eq!(model, None);
+            }
+            _ => panic!("expected file submit"),
+        }
+        let cli = parse(&["file", "submit", "/tmp/a.wav", "--model", "demo"]).unwrap();
+        match cli.command {
+            Action::File {
+                action: FileAction::Submit { model, .. },
+            } => assert_eq!(model.as_deref(), Some("demo")),
+            _ => panic!("expected file submit"),
+        }
+        assert!(parse(&["file", "submit"]).is_err());
+        assert!(parse(&["file", "submit", "/tmp/a.wav", "--model"]).is_err());
+    }
+
+    #[test]
+    fn file_queue_and_job_commands_parse() {
+        assert!(matches!(
+            parse(&["file", "pause"]).unwrap().command,
+            Action::File { action: FileAction::Pause }
+        ));
+        assert!(matches!(
+            parse(&["file", "resume"]).unwrap().command,
+            Action::File { action: FileAction::Resume }
+        ));
+        assert!(matches!(
+            parse(&["file", "list"]).unwrap().command,
+            Action::File { action: FileAction::List }
+        ));
+        match parse(&["file", "cancel", "job_1"]).unwrap().command {
+            Action::File {
+                action: FileAction::Cancel { job_id },
+            } => assert_eq!(job_id, "job_1"),
+            _ => panic!("expected file cancel"),
+        }
+        match parse(&["file", "status", "job_1"]).unwrap().command {
+            Action::File {
+                action: FileAction::Status { job_id },
+            } => assert_eq!(job_id, "job_1"),
+            _ => panic!("expected file status"),
+        }
+        assert!(parse(&["file", "cancel"]).is_err());
+        assert!(parse(&["file", "status"]).is_err());
+        assert!(parse(&["file", "bogus"]).is_err());
+        assert!(parse(&["file"]).is_err());
+    }
+
+    #[test]
+    fn file_fetch_parses_output_short_and_long() {
+        for flag in ["-o", "--output"] {
+            let cli = parse(&["file", "fetch", "job_1", flag, "/tmp/out.wav"]).unwrap();
+            match cli.command {
+                Action::File {
+                    action: FileAction::Fetch { job_id, output },
+                } => {
+                    assert_eq!(job_id, "job_1");
+                    assert_eq!(output, Some(PathBuf::from("/tmp/out.wav")));
+                }
+                _ => panic!("expected file fetch"),
+            }
+        }
+        let cli = parse(&["file", "fetch", "job_1"]).unwrap();
+        assert!(matches!(
+            cli.command,
+            Action::File { action: FileAction::Fetch { output: None, .. } }
+        ));
+        assert!(parse(&["file", "fetch"]).is_err());
+        assert!(parse(&["file", "fetch", "job_1", "-o"]).is_err());
+    }
+
+    #[test]
+    fn model_list_parses_and_global_flags_apply() {
+        let cli = parse(&["model", "list", "--json"]).unwrap();
+        assert!(cli.json);
+        assert!(matches!(
+            cli.command,
+            Action::Model { action: ModelAction::List }
+        ));
+        let cli = parse(&["--json", "file", "list"]).unwrap();
+        assert!(cli.json);
+        assert!(parse(&["model"]).is_err());
+        assert!(parse(&["model", "bogus"]).is_err());
+    }
+
+    #[test]
+    fn restart_parses_all_service_names() {
+        assert!(matches!(
+            parse(&["restart", "pre"]).unwrap().command,
+            Action::Restart { service: ServiceArg::Pre }
+        ));
+        assert!(matches!(
+            parse(&["restart", "rvc"]).unwrap().command,
+            Action::Restart { service: ServiceArg::Rvc }
+        ));
+        assert!(matches!(
+            parse(&["restart", "asr"]).unwrap().command,
+            Action::Restart { service: ServiceArg::Asr }
+        ));
+        assert!(matches!(
+            parse(&["restart", "tts"]).unwrap().command,
+            Action::Restart { service: ServiceArg::Tts }
+        ));
+        assert!(matches!(
+            parse(&["restart", "bridge"]).unwrap().command,
+            Action::Restart { service: ServiceArg::Bridge }
+        ));
+        assert!(matches!(
+            parse(&["restart", "llama"]).unwrap().command,
+            Action::Restart { service: ServiceArg::Llama }
+        ));
+        assert!(parse(&["restart", "bogus"]).is_err());
+        assert!(parse(&["restart"]).is_err());
+        let cli = parse(&["restart", "rvc", "--json"]).unwrap();
+        assert!(cli.json);
+    }
+
+    #[test]
+    fn device_list_parses_and_global_flags_apply() {
+        let cli = parse(&["device", "list", "--json"]).unwrap();
+        assert!(cli.json);
+        assert!(matches!(
+            cli.command,
+            Action::Device { action: DeviceAction::List { all: false } }
+        ));
+        let cli = parse(&["device", "list", "--all"]).unwrap();
+        assert!(matches!(
+            cli.command,
+            Action::Device { action: DeviceAction::List { all: true } }
+        ));
+        assert!(parse(&["device"]).is_err());
+        assert!(parse(&["device", "bogus"]).is_err());
+    }
+
+    #[test]
+    fn config_set_get_parse() {
+        let cli = parse(&["config", "set", "pre.capture_device", "plughw:CARD=X,DEV=0"]).unwrap();
+        match cli.command {
+            Action::Config {
+                action: ConfigAction::Set { key, value },
+            } => {
+                assert_eq!(key, "pre.capture_device");
+                assert_eq!(value, "plughw:CARD=X,DEV=0");
+            }
+            _ => panic!("expected config set"),
+        }
+        let cli = parse(&["config", "get"]).unwrap();
+        assert!(matches!(
+            cli.command,
+            Action::Config { action: ConfigAction::Get { key: None } }
+        ));
+        assert!(parse(&["config"]).is_err());
+        assert!(parse(&["config", "set", "onlykey"]).is_err());
     }
 }

@@ -6,12 +6,12 @@
 #   aplay 正弦 → Loopback DEV=0,SUBDEV=$CAP_SUB → pre 采集 DEV=1,SUBDEV=$CAP_SUB
 #   pre 播放 DEV=0,SUBDEV=$PB_SUB → arecord DEV=1,SUBDEV=$PB_SUB 回录
 # 结果文件留在 $SMOKE_DIR：rec.raw（回录）、st-*.json/txt（各阶段 status）。
-#   MODELS_DIR  模型资产目录（默认 $HOME/Mozart-Old/rvc-golden/qiqi-zh-run）
+#   MODELS_DIR  模型资产目录（默认 $HOME/mozart-assets/models/rvc/qiqi-zh-run）
 #   BIN_DIR     部署二进制目录（默认 $HOME/Mozart/target/release）
 #   SMOKE_DIR   产物目录（默认 /tmp/mozart-smoke）
 set -u
 
-MODELS_DIR=${MODELS_DIR:-$HOME/Mozart-Old/rvc-golden/qiqi-zh-run}
+MODELS_DIR=${MODELS_DIR:-$HOME/mozart-assets/models/rvc/qiqi-zh-run}
 BIN_DIR=${BIN_DIR:-$HOME/Mozart/target/release}
 SMOKE_DIR=${SMOKE_DIR:-/tmp/mozart-smoke}
 CAP_SUB=${CAP_SUB:-2}

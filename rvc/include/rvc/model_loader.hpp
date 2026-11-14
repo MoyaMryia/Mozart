@@ -11,6 +11,7 @@
 #include <optional>
 #include <atomic>
 
+#include "config/rvc_config.h"
 #include "rvc/onnx_engine.hpp"
 #include "rvc/index_search.hpp"
 
@@ -79,7 +80,8 @@ public:
         const std::filesystem::path& models_dir,
         const std::string& device = "cuda",
         bool half = false,
-        size_t cache_limit = 2
+        size_t cache_limit = 2,
+        std::vector<ModelEntry> registry = {}
     );
 
     std::vector<std::map<std::string, std::string>> list_models() const;
@@ -95,6 +97,7 @@ private:
     void trim_cache_locked();
 
     std::filesystem::path models_dir_;
+    std::vector<ModelEntry> registry_;
     std::string device_;
     bool half_;
     mutable std::mutex mutex_;

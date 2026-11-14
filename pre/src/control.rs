@@ -4,7 +4,7 @@
 //! 连接逐个服务：daemon 持单连接每秒轮询，断开后回到 accept。
 
 use crate::state::{QueueReadout, Shared, VERSION};
-use mozart_core::ctl::schema::{error_body, ok_body, MuteSetRequest, RouteSetRequest};
+use mozart_core::ctl::schema::{error_body, ok_body, FileModeSetRequest, MuteSetRequest, RouteSetRequest};
 use mozart_core::ctl::{self, Message, Seqpacket, ACCEPT_POLL, IDLE_TIMEOUT, RECV_POLL};
 use mozart_core::ring::Ring;
 use mozart_core::{OutputFrame, RawFrame};
@@ -12,7 +12,13 @@ use serde_json::{json, Value};
 use std::io;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
+
+/// 文件接管握手等待上限：接收线程按 RECV_POLL（100 ms）节拍释放绑定，
+/// 正常百毫秒内完成；取 1 s 兜底，小于 daemon 缺省 rpc_timeout_ms（2 s）。
+const FILE_HANDOFF_TIMEOUT: Duration = Duration::from_secs(1);
+/// 握手等待的轮询步长。
+const FILE_HANDOFF_POLL: Duration = Duration::from_millis(5);
 
 /// 服务循环：绑定与监听由调用方完成；收到停止标志后返回。
 pub fn serve(
@@ -119,6 +125,42 @@ pub fn dispatch(
             }
             Err(err) => error_body(ctl::CODE_INVALID_ARGUMENT, &err.to_string()),
         },
+        ctl::PRE_SET_FILE_MODE => match serde_json::from_value::<FileModeSetRequest>(body) {
+            Ok(request) => {
+                if request.active {
+                    // 文件接管：先置 file_mode 停发（rvc_ai_active 立即为 false），
+                    // 再置 mode_asserted——次序保证断言激活前恒发已停，杜绝
+                    // 「mode_asserted 先 true、file_mode 尚 false」窗口抢发实时帧
+                    // 污染整段攒帧。随后等接收线程释放输出 socket 的握手完成才
+                    // 应答——daemon 收到 ok 后才绑定同一 socket，次序保证不撞绑。
+                    // 本等待在控制线程，不阻塞音频线程。
+                    shared.set_file_mode(true);
+                    shared.set_mode_asserted(true);
+                    let deadline = Instant::now() + FILE_HANDOFF_TIMEOUT;
+                    while !shared.output_released() {
+                        if Instant::now() >= deadline {
+                            // 接收线程未在时限内释放（异常态）：回滚门控，
+                            // 不留「已暂停但无文件任务」的悬空态；原因经应答可查。
+                            shared.set_file_mode(false);
+                            return error_body(
+                                ctl::CODE_NOT_READY,
+                                "output socket handoff timed out",
+                            );
+                        }
+                        std::thread::sleep(FILE_HANDOFF_POLL);
+                    }
+                    ok_body(json!({"active": true}))
+                } else {
+                    // 交还：daemon 已先解绑输出 socket；接收线程在下一节拍
+                    // 重绑并恢复接收，处理线程恢复 rvc 发送。先置 file_mode 再
+                    // 断言，实时恒发随断言激活（此支路实时帧属预期，非污染）。
+                    shared.set_file_mode(false);
+                    shared.set_mode_asserted(true);
+                    ok_body(json!({"active": false}))
+                }
+            }
+            Err(err) => error_body(ctl::CODE_INVALID_ARGUMENT, &err.to_string()),
+        },
         ctl::PRE_SPEECH_STOP => {
             // speech stop 经 daemon 转发：清播报环，丢弃已送达未播的播报帧。
             // 播放线程下一帧见环空，holdoff 后恢复实时；计数经应答可查。
@@ -165,7 +207,7 @@ mod tests {
         Arc<Ring<OutputFrame>>,
     ) {
         (
-            Arc::new(Shared::new("cap-dev".to_string(), "play-dev".to_string())),
+            Arc::new(Shared::new("cap-dev".to_string(), "play-dev".to_string(), "test".to_string())),
             Arc::new(Ring::new(2)),
             Arc::new(Ring::new(2)),
             Arc::new(Ring::new(2)),
@@ -319,6 +361,90 @@ mod tests {
             &tts,
         );
         assert_eq!(error_code(&reply), ctl::CODE_UNKNOWN_COMMAND);
+    }
+
+    /// 文件接管握手：模拟接收线程按 file_mode 置/清 output_released，
+    /// active=true 必须等握手完成才应答 ok；active=false 立即恢复。
+    #[test]
+    fn set_file_mode_waits_for_handshake_and_roundtrips() {
+        let (shared, cap, trunk, rvc, tts) = context();
+        let stop = Arc::new(AtomicBool::new(false));
+        let watcher = {
+            let shared = shared.clone();
+            let stop = stop.clone();
+            std::thread::spawn(move || {
+                while !stop.load(Ordering::Relaxed) {
+                    // 接收线程的握手行为：接管即释放，交还即重绑。
+                    shared.set_output_released(shared.file_mode());
+                    std::thread::sleep(Duration::from_millis(2));
+                }
+            })
+        };
+
+        let reply = dispatch(
+            &message(ctl::PRE_SET_FILE_MODE, br#"{"active":true}"#),
+            &shared,
+            &cap,
+            &trunk,
+            &rvc,
+            &tts,
+        );
+        assert_eq!(data(&reply)["active"], true);
+        assert!(shared.file_mode());
+        assert!(shared.output_released(), "应答 ok 前握手必须已完成");
+
+        let reply = dispatch(
+            &message(ctl::PRE_SET_FILE_MODE, br#"{"active":false}"#),
+            &shared,
+            &cap,
+            &trunk,
+            &rvc,
+            &tts,
+        );
+        assert_eq!(data(&reply)["active"], false);
+        assert!(!shared.file_mode());
+
+        stop.store(true, Ordering::Relaxed);
+        watcher.join().unwrap();
+    }
+
+    #[test]
+    fn set_file_mode_rejects_bad_body() {
+        let (shared, cap, trunk, rvc, tts) = context();
+        for body in [
+            &b"{}"[..],
+            br#"{"active":"yes"}"#,
+            br#"{"active":true,"x":1}"#,
+            b"not json",
+        ] {
+            let reply = dispatch(
+                &message(ctl::PRE_SET_FILE_MODE, body),
+                &shared,
+                &cap,
+                &trunk,
+                &rvc,
+                &tts,
+            );
+            assert_eq!(error_code(&reply), ctl::CODE_INVALID_ARGUMENT);
+            assert!(!shared.file_mode(), "坏体不得改变门控状态");
+        }
+    }
+
+    /// 接收线程未释放（无握手）：active=true 在时限内回滚门控并报错，
+    /// 不留「已暂停但无文件任务」的悬空态。
+    #[test]
+    fn set_file_mode_timeout_rolls_back() {
+        let (shared, cap, trunk, rvc, tts) = context();
+        let reply = dispatch(
+            &message(ctl::PRE_SET_FILE_MODE, br#"{"active":true}"#),
+            &shared,
+            &cap,
+            &trunk,
+            &rvc,
+            &tts,
+        );
+        assert_eq!(error_code(&reply), ctl::CODE_NOT_READY);
+        assert!(!shared.file_mode(), "超时必须回滚门控");
     }
 
     #[test]

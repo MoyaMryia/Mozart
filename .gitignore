@@ -109,6 +109,10 @@ Thumbs.db
 !.vscode/settings.json
 !.vscode/extensions.json
 
+# ---- 代理工作区 ----
+# SDD 等代理scratch（账本、brief、review 包），不入库。
+.superpowers/
+
 # ---- 报告 ----
 # reports/ 只跟踪 Markdown。证据文件默认留在本地，仅白名单例外入库。
 reports/**/*.wav

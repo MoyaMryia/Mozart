@@ -1,12 +1,16 @@
 //! mozart-pre：音频前端进程（SPEC-02 / SPEC-05）。
-//! 线程结构：采集（ALSA 攒块→环）→ 处理（DSP 全链：80 Hz 高通 + WOLA 谱降噪
+//! 线程结构：采集（ALSA 或测试文件攒块→环）→ 处理（DSP 全链：80 Hz 高通 + WOLA 谱降噪
 //! + gate/AGC/limiter → 主干环；主干同帧打包 16 kHz InputFrame 恒定发送到
 //! rvc 与 asr input_socket）→ 播放（扬声器分时：播报优先，空窗 holdoff 恢复
 //! 实时；实时按路由/静音状态机→淡变→ALSA 写，rvc 路由取 AI 接收环，direct
 //! 路由排空计数）；接收线程独立收 rvc 输出帧入 AI 环、TTS 播报帧入播报环；
 //! 控制线程独立服务 SEQPACKET。
 //! 发送恒定不停（旧 main.c L11「AI 路径永不停」）：路由只决定播放源，
-//! 不停发输入帧。发送侧惰性建链，pre 启动不依赖 rvc/asr 生命周期。
+//! 不停发输入帧。rvc AI 支路受 daemon 单一权威门控（SPEC-04）：仅 daemon
+//! 断言实时态（mode_asserted && !file_mode）才发 input_socket、绑 output_socket；
+//! 启动/重启静默等断言，不单边 reclaim。文件接管（SPEC-03 状态门控交接）期间
+//! rvc 支路停发、输出 socket 释放给 daemon。asr 字幕支路与主干直出恒跑不受门控。
+//! 发送侧惰性建链，pre 启动不依赖 rvc/asr 生命周期。
 //! 停止：SIGTERM/SIGINT 置停止标志，各线程在时限内退出；设备打开失败立即退出，
 //! daemon 按退避重启（SPEC-02：换设备不做在线命令，由重启代替）。
 
@@ -14,7 +18,7 @@ mod ai;
 mod alsa_stream;
 mod capture;
 mod control;
-mod dsp;
+mod file_capture;
 mod playback;
 mod route;
 mod state;
@@ -26,12 +30,13 @@ use mozart_core::ring::Ring;
 use mozart_core::thread::{bind_socket as bind_control_socket, guard_panic, spawn_thread};
 use mozart_core::{OutputFrame, RawFrame};
 use state::Shared;
+use std::io::Read;
 use std::path::PathBuf;
 use std::process::ExitCode;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::thread::JoinHandle;
-use std::time::Duration;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 /// 主干环（处理 → 播放）容量：8 帧，与采集环默认同量级；未配置化（YAGNI，Task 3/4 复核）。
 const TRUNK_QUEUE_FRAMES: usize = 8;
@@ -52,6 +57,25 @@ fn install_signal_handlers() {
         libc::signal(libc::SIGTERM, on_signal as *const () as libc::sighandler_t);
         libc::signal(libc::SIGINT, on_signal as *const () as libc::sighandler_t);
     }
+}
+
+/// 生成 8 位十六进制启动号：优先 /dev/urandom，失败兜底时间+pid。
+/// 每次进程启动唯一，GetStatus 上报供 daemon 识别 pre 重启并重新断言模式
+/// （SPEC-04 单一权威对账，与 asr 启动号同一纪律）。
+fn new_startup_id() -> String {
+    let mut bytes = [0u8; 4];
+    if std::fs::File::open("/dev/urandom")
+        .and_then(|mut file| file.read_exact(&mut bytes))
+        .is_ok()
+    {
+        return bytes.iter().map(|b| format!("{b:02x}")).collect();
+    }
+    let nanos = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_nanos() as u64;
+    let mixed = nanos ^ ((std::process::id() as u64) << 32);
+    format!("{:08x}", mixed as u32)
 }
 
 struct Args {
@@ -88,6 +112,9 @@ fn parse_args() -> Result<Args, String> {
 /// DSP 在采集环之后、direct 分支之前——direct 取的 48 kHz 主干含 DSP，
 /// 与旧实现一致。发送不随路由停发（旧 main.c L11）；同一 InputFrame 恒发到
 /// rvc 与 asr 两条输入支路，各自惰性建链、独立丢弃计数。
+/// rvc 支路例外（SPEC-04 单一权威 + SPEC-03 状态门控交接）：仅 daemon 已断言
+/// 实时态（mode_asserted && !file_mode）才发；未断言（启动/重启）或文件接管
+/// 期间停发。asr 字幕支路与主干直出恒跑，不受断言与文件接管影响。
 fn process_thread(
     capture_ring: Arc<Ring<RawFrame>>,
     trunk: Arc<Ring<RawFrame>>,
@@ -100,13 +127,18 @@ fn process_thread(
     limiter: bool,
 ) -> Result<(), String> {
     // DSP 状态为定长数组，构造后热路径零分配。
-    let mut dsp = dsp::Dsp::new(denoise, gate, agc, limiter);
+    let mut dsp = mozart_dsp::Dsp::new(denoise, gate, agc, limiter);
     while !STOP.load(Ordering::Relaxed) {
         if let Some(mut frame) = capture_ring.pop(Some(PROCESS_POLL)) {
             let conf = dsp.process_frame(&mut frame);
             let input_frame = dsp.pack_frame(&frame, conf);
             trunk.push(frame);
-            ai_sender.send(&input_frame, &shared);
+            // rvc AI 支路仅在 daemon 已断言实时态时发送（SPEC-04 单一权威）：
+            // 未断言（启动/重启）或文件接管期间停发——避免实时帧污染整段攒帧，
+            // 也避免 pre 单边 reclaim。只读原子，不分配不阻塞；asr 支路恒发不受影响。
+            if shared.rvc_ai_active() {
+                ai_sender.send(&input_frame, &shared);
+            }
             asr_sender.send(&input_frame, &shared);
         }
     }
@@ -150,9 +182,15 @@ fn main() -> ExitCode {
 
     install_signal_handlers();
 
+    // 文件采集源时状态报告文件路径（SPEC-02），否则报告 ALSA 设备名。
+    let capture_label = match &config.pre.capture_file {
+        Some(path) => path.display().to_string(),
+        None => config.pre.capture_device.clone(),
+    };
     let shared = Arc::new(Shared::new(
-        config.pre.capture_device.clone(),
+        capture_label,
         config.pre.playback_device.clone(),
+        new_startup_id(),
     ));
     // 容量已由配置校验保证 ≥ 1；Ring::new 对 0 会 panic。
     let capture_ring = Arc::new(Ring::<RawFrame>::new(
@@ -174,23 +212,11 @@ fn main() -> ExitCode {
         return ExitCode::FAILURE;
     }
 
-    // AI 支路输出侧：pre 绑定 output_socket 收 rvc 输出帧（SPEC-02 方向约定）。
-    // 绑定失败（run_dir 缺失等）立即退出：部署路径属配置错误。
-    let rvc_out_socket = match FrameSocket::<OutputFrame>::bind(
-        &config.rvc_output_socket(),
-        ai::RVC_QUEUE_FRAMES,
-    ) {
-        Ok(socket) => socket,
-        Err(err) => {
-            eprintln!(
-                "mozart-pre: bind {}: {err}",
-                config.rvc_output_socket().display()
-            );
-            return ExitCode::FAILURE;
-        }
-    };
+    // AI 支路输出侧（SPEC-04 单一权威）：pre 启动不绑定 output_socket——
+    // rvc 接收线程在 daemon 断言实时态后才惰性绑定（见 ai::recv_loop）。
+    // 杜绝启动/重启无条件 reclaim 孤儿化 daemon 的文件数据面绑定。
     // AI 支路输入侧：连接 rvc input_socket，对端未就绪时发送丢弃计数
-    //（惰性建链，不阻塞启动）。
+    //（惰性建链，不阻塞启动）；发送受 rvc_ai_active 门控。
     let ai_sender = ai::Sender::new(config.rvc_input_socket());
     // 识别支路输入侧：连接 asr input_socket，与 rvc 同帧恒发；asr 未起时
     // 发送丢弃计数，不阻塞 pre（SPEC-05）。
@@ -212,15 +238,8 @@ fn main() -> ExitCode {
         }
     };
 
-    // 设备先就绪，后拉线程（新实现次序：采集设备先于播放；旧实现 main.c
-    // 播放设备先就绪，本实现两设备在拉线程前同步打开，次序差异无行为影响）。
-    let capture_pcm = match alsa_stream::open(&config.pre.capture_device, Direction::Capture) {
-        Ok(pcm) => pcm,
-        Err(message) => {
-            eprintln!("mozart-pre: capture open: {message}");
-            return ExitCode::FAILURE;
-        }
-    };
+    // 播放设备先就绪，后拉线程；采集源二选一：测试文件（SPEC-02 文件采集源）
+    // 或 ALSA 设备。文件契约在采集线程启动时入口校验，失败走致命错误传播。
     let playback_pcm = match alsa_stream::open(&config.pre.playback_device, Direction::Playback) {
         Ok(pcm) => pcm,
         Err(message) => {
@@ -228,7 +247,6 @@ fn main() -> ExitCode {
             return ExitCode::FAILURE;
         }
     };
-    log_stream_setup("capture", &config.pre.capture_device, &capture_pcm);
     log_stream_setup("playback", &config.pre.playback_device, &playback_pcm);
     eprintln!(
         "mozart-pre: ai link out={}",
@@ -237,7 +255,27 @@ fn main() -> ExitCode {
 
     // 采集与处理线程；播放线程持有状态机；接收线程独立收 rvc 输出帧；
     // 控制线程独立服务。
-    let capture_handle = {
+    let capture_handle = if let Some(path) = config.pre.capture_file.clone() {
+        let ring = capture_ring.clone();
+        let shared = shared.clone();
+        match spawn_thread("mozart-capture", move || {
+            stop_on_fatal(
+                &STOP,
+                guard_panic(move || file_capture::run(&path, ring, shared, &STOP)),
+            )
+        }) {
+            Ok(handle) => handle,
+            Err(err) => return spawn_failure("capture", err),
+        }
+    } else {
+        let capture_pcm = match alsa_stream::open(&config.pre.capture_device, Direction::Capture) {
+            Ok(pcm) => pcm,
+            Err(message) => {
+                eprintln!("mozart-pre: capture open: {message}");
+                return ExitCode::FAILURE;
+            }
+        };
+        log_stream_setup("capture", &config.pre.capture_device, &capture_pcm);
         let ring = capture_ring.clone();
         let shared = shared.clone();
         match spawn_thread("mozart-capture", move || {
@@ -269,10 +307,11 @@ fn main() -> ExitCode {
     let rvc_recv_handle = {
         let shared = shared.clone();
         let ring = rvc_ring.clone();
+        let path = config.rvc_output_socket();
         match spawn_thread("mozart-rvc-recv", move || {
             stop_on_fatal(
                 &STOP,
-                guard_panic(move || ai::recv_loop(rvc_out_socket, ring, shared, &STOP)),
+                guard_panic(move || ai::recv_loop(path, ring, shared, &STOP)),
             )
         }) {
             Ok(handle) => handle,
@@ -440,5 +479,72 @@ mod tests {
         assert_eq!(join_threads(vec![("opaque", handle)]), Some("opaque: panicked".to_string()));
         assert!(STOP.load(Ordering::Relaxed));
         STOP.store(false, Ordering::Relaxed);
+    }
+
+    /// 文件接管门控（SPEC-03 状态门控交接 + SPEC-04 单一权威）：daemon 已断言
+    /// 实时态后，file_mode=true 时处理线程停发 rvc 支路，asr 字幕支路恒发不受
+    /// 影响；交还后 rvc 恢复发送。
+    #[test]
+    fn file_mode_gates_rvc_send_but_not_asr() {
+        let _guard = STOP_TEST_MUTEX
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        STOP.store(false, Ordering::Relaxed);
+
+        let dir = std::env::temp_dir().join(format!("mozart-pre-gate-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let rvc_path = dir.join("rvc-in.sock");
+        let asr_path = dir.join("asr-in.sock");
+        let rvc_rx = FrameSocket::<mozart_core::InputFrame>::bind(&rvc_path, 8).unwrap();
+        let asr_rx = FrameSocket::<mozart_core::InputFrame>::bind(&asr_path, 8).unwrap();
+
+        let shared = Arc::new(Shared::new("cap".to_string(), "play".to_string(), "startup".to_string()));
+        // daemon 断言实时态：rvc AI 支路激活。
+        shared.set_mode_asserted(true);
+        let capture = Arc::new(Ring::<RawFrame>::new(8));
+        let trunk = Arc::new(Ring::<RawFrame>::new(8));
+        let worker = {
+            let capture = capture.clone();
+            let trunk = trunk.clone();
+            let shared = shared.clone();
+            let ai_sender = ai::Sender::new(rvc_path.clone());
+            let asr_sender = ai::AsrSender::new(asr_path.clone());
+            std::thread::spawn(move || {
+                process_thread(capture, trunk, shared, ai_sender, asr_sender, false, false, false, false)
+            })
+        };
+        let raw = RawFrame {
+            meta: mozart_core::FrameMeta {
+                pts_ns: 0, frame_idx: 0, vad_flag: 1, energy_db: 0, conf: 0, segment_id: 0,
+            },
+            pcm: [0.0; mozart_core::RAW_SAMPLES],
+        };
+        let recv_timeout = Duration::from_secs(2);
+
+        // 实时态：两条支路都送达。
+        capture.push(raw);
+        assert!(rvc_rx.recv(Some(recv_timeout)).is_ok(), "实时态 rvc 支路必须送达");
+        assert!(asr_rx.recv(Some(recv_timeout)).is_ok(), "实时态 asr 支路必须送达");
+
+        // 文件接管：rvc 停发，asr 恒发。asr 送达证明该帧确已被处理。
+        shared.set_file_mode(true);
+        capture.push(raw);
+        assert!(asr_rx.recv(Some(recv_timeout)).is_ok(), "接管期间 asr 支路必须恒发");
+        assert!(
+            rvc_rx.recv(Some(Duration::from_millis(300))).is_err(),
+            "接管期间 rvc 支路必须停发"
+        );
+
+        // 交还：rvc 恢复发送。
+        shared.set_file_mode(false);
+        capture.push(raw);
+        assert!(rvc_rx.recv(Some(recv_timeout)).is_ok(), "交还后 rvc 支路必须恢复");
+        assert!(asr_rx.recv(Some(recv_timeout)).is_ok());
+
+        STOP.store(true, Ordering::Relaxed);
+        worker.join().unwrap().unwrap();
+        STOP.store(false, Ordering::Relaxed);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

@@ -1,4 +1,4 @@
-// rvc_config.cpp — [rvc] 段 TOML 解析（toml++；键名与 Rust 侧 RvcConfig 一致）
+// rvc_config.cpp — [rvc] 段 + [[models]] 注册表 TOML 解析（toml++）
 #include "config/rvc_config.h"
 
 #include <string>
@@ -24,6 +24,18 @@ bool read_string(const toml::table& table, const char* key,
     return false;
 }
 
+// 特征引擎自动发现：models_dir 下按约定文件名查找，找到即填入。
+void discover_engine(std::filesystem::path& target,
+                     const std::filesystem::path& models_dir,
+                     const char* filename) {
+    if (!target.empty() || models_dir.empty()) return;
+    auto candidate = models_dir / filename;
+    std::error_code ec;
+    if (std::filesystem::exists(candidate, ec)) {
+        target = std::move(candidate);
+    }
+}
+
 } // namespace
 
 bool load_rvc_config(const std::filesystem::path& toml_path,
@@ -44,6 +56,24 @@ bool load_rvc_config(const std::filesystem::path& toml_path,
             + std::string(error.description());
         return false;
     }
+
+    // [[models]] 注册表：取 type=rvc 的条目。
+    if (const auto* arr = table["models"].as_array()) {
+        for (const auto& item : *arr) {
+            const auto* entry = item.as_table();
+            if (!entry) continue;
+            const auto* type_node = (*entry)["type"].as_string();
+            if (!type_node || type_node->get() != "rvc") continue;
+            const auto* id_node = (*entry)["id"].as_string();
+            const auto* path_node = (*entry)["path"].as_string();
+            if (!id_node || !path_node) {
+                reason = "[[models]] type=rvc entry requires id and path strings";
+                return false;
+            }
+            out.models.push_back({id_node->get(), "rvc", path_node->get()});
+        }
+    }
+
     if (const auto* rvc = table["rvc"].as_table()) {
         if (!read_string(*rvc, "models_dir", out.models_dir, reason)) return false;
         if (!read_string(*rvc, "device", out.device, reason)) return false;
@@ -78,6 +108,13 @@ bool load_rvc_config(const std::filesystem::path& toml_path,
             }
         }
     }
+
+    // 特征引擎自动发现：显式配置优先，空时从 models_dir 按约定文件名查找。
+    discover_engine(out.hubert_path, out.models_dir, "hubert_base_dynamic.onnx");
+    discover_engine(out.rmvpe_path, out.models_dir, "rmvpe_dynamic.onnx");
+    discover_engine(out.realtime_hubert_path, out.models_dir, "hubert-realtime.onnx");
+    discover_engine(out.realtime_rmvpe_path, out.models_dir, "rmvpe-realtime.onnx");
+
     return true;
 }
 

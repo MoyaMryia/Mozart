@@ -110,3 +110,5 @@
 - 2026-11-12：配置分类定稿为机制 + 切换成本、能即时生效就运行时（取代“仅 bridge 两开关”）：daemon 超时 / [file] 阈值 / RVC 会话参数（Stop→Start）/ pre DSP（新增 SetDsp）均运行时，固化进结构者重启；新增 [file] 段；schema 落 docs/config.md（SPEC-02、SPEC-04）。
 - 2026-11-12：播报定稿修正：v1 继承旧参考音色播报（TTS 流式直播、扬声器分时），撤销 11-10“走变声替代参考音色”，经变声同音色入 FUTURE；文件队列改落盘续转、SPEC-08 文件验收改 CLI、TARGET 运行时语言改 Rust+C++（SPEC-04、SPEC-05、SPEC-08、TARGET、FUTURE）。
 - 2026-11-13：音频设备识别定稿：枚举归 daemon（ALSA API、按需不缓存、id+标签、配置校验），CLI `device list`；pre 只用设备不枚举；设备热切换入 FUTURE（SPEC-02、SPEC-04）。
+- 2026-11-13：新增 `[process.env]` 段，daemon spawn 子进程时注入 TOML 定义的环境变量（SPEC-04、config.md）。
+- 2026-11-13：模型注册表定稿：TOML 顶层 `[[models]]` 数组（id/type/path），LoadModel 和 ListModels 优先从注册表解析路径，注册表为空时回退 models_dir 扫描；特征引擎四路径改为可选，缺省从 models_dir 按约定文件名自动发现（SPEC-03、config.md）。

@@ -8,6 +8,7 @@
 
 #include <vector>
 #include <memory>
+#include <atomic>
 #include <cstdint>
 #include <filesystem>
 #include <mutex>
@@ -67,6 +68,12 @@ public:
     }
     virtual void reset_realtime() {}
 
+    // 文件批处理进度 seam（SPEC-03 blocks）：已完成的 Generator 窗数，
+    // 整段一次过计 1。真实管线委托 RVCInferencer（infer_window 计数，单一来源）；
+    // mock 管线按整段调用计数。无窗概念的管线恒 0。
+    virtual uint64_t offline_window_count() const { return 0; }
+    virtual void reset_offline_window_count() {}
+
     virtual bool switch_model(const std::string&) { return false; }
     virtual std::string current_model_id() const { return ""; }
     virtual bool is_mock() const { return true; }
@@ -85,10 +92,16 @@ public:
     );
 
     std::vector<float> process(const std::vector<float>& audio) override;
+    std::vector<float> process_cancellable(
+        const std::vector<float>& audio, const std::atomic<bool>& cancelled
+    ) override;
+    uint64_t offline_window_count() const override;
+    void reset_offline_window_count() override;
 
 private:
     uint32_t input_sample_rate_;
     uint32_t output_sample_rate_;
+    std::atomic<uint64_t> window_count_{0};
 
     std::vector<float> upsample_linear(const std::vector<float>& audio, float ratio);
 };
@@ -118,6 +131,8 @@ public:
         const RvcRealtimeRequest& request
     ) override;
     void reset_realtime() override;
+    uint64_t offline_window_count() const override;
+    void reset_offline_window_count() override;
     bool switch_model(const std::string& model_id) override;
     std::string current_model_id() const override;
     bool is_mock() const override { return false; }

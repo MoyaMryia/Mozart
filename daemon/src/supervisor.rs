@@ -1,4 +1,4 @@
-//! 子进程监管：拉起、收集日志、崩溃后退避重启、退出时终止。
+//! 子进程监管：拉起、收集日志、崩溃后退避重启、单服务重启、退出时终止。
 
 use crate::state::{lock_state, now_unix_ms, Role, State};
 use mozart_core::config::Config;
@@ -9,7 +9,7 @@ use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{mpsc, Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -18,6 +18,26 @@ const TERM_GRACE: Duration = Duration::from_secs(2);
 
 pub struct Supervisor {
     handle: thread::JoinHandle<()>,
+    restart: RestartHandle,
+}
+
+/// 单服务重启句柄：控制连接持克隆，向监管线程发送重读出的配置。
+#[derive(Clone)]
+pub struct RestartHandle {
+    role: Role,
+    tx: mpsc::Sender<Arc<Config>>,
+}
+
+impl RestartHandle {
+    pub fn role(&self) -> Role {
+        self.role
+    }
+
+    /// 请求重启：监管线程停子进程后以新配置重起。
+    /// 发送失败仅当监管线程已退出（daemon 关停中）。
+    pub fn restart(&self, config: Arc<Config>) -> Result<(), mpsc::SendError<Arc<Config>>> {
+        self.tx.send(config)
+    }
 }
 
 impl Supervisor {
@@ -28,12 +48,27 @@ impl Supervisor {
         state: Arc<Mutex<State>>,
         running: Arc<AtomicBool>,
     ) -> io::Result<Self> {
+        let (tx, restart_rx) = mpsc::channel();
         let handle = thread::Builder::new()
-            .name(format!("mozart-{}", role_name(role)))
+            .name(format!("mozart-{}", role.name()))
             .spawn(move || {
-                supervise(role, &config, config_path.as_deref(), &state, &running)
+                supervise(
+                    role,
+                    config,
+                    config_path.as_deref(),
+                    &state,
+                    &running,
+                    &restart_rx,
+                )
             })?;
-        Ok(Self { handle })
+        Ok(Self {
+            handle,
+            restart: RestartHandle { role, tx },
+        })
+    }
+
+    pub fn restart_handle(&self) -> RestartHandle {
+        self.restart.clone()
     }
 
     pub fn join(self) {
@@ -41,56 +76,52 @@ impl Supervisor {
     }
 }
 
-fn role_name(role: Role) -> &'static str {
-    match role {
-        Role::Pre => "pre",
-        Role::Rvc => "rvc",
-        Role::Asr => "asr",
-        Role::Tts => "tts",
-        Role::Bridge => "bridge",
-        Role::Llama => "llama",
-    }
-}
-
 fn supervise(
     role: Role,
-    config: &Config,
+    mut config: Arc<Config>,
     config_path: Option<&Path>,
     state: &Mutex<State>,
     running: &AtomicBool,
+    restart_rx: &mpsc::Receiver<Arc<Config>>,
 ) {
-    let bin = match role {
-        Role::Pre => &config.process.pre_bin,
-        Role::Rvc => &config.process.rvc_bin,
-        Role::Asr => &config.process.asr_bin,
-        Role::Tts => &config.process.tts_bin,
-        Role::Bridge => &config.process.bridge_bin,
-        Role::Llama => &config.process.llama_bin,
-    };
-    let socket = match role {
-        Role::Pre => config.pre_socket(),
-        Role::Rvc => config.rvc_socket(),
-        Role::Asr => config.asr_socket(),
-        Role::Tts => config.tts_socket(),
-        Role::Bridge => config.bridge_socket(),
-        Role::Llama => config.llama_socket(),
-    };
-    let log_path = config.log_dir().join(format!("{}.log", role_name(role)));
-    let base = Duration::from_millis(config.daemon.restart_backoff_ms);
-    let max = Duration::from_millis(config.daemon.restart_backoff_max_ms);
-    let stable = Duration::from_millis(config.daemon.restart_stable_ms);
-    let mut backoff = base;
+    let mut backoff = Duration::from_millis(config.daemon.restart_backoff_ms);
 
     while running.load(Ordering::Acquire) {
+        // 重启重读配置（SPEC-04）：spawn 参数每轮跟随当前配置。
+        let base = Duration::from_millis(config.daemon.restart_backoff_ms);
+        let max = Duration::from_millis(config.daemon.restart_backoff_max_ms);
+        let stable = Duration::from_millis(config.daemon.restart_stable_ms);
+        let bin = match role {
+            Role::Pre => &config.process.pre_bin,
+            Role::Rvc => &config.process.rvc_bin,
+            Role::Asr => &config.process.asr_bin,
+            Role::Tts => &config.process.tts_bin,
+            Role::Bridge => &config.process.bridge_bin,
+            Role::Llama => &config.process.llama_bin,
+        };
+        let socket = match role {
+            Role::Pre => config.pre_socket(),
+            Role::Rvc => config.rvc_socket(),
+            Role::Asr => config.asr_socket(),
+            Role::Tts => config.tts_socket(),
+            Role::Bridge => config.bridge_socket(),
+            Role::Llama => config.llama_socket(),
+        };
+        let log_path = config.log_dir().join(format!("{}.log", role.name()));
+
         lock_state(state).process_starting(role);
-        let mut child = match start_child(role, bin, &socket, config, config_path, &log_path) {
+        let mut child = match start_child(role, bin, &socket, &config, config_path, &log_path) {
             Ok(child) => child,
             Err(err) => {
                 lock_state(state).process_failed(role, format!("spawn: {err}"));
-                if !sleep_unless_stopped(backoff, running) {
-                    break;
+                match backoff_wait(backoff, running, restart_rx) {
+                    Backoff::Stopped => break,
+                    Backoff::Restart(new) => {
+                        config = new;
+                        backoff = Duration::from_millis(config.daemon.restart_backoff_ms);
+                    }
+                    Backoff::Elapsed => backoff = next_backoff(backoff, max),
                 }
-                backoff = next_backoff(backoff, max);
                 continue;
             }
         };
@@ -99,10 +130,18 @@ fn supervise(
         let started = Instant::now();
         lock_state(state).process_running(role, pid);
 
+        let mut restart_now = false;
         let exit = loop {
             if !running.load(Ordering::Acquire) {
                 terminate(&mut child, state, role);
                 return;
+            }
+            if let Some(new_config) = take_restart(restart_rx) {
+                // 显式重启：停子进程后立即以新配置重起，不计崩溃退避。
+                terminate(&mut child, state, role);
+                config = new_config;
+                restart_now = true;
+                break None;
             }
             match child.try_wait() {
                 Ok(Some(status)) => break Some(exit_info(&status)),
@@ -116,18 +155,66 @@ fn supervise(
             }
         };
 
+        if restart_now {
+            backoff = Duration::from_millis(config.daemon.restart_backoff_ms);
+            continue;
+        }
         if let Some(exit) = exit {
             lock_state(state).process_exited(role, exit);
         }
         if started.elapsed() >= stable {
             backoff = base;
         }
-        if !sleep_unless_stopped(backoff, running) {
-            break;
+        match backoff_wait(backoff, running, restart_rx) {
+            Backoff::Stopped => break,
+            Backoff::Restart(new) => {
+                config = new;
+                backoff = Duration::from_millis(config.daemon.restart_backoff_ms);
+            }
+            Backoff::Elapsed => backoff = next_backoff(backoff, max),
         }
-        backoff = next_backoff(backoff, max);
     }
     lock_state(state).process_stopped(role);
+}
+
+/// 退避等待的结果：停止监管 / 睡满时长 / 被重启请求打断。
+enum Backoff {
+    Stopped,
+    Elapsed,
+    Restart(Arc<Config>),
+}
+
+/// 退避等待：每 POLL 检查 running 与重启请求，重启不被退避拖延。
+fn backoff_wait(
+    mut remaining: Duration,
+    running: &AtomicBool,
+    restart_rx: &mpsc::Receiver<Arc<Config>>,
+) -> Backoff {
+    while !remaining.is_zero() {
+        if !running.load(Ordering::Acquire) {
+            return Backoff::Stopped;
+        }
+        if let Some(config) = take_restart(restart_rx) {
+            return Backoff::Restart(config);
+        }
+        let step = remaining.min(POLL);
+        thread::sleep(step);
+        remaining -= step;
+    }
+    if running.load(Ordering::Acquire) {
+        Backoff::Elapsed
+    } else {
+        Backoff::Stopped
+    }
+}
+
+/// 取最近一次重启请求：多次请求合并，最后一份配置生效。
+fn take_restart(restart_rx: &mpsc::Receiver<Arc<Config>>) -> Option<Arc<Config>> {
+    let mut latest = None;
+    while let Ok(config) = restart_rx.try_recv() {
+        latest = Some(config);
+    }
+    latest
 }
 
 fn start_child(
@@ -176,6 +263,9 @@ fn start_child(
         if let Some(config_path) = config_path {
             command.arg("--config").arg(config_path);
         }
+    }
+    for (key, value) in &config.process.env {
+        command.env(key, value);
     }
     command
         .stdin(Stdio::null())
