@@ -515,8 +515,17 @@ fn read_wav(path: &Path) -> Wav {
         let body = &bytes[offset + 8..offset + 8 + size];
         match id {
             b"fmt " => {
+                let raw_format = u16::from_le_bytes(body[0..2].try_into().unwrap());
+                // WAVE_FORMAT_EXTENSIBLE（0xFFFE）：真实格式标签在 SubFormat
+                // GUID 前 2 字节。不同 ffmpeg 版本对 float WAV 用普通头（3）
+                // 或扩展头（65534），归一化后统一按真实格式判定。
+                let format = if raw_format == 0xFFFE {
+                    u16::from_le_bytes(body[24..26].try_into().unwrap())
+                } else {
+                    raw_format
+                };
                 fmt = Some((
-                    u16::from_le_bytes(body[0..2].try_into().unwrap()),
+                    format,
                     u16::from_le_bytes(body[2..4].try_into().unwrap()),
                     u32::from_le_bytes(body[4..8].try_into().unwrap()),
                     u16::from_le_bytes(body[14..16].try_into().unwrap()),
@@ -539,4 +548,47 @@ fn read_wav(path: &Path) -> Wav {
             .map(|chunk| f32::from_le_bytes(chunk.try_into().unwrap()))
             .collect(),
     }
+}
+
+#[test]
+fn read_wav_normalizes_extensible_float_header() {
+    // 构造 WAVE_FORMAT_EXTENSIBLE（0xFFFE）float WAV：真实格式标签在 SubFormat
+    // GUID 前 2 字节（IEEE float = 3）。验证 read_wav 归一化扩展头，不受 ffmpeg
+    // 版本写普通头还是扩展头影响。
+    let mut fmt = Vec::new();
+    fmt.extend_from_slice(&0xFFFEu16.to_le_bytes());
+    fmt.extend_from_slice(&1u16.to_le_bytes());
+    fmt.extend_from_slice(&48000u32.to_le_bytes());
+    fmt.extend_from_slice(&192000u32.to_le_bytes());
+    fmt.extend_from_slice(&4u16.to_le_bytes());
+    fmt.extend_from_slice(&32u16.to_le_bytes());
+    fmt.extend_from_slice(&22u16.to_le_bytes());
+    fmt.extend_from_slice(&32u16.to_le_bytes());
+    fmt.extend_from_slice(&0u32.to_le_bytes());
+    fmt.extend_from_slice(&[
+        0x03, 0x00, 0x00, 0x00, 0x00, 0x00, 0x10, 0x00, 0x80, 0x00, 0x00, 0xAA, 0x00, 0x38,
+        0x9B, 0x71,
+    ]);
+    let sample = 0.5f32.to_le_bytes();
+    let mut body = Vec::new();
+    body.extend_from_slice(b"fmt ");
+    body.extend_from_slice(&(fmt.len() as u32).to_le_bytes());
+    body.extend_from_slice(&fmt);
+    body.extend_from_slice(b"data");
+    body.extend_from_slice(&(sample.len() as u32).to_le_bytes());
+    body.extend_from_slice(&sample);
+    let mut bytes = Vec::new();
+    bytes.extend_from_slice(b"RIFF");
+    bytes.extend_from_slice(&((body.len() + 4) as u32).to_le_bytes());
+    bytes.extend_from_slice(b"WAVE");
+    bytes.extend_from_slice(&body);
+
+    let path = std::env::temp_dir().join(format!("mozart-extensible-{}.wav", std::process::id()));
+    std::fs::write(&path, &bytes).unwrap();
+    let wav = read_wav(&path);
+    let _ = std::fs::remove_file(&path);
+    assert_eq!(wav.format, 3, "扩展头应归一化为 IEEE float");
+    assert_eq!(wav.channels, 1);
+    assert_eq!(wav.sample_rate, 48000);
+    assert_eq!(wav.samples.len(), 1);
 }
