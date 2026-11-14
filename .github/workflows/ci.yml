@@ -51,6 +51,11 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
+      # pre/daemon 依赖 alsa-sys，需要 ALSA 开发库提供 alsa.pc。
+      - name: 安装构建依赖
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends libasound2-dev pkg-config
       # ubuntu-24.04 运行器自带稳定版 Rust 工具链。
       - name: 构建与单元测试（Rust）
         run: bash tools/ci-local.sh rust
