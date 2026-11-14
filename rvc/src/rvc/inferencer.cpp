@@ -2,6 +2,7 @@
 // 搬运自 Mozart-Old/rvc-backend/src/rvc/inferencer.cpp，改动：裁掉 filter_radius
 //（只保存未参与计算的死参数，SPEC-03 v1 不暴露）。
 #include "rvc/profile.hpp"
+#include "rvc/resample.hpp"
 #include "mozart/frame.h"
 #include <future>
 #include <cstdlib>
@@ -725,23 +726,7 @@ std::vector<float> RVCInferencer::resample(
     const std::vector<float>& audio,
     uint32_t src_sr, uint32_t dst_sr
 ) {
-    if (src_sr == dst_sr || audio.empty()) return audio;
-
-    float ratio = static_cast<float>(dst_sr) / static_cast<float>(src_sr);
-    size_t n_out = static_cast<size_t>(static_cast<float>(audio.size()) * ratio);
-    std::vector<float> result(n_out);
-
-    for (size_t i = 0; i < n_out; ++i) {
-        float src_idx = static_cast<float>(i) / ratio;
-        size_t idx0 = static_cast<size_t>(src_idx);
-        if (idx0 + 1 >= audio.size()) {
-            result[i] = audio.back();
-        } else {
-            float frac = src_idx - static_cast<float>(idx0);
-            result[i] = audio[idx0] * (1.0f - frac) + audio[idx0 + 1] * frac;
-        }
-    }
-    return result;
+    return resample_audio(audio, src_sr, dst_sr);
 }
 
 std::vector<float> RVCInferencer::apply_index(const std::vector<float>& feats) {

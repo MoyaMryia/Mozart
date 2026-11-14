@@ -39,3 +39,9 @@ add_executable(t_rvc_streaming test_rvc_streaming.cpp)
 target_link_libraries(t_rvc_streaming PRIVATE mozart_rvc_runtime mozart_warnings)
 add_test(NAME rvc_streaming COMMAND t_rvc_streaming)
 set_tests_properties(rvc_streaming PROPERTIES LABELS "unit" TIMEOUT 60)
+
+# 重采样抗镜像/抗混叠：合成信号频谱度量（无 GPU 依赖）。
+add_executable(t_resample test_resample.cpp)
+target_link_libraries(t_resample PRIVATE mozart_rvc_runtime mozart_warnings)
+add_test(NAME resample COMMAND t_resample)
+set_tests_properties(resample PROPERTIES LABELS "unit" TIMEOUT 30)
