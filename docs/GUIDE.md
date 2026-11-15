@@ -79,7 +79,7 @@ mozart-ctl speech stop        # 急停并清空待播队列
 ## 七、管理与排障
 
 ```bash
-mozart-ctl model list                              # 查看已注册模型与加载状态
+mozart-ctl model list [--available]                # 查看已注册模型与加载状态；--available 只列资产存在的模型
 mozart-ctl config get <键>                          # 读取配置基线
 mozart-ctl restart <pre|rvc|asr|tts|bridge|llama>  # 重启单个服务
 ```

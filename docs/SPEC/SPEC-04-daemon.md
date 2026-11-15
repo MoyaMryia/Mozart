@@ -39,9 +39,9 @@
 - [x] 模式建模用资源仲裁，不用大模式枚举：资源为 GPU 与扬声器；活动（实时变声、文件转换、翻译播报、直出）声明占用，daemon 仲裁，冲突按裁决判据处理；mode 是派生状态。继承旧原则：控制面不碰音频、GPU 互斥、文件队列串行加取消检查点、上限 50。（`daemon/src/file/arbitrate.rs`、`daemon/src/services.rs:327-333`）
 - [x] v1 资源仲裁范围：GPU 仲裁（实时 / 文件互斥）+ 扬声器分时（播报时静音实时、播完恢复，沿用旧实现）；播报经变声占 GPU 的仲裁与混音见 [FUTURE.md](../FUTURE.md)。
 - [x] 文件任务队列 v1 落盘持久化（上限 50 沿用）；daemon/rvc 重启后续转待转任务（推理状态不保留，从头重跑），源副本已在受管存储目录持久。模式是资源仲裁的派生活状态，归 daemon 内存，不入配置状态文件，重启不恢复；会话参数实时与文件共用一份配置覆盖。（`daemon/src/file/queue.rs:76-109`、`daemon/tests/file_queue.rs:193`）
-- [x] 冲突裁决判据：等待能解决的接受意图并排队/挂起，不让用户重试；等待不能解决的拒绝带原因。文件提交遇 GPU 被实时占用 → 入文件队列等待；GPU 空闲且有排队任务 → daemon 自动启动转换，无需显式启动命令。文件任务执行中收到 `route set rvc` → 挂路由等待槽（单槽，后请求覆盖前请求），当前任务结束后切换，剩余文件任务继续排队。模型不存在、参数非法、daemon 关停中 → 拒绝。队列满 50 拒收是容量准入规则，独立于本判据。
+- [x] 冲突裁决判据：等待能解决的接受意图并排队/挂起，不让用户重试；等待不能解决的拒绝带原因。文件提交遇 GPU 被实时占用 → 入文件队列等待；GPU 空闲且有排队任务 → daemon 自动启动转换，无需显式启动命令。文件任务执行中收到 `route set rvc` → 挂路由等待槽（单槽，后请求覆盖前请求），当前任务结束后切换，剩余文件任务继续排队。参数非法、daemon 关停中 → 拒绝（模型缺失不拒收，执行时报错，见 SPEC-10）。队列满 50 拒收是容量准入规则，独立于本判据。
 - [x] 文件队列暂停/恢复保留：`file pause` 置暂停标志，不再启动新任务，正在执行的任务跑完；`file resume` 清除标志继续。暂停是队列级布尔标志，独立于 GPU 仲裁。
-- [x] 文件任务按任务选模型保留：`file submit <path> [--model <id>]`，不带 `--model` 用当前已加载模型。rvc 增 `ListModels` 查询；daemon 入队时经它校验模型存在，不存在当场拒收（沿用旧行为）。执行时 `LoadModel` 仍可能失败（如模型损坏），失败标 failed 带原因、队列继续。
+- [x] 文件任务按任务选模型保留：`file submit <path> [--model <id>]`，不带 `--model` 用当前已加载模型。rvc 增 `ListModels` 查询，供 CLI `model list`（`--available` 滤空）。入队不预检模型存在性，报错统一归推理层（SPEC-10）：执行时 `LoadModel` 缺失回 InvalidArgument、损坏回 InferenceFailed，失败标 failed 带原因、队列继续。
 - [x] 文件转换数据面中间层归 daemon（Rust）：解码文件为 16 kHz 帧喂给 rvc、收 48 kHz 输出帧编码为结果文件；文件期间 daemon 绑定输出 socket 作数据面对端。此路径离线，不在实时音频路径上，不影响实时延迟。（`daemon/src/file/`）
 - [x] 数据面所有权归 daemon 单一权威（根治共享 socket 约定式所有权竞态）：pre 的 rvc AI 支路（发 `input_socket` + 绑 `output_socket`）仅在 daemon 断言实时态时活跃，pre 启动/重启后静默待断言、不单边 reclaim。daemon 每轮对账 pre 模式到权威态（`gpu_owner==File` → 文件接管），并按 pre 上报的 `startup_id` 识别重启重新断言；文件交接窗口内对账让位给交接守卫。文件任务期间 pre 重启不再丢失交接：pre 静默不污染攒帧、不孤儿化输出绑定，daemon 重断言恢复交接、任务继续；仅 pre 持续不可达才带原因中止。（`daemon/src/services.rs:627-653`）
 - [x] 文件降噪保留（旧 `file_denoise`，默认关）：daemon 离线调用与 pre 同一套共享 DSP（SPEC-02）对文件先降噪再喂 rvc；实时链路降噪不受影响。（`daemon/Cargo.toml:11` 共用 `mozart-dsp`）

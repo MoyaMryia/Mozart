@@ -182,7 +182,8 @@ Python 脚本，居仓库 `tools/model/`，直接调用，不做 CLI 封装。
 | `export_generator_split_onnx.py` | 生成器 pth → front/decoder onnx（实时拆分） |
 | `export_hubert_onnx.py` | HuBERT base → onnx |
 | `export_rmvpe_onnx.py` | RMVPE → onnx |
-| `build_dynamic_engines.py` | onnx → engine（trtexec 包装，须在设备上） |
+| `build_dynamic_engines.py` | 文件路径动态 onnx → engine（trtexec 包装，须在设备上） |
+| `build_realtime_engines.py` | 实时定长 onnx → engine（front/decoder/hubert/rmvpe，设备上） |
 | `run_reference.py` | PyTorch 参考推理，保存各模型输入张量 |
 | `verify_golden.py` | golden 对拍校验 |
 | `compare_streaming_quality.py` | 流式输出质量对比（verify_golden 调用） |
@@ -208,11 +209,11 @@ Python 脚本，居仓库 `tools/model/`，直接调用，不做 CLI 封装。
 python3 tools/model/export_generator_onnx.py ~/rvc-pth/qiqi-zh.pth \
     --rvc-source ~/mozart-archive/RVC --output qiqi-zh.onnx --frames 200
 
-# 导出实时拆分生成器
+# 导出实时拆分生成器（帧数须匹配实时契约：front 280 / decoder 30）
 python3 tools/model/export_generator_split_onnx.py ~/rvc-pth/qiqi-zh.pth \
     --rvc-source ~/mozart-archive/RVC \
     --front-output qiqi-zh-front.onnx --decoder-output qiqi-zh-decoder.onnx \
-    --skip-head 250 --return-frames 30
+    --front-frames 280 --decoder-frames 30 --skip-head 250 --return-frames 30
 
 # 编译引擎（设备）
 python3 tools/model/build_dynamic_engines.py --assets <onnx目录> --feature-assets <特征onnx目录>
@@ -224,6 +225,34 @@ RVC_SOURCE=~/mozart-archive/RVC python3 tools/model/run_reference.py \
     --output ref.wav --tensor-dir tensors --metadata reference.json
 python3 tools/model/verify_golden.py --manifest golden_manifest.json
 ```
+
+### 实时链路资产生成
+
+实时链路用 4 个定长引擎，与文件路径的动态引擎不同。契约形状（`rvc/src/rvc/pipeline.cpp`）：
+
+| 引擎 | 定长形状 |
+| --- | --- |
+| 生成器 front | feats `1×280×768` |
+| 生成器 decoder | z `1×192×30` → audio |
+| hubert-realtime | audio `1×44800` |
+| rmvpe-realtime | mel `1×128×32` |
+
+几何来源：窗 3840 样本、过去上下文 40000、淡化 2400、SOLA 搜索 480（`rvc/src/rvc/audio_worker.cpp`）。front 280 帧 = (40000+3840+960)/160；decoder 30 帧 = out_block 14400/480；skip-head 250 = 40000/160。
+
+生成步骤：
+
+1. 导出 front/decoder（每模型）：`export_generator_split_onnx.py --front-frames 280 --decoder-frames 30 --skip-head 250 --return-frames 30`。
+2. 导出实时特征引擎（共享，一次）：`export_hubert_onnx.py --samples 44800`、`export_rmvpe_onnx.py --frames 32`。
+3. 设备上编译定长引擎：
+
+```bash
+python3 tools/model/build_realtime_engines.py \
+    --front qiqi-zh-front.onnx --decoder qiqi-zh-decoder.onnx \
+    --hubert hubert-realtime.onnx --rmvpe rmvpe-realtime.onnx \
+    --output-dir <成品目录>
+```
+
+`build_realtime_engines.py` 从 onnx 读回定长形状再调 trtexec，模型相关维度（inter_channels、source_dim）不写死。`build_dynamic_engines.py` 只管文件路径动态引擎，不覆盖实时。
 
 ## 加新模型流程
 

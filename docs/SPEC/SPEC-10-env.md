@@ -46,7 +46,7 @@ Python 脚本，居 `tools/model/`，直接调用。导出依赖 PyTorch，不�
 下载 → 导出 → 编译 → 登记 → 测试。
 
 - [ ] 下载：权重落入原料层 `~/rvc-pth/<id>.pth`。
-- [ ] 导出：开发机运行导出脚本，产出 onnx。
+- [ ] 导出：设备上运行导出脚本（PyTorch ARM64），产出 onnx。
 - [ ] 编译：设备上运行编译脚本，产出生成器 engine。
 - [ ] 登记：编辑 `[[models]]` 注册表（id、type=rvc、path），复用现有加载路径解析（`rvc/src/rvc/model_loader.cpp:262-292`）。
 - [ ] 测试：`file submit --model <id>`，按需 golden 对拍（SPEC-08 验收）。
@@ -56,14 +56,13 @@ Python 脚本，居 `tools/model/`，直接调用。导出依赖 PyTorch，不�
 - [x] 加载注册表优先，入口不硬拼 `models_dir/<id>`（`rvc/control/stream_session.cpp:450-465`，提交 09e396c）。
 - [x] LoadModel 三态枚举：NotFound / Failed / Ok（`rvc/control/stream_session.h:71-73`）。
 - [x] model not found 只在推理层运行时报错：NotFound → InvalidArgument（`rvc/control/stream_session.cpp:456-458`），不做复杂回退。
-- [ ] daemon 去掉模型存在预检（`daemon/src/file/mod.rs:366`），报错统一归推理层。
-- [ ] model list 可选自动过滤资产缺失的模型（滤空）；运行时请求缺失模型再报错。
+- [x] daemon 去掉模型存在预检，报错统一归推理层：入队原样收模型 id，执行时 LoadModel 失败标 failed 带原因、队列继续（`daemon/src/file/mod.rs:369-387`，回归 `daemon/tests/file_worker.rs` unknown_model_fails_at_load_and_queue_continues）。
+- [x] model list 可选自动过滤资产缺失的模型（滤空）：CLI `model list --available` 只列 exists=true，缺省列全部；CLI 侧过滤，不改 ListModels 协议（`ctl/src/main.rs:584-613`）。运行时请求缺失模型再报错。
 - [ ] 资产根与编译产出路径：资产根由 runtime 配置 `models_dir` 给定，编译输出走脚本参数。
 
 ## 待决策
 
-- 导出在主机、编译在设备，脚本如何跨机调用。
-- golden 对拍工具归属：实现归本规格，验收门槛归 SPEC-08。
+- 无。导出与编译均在 Jetson 上执行（PyTorch ARM64 JetPack 轮子 + trtexec），无跨机编排。golden 对拍工具实现归本规格，验收门槛归 SPEC-08（边界节已定）。
 
 ## 验收
 
