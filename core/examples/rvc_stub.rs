@@ -1,4 +1,7 @@
 //! 推理进程协议桩：实现 SPEC-03 控制面，不加载模型、不推理。
+//! 模型清单固定一个 demo：LoadModel 未知 id 回 InvalidArgument（model not
+//! found），与真 rvc 的 NotFound → InvalidArgument 同口径（SPEC-10 报错归
+//! 推理层，daemon 入队不预检）。
 //! kind=file 时另跑整段批处理数据面（D1）：攒满 total_frames 帧 →
 //! 零阶保持 3:1 上采样 → 阻塞回 total_frames 帧到配置默认 output_socket。
 //! 数据面复用 [rvc] 默认 socket（SPEC-03 状态门控交接，无独立文件 socket）。
@@ -25,6 +28,9 @@ use stub_common::{body, expect_known, fail, ok, parse_args, serve};
 
 /// 数据面 socket 缓冲帧数：SPEC-02「接收缓冲 4–8 帧」取上沿。
 const QUEUE_FRAMES: usize = 8;
+
+/// 桩注册表唯一模型：LoadModel 与 ListModels 共用同一口径。
+const STUB_MODEL: &str = "demo";
 
 /// 攒帧与模拟推理期间的取消检查间隔。
 const POLL: Duration = Duration::from_millis(20);
@@ -115,6 +121,13 @@ fn handle(msg: &Message, state: &mut State) -> Vec<u8> {
             let Some(model_id) = model_id.filter(|id| !id.is_empty()) else {
                 return fail(ctl::CODE_INVALID_ARGUMENT, "model_id is required");
             };
+            // 桩注册表固定 demo；未知 id 与真 rvc 同口径回 InvalidArgument。
+            if model_id != STUB_MODEL {
+                return fail(
+                    ctl::CODE_INVALID_ARGUMENT,
+                    &format!("model not found: {model_id}"),
+                );
+            }
             state.model = Some(model_id.to_string());
             ok(json!({
                 "model_id": model_id,
@@ -189,21 +202,9 @@ fn handle(msg: &Message, state: &mut State) -> Vec<u8> {
             }))
         }
         ctl::RVC_LIST_MODELS => {
-            // 桩模型目录固定一个 demo；已加载的其他模型一并列出。
-            let mut ids = vec!["demo".to_string()];
-            if let Some(model) = state.model.as_ref() {
-                if model != "demo" {
-                    ids.push(model.clone());
-                }
-            }
-            let models: Vec<_> = ids
-                .into_iter()
-                .map(|id| {
-                    let loaded = state.model.as_deref() == Some(id.as_str());
-                    json!({"id": id, "exists": true, "loaded": loaded})
-                })
-                .collect();
-            ok(json!({"models": models}))
+            // 桩注册表固定一个 demo（与 LoadModel 同一口径）。
+            let loaded = state.model.as_deref() == Some(STUB_MODEL);
+            ok(json!({"models": [{"id": STUB_MODEL, "exists": true, "loaded": loaded}]}))
         }
         _ => unreachable!("expect_known covers all commands"),
     }

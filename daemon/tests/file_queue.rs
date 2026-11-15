@@ -43,12 +43,18 @@ fn queue_admission_pause_cancel_and_drain() {
         .iter()
         .any(|model| model["id"] == "demo" && model["exists"] == true));
 
-    // 未加载模型且未指定 → NotReady；模型不存在 → InvalidArgument。
+    // 未加载模型且未指定 → NotReady；未知模型入队不拦截（SPEC-10 报错统一
+    // 归推理层），执行时落 failed 带原因。
     let src = source(&daemon.dir, "a.wav");
     let reply = submit_file(&conn, &src, None);
     assert_eq!(reply.code, ctl::CODE_NOT_READY);
     let reply = submit_file(&conn, &src, Some("nope"));
-    assert_eq!(reply.code, ctl::CODE_INVALID_ARGUMENT);
+    assert_eq!(reply.status, "ok", "{}", reply.reason);
+    assert_eq!(reply.data["state"], "queued");
+    let job_nope = reply.data["job_id"].as_str().unwrap().to_string();
+    // 占位源数据面必失败；等终态落定释放容量，不影响后续准入用例。
+    let failed = wait_job_state(&conn, &job_nope, FileJobState::Failed, Duration::from_secs(5));
+    assert!(failed.error.is_some());
 
     // 暂停后入队两个，第三个容量拒收（Busy）。
     let reply = call(&conn, ctl::DAEMON_FILE_PAUSE, b"");
@@ -67,11 +73,13 @@ fn queue_admission_pause_cancel_and_drain() {
     let third = submit_file(&conn, &src_c, Some("demo"));
     assert_eq!(third.code, ctl::CODE_BUSY);
 
-    // list/status 快照。
+    // list/status 快照：失败任务留单可查，新入队两个处于 queued。
     let list = call(&conn, ctl::DAEMON_FILE_LIST, b"");
     assert_eq!(list.status, "ok");
     assert_eq!(list.data["paused"], true);
-    assert_eq!(list.data["jobs"].as_array().unwrap().len(), 2);
+    let jobs = list.data["jobs"].as_array().unwrap();
+    assert_eq!(jobs.len(), 3);
+    assert_eq!(jobs.iter().filter(|job| job["state"] == "queued").count(), 2);
     let job = file_job(&conn, &job_a);
     assert_eq!(job.name, "a.wav");
     assert_eq!(job.model_id, "demo");

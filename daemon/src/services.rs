@@ -423,7 +423,8 @@ fn switch_direct(state: &Mutex<State>, services: &Services) -> Result<Route, (St
     Ok(Route::Direct)
 }
 
-/// rvc 模型清单（RVC_LIST_MODELS）。model list 命令与文件提交模型校验共用。
+/// rvc 模型清单（RVC_LIST_MODELS）。model list 命令转发用；文件入队不预检
+/// 模型存在性，缺失统一由推理层 LoadModel 运行时报错（SPEC-10）。
 pub(crate) fn list_models(services: &Services) -> Result<Vec<ModelEntry>, (String, String)> {
     let response = services
         .rvc()

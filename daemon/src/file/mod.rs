@@ -366,20 +366,12 @@ impl FileCoordinator {
         }))
     }
 
-    /// 显式 --model 经 ListModels 校验存在；缺省用当前已加载模型。
+    /// 显式 --model 原样入队，不预检存在性：缺失/损坏统一由推理层
+    /// LoadModel 运行时报错（SPEC-10），任务标 failed 带原因、队列继续。
+    /// 缺省用当前已加载模型。
     fn resolve_model(&self, requested: Option<String>) -> Result<String, (String, String)> {
         match requested {
-            Some(model_id) => {
-                let models = services::list_models(&self.services)?;
-                if models.iter().any(|model| model.id == model_id && model.exists) {
-                    Ok(model_id)
-                } else {
-                    Err((
-                        ctl::CODE_INVALID_ARGUMENT.to_string(),
-                        format!("model not found: {model_id}"),
-                    ))
-                }
-            }
+            Some(model_id) => Ok(model_id),
             None => self
                 .services
                 .rvc_status()?
@@ -1033,41 +1025,6 @@ mod tests {
         fs::remove_dir_all(&dir).unwrap();
     }
 
-    /// 最小 rvc 控制桩：只应答 HELLO/GET_STATUS/LIST_MODELS，让 coordinator.submit
-    /// 的模型校验在单测内可达，无需外部进程。绑定与 listen 同步完成后再起 accept 循环。
-    fn spawn_rvc_stub(socket: &Path) {
-        let listener = ctl::Seqpacket::bind(socket).unwrap();
-        listener.listen(4).unwrap();
-        thread::spawn(move || {
-            while let Ok(conn) = listener.accept() {
-                while let Ok(msg) = conn.recv(None) {
-                    let type_ = msg.header.type_;
-                    let data = match type_ {
-                        ctl::RVC_HELLO => json!({"version": "0.1.0", "stub": true}),
-                        ctl::RVC_LIST_MODELS => {
-                            json!({"models": [{"id": "demo", "exists": true, "loaded": true}]})
-                        }
-                        ctl::RVC_GET_STATUS => json!({
-                            "state": "loaded", "model_id": "demo", "model_version": null,
-                            "capabilities": [], "stream_kind": null,
-                            "frames_in": 0, "frames_out": 0, "frames_dropped": 0, "blocks": 0,
-                            "inference_ms_last": null, "inference_ms_avg": null,
-                            "inference_ms_p95": null, "queue_depth": 0, "last_error": null
-                        }),
-                        _ => json!({}),
-                    };
-                    let reply =
-                        json!({"status": "ok", "code": ctl::CODE_OK, "reason": "", "data": data})
-                            .to_string()
-                            .into_bytes();
-                    if conn.send(type_, msg.header.request_id, &reply).is_err() {
-                        break;
-                    }
-                }
-            }
-        });
-    }
-
     /// 回归（Important #1）：finish 快照保护集合与驱逐必须和 submit 串行。
     /// 旧代码 finish 不持 submit_lock：submit 的“入队 + 清在途标记”若落在 finish
     /// 快照之后、读在途标记之前，新排队任务的源副本既不在保护集合也不在在途标记里，
@@ -1080,12 +1037,9 @@ mod tests {
         let dir = temp_dir("evict-submit-race");
         let src_dir = temp_dir("evict-submit-race-src");
         let mut config = Config::default();
-        config.daemon.run_dir = dir.clone();
-        config.rvc.socket = "rvc.sock".to_string();
         config.file.storage_dir = dir.clone();
         config.file.storage_limit_bytes = 100;
         let config = SharedConfig::new(config);
-        spawn_rvc_stub(&config.snapshot().rvc_socket());
 
         let state = Arc::new(Mutex::new(State::new()));
         lock_state(&state).set_rvc_status(Some(fake_rvc_status()));

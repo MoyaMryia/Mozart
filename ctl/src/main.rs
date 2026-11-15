@@ -157,7 +157,11 @@ enum FileAction {
 #[derive(Subcommand)]
 enum ModelAction {
     /// 列出模型（id、是否存在、是否已加载）
-    List,
+    List {
+        /// 只列资产存在的模型（exists=true）；缺省列全部
+        #[arg(long)]
+        available: bool,
+    },
 }
 
 #[derive(Clone, Copy, ValueEnum)]
@@ -242,7 +246,7 @@ fn run(cli: Cli) -> Result<(), CliError> {
         Action::Speech { action } => speech(&config, action, cli.json),
         Action::File { action } => file_command(&config, action, cli.json),
         Action::Model { action } => match action {
-            ModelAction::List => model_list(&config, cli.json),
+            ModelAction::List { available } => model_list(&config, cli.json, available),
         },
         Action::Restart { service } => restart(&config, service, cli.json),
         Action::Device { action } => match action {
@@ -577,17 +581,21 @@ fn file_fetch(
     Ok(())
 }
 
-fn model_list(config: &Config, json_output: bool) -> Result<(), CliError> {
+fn model_list(config: &Config, json_output: bool, available: bool) -> Result<(), CliError> {
     let data = call(config, ctl::DAEMON_MODEL_LIST, b"{}")?;
-    if json_output {
-        println!("{data}");
-        return Ok(());
-    }
     let models = data
         .get("models")
         .ok_or_else(|| CliError::new(EXIT_ERROR, "invalid model list payload: missing models"))?;
-    let models: Vec<ModelEntry> = serde_json::from_value(models.clone())
+    let mut models: Vec<ModelEntry> = serde_json::from_value(models.clone())
         .map_err(|err| CliError::new(EXIT_ERROR, format!("invalid model list payload: {err}")))?;
+    // SPEC-10 滤空：CLI 侧过滤，不改 ListModels 协议；缺省显示全部。
+    if available {
+        models.retain(|model| model.exists);
+    }
+    if json_output {
+        println!("{}", json!({"models": models}));
+        return Ok(());
+    }
     if models.is_empty() {
         println!("no models");
         return Ok(());
@@ -1270,7 +1278,11 @@ mod tests {
         assert!(cli.json);
         assert!(matches!(
             cli.command,
-            Action::Model { action: ModelAction::List }
+            Action::Model { action: ModelAction::List { available: false } }
+        ));
+        assert!(matches!(
+            parse(&["model", "list", "--available"]).unwrap().command,
+            Action::Model { action: ModelAction::List { available: true } }
         ));
         let cli = parse(&["--json", "file", "list"]).unwrap();
         assert!(cli.json);

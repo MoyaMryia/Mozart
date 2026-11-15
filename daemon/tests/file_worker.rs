@@ -191,6 +191,42 @@ fn over_duration_source_is_rejected_after_decode() {
     h.assert_gpu_free();
 }
 
+/// SPEC-10：模型存在性入队不预检，未知模型由推理层 LoadModel 运行时报错
+/// （NotFound → InvalidArgument）：任务标 failed 带可查原因、交接恢复、
+/// GPU 释放，队列继续（下一任务正常完成）。
+#[test]
+fn unknown_model_fails_at_load_and_queue_continues() {
+    let h = Harness::new("worker-unknown-model", "", &[]);
+    let source = h.daemon.dir.join("tone.wav");
+    write_wav(&source, 1, 16000);
+    let reply = submit_file(&h.conn, &source, Some("nope"));
+    assert_eq!(reply.status, "ok", "未知模型入队不应拦截：{}", reply.reason);
+    assert_eq!(reply.data["state"], "queued");
+    let job_id = reply.data["job_id"].as_str().unwrap().to_string();
+
+    let job = wait_job_state(&h.conn, &job_id, FileJobState::Failed, JOB_TIMEOUT);
+    let error = job.error.expect("失败必须带可查询原因");
+    assert!(error.contains("load model"), "{error}");
+    assert!(error.contains("model not found"), "{error}");
+    assert!(!job.result_ready);
+    assert!(!h.result(&job_id).exists());
+    h.assert_temp_clean(&job_id);
+    h.assert_gpu_free();
+    // LoadModel 失败出口经守卫 Drop 收尾：pre 交接必须恢复。
+    assert!(
+        wait_until(POLL_TIMEOUT, || {
+            status(&h.conn).pre.is_some_and(|pre| !pre.file_mode)
+        }),
+        "LoadModel 失败后 pre 必须恢复"
+    );
+
+    // 队列继续：下一个已知模型任务正常完成。
+    let (next_id, _pcm) = h.submit("next.wav", 1, 16000);
+    let next = wait_job_state(&h.conn, &next_id, FileJobState::Completed, JOB_TIMEOUT);
+    assert!(next.result_ready, "后续任务应正常完成");
+    h.assert_gpu_free();
+}
+
 #[test]
 fn missing_ffmpeg_fails_with_reason() {
     let h = Harness::new(

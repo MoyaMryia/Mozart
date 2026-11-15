@@ -756,6 +756,51 @@ fn model_list_json_and_table() {
 }
 
 #[test]
+fn model_list_available_filters_missing_assets() {
+    let env = CtlEnv::new("model-available");
+    let _stub = StubDaemon::start(
+        &env.socket(),
+        vec![(
+            ctl::DAEMON_MODEL_LIST,
+            ok_body(json!({"models": [
+                {"id": "demo", "exists": true, "loaded": true},
+                {"id": "other", "exists": false, "loaded": false},
+            ]})),
+        )],
+    );
+    // --available 只留资产存在的条目，JSON 与人读同一口径。
+    let data = stdout_json(&env.run(&["model", "list", "--available", "--json"]));
+    let models: Vec<ModelEntry> = serde_json::from_value(data["models"].clone()).unwrap();
+    assert_eq!(models.len(), 1);
+    assert_eq!(models[0].id, "demo");
+
+    let human = env.run(&["model", "list", "--available"]);
+    assert_success(&human);
+    let text = String::from_utf8_lossy(&human.stdout);
+    assert!(text.contains("demo"), "stdout: {text}");
+    assert!(!text.contains("other"), "stdout: {text}");
+}
+
+#[test]
+fn model_list_available_empty_renders_no_models() {
+    let env = CtlEnv::new("model-available-empty");
+    let _stub = StubDaemon::start(
+        &env.socket(),
+        vec![(
+            ctl::DAEMON_MODEL_LIST,
+            ok_body(json!({"models": [
+                {"id": "other", "exists": false, "loaded": false},
+            ]})),
+        )],
+    );
+    let data = stdout_json(&env.run(&["model", "list", "--available", "--json"]));
+    assert_eq!(data, json!({"models": []}));
+    let human = env.run(&["model", "list", "--available"]);
+    assert_success(&human);
+    assert!(String::from_utf8_lossy(&human.stdout).contains("no models"));
+}
+
+#[test]
 fn rejects_unknown_file_and_model_arguments() {
     let env = CtlEnv::new("file-usage");
     for args in [
