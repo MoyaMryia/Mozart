@@ -183,7 +183,7 @@ path = "<资产根>/models/asr/<模型id>"
 
 ## 特殊机制说明
 
-- **RVC 会话参数**（f0_method / pitch_shift / index_rate / rms_mix_rate / protect）：`config set rvc.<会话参数>` 写 TOML 持久基线。实时：只有 `pitch_shift` / `index_rate` / `f0_method` 的值变化且实时流在跑时触发 `StopStream`→`StartStream`，短暂打断，启动成功后才更新生效配置；direct/空闲只更新生效配置。启动失败用旧参恢复实时流并返回错误，TOML 保留新基线、生效配置保留旧值；失败后不自动重试，下一次同键写入或 daemon 重启时应用新基线。仅改 `protect` / `rms_mix_rate` 或参数值未变化只更新 TOML 基线与生效配置，不打断实时流。文件：当前任务用旧参、下一任务用新参，不中断。`status.rvc_params` 表示当前生效配置；存在待生效基线或 rvc 不可达时，可能不等于正在跑的流参数。`protect` / `rms_mix_rate` 在实时链路不应用，仍只对文件链路生效；实时补应用与干净块边界 `SetParams` 见 [FUTURE.md](FUTURE.md)。编排细节见 [SPEC-04](SPEC/SPEC-04-daemon.md)。
+- **RVC 会话参数**（f0_method / pitch_shift / index_rate / rms_mix_rate / protect）：`config set rvc.<会话参数>` 写 TOML 持久基线。实时流在跑且本次写入的 `pitch_shift`、`index_rate` 或 `f0_method` 值变化时，daemon 以 `StopStream`→`StartStream` 应用新参，短暂打断。仅改 `protect` / `rms_mix_rate` 更新基线与生效配置，不打断实时流。direct/空闲只更新生效配置。文件任务不中断：当前任务用旧参、下一任务用新参。触发细则与失败恢复见 [SPEC-04](SPEC/SPEC-04-daemon.md)。`protect` / `rms_mix_rate` 在实时链路不应用，仍只对文件链路生效；实时补应用与干净块边界 `SetParams` 见 [FUTURE.md](FUTURE.md)。
 - **pre DSP 开关**经 `SetDsp`（0x0207，体含 denoise/gate/agc/limiter 四键）运行时生效：denoise 重新启用时重置 WOLA 流式状态、重新攒初始化帧，gate/agc/limiter 直接切换。
 - **逻辑上限 vs 预分配环**：`[file].queue_capacity` 是入队时查的逻辑上限（未预分配）→ R；`[pre].capture_queue_frames` 与 asr/tts/bridge 的 `*_capacity` 是预分配环/队列 → S。
 - **位置键**（storage_dir、subtitles_path）归 S：运行中改位置会使已有文件/队列分裂，需重启统一。
