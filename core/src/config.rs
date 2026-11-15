@@ -954,9 +954,10 @@ pub fn set_key(path: Option<&Path>, key: &str, value: &str) -> Result<KeyEffect,
 }
 
 /// daemon/file 运行时键与 rvc 会话参数键的字符串值 → 带类型 TOML 值。
-/// 类型与取值按 docs/config.md：file.denoise 为 bool；file.ffmpeg_path、rvc.f0_method
-/// 为 string；rvc 浮点键为 float；其余为整数。rvc 键在此先校验取值，非法值不进入
-/// 编辑后的文档；写入前仍走整体校验（write_runtime_key），跨键约束由该校验把住。
+/// 这里只做类型转换：file.denoise 为 bool；file.ffmpeg_path、rvc.f0_method 为
+/// string；rvc.index_rate/rms_mix_rate/protect 为 float；其余（含 rvc.pitch_shift）
+/// 为整数。取值范围与 f0_method 白名单只在 `Config::validate()` 定义，由
+/// write_runtime_key 写入前的整体校验拒绝非法值，不落盘。
 fn parse_runtime_value(key: &str, value: &str) -> Result<toml_edit::Item, ConfigError> {
     match key {
         "file.denoise" => match value {
@@ -964,24 +965,13 @@ fn parse_runtime_value(key: &str, value: &str) -> Result<toml_edit::Item, Config
             "false" => Ok(toml_edit::value(false)),
             _ => Err(ConfigError::Invalid(format!("键 {key} 需要 true/false"))),
         },
-        "file.ffmpeg_path" => Ok(toml_edit::value(value)),
-        "rvc.f0_method" => match value {
-            "rmvpe" => Ok(toml_edit::value(value)),
-            _ => Err(ConfigError::Invalid(format!("键 {key} 仅支持 rmvpe"))),
-        },
-        "rvc.pitch_shift" => {
-            let number: i32 = value
+        "file.ffmpeg_path" | "rvc.f0_method" => Ok(toml_edit::value(value)),
+        "rvc.index_rate" | "rvc.rms_mix_rate" | "rvc.protect" => {
+            let number: f64 = value
                 .parse()
-                .map_err(|_| ConfigError::Invalid(format!("键 {key} 需要整数")))?;
-            if !(-12..=12).contains(&number) {
-                return Err(ConfigError::Invalid(format!(
-                    "键 {key} 必须在 -12..=12 内"
-                )));
-            }
-            Ok(toml_edit::value(i64::from(number)))
+                .map_err(|_| ConfigError::Invalid(format!("键 {key} 需要浮点")))?;
+            Ok(toml_edit::value(number))
         }
-        "rvc.index_rate" | "rvc.rms_mix_rate" => parse_runtime_float(key, value, 1.0),
-        "rvc.protect" => parse_runtime_float(key, value, 0.5),
         _ => {
             let number: i64 = value
                 .parse()
@@ -989,19 +979,6 @@ fn parse_runtime_value(key: &str, value: &str) -> Result<toml_edit::Item, Config
             Ok(toml_edit::value(number))
         }
     }
-}
-
-/// 浮点运行时键的解析与范围校验（下界 0）；NaN 与 ±∞ 由范围判断一并拒绝。
-fn parse_runtime_float(key: &str, value: &str, max: f64) -> Result<toml_edit::Item, ConfigError> {
-    let number: f64 = value
-        .parse()
-        .map_err(|_| ConfigError::Invalid(format!("键 {key} 需要浮点")))?;
-    if !(0.0..=max).contains(&number) {
-        return Err(ConfigError::Invalid(format!(
-            "键 {key} 必须在 0..={max} 内"
-        )));
-    }
-    Ok(toml_edit::value(number))
 }
 
 /// config save（SPEC-04）：状态文件覆盖批量写进 TOML 基线（原子写，保留注释）。
@@ -1339,16 +1316,19 @@ mod tests {
         assert_eq!(config.rvc.protect, 0.25);
         assert_eq!(config.rvc.f0_method, "rmvpe");
 
-        // 边界值合法：pitch_shift 12 / index_rate 0 / rms_mix_rate 0 / protect 0.5。
+        // 边界值合法：pitch_shift 12/-12、index_rate 0/1.0、rms_mix_rate 0、
+        // protect 0/0.5。
         set_key(Some(&path), "rvc.pitch_shift", "12").unwrap();
         set_key(Some(&path), "rvc.index_rate", "0").unwrap();
         set_key(Some(&path), "rvc.rms_mix_rate", "0").unwrap();
         set_key(Some(&path), "rvc.protect", "0.5").unwrap();
+        set_key(Some(&path), "rvc.index_rate", "1.0").unwrap();
+        set_key(Some(&path), "rvc.protect", "0").unwrap();
         let config = Config::load_from(Some(&path)).unwrap();
         assert_eq!(config.rvc.pitch_shift, 12);
-        assert_eq!(config.rvc.index_rate, 0.0);
+        assert_eq!(config.rvc.index_rate, 1.0);
         assert_eq!(config.rvc.rms_mix_rate, 0.0);
-        assert_eq!(config.rvc.protect, 0.5);
+        assert_eq!(config.rvc.protect, 0.0);
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -1374,6 +1354,10 @@ mod tests {
             ("rvc.pitch_shift", "1.5"),
             ("rvc.index_rate", "abc"),
             ("rvc.protect", "NaN"),
+            ("rvc.index_rate", "inf"),
+            ("rvc.index_rate", "-inf"),
+            ("rvc.protect", "inf"),
+            ("rvc.protect", "-inf"),
             // f0_method 仅 rmvpe。
             ("rvc.f0_method", "harvest"),
             ("rvc.f0_method", "RMVPE"),
@@ -1389,6 +1373,11 @@ mod tests {
         let err = set_key(Some(&path), "rvc.pitch_shift", "13").err().unwrap();
         assert!(
             err.to_string().contains("-12..=12"),
+            "错误信息应带范围：{err}"
+        );
+        let err = set_key(Some(&path), "rvc.index_rate", "1.01").err().unwrap();
+        assert!(
+            err.to_string().contains("0.0..=1.0"),
             "错误信息应带范围：{err}"
         );
 

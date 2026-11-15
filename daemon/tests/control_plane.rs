@@ -256,4 +256,5 @@ fn config_set_validates_and_get_reads_baseline() {
     // 被拒绝的 set 未改动基线。
     let config = std::fs::read_to_string(daemon.dir.join("config.toml")).unwrap();
     assert!(config.contains("capture_device = \"default\""), "config: {config}");
+    assert!(config.contains("model_id = \"demo\""), "config: {config}");
 }
