@@ -34,7 +34,7 @@
 - [x] 数据面过载：非阻塞发送，丢弃计数；对端排队上限由发送方 connect 侧 `SO_SNDBUF` 按 4–8 帧执行——Linux AF_UNIX 数据报流控只按发送方发送缓冲记账，接收方 `SO_RCVBUF` 不约束发送方（bind 侧 `SO_RCVBUF` 保留设置但不参与流控）。（`core/src/dgram.rs:174-182`、`pre/src/ai.rs:26`）
 - [x] 数据面 socket 命名与方向：`input_socket`（默认 `rvc-in.sock`）由 rvc 绑定收输入帧；`output_socket`（默认 `rvc-out.sock`）由 pre 绑定收输出帧；配置键在 `[rvc]`，路径相对 run_dir。（`core/src/config.rs`）
 - [x] Socket 路径在 `/run/mozart/` 下；对端重启后重连（惰性建链）。（`pre/src/ai.rs`）
-- [ ] 锁文件防重复实例：全仓无 flock/lockfile 代码。
+- [x] 锁文件防重复实例：`run_dir/pre.lock` 独占锁，与 daemon 的 `daemon.lock` 同一模式（std 文件锁）；配置解析后、socket 绑定与 ALSA 打开前拿锁，拿不到报错退出，锁持有到进程退出。（`pre/src/main.rs`）
 - [x] 控制面（daemon → pre）：Unix SEQPACKET 定长头 + JSON。命令 `Hello`（版本握手）、`SetRoute{route}`（切 direct/rvc）、`SetMute{mute}`（静音开关）、`SetFileMode{active}`（文件接管开关：暂停/恢复 rvc AI 发送并交接 output_socket 绑定，asr 不受影响）、`GetStatus`。路由与静音由 pre 执行淡变，策略归 daemon。（`pre/src/control.rs:112-186`；`SetDsp` 未落地，见下条）
 - [ ] `SetDsp{denoise,gate,agc,limiter}`（运行中切换 DSP 级）：命令号未登记（`core/src/ctl.rs:62-71`、`core/include/mozart/ctl.h:65-73` 的 pre 段均无），pre 分发无此分支（`pre/src/control.rs:112-186`）；DSP 开关仅启动时从 `[pre.dsp]` 读取（`pre/src/main.rs:296-301`）。
 - [x] 状态：`GetStatus` 返回运行状态、路由、静音、文件接管状态（file_mode）、采集/播放设备名、采集/播放/丢弃帧计数、队列深度、各消费者丢弃计数、最近错误、版本。daemon 每秒轮询，pre 不主动推；旧 `pre-status.json` 废弃。（`pre/src/state.rs`）

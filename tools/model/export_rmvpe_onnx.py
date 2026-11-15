@@ -9,7 +9,7 @@ import torch
 
 def main():
     parser = argparse.ArgumentParser(description="Export RMVPE to ONNX")
-    parser.add_argument("--rmvpe-path", default="assets/rmvpe/rmvpe.pt")
+    parser.add_argument("--rmvpe-path", required=True)
     parser.add_argument("--output", default="rmvpe.onnx")
     parser.add_argument("--opset", type=int, default=17)
     parser.add_argument("--frames", type=int, default=128)

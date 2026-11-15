@@ -13,7 +13,7 @@
 - [ ] 环形队列日志限频：满丢最旧时无日志，仅 `dropped` 计数。（`core/src/ring.rs:93-95`，依赖中亦无日志库）机制：实时热路径不打日志（禁分配与阻塞），由持有方非热路径线程（如 GetStatus 处理侧）发现计数增量时限频记录，带时间与增量。
 - [x] 数据面：Unix `SOCK_DGRAM`，一帧一条消息；控制面：Unix `SOCK_SEQPACKET`，定长头 + JSON 体。（`core/src/dgram.rs:136-147`、`core/src/ctl.rs:142-207`）
 - [x] 控制信封：16 B 小端定长头（magic `'MCTL'`、version、type、request_id、body_len），体为 JSON，上限 64 KiB；命令号按平面分段：daemon `0x01xx`、pre `0x02xx`、rvc `0x03xx`、asr `0x04xx`、bridge `0x05xx`、tts `0x06xx`。（`core/src/ctl.rs:20,142-207,678-696`）
-- [ ] 响应契约统一：响应 type 回显、体固定 `status` / `code` / `reason` / `data`。TTS 任务应答 `TTS_JOB_REPLY`（0x0611）当前不回显 type、体为 `status`/`utterance_id`/`reason`，与本条不符。（`core/include/mozart/ctl.h:96-97`、`core/src/ctl.rs:98-99`）已定：TTS 改标准信封——type 回显 0x0611，体 `status`/`code`/`reason`/`data`，`utterance_id` 放 `data`。
+- [x] 响应契约统一：响应 type 回显、体固定 `status` / `code` / `reason` / `data`。TTS 任务应答已对齐：type 回显请求号（SUBMIT→0x0610、STOP→0x0612），`utterance_id` 放 `data`，受理三态映射 ok/Ok（submitted）、error/Busy（队满 skipped）、error（failed）。（`tts/src/jobs.rs`、`bridge/src/speech.rs`）
 - [x] 识别事件流（识别服务 → 字幕桥）：Unix `SOCK_SEQPACKET`，一条消息一个 JSON 事件，无定长头；socket 默认 `asr-events.sock`（run_dir 下）；事件契约见 SPEC-05。（`core/src/ctl.rs:426-462`、`core/src/config.rs:207,464-466`）
 - [x] 数据包沿用旧格式：4 字节魔数 + 16 字节元数据 + PCM；输入 1300 字节，输出 3860 字节。（`core/src/lib.rs:60-61` 编译期断言）
 - [x] 帧契约以 C 头文件为单一来源；Rust 用 `#[repr(C)]` 镜像，加编译期大小断言。（`core/src/lib.rs:56-61`）

@@ -54,7 +54,7 @@
 - [x] 音频设备识别归 daemon（硬件发现，与 hwmon 一类）：用 ALSA API（`snd_device_name_hint`）枚举采集/播放设备，不 shell `arecord`/`aplay`；按需查询不缓存（USB 插拔）；返回设备 id（ALSA 名，配置用）+ 人读标签。CLI `device list` 缺省只列配置首选（`plughw:` 与 `default`），`--all` 返回完整 ALSA 别名清单。配置/切换设备时对照当前清单校验存在。pre 只打开配置的设备（使用）、不做枚举；换设备仍由 daemon 重启 pre，热切换见 [FUTURE.md](../FUTURE.md)。（`daemon/src/device.rs:14-82`、`ctl/src/main.rs:636-654`）
 - [x] 语言服务（识别、桥、TTS）各绑控制 socket，daemon 连接并每秒轮询，接法与 pre/rvc 一致。llama-server 不说控制协议：daemon 只管其进程存活与重启，业务可达性由桥的 `GetStatus` 带报。（`daemon/src/services.rs`）
 - [x] 监管退避：崩溃后从 500 ms 起倍增，上限 10 s；连续稳定运行 30 s 后重置。子进程日志追加到 `run_dir/logs/<name>.log`，daemon 退出前先停止子进程。（`daemon/src/supervisor.rs:87-175`）
-- [ ] 路由执行顺序：切到 rvc 先 `LoadModel` / `StartStream` 再让 pre `SetRoute(rvc)`，失败回滚停流；切回 direct 先 pre `SetRoute(direct)` 再 `StopStream` 并释放 GPU。轮询发现实际状态偏离期望时按同一顺序对账。切换本身已实现；对账 rvc 方向次序写反（先 SetRoute 后起流，`daemon/src/services.rs:668-700`），双偏场景会在起流窗口丢帧。已核实为疏忽，待修：rvc 方向对账改先起流后 SetRoute，与 switch_rvc（`services.rs:415-439`）一致。
+- [x] 路由执行顺序：切到 rvc 先 `LoadModel` / `StartStream` 再让 pre `SetRoute(rvc)`，失败回滚停流；切回 direct 先 pre `SetRoute(direct)` 再 `StopStream` 并释放 GPU。轮询对账按同一顺序：rvc 方向先确保实时流在跑再切 pre 路由，流未就绪（rvc 缺席或起流失败）本轮不切、下一轮重试；direct 方向先切路由再停流，文件 GPU 门控不变。（`daemon/src/services.rs`；次序回归 `daemon/tests/linkage.rs`）
 - [x] 主机硬件指标（CPU/内存/GPU/可用性）由 daemon 读 `/proc`、`/sys` 采集（移植旧 `SystemMonitor`），并入 status。监控出口经 CLI `status`/`logs`，以后 HTTP 适配器推网页；历史时序、告警、面板推迟。（`daemon/src/hwmon.rs`）
 - [x] RPC 超时（`rpc_timeout_ms`）覆盖 connect、send、recv 全程；控制通道任何一步不得无限阻塞，卡死的子进程不得拖住控制面。
 - [x] 子进程设 `PDEATHSIG` 后校验父进程仍存活（ppid 未变为 1），daemon 崩溃瞬间不留孤儿。（`daemon/src/supervisor.rs:275-286`）

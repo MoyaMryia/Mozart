@@ -53,7 +53,7 @@
 3. **对外控制面**（已定）：Rust 独立适配器进程，全包静态文件 + REST + SSE + 文件上传下载，作 daemon 控制 socket 客户端。循环等待已破。
 4. **部署布局**：SPEC-09 草案的 `releases/<版本>/` + `current` 与 SPEC-04 定稿"cargo 产物目录为唯一部署目录、子进程同目录解析"冲突；改 releases 会破坏同目录解析前提，二选一。
 5. **pre 分发消费者**（已定）：配置化，允许多支路，按统一规范声明消费者。待实现。
-6. **控制信封对齐**（已定）：TTS 任务应答（0x0611）改标准信封，type 回显、体 `status`/`code`/`reason`/`data`，`utterance_id` 放 `data`。待实现。
+6. **控制信封对齐**（已实现）：TTS 任务应答改标准信封，type 回显请求号、体 `status`/`code`/`reason`/`data`，`utterance_id` 放 `data`。
 
 ## 讨论与记录方式
 

@@ -774,7 +774,7 @@ fn validate_device_name(name: &str, field: &str) -> Result<(), ConfigError> {
     Ok(())
 }
 
-/// 运行目录承载控制 socket，统一收敛到 0700；ctl 与 daemon 共用此定义，
+/// 运行目录承载控制 socket，统一收敛到 0700；ctl、daemon 与 pre 共用此定义，
 /// 避免 ctl 抢先建目录导致权限策略失效。
 pub fn ensure_run_dir(dir: &Path) -> io::Result<()> {
     std::fs::create_dir_all(dir)?;

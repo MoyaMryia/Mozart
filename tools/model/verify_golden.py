@@ -18,9 +18,6 @@ import soundfile as sf
 from compare_streaming_quality import compare as compare_streaming_quality
 
 
-ROOT = Path(__file__).resolve().parent
-
-
 def sha256(path: Path) -> str:
     digest = hashlib.sha256()
     with path.open("rb") as stream:
@@ -298,7 +295,7 @@ def reproduce_standard(
 
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--manifest", default=str(ROOT / "golden_manifest.json"))
+    parser.add_argument("--manifest", required=True)
     parser.add_argument("--model", default=None,
                         help="override the model path recorded in the manifest")
     parser.add_argument(

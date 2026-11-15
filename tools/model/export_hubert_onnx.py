@@ -25,7 +25,7 @@ class RvcV2Hubert(torch.nn.Module):
 
 def main():
     parser = argparse.ArgumentParser(description="Export RVC v2 HuBERT to ONNX")
-    parser.add_argument("--hubert-path", default="rvc-golden/assets/hubert_base")
+    parser.add_argument("--hubert-path", required=True)
     parser.add_argument("--output", default="hubert_base.onnx")
     parser.add_argument("--opset", type=int, default=17)
     parser.add_argument("--samples", type=int, default=32000)

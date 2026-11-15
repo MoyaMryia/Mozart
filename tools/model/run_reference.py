@@ -129,14 +129,16 @@ def load_generator(model_path, deterministic=False):
 
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument("--input", default=str(ROOT / "input" / "sample-10s.wav"))
+    parser.add_argument("--input", required=True)
     parser.add_argument("--model", required=True)
-    parser.add_argument("--output", default=str(ROOT / "output" / "python-reference.wav"))
-    parser.add_argument("--tensor-dir", default=str(ROOT / "tensors"))
+    parser.add_argument("--hubert-path", required=True)
+    parser.add_argument("--rmvpe-path", required=True)
+    parser.add_argument("--output", required=True)
+    parser.add_argument("--tensor-dir", required=True)
     parser.add_argument("--deterministic-generator", action="store_true",
                         help="use the export-alignment mean path instead of original RVC inference")
-    parser.add_argument("--metadata", default=str(ROOT / "reference.json"),
-                        help="path to write the run metadata (defaults to reference.json)")
+    parser.add_argument("--metadata", required=True,
+                        help="path to write the run metadata")
     parser.add_argument("--seed", type=int, default=114514)
     parser.add_argument(
         "--wav-peak-timestamp",
@@ -171,12 +173,12 @@ def main():
         generator, tensor_dir, deterministic=args.deterministic_generator
     )
 
-    hubert_path = ROOT / "assets" / "hubert_base"
+    hubert_path = Path(args.hubert_path)
     hubert = HubertModelWithFinalProj.from_pretrained(
         str(hubert_path), local_files_only=True, torch_dtype=torch.float32
     ).eval().float()
 
-    rmvpe_path = ROOT / "assets" / "rmvpe" / "rmvpe.pt"
+    rmvpe_path = Path(args.rmvpe_path)
     pipeline = Pipeline(target_rate, ReferenceConfig())
     pipeline.model_rmvpe = RMVPE(str(rmvpe_path), is_half=False, device="cpu")
 

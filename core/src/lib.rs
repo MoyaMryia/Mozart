@@ -60,6 +60,19 @@ const _: () = assert!(std::mem::size_of::<RawFrame>() == 16 + RAW_SAMPLES * 4);
 const _: () = assert!(std::mem::size_of::<InputFrame>() + 4 == 1300);
 const _: () = assert!(std::mem::size_of::<OutputFrame>() + 4 == 3860);
 
+const _: () = assert!(std::mem::offset_of!(FrameMeta, pts_ns) == 0);
+const _: () = assert!(std::mem::offset_of!(FrameMeta, frame_idx) == 8);
+const _: () = assert!(std::mem::offset_of!(FrameMeta, vad_flag) == 12);
+const _: () = assert!(std::mem::offset_of!(FrameMeta, energy_db) == 13);
+const _: () = assert!(std::mem::offset_of!(FrameMeta, conf) == 14);
+const _: () = assert!(std::mem::offset_of!(FrameMeta, segment_id) == 15);
+const _: () = assert!(std::mem::offset_of!(InputFrame, meta) == 0);
+const _: () = assert!(std::mem::offset_of!(InputFrame, pcm) == 16);
+const _: () = assert!(std::mem::offset_of!(OutputFrame, meta) == 0);
+const _: () = assert!(std::mem::offset_of!(OutputFrame, pcm) == 16);
+const _: () = assert!(std::mem::offset_of!(RawFrame, meta) == 0);
+const _: () = assert!(std::mem::offset_of!(RawFrame, pcm) == 16);
+
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -449,8 +449,14 @@ InferenceBackend::InferenceBackend(const InferenceBackendConfig& config)
 
 LoadResult InferenceBackend::load_model(const std::string& model_id,
                                           std::string& reason) {
-    // 路径解析归 ModelManager（注册表优先，空时回退 models_dir），
-    // 入口不预检目录，避免架空注册表 path（SPEC-03）。
+    // 存在性与路径解析归 ModelManager（注册表优先，空时回退 models_dir），
+    // 入口不硬拼 models_dir/<id>，避免架空注册表 path（SPEC-03）。
+    // get_model 未知 id 回 nullptr → NotFound（请求错误），与加载失败区分；
+    // 它只构造模型对象，不加载引擎。
+    if (!models_->get_model(model_id)) {
+        reason = "model not found: " + model_id;
+        return LoadResult::NotFound;
+    }
     // load_mutex 串行加载；命中缓存约 1 ms，冷加载含引擎反序列化。
     if (!models_->load_model(model_id) || !pipeline_->switch_model(model_id)) {
         reason = "model load failed: " + model_id + " (see log for details)";

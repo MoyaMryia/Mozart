@@ -1,9 +1,11 @@
 //! 协议桩共用逻辑：参数解析、应答组装、连接服务循环。
 //! 仅用于测试；不实现音频或推理。
+//! 测试旋钮 `MOZART_STUB_LOG=<path>`：收到的命令按 `{桩名} {命令号} {请求体}`
+//! 逐行追加到该文件，多桩可共写一份，供测试断言跨进程命令次序。
 
 use mozart_core::ctl::{self, Message, Seqpacket};
 use serde_json::{json, Value};
-use std::io::ErrorKind;
+use std::io::{ErrorKind, Write};
 use std::path::PathBuf;
 use std::time::Duration;
 
@@ -109,6 +111,17 @@ pub fn serve(args: StubArgs, mut handler: impl FnMut(&Message) -> Vec<u8>) -> ! 
         std::process::exit(1);
     });
 
+    let mut command_log = std::env::var("MOZART_STUB_LOG").ok().map(|path| {
+        std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&path)
+            .unwrap_or_else(|err| {
+                eprintln!("{}: open command log {path}: {err}", args.name);
+                std::process::exit(1);
+            })
+    });
+
     loop {
         let conn = match listener.accept() {
             Ok(conn) => conn,
@@ -128,6 +141,16 @@ pub fn serve(args: StubArgs, mut handler: impl FnMut(&Message) -> Vec<u8>) -> ! 
             };
             let type_ = msg.header.type_;
             let request_id = msg.header.request_id;
+            if let Some(log) = command_log.as_mut() {
+                // 整行一次写入：多桩共写一份日志时 O_APPEND 保证不交错。
+                let line = format!(
+                    "{} {} {}\n",
+                    args.name,
+                    type_,
+                    String::from_utf8_lossy(&msg.body)
+                );
+                let _ = log.write_all(line.as_bytes());
+            }
             std::thread::sleep(args.reply_delay);
             let reply = handler(&msg);
             if let Err(err) = conn.send(type_, request_id, &reply) {

@@ -1,6 +1,7 @@
 //! 控制面服务端（SPEC-02）：Unix SEQPACKET + core 信封，复用 schema 的应答封装。
 //! Hello/SetRoute/SetMute/GetStatus。命令解析与执行只读写原子，不阻塞音频线程；
-//! GetStatus 只读原子快照与队列读数（AGENTS「GetStatus 只读原子快照」精神）。
+//! GetStatus 只读原子快照与队列读数（AGENTS「GetStatus 只读原子快照」精神），
+//! 并限频上报环丢帧增量（SPEC-01：热路径只计数，日志在控制线程）。
 //! 连接逐个服务：daemon 持单连接每秒轮询，断开后回到 accept。
 
 use crate::state::{QueueReadout, Shared, VERSION};
@@ -12,13 +13,57 @@ use serde_json::{json, Value};
 use std::io;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 /// 文件接管握手等待上限：接收线程按 RECV_POLL（100 ms）节拍释放绑定，
 /// 正常百毫秒内完成；取 1 s 兜底，小于 daemon 缺省 rpc_timeout_ms（2 s）。
 const FILE_HANDOFF_TIMEOUT: Duration = Duration::from_secs(1);
 /// 握手等待的轮询步长。
 const FILE_HANDOFF_POLL: Duration = Duration::from_millis(5);
+/// 环丢帧日志的最小间隔（SPEC-01 限频）：窗口内的增量并入下一条。
+const DROP_LOG_INTERVAL: Duration = Duration::from_secs(1);
+
+/// 环丢帧限频上报（SPEC-01）：实时热路径只计数不打日志，控制线程在
+/// GetStatus 发现增量时记录。距上次日志不足 DROP_LOG_INTERVAL 时不推进
+/// 基线，增量并入下一条日志。
+struct DropLog {
+    /// 上次写入日志的各环累计值，顺序与 report 的环列表一致。
+    last: [u64; 4],
+    last_log: Option<Instant>,
+}
+
+impl DropLog {
+    fn new() -> Self {
+        Self { last: [0; 4], last_log: None }
+    }
+
+    /// `rings` 为（环名, 当前累计）。只在控制线程调用，允许分配与阻塞。
+    fn report(&mut self, rings: [(&'static str, u64); 4]) {
+        let now = Instant::now();
+        if let Some(last) = self.last_log {
+            if now.duration_since(last) < DROP_LOG_INTERVAL {
+                return;
+            }
+        }
+        let at_ms = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_millis() as u64;
+        let mut logged = false;
+        for (slot, (name, total)) in rings.iter().enumerate() {
+            // 累计计数单调递增，差值即上次日志以来的增量。
+            let delta = total - self.last[slot];
+            if delta > 0 {
+                eprintln!("mozart-pre: ring {name} dropped +{delta} (total {total}) unix_ms={at_ms}");
+                logged = true;
+            }
+        }
+        if logged {
+            self.last = rings.map(|(_, total)| total);
+            self.last_log = Some(now);
+        }
+    }
+}
 
 /// 服务循环：绑定与监听由调用方完成；收到停止标志后返回。
 pub fn serve(
@@ -30,6 +75,7 @@ pub fn serve(
     tts_ring: Arc<Ring<OutputFrame>>,
     stop: &'static AtomicBool,
 ) {
+    let mut drop_log = DropLog::new();
     while !stop.load(Ordering::Relaxed) {
         if let Err(err) = listener.wait_readable(Some(ACCEPT_POLL)) {
             if err.kind() == io::ErrorKind::TimedOut {
@@ -45,7 +91,7 @@ pub fn serve(
                 continue;
             }
         };
-        serve_connection(&conn, &shared, &capture_ring, &trunk, &rvc_ring, &tts_ring, stop);
+        serve_connection(&conn, &shared, &capture_ring, &trunk, &rvc_ring, &tts_ring, &mut drop_log, stop);
     }
 }
 
@@ -56,6 +102,7 @@ fn serve_connection(
     trunk: &Ring<RawFrame>,
     rvc_ring: &Ring<OutputFrame>,
     tts_ring: &Ring<OutputFrame>,
+    drop_log: &mut DropLog,
     stop: &AtomicBool,
 ) {
     let mut idle = Duration::ZERO;
@@ -80,7 +127,7 @@ fn serve_connection(
         idle = Duration::ZERO;
         let type_ = msg.header.type_;
         let request_id = msg.header.request_id;
-        let reply = dispatch(&msg, shared, capture_ring, trunk, rvc_ring, tts_ring);
+        let reply = dispatch(&msg, shared, capture_ring, trunk, rvc_ring, tts_ring, drop_log);
         if conn.send(type_, request_id, &reply).is_err() {
             return;
         }
@@ -97,13 +144,14 @@ fn parse_body(body: &[u8]) -> Result<Value, Vec<u8>> {
 }
 
 /// 命令分发。请求体是外部输入，在此校验一次；内部执行信任已校验的值。
-pub fn dispatch(
+fn dispatch(
     msg: &Message,
     shared: &Shared,
     capture_ring: &Ring<RawFrame>,
     trunk: &Ring<RawFrame>,
     rvc_ring: &Ring<OutputFrame>,
     tts_ring: &Ring<OutputFrame>,
+    drop_log: &mut DropLog,
 ) -> Vec<u8> {
     let body = match parse_body(&msg.body) {
         Ok(body) => body,
@@ -171,11 +219,21 @@ pub fn dispatch(
             ok_body(json!({"stopped": true, "frames_cleared": frames_cleared}))
         }
         ctl::PRE_GET_STATUS => {
+            let capture_dropped = capture_ring.dropped();
+            let trunk_dropped = trunk.dropped();
+            let rvc_dropped = rvc_ring.dropped();
+            let tts_dropped = tts_ring.dropped();
+            drop_log.report([
+                ("capture", capture_dropped),
+                ("trunk", trunk_dropped),
+                ("rvc", rvc_dropped),
+                ("tts", tts_dropped),
+            ]);
             let readout = QueueReadout {
                 depth: capture_ring.depth() as u64,
-                dropped: capture_ring.dropped() + trunk.dropped(),
-                rvc_dropped: rvc_ring.dropped(),
-                tts_dropped: tts_ring.dropped(),
+                dropped: capture_dropped + trunk_dropped,
+                rvc_dropped,
+                tts_dropped,
             };
             match serde_json::to_value(shared.status(readout)) {
                 Ok(value) => ok_body(value),
@@ -205,6 +263,7 @@ mod tests {
         Arc<Ring<RawFrame>>,
         Arc<Ring<OutputFrame>>,
         Arc<Ring<OutputFrame>>,
+        DropLog,
     ) {
         (
             Arc::new(Shared::new("cap-dev".to_string(), "play-dev".to_string(), "test".to_string())),
@@ -212,6 +271,7 @@ mod tests {
             Arc::new(Ring::new(2)),
             Arc::new(Ring::new(2)),
             Arc::new(Ring::new(2)),
+            DropLog::new(),
         )
     }
 
@@ -229,21 +289,21 @@ mod tests {
 
     #[test]
     fn hello_reports_version() {
-        let (shared, cap, trunk, rvc, tts) = context();
-        let reply = dispatch(&message(ctl::PRE_HELLO, b"{}"), &shared, &cap, &trunk, &rvc, &tts);
+        let (shared, cap, trunk, rvc, tts, mut log) = context();
+        let reply = dispatch(&message(ctl::PRE_HELLO, b"{}"), &shared, &cap, &trunk, &rvc, &tts, &mut log);
         assert_eq!(data(&reply)["version"], VERSION);
     }
 
     #[test]
     fn hello_accepts_empty_body() {
-        let (shared, cap, trunk, rvc, tts) = context();
-        let reply = dispatch(&message(ctl::PRE_HELLO, b""), &shared, &cap, &trunk, &rvc, &tts);
+        let (shared, cap, trunk, rvc, tts, mut log) = context();
+        let reply = dispatch(&message(ctl::PRE_HELLO, b""), &shared, &cap, &trunk, &rvc, &tts, &mut log);
         assert_eq!(data(&reply)["version"], VERSION);
     }
 
     #[test]
     fn set_route_and_status_roundtrip() {
-        let (shared, cap, trunk, rvc, tts) = context();
+        let (shared, cap, trunk, rvc, tts, mut log) = context();
         let reply = dispatch(
             &message(ctl::PRE_SET_ROUTE, br#"{"route":"rvc"}"#),
             &shared,
@@ -251,10 +311,11 @@ mod tests {
             &trunk,
             &rvc,
             &tts,
+            &mut log,
         );
         assert_eq!(data(&reply)["route"], "rvc");
 
-        let reply = dispatch(&message(ctl::PRE_GET_STATUS, b"{}"), &shared, &cap, &trunk, &rvc, &tts);
+        let reply = dispatch(&message(ctl::PRE_GET_STATUS, b"{}"), &shared, &cap, &trunk, &rvc, &tts, &mut log);
         let status = data(&reply);
         assert_eq!(status["route"], "rvc");
         assert_eq!(status["state"], "running");
@@ -274,7 +335,7 @@ mod tests {
 
     #[test]
     fn set_route_rejects_unknown_value() {
-        let (shared, cap, trunk, rvc, tts) = context();
+        let (shared, cap, trunk, rvc, tts, mut log) = context();
         let reply = dispatch(
             &message(ctl::PRE_SET_ROUTE, br#"{"route":"bogus"}"#),
             &shared,
@@ -282,6 +343,7 @@ mod tests {
             &trunk,
             &rvc,
             &tts,
+            &mut log,
         );
         assert_eq!(error_code(&reply), ctl::CODE_INVALID_ARGUMENT);
 
@@ -292,6 +354,7 @@ mod tests {
             &trunk,
             &rvc,
             &tts,
+            &mut log,
         );
         assert_eq!(error_code(&reply), ctl::CODE_INVALID_ARGUMENT);
 
@@ -302,6 +365,7 @@ mod tests {
             &trunk,
             &rvc,
             &tts,
+            &mut log,
         );
         assert_eq!(error_code(&reply), ctl::CODE_INVALID_ARGUMENT);
 
@@ -313,13 +377,14 @@ mod tests {
             &trunk,
             &rvc,
             &tts,
+            &mut log,
         );
         assert_eq!(error_code(&reply), ctl::CODE_INVALID_ARGUMENT);
     }
 
     #[test]
     fn set_mute_roundtrip_and_rejects_bad_body() {
-        let (shared, cap, trunk, rvc, tts) = context();
+        let (shared, cap, trunk, rvc, tts, mut log) = context();
         let reply = dispatch(
             &message(ctl::PRE_SET_MUTE, br#"{"mute":true}"#),
             &shared,
@@ -327,6 +392,7 @@ mod tests {
             &trunk,
             &rvc,
             &tts,
+            &mut log,
         );
         assert_eq!(data(&reply)["mute"], true);
         let reply = dispatch(
@@ -336,6 +402,7 @@ mod tests {
             &trunk,
             &rvc,
             &tts,
+            &mut log,
         );
         assert_eq!(data(&reply)["mute"], false);
         let reply = dispatch(
@@ -345,13 +412,14 @@ mod tests {
             &trunk,
             &rvc,
             &tts,
+            &mut log,
         );
         assert_eq!(error_code(&reply), ctl::CODE_INVALID_ARGUMENT);
     }
 
     #[test]
     fn unknown_command_is_rejected() {
-        let (shared, cap, trunk, rvc, tts) = context();
+        let (shared, cap, trunk, rvc, tts, mut log) = context();
         let reply = dispatch(
             &message(ctl::DAEMON_HELLO, b"{}"),
             &shared,
@@ -359,15 +427,68 @@ mod tests {
             &trunk,
             &rvc,
             &tts,
+            &mut log,
         );
         assert_eq!(error_code(&reply), ctl::CODE_UNKNOWN_COMMAND);
+    }
+
+    /// 限频状态机（SPEC-01）：无增量不记；首次增量立即记并推进基线；
+    /// 窗口内增量被抑制、基线不动；窗口过后合并上报。
+    #[test]
+    fn drop_log_rate_limits_and_merges_deltas() {
+        fn rings(capture: u64, trunk: u64, rvc: u64, tts: u64) -> [(&'static str, u64); 4] {
+            [("capture", capture), ("trunk", trunk), ("rvc", rvc), ("tts", tts)]
+        }
+        let mut log = DropLog::new();
+        log.report(rings(0, 0, 0, 0));
+        assert!(log.last_log.is_none(), "无增量不得记日志时间");
+
+        log.report(rings(3, 0, 2, 0));
+        assert_eq!(log.last, [3, 0, 2, 0]);
+        let first = log.last_log.expect("首次增量必须立即上报");
+
+        log.report(rings(5, 1, 2, 0));
+        assert_eq!(log.last, [3, 0, 2, 0], "窗口内抑制时基线不动，增量留待合并");
+        assert_eq!(log.last_log.unwrap(), first);
+
+        // 回拨上次日志时间模拟窗口已过：合并增量一次上报。
+        log.last_log = Some(first - DROP_LOG_INTERVAL);
+        log.report(rings(5, 1, 2, 0));
+        assert_eq!(log.last, [5, 1, 2, 0]);
+        assert!(log.last_log.unwrap() > first);
+    }
+
+    /// GetStatus 把环丢帧读数交给限频上报：应答口径不变，基线随读数推进。
+    #[test]
+    fn get_status_feeds_drop_log() {
+        let (shared, cap, trunk, rvc, tts, mut log) = context();
+        // 采集环容量 2，塞 4 帧丢 2。
+        for frame_idx in 0..4 {
+            cap.push(RawFrame {
+                meta: mozart_core::FrameMeta {
+                    pts_ns: 0, frame_idx, vad_flag: 1, energy_db: 0, conf: 0, segment_id: 0,
+                },
+                pcm: [0.0; mozart_core::RAW_SAMPLES],
+            });
+        }
+        let reply = dispatch(
+            &message(ctl::PRE_GET_STATUS, b"{}"),
+            &shared,
+            &cap,
+            &trunk,
+            &rvc,
+            &tts,
+            &mut log,
+        );
+        assert_eq!(data(&reply)["frames_dropped"], 2);
+        assert_eq!(log.last, [2, 0, 0, 0]);
     }
 
     /// 文件接管握手：模拟接收线程按 file_mode 置/清 output_released，
     /// active=true 必须等握手完成才应答 ok；active=false 立即恢复。
     #[test]
     fn set_file_mode_waits_for_handshake_and_roundtrips() {
-        let (shared, cap, trunk, rvc, tts) = context();
+        let (shared, cap, trunk, rvc, tts, mut log) = context();
         let stop = Arc::new(AtomicBool::new(false));
         let watcher = {
             let shared = shared.clone();
@@ -388,6 +509,7 @@ mod tests {
             &trunk,
             &rvc,
             &tts,
+            &mut log,
         );
         assert_eq!(data(&reply)["active"], true);
         assert!(shared.file_mode());
@@ -400,6 +522,7 @@ mod tests {
             &trunk,
             &rvc,
             &tts,
+            &mut log,
         );
         assert_eq!(data(&reply)["active"], false);
         assert!(!shared.file_mode());
@@ -410,7 +533,7 @@ mod tests {
 
     #[test]
     fn set_file_mode_rejects_bad_body() {
-        let (shared, cap, trunk, rvc, tts) = context();
+        let (shared, cap, trunk, rvc, tts, mut log) = context();
         for body in [
             &b"{}"[..],
             br#"{"active":"yes"}"#,
@@ -424,6 +547,7 @@ mod tests {
                 &trunk,
                 &rvc,
                 &tts,
+                &mut log,
             );
             assert_eq!(error_code(&reply), ctl::CODE_INVALID_ARGUMENT);
             assert!(!shared.file_mode(), "坏体不得改变门控状态");
@@ -434,7 +558,7 @@ mod tests {
     /// 不留「已暂停但无文件任务」的悬空态。
     #[test]
     fn set_file_mode_timeout_rolls_back() {
-        let (shared, cap, trunk, rvc, tts) = context();
+        let (shared, cap, trunk, rvc, tts, mut log) = context();
         let reply = dispatch(
             &message(ctl::PRE_SET_FILE_MODE, br#"{"active":true}"#),
             &shared,
@@ -442,6 +566,7 @@ mod tests {
             &trunk,
             &rvc,
             &tts,
+            &mut log,
         );
         assert_eq!(error_code(&reply), ctl::CODE_NOT_READY);
         assert!(!shared.file_mode(), "超时必须回滚门控");
@@ -455,7 +580,7 @@ mod tests {
         let path: PathBuf = dir.join("pre.sock");
         let _ = std::fs::remove_file(&path);
 
-        let (shared, cap, trunk, rvc, tts) = context();
+        let (shared, cap, trunk, rvc, tts, _log) = context();
         let listener = Seqpacket::bind(&path).unwrap();
         listener.listen(4).unwrap();
         let stop: &'static AtomicBool = Box::leak(Box::new(AtomicBool::new(false)));

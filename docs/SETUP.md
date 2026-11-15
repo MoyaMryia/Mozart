@@ -11,7 +11,7 @@
 
 ## 资产两层布局
 
-原料层放待处理权重，成品层放可直接推理的整套资产。
+原料层放待处理内容，成品层放可直接推理的整套资产。
 
 | 层 | 路径 | 内容 |
 | --- | --- | --- |
@@ -68,19 +68,63 @@ HuBERT/RMVPE 所有 v2 模型共用，存于 qiqi-zh 目录，其余模型符号
 
 ## 工具链
 
-Python 脚本，居仓库 `tools/model/`，直接调用（规范见 SPEC-10）：
+Python 脚本，居仓库 `tools/model/`，直接调用，不做 CLI 封装。
+原则：**逻辑在仓库，资产在仓外，路径全部由参数或环境变量注入**，脚本不写死资产位置。
 
-- 导出 pth→onnx：`export_generator_onnx.py` 等，`--rvc-source` 指向 RVC 源码树。
-- 编译 onnx→engine：`build_dynamic_engines.py`（trtexec，须在设备上）。
-- golden 对拍：`run_reference.py`、`verify_golden.py`，`RVC_SOURCE` 环境变量必填。
+| 脚本 | 作用 |
+| --- | --- |
+| `export_generator_onnx.py` | 生成器 pth → onnx（离线，固定帧数） |
+| `export_generator_split_onnx.py` | 生成器 pth → front/decoder onnx（实时拆分） |
+| `export_hubert_onnx.py` | HuBERT base → onnx |
+| `export_rmvpe_onnx.py` | RMVPE → onnx |
+| `build_dynamic_engines.py` | onnx → engine（trtexec 包装，须在设备上） |
+| `run_reference.py` | PyTorch 参考推理，保存各模型输入张量 |
+| `verify_golden.py` | golden 对拍校验 |
+| `compare_streaming_quality.py` | 流式输出质量对比（verify_golden 调用） |
 
-RVC 源码树与归档在设备 `~/mozart-archive/`：`RVC`（导出所需源码）、`RVC_Model_Collection`（七七四语原始权重）、`rvc-trt`（FP16/FP32 基准引擎）。
+### 外部资产依赖
+
+工具链本身不含资产，运行需要以下外部输入：
+
+| 依赖 | 用于 | 传入方式 | 位置 |
+| --- | --- | --- | --- |
+| RVC 源码树 | 导出、golden | `--rvc-source` / `RVC_SOURCE` 必填 | `~/mozart-archive/RVC` |
+| HuBERT base 模型 | export_hubert、run_reference | `--hubert-path` 必填 | RVC 归档 assets |
+| RMVPE 权重 | export_rmvpe、run_reference | `--rmvpe-path` 必填 | RVC 归档 assets |
+| 目标权重 | export_generator、run_reference | 位置参数 / `--model` | `~/rvc-pth/<id>.pth` |
+| golden 参考 | run_reference、verify_golden | `--input` / `--manifest` 等必填 | 仓外 |
+
+导出依赖 PyTorch，在开发机运行；编译依赖 trtexec，在设备运行。RVC 源码树是上游实现，不是旧仓库代码。
+
+### 调用示例
+
+```bash
+# 导出离线生成器（开发机）
+python3 tools/model/export_generator_onnx.py ~/rvc-pth/qiqi-zh.pth \
+    --rvc-source ~/mozart-archive/RVC --output qiqi-zh.onnx --frames 200
+
+# 导出实时拆分生成器
+python3 tools/model/export_generator_split_onnx.py ~/rvc-pth/qiqi-zh.pth \
+    --rvc-source ~/mozart-archive/RVC \
+    --front-output qiqi-zh-front.onnx --decoder-output qiqi-zh-decoder.onnx \
+    --skip-head 250 --return-frames 30
+
+# 编译引擎（设备）
+python3 tools/model/build_dynamic_engines.py --assets <onnx目录> --feature-assets <特征onnx目录>
+
+# golden 参考与对拍
+RVC_SOURCE=~/mozart-archive/RVC python3 tools/model/run_reference.py \
+    --input in.wav --model ~/rvc-pth/qiqi-zh.pth \
+    --hubert-path <hubert_base目录> --rmvpe-path <rmvpe.pt> \
+    --output ref.wav --tensor-dir tensors --metadata reference.json
+python3 tools/model/verify_golden.py --manifest golden_manifest.json
+```
 
 ## 加新模型流程
 
 1. 权重落入 `~/rvc-pth/<id>.pth`。
-2. 导出 onnx（开发机，PyTorch）。
-3. 设备上 trtexec 编译生成器 engine。特征引擎共享，不用重编。
+2. 开发机运行导出脚本，产出 onnx。
+3. 设备上运行编译脚本，产出生成器 engine。特征引擎共享，不用重编。
 4. 成品层建 `<id>/` 目录，放 config 与生成器，登记 `[[models]]`。
 5. 测试：`file submit --model <id>`，按需 golden 对拍。
 
@@ -89,3 +133,4 @@ RVC 源码树与归档在设备 `~/mozart-archive/`：`RVC`（导出所需源码
 - 模型状态与资产布局为 2026-11-15 板端核对。模型切换经 qiqi-en、de-narrator 短文件转换实测通过。
 - asr、tts、llm 资产内容未逐项核对。
 - de-narrator 离线 engine、qiqi-en 实时资产未补齐。
+- 工具链脚本已迁入并通过语法检查；功能运行需 PyTorch 与 RVC 源码树，未在本文档环境实跑。

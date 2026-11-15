@@ -1,14 +1,16 @@
 //! 任务面（SPEC-05 播报投递）：tts-jobs.sock SEQPACKET，桥连接、TTS 绑定。
-//! 复用 core 16 字节信封 + JSON 体：TTS_JOB_SUBMIT 收译文任务，TTS_JOB_REPLY 回
-//! 受理状态 submitted/skipped/failed；TTS_JOB_STOP 推进任务代际（清队列并中止在途
-//! 合成，见 synth）。有界任务队列经 try_send 入队，队满标 skipped 并计数，不阻塞桥。
+//! 标准信封（同控制面）：TTS_JOB_SUBMIT 收译文任务，响应 type 回显请求号、体固定
+//! status/code/reason/data，受理结果 submitted/skipped/failed 映射 ok/Ok、error/Busy、
+//! error，utterance_id 放 data；TTS_JOB_STOP 推进任务代际（清队列并中止在途合成，见
+//! synth）。有界任务队列经 try_send 入队，队满标 skipped 并计数，不阻塞桥。
 //! 桥持一条长连接投递，speech stop 另开短连接下发停止，故逐连接并发服务。
 //! v1 单目标音色（配置参考 WAV），voice_params 仅校验不生效。
 
 use crate::control::{ACCEPT_POLL, RECV_POLL};
 use crate::state::Shared;
+use mozart_core::ctl::schema::{error_body, ok_body, Response};
 use mozart_core::ctl::{self, Message, Seqpacket};
-use serde::{Deserialize, Serialize};
+use serde::Deserialize;
 use serde_json::{json, Value};
 use std::io;
 use std::sync::atomic::{AtomicBool, Ordering::Relaxed};
@@ -37,36 +39,17 @@ pub struct JobRequest {
     pub voice_params: Option<Value>,
 }
 
-/// 受理状态，沿用旧语义：submitted 已入队 / skipped 队满 / failed 请求无效或无法入队。
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "lowercase")]
-pub enum JobStatus {
-    Submitted,
-    Skipped,
-    Failed,
-}
-
-/// TTS_JOB_REPLY 应答体。
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
-pub struct JobReply {
-    pub status: JobStatus,
-    pub utterance_id: String,
-    #[serde(skip_serializing_if = "Option::is_none", default)]
-    pub reason: Option<String>,
-}
-
-impl JobReply {
-    pub fn failed(utterance_id: &str, reason: &str) -> Self {
-        Self {
-            status: JobStatus::Failed,
-            utterance_id: utterance_id.to_string(),
-            reason: Some(reason.to_string()),
-        }
-    }
-
-    pub fn to_bytes(&self) -> Vec<u8> {
-        serde_json::to_vec(self).expect("job reply is JSON-serializable")
-    }
+/// 受理拒绝应答（标准 error 信封）：utterance_id 放 data 供桥对账。
+/// 受理三态映射：submitted→ok/Ok（ok_body）、队满 skipped→error/Busy、
+/// 请求无效或无法入队 failed→error/InvalidArgument 或 Internal。
+fn submit_error(code: &str, reason: &str, utterance_id: &str) -> Vec<u8> {
+    serde_json::to_vec(&Response {
+        status: "error".to_string(),
+        code: code.to_string(),
+        reason: reason.to_string(),
+        data: json!({ "utterance_id": utterance_id }),
+    })
+    .expect("job reply is JSON-serializable")
 }
 
 /// 入口校验一次：请求体 JSON 结构与必填字段。内部函数信任校验结果。
@@ -149,58 +132,50 @@ fn serve_connection(conn: &Seqpacket, tasks: &SyncSender<Job>, shared: &Shared, 
             }
         };
         let request_id = msg.header.request_id;
+        let type_ = msg.header.type_;
         let reply = dispatch(&msg, tasks, shared);
-        if conn.send(ctl::TTS_JOB_REPLY, request_id, &reply).is_err() {
+        // 标准信封：响应 type 回显请求号。
+        if conn.send(type_, request_id, &reply).is_err() {
             return;
         }
     }
 }
 
-/// 命令分发：TTS_JOB_SUBMIT 入队（受理状态决定应答）；TTS_JOB_STOP 推进任务代际
-/// （在途合成中止、在队任务由 synth 线程清空），应答 {"stopped":true}。
+/// 命令分发：TTS_JOB_SUBMIT 入队（受理结果决定应答）；TTS_JOB_STOP 推进任务代际
+/// （在途合成中止、在队任务由 synth 线程清空），应答 data {"stopped":true}。
 pub fn dispatch(msg: &Message, tasks: &SyncSender<Job>, shared: &Shared) -> Vec<u8> {
     match msg.header.type_ {
         ctl::TTS_JOB_SUBMIT => dispatch_submit(msg, tasks, shared),
         ctl::TTS_JOB_STOP => {
             // 入口校验一次：停止体为空或 {}。
             if !msg.body.is_empty() && msg.body != b"{}" {
-                return JobReply::failed("", "invalid stop body").to_bytes();
+                return error_body(ctl::CODE_INVALID_ARGUMENT, "invalid stop body");
             }
             shared.stop_jobs();
-            serde_json::to_vec(&json!({ "stopped": true })).expect("stop reply is JSON-serializable")
+            ok_body(json!({ "stopped": true }))
         }
-        _ => JobReply::failed("", "unknown command").to_bytes(),
+        _ => error_body(ctl::CODE_UNKNOWN_COMMAND, "unknown command"),
     }
 }
 
-/// TTS_JOB_SUBMIT：入队结果决定受理状态。
+/// TTS_JOB_SUBMIT：入队结果决定受理应答（标准信封，utterance_id 放 data）。
 fn dispatch_submit(msg: &Message, tasks: &SyncSender<Job>, shared: &Shared) -> Vec<u8> {
     let job = match parse_request(&msg.body) {
         Ok(job) => job,
-        Err(reason) => return JobReply::failed("", &reason).to_bytes(),
+        Err(reason) => return submit_error(ctl::CODE_INVALID_ARGUMENT, &reason, ""),
     };
     let utterance_id = job.utterance_id.clone();
     shared.queue_push();
     match tasks.try_send(job) {
-        Ok(()) => JobReply {
-            status: JobStatus::Submitted,
-            utterance_id,
-            reason: None,
-        }
-        .to_bytes(),
+        Ok(()) => ok_body(json!({ "utterance_id": utterance_id })),
         Err(TrySendError::Full(_)) => {
             shared.queue_pop();
             shared.add_skipped(1);
-            JobReply {
-                status: JobStatus::Skipped,
-                utterance_id,
-                reason: Some("queue full".to_string()),
-            }
-            .to_bytes()
+            submit_error(ctl::CODE_BUSY, "queue full", &utterance_id)
         }
         Err(TrySendError::Disconnected(_)) => {
             shared.queue_pop();
-            JobReply::failed(&utterance_id, "synth worker stopped").to_bytes()
+            submit_error(ctl::CODE_INTERNAL, "synth worker stopped", &utterance_id)
         }
     }
 }
@@ -226,7 +201,7 @@ mod tests {
         }
     }
 
-    fn reply_of(bytes: &[u8]) -> JobReply {
+    fn reply_of(bytes: &[u8]) -> Response {
         serde_json::from_slice(bytes).unwrap()
     }
 
@@ -259,27 +234,16 @@ mod tests {
     }
 
     #[test]
-    fn reply_serialization_omits_absent_reason() {
-        let reply = JobReply {
-            status: JobStatus::Submitted,
-            utterance_id: "ab12:1".to_string(),
-            reason: None,
-        };
-        let value: Value = serde_json::from_slice(&reply.to_bytes()).unwrap();
-        assert_eq!(value["status"], "submitted");
-        assert_eq!(value["utterance_id"], "ab12:1");
-        assert!(value.get("reason").is_none());
-        // 三态序列化稳定。
-        for (status, text) in [
-            (JobStatus::Submitted, "submitted"),
-            (JobStatus::Skipped, "skipped"),
-            (JobStatus::Failed, "failed"),
-        ] {
-            let reply = JobReply { status, utterance_id: String::new(), reason: None };
-            let back: JobReply = serde_json::from_slice(&reply.to_bytes()).unwrap();
-            assert_eq!(back, reply);
-            assert_eq!(serde_json::to_value(&back).unwrap()["status"], text);
-        }
+    fn submit_reply_is_standard_envelope() {
+        let (tx, _rx) = mpsc::sync_channel(1);
+        let shared = Shared::new();
+        let body = br#"{"text":"Hi","utterance_id":"ab12:1"}"#;
+        let reply = reply_of(&dispatch(&submit(body), &tx, &shared));
+        // 体固定 status/code/reason/data，utterance_id 放 data。
+        assert_eq!(reply.status, "ok");
+        assert_eq!(reply.code, ctl::CODE_OK);
+        assert_eq!(reply.reason, "");
+        assert_eq!(reply.data["utterance_id"], "ab12:1");
     }
 
     #[test]
@@ -288,9 +252,10 @@ mod tests {
         let shared = Shared::new();
         let body = br#"{"text":"Hello","utterance_id":"ab12:1"}"#;
         let reply = reply_of(&dispatch(&submit(body), &tx, &shared));
-        assert_eq!(reply.status, JobStatus::Submitted);
-        assert_eq!(reply.utterance_id, "ab12:1");
-        assert_eq!(reply.reason, None);
+        assert_eq!(reply.status, "ok");
+        assert_eq!(reply.code, ctl::CODE_OK);
+        assert_eq!(reply.data["utterance_id"], "ab12:1");
+        assert_eq!(reply.reason, "");
         assert_eq!(shared.status().queue_depth, 1);
         let job = rx.try_recv().unwrap();
         assert_eq!(job.text, "Hello");
@@ -301,19 +266,20 @@ mod tests {
         let (tx, rx) = mpsc::sync_channel(1);
         let shared = Shared::new();
         let body = br#"{"text":"first","utterance_id":"ab12:1"}"#;
-        assert_eq!(reply_of(&dispatch(&submit(body), &tx, &shared)).status, JobStatus::Submitted);
+        assert_eq!(reply_of(&dispatch(&submit(body), &tx, &shared)).status, "ok");
         let body = br#"{"text":"second","utterance_id":"ab12:2"}"#;
         let reply = reply_of(&dispatch(&submit(body), &tx, &shared));
-        assert_eq!(reply.status, JobStatus::Skipped);
-        assert_eq!(reply.utterance_id, "ab12:2");
-        assert_eq!(reply.reason.as_deref(), Some("queue full"));
+        assert_eq!(reply.status, "error");
+        assert_eq!(reply.code, ctl::CODE_BUSY);
+        assert_eq!(reply.data["utterance_id"], "ab12:2");
+        assert_eq!(reply.reason, "queue full");
         let status = shared.status();
         assert_eq!(status.skipped, 1);
         assert_eq!(status.queue_depth, 1);
         // 出队后可再入队。
         rx.try_recv().unwrap();
         shared.queue_pop();
-        assert_eq!(reply_of(&dispatch(&submit(body), &tx, &shared)).status, JobStatus::Submitted);
+        assert_eq!(reply_of(&dispatch(&submit(body), &tx, &shared)).status, "ok");
     }
 
     #[test]
@@ -321,8 +287,9 @@ mod tests {
         let (tx, rx) = mpsc::sync_channel(1);
         let shared = Shared::new();
         let reply = reply_of(&dispatch(&submit(b"{}"), &tx, &shared));
-        assert_eq!(reply.status, JobStatus::Failed);
-        assert!(reply.reason.is_some());
+        assert_eq!(reply.status, "error");
+        assert_eq!(reply.code, ctl::CODE_INVALID_ARGUMENT);
+        assert!(!reply.reason.is_empty());
         assert_eq!(shared.status().queue_depth, 0);
         assert!(rx.try_recv().is_err());
     }
@@ -336,8 +303,9 @@ mod tests {
             body: Vec::new(),
         };
         let reply = reply_of(&dispatch(&msg, &tx, &shared));
-        assert_eq!(reply.status, JobStatus::Failed);
-        assert_eq!(reply.reason.as_deref(), Some("unknown command"));
+        assert_eq!(reply.status, "error");
+        assert_eq!(reply.code, ctl::CODE_UNKNOWN_COMMAND);
+        assert_eq!(reply.reason, "unknown command");
     }
 
     #[test]
@@ -347,8 +315,10 @@ mod tests {
         let shared = Shared::new();
         let body = br#"{"text":"Hello","utterance_id":"ab12:1"}"#;
         let reply = reply_of(&dispatch(&submit(body), &tx, &shared));
-        assert_eq!(reply.status, JobStatus::Failed);
-        assert_eq!(reply.reason.as_deref(), Some("synth worker stopped"));
+        assert_eq!(reply.status, "error");
+        assert_eq!(reply.code, ctl::CODE_INTERNAL);
+        assert_eq!(reply.reason, "synth worker stopped");
+        assert_eq!(reply.data["utterance_id"], "ab12:1");
         assert_eq!(shared.status().queue_depth, 0);
     }
 
@@ -358,9 +328,9 @@ mod tests {
         let shared = Shared::new();
         assert_eq!(shared.job_epoch(), 0);
         for body in [&b""[..], &b"{}"[..]] {
-            let reply = dispatch(&stop(body), &tx, &shared);
-            let value: Value = serde_json::from_slice(&reply).unwrap();
-            assert_eq!(value["stopped"], true);
+            let reply = reply_of(&dispatch(&stop(body), &tx, &shared));
+            assert_eq!(reply.status, "ok");
+            assert_eq!(reply.data["stopped"], true);
         }
         assert_eq!(shared.job_epoch(), 2, "每次停止推进一代");
     }
@@ -370,8 +340,9 @@ mod tests {
         let (tx, _rx) = mpsc::sync_channel::<Job>(1);
         let shared = Shared::new();
         let reply = reply_of(&dispatch(&stop(b"{\"x\":1}"), &tx, &shared));
-        assert_eq!(reply.status, JobStatus::Failed);
-        assert_eq!(reply.reason.as_deref(), Some("invalid stop body"));
+        assert_eq!(reply.status, "error");
+        assert_eq!(reply.code, ctl::CODE_INVALID_ARGUMENT);
+        assert_eq!(reply.reason, "invalid stop body");
         assert_eq!(shared.job_epoch(), 0, "坏体不得推进代际");
     }
 
@@ -398,9 +369,10 @@ mod tests {
         stop_conn.send(ctl::TTS_JOB_STOP, 1, b"").unwrap();
         let reply = stop_conn.recv(Some(Duration::from_secs(2))).unwrap();
         let reply_type = reply.header.type_;
-        assert_eq!(reply_type, ctl::TTS_JOB_REPLY);
+        assert_eq!(reply_type, ctl::TTS_JOB_STOP);
         let body: Value = serde_json::from_slice(&reply.body).unwrap();
-        assert_eq!(body["stopped"], true);
+        assert_eq!(body["status"], "ok");
+        assert_eq!(body["data"]["stopped"], true);
         assert_eq!(shared.job_epoch(), 1);
 
         stop.store(true, Relaxed);

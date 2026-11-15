@@ -90,14 +90,14 @@ fn get_status(conn: &Seqpacket) -> Value {
     call_ok(conn, ctl::TTS_GET_STATUS, 1)
 }
 
-/// 任务面提交：回 TTS_JOB_REPLY 的 JSON 体，校验命令号与 request_id 回显。
+/// 任务面提交：回标准信封（type 回显请求号），校验命令号与 request_id 回显。
 fn submit_job(conn: &Seqpacket, request_id: u32, body: &Value) -> Value {
     let bytes = serde_json::to_vec(body).unwrap();
     conn.send(ctl::TTS_JOB_SUBMIT, request_id, &bytes).unwrap();
     let reply = conn.recv(Some(Duration::from_secs(2))).unwrap();
     let reply_type = reply.header.type_;
     let reply_request = reply.header.request_id;
-    assert_eq!(reply_type, ctl::TTS_JOB_REPLY);
+    assert_eq!(reply_type, ctl::TTS_JOB_SUBMIT);
     assert_eq!(reply_request, request_id);
     serde_json::from_slice(&reply.body).expect("受理应答是 JSON")
 }
@@ -190,9 +190,9 @@ fn job_submit_reply_and_output_frames() {
         42,
         &json!({"text": "Hello world", "utterance_id": "ab12cd34:1"}),
     );
-    assert_eq!(reply["status"], "submitted");
-    assert_eq!(reply["utterance_id"], "ab12cd34:1");
-    assert!(reply.get("reason").is_none());
+    assert_eq!(reply["status"], "ok");
+    assert_eq!(reply["code"], ctl::CODE_OK);
+    assert_eq!(reply["data"]["utterance_id"], "ab12cd34:1");
 
     // stub 合成 0.1 s @ 24 kHz → 4800 samples @ 48 kHz → 恰 5 契约帧。
     wait_until("合成完成", Duration::from_secs(5), || {
@@ -245,13 +245,13 @@ fn queue_full_burst_conserves_jobs() {
             idx,
             &json!({"text": "Burst sentence", "utterance_id": format!("ab12cd34:{}", idx + 1)}),
         );
-        match reply["status"].as_str().unwrap() {
-            "submitted" => submitted += 1,
-            "skipped" => {
+        match reply["code"].as_str().unwrap() {
+            ctl::CODE_OK => submitted += 1,
+            ctl::CODE_BUSY => {
                 skipped += 1;
                 assert_eq!(reply["reason"], "queue full");
             }
-            other => panic!("意外受理状态：{other}"),
+            other => panic!("意外受理码：{other}"),
         }
     }
     assert!(skipped > 0, "容量 1 突发 {BURST} 句应有队满拒收");
@@ -291,16 +291,18 @@ fn invalid_jobs_reply_failed_and_process_continues() {
     ];
     for (idx, body) in bad_bodies.iter().enumerate() {
         let reply = submit_job(&jobs, idx as u32, body);
-        assert_eq!(reply["status"], "failed", "body: {body}");
-        assert!(reply["reason"].as_str().is_some());
+        assert_eq!(reply["status"], "error", "body: {body}");
+        assert_eq!(reply["code"], ctl::CODE_INVALID_ARGUMENT);
+        assert!(!reply["reason"].as_str().unwrap().is_empty());
     }
-    // 未知命令号同样回 failed。
+    // 未知命令号同样回 error，type 回显请求号。
     jobs.send(ctl::TTS_HELLO, 99, b"").unwrap();
     let reply = jobs.recv(Some(Duration::from_secs(2))).unwrap();
     let reply_type = reply.header.type_;
-    assert_eq!(reply_type, ctl::TTS_JOB_REPLY);
+    assert_eq!(reply_type, ctl::TTS_HELLO);
     let body: Value = serde_json::from_slice(&reply.body).unwrap();
-    assert_eq!(body["status"], "failed");
+    assert_eq!(body["status"], "error");
+    assert_eq!(body["code"], ctl::CODE_UNKNOWN_COMMAND);
 
     // 无效请求不入队：后续合法任务正常受理。
     let reply = submit_job(
@@ -308,7 +310,7 @@ fn invalid_jobs_reply_failed_and_process_continues() {
         100,
         &json!({"text": "Still alive", "utterance_id": "x:2"}),
     );
-    assert_eq!(reply["status"], "submitted");
+    assert_eq!(reply["status"], "ok");
     wait_until("合法任务合成", Duration::from_secs(5), || {
         get_status(&control)["synthesized"] == 1
     });
@@ -354,7 +356,7 @@ fn reference_wav_loads_at_startup() {
         1,
         &json!({"text": "With reference", "utterance_id": "wav:1"}),
     );
-    assert_eq!(reply["status"], "submitted");
+    assert_eq!(reply["status"], "ok");
     wait_until("合成完成", Duration::from_secs(5), || {
         get_status(&control)["synthesized"] == 1
     });

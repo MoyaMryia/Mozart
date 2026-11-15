@@ -5,8 +5,8 @@
 //! 队满丢最旧在入队侧计数（Queues::push_speech）。
 
 use crate::state::{Queues, Shared, SpeechJob};
+use mozart_core::ctl::schema::Response;
 use mozart_core::ctl::{self, Seqpacket};
-use serde::Deserialize;
 use serde_json::json;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering::Relaxed};
@@ -29,21 +29,12 @@ const IO_TIMEOUT: Duration = Duration::from_millis(500);
 /// 重连重试的停止检查步长。
 const STOP_CHECK: Duration = Duration::from_millis(50);
 
-/// TTS 受理状态（沿用旧语义）。
+/// TTS 受理状态（沿用旧语义）：由标准信封的 status/code 映射。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum JobStatus {
     Submitted,
     Skipped,
     Failed,
-}
-
-/// TTS_JOB_REPLY 应答体：status 必填，其余字段忽略。
-#[derive(Debug, Deserialize)]
-struct ReplyBody {
-    status: String,
-    utterance_id: String,
-    #[serde(default)]
-    reason: Option<String>,
 }
 
 /// 投递线程主循环：停止标志置位后退出，在途请求随连接丢弃。
@@ -114,7 +105,7 @@ pub fn run(
     Ok(())
 }
 
-/// 发一条任务并等受理应答；入口校验应答类型、句编号与状态取值。
+/// 发一条任务并等受理应答；入口校验应答类型（回显请求号）、句编号与状态取值。
 fn submit(conn: &Seqpacket, request_id: u32, job: &SpeechJob) -> Result<JobStatus, String> {
     let body = serde_json::to_vec(&json!({
         "text": job.text,
@@ -127,23 +118,22 @@ fn submit(conn: &Seqpacket, request_id: u32, job: &SpeechJob) -> Result<JobStatu
         .recv(Some(IO_TIMEOUT))
         .map_err(|err| format!("recv：{err}"))?;
     let reply_type = reply.header.type_;
-    if reply_type != ctl::TTS_JOB_REPLY {
+    if reply_type != ctl::TTS_JOB_SUBMIT {
         return Err(format!("unexpected reply type 0x{reply_type:04x}"));
     }
-    let parsed: ReplyBody =
+    let parsed: Response =
         serde_json::from_slice(&reply.body).map_err(|err| format!("invalid reply JSON: {err}"))?;
-    if parsed.utterance_id != job.utterance_id {
-        return Err(format!(
-            "reply utterance_id mismatch: {}",
-            parsed.utterance_id
-        ));
+    let utterance_id = parsed.data["utterance_id"].as_str().unwrap_or("");
+    if utterance_id != job.utterance_id {
+        return Err(format!("reply utterance_id mismatch: {utterance_id}"));
     }
+    // 受理三态映射：ok→submitted，error/Busy→skipped（队满），其余 error→failed。
     match parsed.status.as_str() {
-        "submitted" => Ok(JobStatus::Submitted),
-        "skipped" => Ok(JobStatus::Skipped),
-        "failed" => {
-            if let Some(reason) = &parsed.reason {
-                eprintln!("mozart-bridge: tts failed {}：{reason}", job.utterance_id);
+        "ok" => Ok(JobStatus::Submitted),
+        "error" if parsed.code == ctl::CODE_BUSY => Ok(JobStatus::Skipped),
+        "error" => {
+            if !parsed.reason.is_empty() {
+                eprintln!("mozart-bridge: tts failed {}：{}", job.utterance_id, parsed.reason);
             }
             Ok(JobStatus::Failed)
         }

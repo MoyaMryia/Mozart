@@ -3,11 +3,13 @@
 //! broadcast 且播报帧计数增长，停喂后 holdoff 200 ms 恢复 realtime。
 //! 路由选源与 holdoff 的逐分支时序由 playback 单元测试钉住；本用例验证
 //! socket → 接收环 → 播放线程 → 状态上报的端到端接线。
+//! 另含锁文件防重复实例用例（SPEC-02）：同 run_dir 第二实例必须失败退出。
 
 use mozart_core::ctl::{self, Seqpacket};
 use mozart_core::dgram::FrameSocket;
 use mozart_core::{FrameMeta, OutputFrame, OUTPUT_SAMPLES};
 use serde_json::Value;
+use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, ExitStatus};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering::Relaxed};
@@ -170,5 +172,45 @@ fn broadcast_priority_and_holdoff_recovery() {
     sigterm(&child.0);
     let status = wait_exit(&mut child.0, Duration::from_secs(2));
     assert!(status.success(), "退出状态：{status}");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// 锁文件防重复实例（SPEC-02）：同 run_dir 的第二实例必须立即失败退出，
+/// 错误信息指明已有实例；首实例不受影响。
+#[test]
+fn second_instance_rejected_by_lock_file() {
+    let dir = run_dir("lock");
+    let mut first = spawn_pre(&dir);
+    wait_sockets(&dir);
+
+    let mut second = Command::new(env!("CARGO_BIN_EXE_mozart-pre"))
+        .arg("--socket")
+        .arg(dir.join("pre.sock"))
+        .arg("--config")
+        .arg(dir.join("mozart.toml"))
+        .env_remove("MOZART_CONFIG")
+        .env_remove("MOZART_RUN_DIR")
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .expect("启动第二实例");
+    let status = wait_exit(&mut second, Duration::from_secs(2));
+    assert!(!status.success(), "第二实例必须失败退出：{status}");
+    let mut stderr = String::new();
+    second
+        .stderr
+        .take()
+        .unwrap()
+        .read_to_string(&mut stderr)
+        .unwrap();
+    assert!(
+        stderr.contains("pre already running"),
+        "错误信息必须指明已有实例：{stderr}"
+    );
+
+    // 首实例不受影响：控制面仍可用，SIGTERM 正常退出。
+    let control = Seqpacket::connect(&dir.join("pre.sock")).unwrap();
+    assert_eq!(get_status(&control)["speaker_state"], "realtime");
+    sigterm(&first.0);
+    assert!(wait_exit(&mut first.0, Duration::from_secs(2)).success());
     let _ = std::fs::remove_dir_all(&dir);
 }

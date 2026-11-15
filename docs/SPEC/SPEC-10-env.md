@@ -35,7 +35,8 @@ Python 脚本，居 `tools/model/`，直接调用。导出依赖 PyTorch，不�
 
 - [x] 导出 pth→onnx：`export_generator_onnx.py`、`export_generator_split_onnx.py`、`export_hubert_onnx.py`、`export_rmvpe_onnx.py`。`--rvc-source` 必填，指向 RVC 源码树。
 - [x] 编译 onnx→engine：`build_dynamic_engines.py`。trtexec 须在目标设备执行，引擎绑设备。
-- [x] golden 对拍：`run_reference.py`、`verify_golden.py`。`RVC_SOURCE` 环境变量必填。
+- [x] golden 对拍：`run_reference.py`、`verify_golden.py`、`compare_streaming_quality.py`。`RVC_SOURCE` 环境变量必填。
+- [x] 资产路径全部参数化：RVC 源码树（`--rvc-source`/`RVC_SOURCE`）、基础特征模型（`--hubert-path`/`--rmvpe-path`）、目标权重、golden 参考均由调用方注入，脚本不写死。外部依赖清单见 [SETUP](../SETUP.md)。
 
 每模型只需编译自己的生成器（离线 1 个，实时再加 front/decoder 2 个）。特征引擎编译一次共享。
 

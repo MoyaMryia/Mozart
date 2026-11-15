@@ -3,6 +3,7 @@
 //! 验证字幕落盘、启动号校验与重连、开关命令与状态文件恢复、翻译调度与播报投递、
 //! SIGTERM 收尾。
 
+use mozart_core::ctl::schema::Response;
 use mozart_core::ctl::{self, Seqpacket};
 use serde_json::{json, Value};
 use std::io::{self, Read, Write};
@@ -729,9 +730,21 @@ impl MockTts {
                 assert_eq!(msg_type, ctl::TTS_JOB_SUBMIT);
                 let body: Value = serde_json::from_slice(&msg.body).expect("任务体是 JSON");
                 let utterance_id = body["utterance_id"].as_str().expect("utterance_id");
-                let reply = json!({ "status": status, "utterance_id": utterance_id });
+                // 标准信封：受理三态映射 ok/Ok、error/Busy、error，utterance_id 放 data。
+                let (reply_status, code, reason) = match status {
+                    "submitted" => ("ok", ctl::CODE_OK, ""),
+                    "skipped" => ("error", ctl::CODE_BUSY, "queue full"),
+                    "failed" => ("error", ctl::CODE_INTERNAL, "synth worker stopped"),
+                    other => panic!("未知受理状态：{other}"),
+                };
+                let reply = Response {
+                    status: reply_status.to_string(),
+                    code: code.to_string(),
+                    reason: reason.to_string(),
+                    data: json!({ "utterance_id": utterance_id }),
+                };
                 recorded.lock().unwrap().push(body);
-                conn.send(ctl::TTS_JOB_REPLY, request_id, &serde_json::to_vec(&reply).unwrap())
+                conn.send(msg_type, request_id, &serde_json::to_vec(&reply).unwrap())
                     .expect("回受理");
             }
             loop {

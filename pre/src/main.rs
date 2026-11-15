@@ -24,13 +24,14 @@ mod route;
 mod state;
 
 use alsa::Direction;
-use mozart_core::config::Config;
+use mozart_core::config::{ensure_run_dir, Config};
 use mozart_core::dgram::FrameSocket;
 use mozart_core::ring::Ring;
 use mozart_core::thread::{bind_socket as bind_control_socket, guard_panic, spawn_thread};
 use mozart_core::{OutputFrame, RawFrame};
 use state::Shared;
-use std::io::Read;
+use std::fs::{File, OpenOptions};
+use std::io::{self, Read};
 use std::path::PathBuf;
 use std::process::ExitCode;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -162,6 +163,27 @@ fn join_threads(handles: Vec<(&'static str, JoinHandle<Result<(), String>>)>) ->
     mozart_core::thread::join_threads(&STOP, handles)
 }
 
+/// run_dir/pre.lock 独占锁（SPEC-02）：与 daemon 的 daemon.lock 同一模式。
+/// File 存活期间持锁，进程退出（含崩溃）由内核释放；不删锁文件，避免删除后
+/// 新 inode 让第三实例拿到锁的竞态。
+fn lock_instance(config: &Config) -> io::Result<File> {
+    ensure_run_dir(&config.daemon.run_dir).map_err(|err| {
+        io::Error::new(
+            err.kind(),
+            format!("prepare {}: {err}", config.daemon.run_dir.display()),
+        )
+    })?;
+    let path = config.daemon.run_dir.join("pre.lock");
+    let file = OpenOptions::new().create(true).write(true).open(&path)?;
+    file.try_lock().map_err(|err| match err {
+        std::fs::TryLockError::WouldBlock => {
+            io::Error::new(io::ErrorKind::AddrInUse, "pre already running")
+        }
+        std::fs::TryLockError::Error(source) => source,
+    })?;
+    Ok(file)
+}
+
 fn main() -> ExitCode {
     let args = match parse_args() {
         Ok(args) => args,
@@ -174,6 +196,16 @@ fn main() -> ExitCode {
     // 入口校验一次：[pre] 设备名与队列容量在 Config::load 内完成。
     let config = match Config::load(args.config.as_deref()) {
         Ok(config) => config,
+        Err(err) => {
+            eprintln!("mozart-pre: {err}");
+            return ExitCode::FAILURE;
+        }
+    };
+
+    // 锁文件防重复实例（SPEC-02）：先于 socket 绑定与 ALSA 打开拿锁，
+    // 拿不到说明已有实例在跑，报错退出；锁持有到进程退出。
+    let _lock = match lock_instance(&config) {
+        Ok(lock) => lock,
         Err(err) => {
             eprintln!("mozart-pre: {err}");
             return ExitCode::FAILURE;
@@ -395,6 +427,27 @@ mod tests {
     /// 本模块两条用例都操纵全局 STOP，用互斥锁串行：并行置位会让
     /// "正常退出不得置停止标志"的断言观察到对方线程的置位，必然竞态失败。
     static STOP_TEST_MUTEX: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    /// 锁文件防重复实例（SPEC-02）：持锁期间第二把锁必须失败（AddrInUse），
+    /// 释放后可再拿——进程退出由内核释放锁，此处用 drop 模拟。
+    #[test]
+    fn lock_file_rejects_second_instance() {
+        let dir = std::env::temp_dir().join(format!("mozart-pre-lock-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let mut config = Config::default();
+        config.daemon.run_dir = dir.clone();
+
+        let lock = lock_instance(&config).expect("首实例必须拿到锁");
+        let err = lock_instance(&config).expect_err("持锁期间第二实例必须失败");
+        assert_eq!(err.kind(), io::ErrorKind::AddrInUse);
+        assert!(
+            err.to_string().contains("pre already running"),
+            "错误信息必须指明已有实例：{err}"
+        );
+        drop(lock);
+        lock_instance(&config).expect("锁释放后必须可再拿");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 
     /// 线程返回 Err（致命设备错误、无进展降级）必须置停止标志，其余线程据此
     /// 退出、主线程得以收尾（审查修正点）；正常退出不得置。

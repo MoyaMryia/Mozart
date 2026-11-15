@@ -431,14 +431,15 @@ int main() {
               && reply.reason.rfind("model load failed", 0) == 0,
               "registry path reaches ModelManager without models_dir precheck");
 
-        // 注册表与 models_dir 皆空：明确报错，不静默成功。
+        // 注册表与 models_dir 皆空：模型不存在，归 NotFound（请求错误），
+        // 与引擎加载失败区分，不静默成功。
         StreamSession empty(std::make_unique<InferenceBackend>(
             InferenceBackendConfig{}));
         const Reply none = parse_reply(empty.handle(make_message(
             MOZART_CTL_RVC_LOAD_MODEL, {{"model_id", "qiqi"}})));
-        CHECK(none.status == "error"
-              && none.reason.rfind("model load failed", 0) == 0,
-              "empty registry and models_dir fail with a reason");
+        CHECK(none.code == MOZART_CTL_CODE_INVALID_ARGUMENT
+              && none.reason.rfind("model not found", 0) == 0,
+              "unknown model maps to NotFound/InvalidArgument");
         std::filesystem::remove_all(dir);
     }
 

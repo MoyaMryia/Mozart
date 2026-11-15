@@ -665,8 +665,21 @@ fn reconcile(
         (state.route_active(), state.mute(), state.gpu_owner())
     };
 
+    // 文件任务持有 GPU 时 rvc 流归文件数据面，实时对账不得停/起流；
+    // pre 路由/静音仍按 active（direct）对账。
+    let file_gpu = gpu_owner == Some(Activity::File);
+
+    // rvc 方向与 switch_rvc 同序：先确保实时流在跑，再让 pre 切到 rvc。
+    // 双偏（rvc 重启 + pre 路由偏）时先切路由，起流窗口内 pre 发往 rvc
+    // 的帧会丢。流未就绪本轮不切 rvc 路由，下一轮重试。
+    let rvc_route_ready = if file_gpu || active != Route::Rvc {
+        true
+    } else {
+        ensure_realtime_stream(services, config, rvc_status, degraded)
+    };
+
     if let Some(status) = pre_status {
-        if status.route != active {
+        if status.route != active && rvc_route_ready {
             if let Err(err) = set_pre_route(services, active) {
                 degraded.push(format!("pre route apply: {}", err.describe()));
             }
@@ -678,33 +691,43 @@ fn reconcile(
         }
     }
 
-    // 文件任务持有 GPU 时 rvc 流归文件数据面，实时对账不得停/起流；
-    // pre 路由/静音仍按 active（direct）对账。
-    if gpu_owner == Some(Activity::File) {
-        return;
-    }
-
-    if let Some(status) = rvc_status {
-        match active {
-            Route::Rvc => match resolve_model_id(config, status) {
-                Ok(model_id) => {
-                    if !realtime_stream_matches(status, &model_id) {
-                        if let Err(err) = start_rvc_stream(services, config, &model_id) {
-                            degraded.push(format!("rvc stream apply: {}", err.describe()));
-                        }
-                    }
-                }
-                Err((code, reason)) => {
-                    degraded.push(format!("rvc stream apply: {code}: {reason}"));
-                }
-            },
-            Route::Direct => {
-                if status.state == "streaming" {
-                    if let Err(err) = stop_rvc_stream(services) {
-                        degraded.push(format!("rvc stream stop: {}", err.describe()));
-                    }
+    if !file_gpu && active == Route::Direct {
+        if let Some(status) = rvc_status {
+            if status.state == "streaming" {
+                if let Err(err) = stop_rvc_stream(services) {
+                    degraded.push(format!("rvc stream stop: {}", err.describe()));
                 }
             }
+        }
+    }
+}
+
+/// 实时流是否已按期望就绪：已在跑或本轮起流成功为 true。
+/// rvc 缺席、模型不可解析或起流失败为 false，原因记入 degraded。
+fn ensure_realtime_stream(
+    services: &Services,
+    config: &Config,
+    status: Option<&RvcStatus>,
+    degraded: &mut Vec<String>,
+) -> bool {
+    let Some(status) = status else {
+        return false;
+    };
+    let model_id = match resolve_model_id(config, status) {
+        Ok(model_id) => model_id,
+        Err((code, reason)) => {
+            degraded.push(format!("rvc stream apply: {code}: {reason}"));
+            return false;
+        }
+    };
+    if realtime_stream_matches(status, &model_id) {
+        return true;
+    }
+    match start_rvc_stream(services, config, &model_id) {
+        Ok(()) => true,
+        Err(err) => {
+            degraded.push(format!("rvc stream apply: {}", err.describe()));
+            false
         }
     }
 }

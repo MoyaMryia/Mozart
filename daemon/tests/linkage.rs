@@ -76,6 +76,113 @@ fn reapplies_route_and_stream_after_restart() {
     );
 }
 
+/// 双偏对账次序（SPEC-04 路由执行顺序）：rvc 与 pre 同时重启后，对账必须与
+/// switch_rvc 同序——先起流再让 pre 切到 rvc，否则起流窗口内 pre 发往 rvc 的
+/// 帧丢失。桩经 MOZART_STUB_LOG 记录命令，断言每轮重启后第一条 realtime
+/// StartStream 先于第一条 SetRoute(rvc)。
+#[test]
+fn reconcile_rvc_starts_stream_before_route_after_double_restart() {
+    let dir = std::env::temp_dir().join(format!("mozart-reconcile-order-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let log = dir.join("commands.log");
+
+    // wrapper 给 pre/rvc 桩注入命令日志旋钮（其余桩不记录）。
+    let pre_wrapper = dir.join("pre.sh");
+    let rvc_wrapper = dir.join("rvc.sh");
+    for (script, stub) in [(&pre_wrapper, "pre_stub"), (&rvc_wrapper, "rvc_stub")] {
+        std::fs::write(
+            script,
+            format!(
+                "#!/bin/sh\nMOZART_STUB_LOG='{}' exec '{}' \"$@\"\n",
+                log.display(),
+                example(stub).display()
+            ),
+        )
+        .unwrap();
+        let mut perms = std::fs::metadata(script).unwrap().permissions();
+        perms.set_mode(0o755);
+        std::fs::set_permissions(script, perms).unwrap();
+    }
+
+    let daemon = DaemonProcess::start("reconcile-order", &pre_wrapper, &rvc_wrapper);
+    let conn = daemon.connect();
+    wait_running(&conn);
+
+    let reply = call(&conn, ctl::DAEMON_ROUTE_SET, br#"{"route":"rvc"}"#);
+    assert_eq!(reply.status, "ok");
+    assert!(
+        wait_until(Duration::from_secs(5), || {
+            let status = status(&conn);
+            status.rvc.as_ref().map(|rvc| rvc.state.as_str()) == Some("streaming")
+                && status.pre.as_ref().map(|pre| pre.route) == Some(Route::Rvc)
+        }),
+        "route rvc was not applied"
+    );
+
+    // 重复三轮：双偏须落在同一轮轮询才暴露次序问题，单轮可能恰好错开。
+    for round in 0..3 {
+        let marker = std::fs::read_to_string(&log).unwrap().lines().count();
+        let rvc_pid = status(&conn).processes.rvc.pid.unwrap();
+        let pre_pid = status(&conn).processes.pre.pid.unwrap();
+        kill(rvc_pid);
+        kill(pre_pid);
+        assert!(
+            wait_until(Duration::from_secs(10), || {
+                let status = status(&conn);
+                status.processes.rvc.pid.is_some_and(|pid| pid != rvc_pid)
+                    && status.processes.pre.pid.is_some_and(|pid| pid != pre_pid)
+                    && status.rvc.as_ref().map(|rvc| rvc.state.as_str()) == Some("streaming")
+                    && status.pre.as_ref().map(|pre| pre.route) == Some(Route::Rvc)
+            }),
+            "round {round}: route/stream were not reapplied after double restart"
+        );
+
+        let lines: Vec<String> = std::fs::read_to_string(&log)
+            .unwrap()
+            .lines()
+            .skip(marker)
+            .map(str::to_string)
+            .collect();
+        let start = command_position(
+            &lines,
+            "mozart-rvc-stub",
+            ctl::RVC_START_STREAM,
+            "kind",
+            "realtime",
+        )
+        .unwrap_or_else(|| panic!("round {round}: no realtime StartStream:\n{}", lines.join("\n")));
+        let route = command_position(&lines, "mozart-pre-stub", ctl::PRE_SET_ROUTE, "route", "rvc")
+            .unwrap_or_else(|| panic!("round {round}: no SetRoute(rvc):\n{}", lines.join("\n")));
+        assert!(
+            start < route,
+            "round {round}: reconcile must start the stream before SetRoute(rvc):\n{}",
+            lines.join("\n")
+        );
+    }
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// 日志行格式 `{桩名} {命令号} {请求体}`；返回首条匹配命令的行号。
+fn command_position(
+    lines: &[String],
+    stub: &str,
+    type_: u16,
+    field: &str,
+    value: &str,
+) -> Option<usize> {
+    lines.iter().position(|line| {
+        let mut parts = line.splitn(3, ' ');
+        let (Some(name), Some(kind), Some(body)) = (parts.next(), parts.next(), parts.next()) else {
+            return false;
+        };
+        name == stub
+            && kind.parse::<u16>() == Ok(type_)
+            && serde_json::from_str::<serde_json::Value>(body)
+                .is_ok_and(|body| body[field] == value)
+    })
+}
+
 /// 权威对账（SPEC-04 单一权威根因治愈）：daemon 启动即断言 pre 实时态
 /// （mode_asserted=true、非文件接管）；pre 重启后 startup_id 变化，daemon 据此
 /// 重新断言，pre 恢复实时态。旧代码 pre 启动单边绑定/恒发、重启无条件 reclaim；

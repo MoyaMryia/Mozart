@@ -91,10 +91,10 @@ enum {
 
     MOZART_CTL_TTS_HELLO      = 0x0601,
     MOZART_CTL_TTS_GET_STATUS = 0x0602,
-    // 任务面（tts-jobs.sock，自有协议复用本信封）：
-    MOZART_CTL_TTS_JOB_SUBMIT = 0x0610,  // 桥→TTS，体 {"text","utterance_id","voice_params"?}
-    MOZART_CTL_TTS_JOB_REPLY  = 0x0611,  // TTS→桥，体 {"status","utterance_id","reason"?}
-    MOZART_CTL_TTS_JOB_STOP   = 0x0612   // 桥→TTS，体 {}（空）；清队列并中止在途合成，应答 TTS_JOB_REPLY 体 {"stopped":true}
+    // 任务面（tts-jobs.sock，标准信封：响应 type 回显请求号，体 {"status","code","reason","data"}）：
+    MOZART_CTL_TTS_JOB_SUBMIT = 0x0610,  // 桥→TTS，体 {"text","utterance_id","voice_params"?}；受理应答 data {"utterance_id"}
+    MOZART_CTL_TTS_JOB_REPLY  = 0x0611,  // 受理应答：submitted→ok/Ok、队满→error/Busy、无效→error；type 回显请求号（0x0610/0x0612）
+    MOZART_CTL_TTS_JOB_STOP   = 0x0612   // 桥→TTS，体 {}（空）；清队列并中止在途合成，应答 data {"stopped":true}
 };
 
 // ---- 响应体 {"status","code","reason","data"} 的 code 值 -----------------------

@@ -94,10 +94,12 @@ pub const BRIDGE_SPEECH_STOP: u16 = 0x0505;
 pub const TTS_HELLO: u16 = 0x0601;
 pub const TTS_GET_STATUS: u16 = 0x0602;
 /// 任务面（tts-jobs.sock，桥连接）：体 {"text","utterance_id","voice_params"?}。
+/// 标准信封：响应 type 回显请求号，体 {"status","code","reason","data"}。
 pub const TTS_JOB_SUBMIT: u16 = 0x0610;
-/// 任务面受理应答：体 {"status","utterance_id","reason"?}，status 取 submitted/skipped/failed。
+/// 任务面受理应答：submitted→ok/Ok、队满→error/Busy、无效→error，utterance_id 放 data；
+/// type 回显请求号（0x0610/0x0612）。
 pub const TTS_JOB_REPLY: u16 = 0x0611;
-/// 任务面停止：体 {}（空）；TTS 清空任务队列并中止在途合成，应答体 {"stopped":true}。
+/// 任务面停止：体 {}（空）；TTS 清空任务队列并中止在途合成，应答 data {"stopped":true}。
 pub const TTS_JOB_STOP: u16 = 0x0612;
 
 /// 控制连接空闲断开，各进程控制面同一纪律（SPEC-04）。
