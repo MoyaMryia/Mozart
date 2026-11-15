@@ -866,7 +866,9 @@ pub fn device_key_kind(key: &str) -> Option<&'static str> {
 }
 
 /// 运行时键 → owning 服务（docs/config.md 的 R 类分类）。None 表示非运行时键。
-/// daemon/file 键由 daemon 自身即时应用；pre/rvc/bridge 键需对端运行时命令下发。
+/// daemon/file 键由 daemon 自身即时应用；rvc 会话参数由 daemon 编排
+/// StopStream→StartStream 或只更新生效配置；pre/bridge 键需对端运行时命令
+/// 下发（未接入）。
 pub fn runtime_key_owner(key: &str) -> Option<&'static str> {
     match key {
         "daemon.poll_interval_ms"

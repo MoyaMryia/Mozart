@@ -5,7 +5,7 @@
 use crate::runtime::SharedConfig;
 use crate::state::{lock_state, State};
 use crate::state_file::BridgeRestore;
-use mozart_core::config::Config;
+use mozart_core::config::{Config, RvcConfig};
 use mozart_core::ctl::schema::{
     Activity, AsrStatus, BridgeStatus, ModelEntry, PreStatus, Response, Route, RvcStatus, TtsStatus,
 };
@@ -452,7 +452,7 @@ fn switch_rvc(
     let status = services.rvc_status()?;
     let model_id = resolve_model_id(config, &status)?;
     if !realtime_stream_matches(&status, &model_id) {
-        start_rvc_stream(services, config, &model_id).map_err(CallError::into_rejection)?;
+        start_rvc_stream(services, config, &model_id, true).map_err(CallError::into_rejection)?;
     }
 
     let pre_result = {
@@ -495,6 +495,7 @@ fn start_rvc_stream(
     services: &Services,
     config: &Config,
     model_id: &str,
+    busy_ok: bool,
 ) -> Result<(), CallError> {
     let handle = services.load_model_handle(model_id)?;
     let mut body = stream_body(config, handle);
@@ -503,8 +504,10 @@ fn start_rvc_stream(
     let mut rvc = services.rvc();
     match rvc.call_ok(ctl::RVC_START_STREAM, text.as_bytes()) {
         Ok(_) => Ok(()),
+        // 路由切换/对账时已有流视为就绪；config set 重启链路要求确认新参生效，
+        // Busy 说明流未按新参重建，按失败处理。
         Err(err) => match &err {
-            CallError::Remote(response) if response.code == ctl::CODE_BUSY => Ok(()),
+            CallError::Remote(response) if busy_ok && response.code == ctl::CODE_BUSY => Ok(()),
             _ => Err(err),
         },
     }
@@ -755,11 +758,90 @@ fn ensure_realtime_stream(
     if realtime_stream_matches(status, &model_id) {
         return true;
     }
-    match start_rvc_stream(services, config, &model_id) {
+    match start_rvc_stream(services, config, &model_id, true) {
         Ok(()) => true,
         Err(err) => {
             degraded.push(format!("rvc stream apply: {}", err.describe()));
             false
         }
     }
+}
+
+/// config set rvc.<会话参数> 的实时链路编排（SPEC-04）：写 TOML 由 core 完成，
+/// daemon 负责应用。只有 realtime 流在跑且实时链路实际使用的 `pitch_shift`、
+/// `index_rate`、`f0_method` 变化时才 StopStream→StartStream（短暂打断）；
+/// 失败用旧参恢复实时流，恢复失败返回组合错误并记录持久降级原因。
+/// GPU 归文件、路由非 rvc 或没有实时流时只更新生效配置：文件任务使用启动时
+/// 的配置快照，下一任务与下一次建流自然读到新值。
+pub(crate) fn apply_rvc_session_params(
+    state: &Mutex<State>,
+    services: &Services,
+    old: &Config,
+    new: &Config,
+) -> Result<(), (String, String)> {
+    // 仅 protect/rms_mix_rate 变化或值未变化：实时链路不应用，无需停流。
+    if !realtime_params_changed(&old.rvc, &new.rvc) {
+        return Ok(());
+    }
+    let _transition = services.transition();
+    let (route, gpu_owner) = {
+        let state = lock_state(state);
+        (state.route_active(), state.gpu_owner())
+    };
+    if gpu_owner == Some(Activity::File) || route != Route::Rvc {
+        return Ok(());
+    }
+    let Ok(status) = services.rvc_status() else {
+        // rvc 不可达时无法确认实时流；不打断，下一次建流用新快照。
+        return Ok(());
+    };
+    if status.state != "streaming" || status.stream_kind.as_deref() != Some("realtime") {
+        return Ok(());
+    }
+    let model_id = resolve_model_id(new, &status)?;
+
+    if let Err(err) = stop_rvc_stream(services) {
+        // 停流失败时流可能仍在（旧参）：Busy 视为已恢复。
+        let (code, reason) = err.into_rejection();
+        let original = format!("rvc stop stream: {reason}");
+        return match start_rvc_stream(services, old, &model_id, true) {
+            Ok(()) => Err((code, original)),
+            Err(restore) => Err(restore_failure(state, code, original, restore)),
+        };
+    }
+    // 停流成功：先按新参重建，失败再按旧参恢复。
+    match start_rvc_stream(services, new, &model_id, false) {
+        Ok(()) => Ok(()),
+        Err(err) => {
+            let (code, reason) = err.into_rejection();
+            let original = format!("rvc start with new params: {reason}");
+            match start_rvc_stream(services, old, &model_id, true) {
+                Ok(()) => Err((code, original)),
+                Err(restore) => Err(restore_failure(state, code, original, restore)),
+            }
+        }
+    }
+}
+
+/// 实时链路实际使用的会话参数是否变化（SPEC-03 参数边界表）：
+/// `protect`、`rms_mix_rate` 只在文件链路生效，变化不打断实时流。
+fn realtime_params_changed(old: &RvcConfig, new: &RvcConfig) -> bool {
+    old.pitch_shift != new.pitch_shift
+        || old.index_rate != new.index_rate
+        || old.f0_method != new.f0_method
+}
+
+/// 恢复失败：组合原始错误与恢复错误，并留可查询的持久降级原因。
+fn restore_failure(
+    state: &Mutex<State>,
+    code: String,
+    original: String,
+    restore: CallError,
+) -> (String, String) {
+    let reason = format!(
+        "{original}; restore with old params: {}",
+        restore.describe()
+    );
+    lock_state(state).push_degraded(format!("rvc session params: {reason}"));
+    (code, reason)
 }

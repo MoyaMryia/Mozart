@@ -7,12 +7,13 @@ use crate::state::{lock_state, Role, State};
 use crate::state_file::{self, StateFile};
 use crate::supervisor::{RestartHandle, Supervisor};
 use mozart_core::config::{
-    device_key_kind, ensure_run_dir, get_key, save_overrides, set_key, state_file_path, Config,
+    device_key_kind, ensure_run_dir, get_key, runtime_key_owner, save_overrides, set_key,
+    state_file_path, Config,
 };
 use mozart_core::ctl::schema::{
     self, ConfigGetRequest, ConfigSetRequest, DeviceListRequest, FileCancelRequest, FileFetchRequest,
     FileStatusRequest, FileSubmitRequest, MuteSetRequest, RestartRequest, RouteSetRequest,
-    SwitchSetRequest,
+    RvcParams, SwitchSetRequest,
 };
 use mozart_core::ctl::{self, Message, Seqpacket};
 use serde_json::json;
@@ -233,7 +234,16 @@ fn handle_request(ctx: &Ctx, msg: &Message) -> (Vec<u8>, bool) {
             false,
         ),
         ctl::DAEMON_GET_STATUS => {
-            let status = lock_state(&ctx.state).status();
+            let mut status = lock_state(&ctx.state).status();
+            // 当前生效配置里的会话参数：config set 失败回退后仍显示旧值。
+            let rvc = ctx.config.snapshot().rvc.clone();
+            status.rvc_params = Some(RvcParams {
+                pitch_shift: rvc.pitch_shift,
+                index_rate: rvc.index_rate,
+                rms_mix_rate: rvc.rms_mix_rate,
+                protect: rvc.protect,
+                f0_method: rvc.f0_method,
+            });
             match serde_json::to_value(status) {
                 Ok(status) => (schema::ok_body(status), false),
                 Err(err) => (schema::error_body(ctl::CODE_INTERNAL, &err.to_string()), false),
@@ -383,8 +393,10 @@ fn file_reply(result: Result<serde_json::Value, (String, String)>) -> (Vec<u8>, 
 }
 
 /// config set（SPEC-04）：设备键先对照当前清单校验存在（防呆），再原子写基线，
-/// 回重启提示契约 restart_required + affected，并登记待重启。daemon/file 运行时键
-/// 写基线后清该键状态覆盖并即时下发生效。其余键由 core::set_key 分类拒绝。
+/// 回重启提示契约 restart_required + affected，并登记待重启。daemon 运行时键与
+/// rvc 会话参数键写基线后即时应用：daemon/file 键清覆盖并重建生效配置；rvc 会话
+/// 参数按参数决定是否 StopStream→StartStream，失败保留旧生效配置。其余键由
+/// core::set_key 分类拒绝。
 fn config_set_reply(ctx: &Ctx, request: &ConfigSetRequest) -> Vec<u8> {
     if let Some(kind) = device_key_kind(&request.key) {
         match device::exists(&request.value, kind) {
@@ -402,12 +414,14 @@ fn config_set_reply(ctx: &Ctx, request: &ConfigSetRequest) -> Vec<u8> {
         }
     }
     let _toml = ctx.toml_lock.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+    // 写键前的生效配置：rvc 会话参数判断变化与失败回退都以它为旧值。
+    let old = ctx.config.snapshot();
     match set_key(ctx.config_path.as_deref(), &request.key, &request.value) {
         Ok(effect) => {
             if effect.restart_required {
                 lock_state(&ctx.state).mark_pending_restart(&effect.affected);
-            } else if let Err(err) = apply_runtime_key(ctx, &request.key) {
-                return schema::error_body(ctl::CODE_INTERNAL, &err);
+            } else if let Err((code, reason)) = apply_runtime_key(ctx, &request.key, &old) {
+                return schema::error_body(&code, &reason);
             }
             schema::ok_body(json!({
                 "key": request.key,
@@ -422,13 +436,22 @@ fn config_set_reply(ctx: &Ctx, request: &ConfigSetRequest) -> Vec<u8> {
 
 /// 运行时键即时生效（SPEC-04）：清该键状态覆盖，重读 TOML 基线叠加剩余覆盖
 /// 重建生效配置，更新共享句柄与文件队列/存储阈值。服务侧每次操作读最新快照。
-fn apply_runtime_key(ctx: &Ctx, key: &str) -> Result<(), String> {
+/// rvc 会话参数先按需重启实时流，成功才替换生效配置；失败保留旧值（TOML 新
+/// 基线保留，下一次 rvc 键写入或 daemon 重启再尝试）。
+fn apply_runtime_key(ctx: &Ctx, key: &str, old: &Config) -> Result<(), (String, String)> {
     lock_state_file(&ctx.state_file)
         .remove_key(key)
-        .map_err(|err| err.to_string())?;
-    let mut fresh = Config::load_from(ctx.config_path.as_deref()).map_err(|err| err.to_string())?;
+        .map_err(|err| (ctl::CODE_INTERNAL.to_string(), err.to_string()))?;
+    let mut fresh = Config::load_from(ctx.config_path.as_deref())
+        .map_err(|err| (ctl::CODE_INTERNAL.to_string(), err.to_string()))?;
     let overrides = lock_state_file(&ctx.state_file).overrides().clone();
     state_file::overlay(&mut fresh, &overrides);
+    if runtime_key_owner(key) == Some("rvc") {
+        services::apply_rvc_session_params(&ctx.state, &ctx.services, old, &fresh)?;
+    } else {
+        // 其他运行时键不得把尚未应用的 rvc 参数基线静默混入生效配置。
+        fresh.rvc = old.rvc.clone();
+    }
     ctx.file.apply_file_config(&fresh);
     ctx.config.replace(fresh);
     Ok(())

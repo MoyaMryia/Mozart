@@ -3,7 +3,7 @@
 mod common;
 
 use common::{call, example, status, wait_exit, wait_ready, wait_until, DaemonProcess};
-use mozart_core::ctl::schema::{ProcessState, Status};
+use mozart_core::ctl::schema::{ProcessState, Route, Status};
 use mozart_core::ctl::{self, Seqpacket};
 use std::os::unix::fs::PermissionsExt;
 use std::path::PathBuf;
@@ -257,4 +257,48 @@ fn config_set_validates_and_get_reads_baseline() {
     let config = std::fs::read_to_string(daemon.dir.join("config.toml")).unwrap();
     assert!(config.contains("capture_device = \"default\""), "config: {config}");
     assert!(config.contains("model_id = \"demo\""), "config: {config}");
+}
+
+/// Task 2 接入的 rvc 会话参数走接受路径：写 TOML 基线、无需重启，
+/// 当前无实时流时只更新 daemon 生效配置（status.rvc_params 可查）。
+#[test]
+fn config_set_accepts_rvc_session_key() {
+    let daemon = DaemonProcess::start_with_config(
+        "rvc-session",
+        &example("pre_stub"),
+        &example("rvc_stub"),
+        "[daemon]\nrpc_timeout_ms = 300\n\n[rvc]\nmodel_id = \"demo\"\n",
+    );
+    let conn = daemon.connect();
+    wait_ready(&conn);
+
+    let reply = call(
+        &conn,
+        ctl::DAEMON_CONFIG_SET,
+        br#"{"key":"rvc.pitch_shift","value":"3"}"#,
+    );
+    assert_eq!(reply.status, "ok", "reason: {}", reply.reason);
+    assert_eq!(reply.data["key"], "rvc.pitch_shift");
+    assert_eq!(reply.data["value"], "3");
+    assert_eq!(reply.data["restart_required"], false);
+    assert!(
+        reply.data["affected"].as_array().is_some_and(Vec::is_empty),
+        "会话参数不影响任何服务重启：{:?}",
+        reply.data["affected"]
+    );
+
+    // status 从生效配置填入 rvc_params（direct 路由、无实时流也可见）。
+    let status = status(&conn);
+    assert_eq!(status.route.active, Route::Direct);
+    let params = status.rvc_params.expect("status 应带 rvc_params");
+    assert_eq!(params.pitch_shift, 3);
+
+    // config get 读 TOML 新基线。
+    let reply = call(
+        &conn,
+        ctl::DAEMON_CONFIG_GET,
+        br#"{"key":"rvc.pitch_shift"}"#,
+    );
+    assert_eq!(reply.status, "ok", "reason: {}", reply.reason);
+    assert_eq!(reply.data["value"], 3);
 }

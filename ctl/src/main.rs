@@ -1050,6 +1050,16 @@ fn print_status(status: &Status) {
             rvc.queue_depth
         );
     }
+    if let Some(params) = &status.rvc_params {
+        println!(
+            "rvc params pitch={} index={} rms={} protect={} f0={}",
+            params.pitch_shift,
+            params.index_rate,
+            params.rms_mix_rate,
+            params.protect,
+            params.f0_method
+        );
+    }
     if let Some(asr) = &status.asr {
         println!(
             "asr      state={} finals={} frames={} bridge={}",

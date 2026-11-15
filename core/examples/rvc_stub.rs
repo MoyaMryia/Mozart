@@ -11,6 +11,10 @@
 //! 让取消用例稳定停在 infer 段；等待可被 StopStream 打断。
 //! 测试旋钮 `MOZART_RVC_STUB_FILE_HANG=1`：绑定输入 socket 但永不读帧，
 //! 模拟推理线程挂死（进程活着），让喂帧方填满缓冲后阻塞。
+//! 测试旋钮 `MOZART_RVC_STUB_FAIL_START_PITCH=<i32>`：StartStream 的
+//! pitch_shift 等于该值时回 InferenceFailed（仅一次），模拟新参起流失败。
+//! 测试旋钮 `MOZART_RVC_STUB_FAIL_START_AFTER=<n>`：前 n 次 StartStream 成功，
+//! 之后全部回 InferenceFailed，模拟新参与旧参恢复都失败。
 
 mod stub_common;
 
@@ -61,6 +65,11 @@ struct State {
     delay: Duration,
     hang: bool,
     feed_pace: Duration,
+    /// 一次性失败：pitch_shift 命中后清空，供失败恢复用例重试成功。
+    fail_start_pitch: Option<i32>,
+    /// 前 n 次 StartStream 成功，之后全部失败。
+    fail_start_after: Option<u32>,
+    starts: u32,
 }
 
 fn main() {
@@ -82,6 +91,12 @@ fn main() {
         .and_then(|value| value.parse::<u64>().ok())
         .map(Duration::from_millis)
         .unwrap_or(Duration::ZERO);
+    let fail_start_pitch = std::env::var("MOZART_RVC_STUB_FAIL_START_PITCH")
+        .ok()
+        .and_then(|value| value.parse::<i32>().ok());
+    let fail_start_after = std::env::var("MOZART_RVC_STUB_FAIL_START_AFTER")
+        .ok()
+        .and_then(|value| value.parse::<u32>().ok());
     let mut state = State {
         model: None,
         streaming: false,
@@ -92,6 +107,9 @@ fn main() {
         delay,
         hang,
         feed_pace,
+        fail_start_pitch,
+        fail_start_after,
+        starts: 0,
     };
     serve(args, move |msg| handle(msg, &mut state));
 }
@@ -142,6 +160,24 @@ fn handle(msg: &Message, state: &mut State) -> Vec<u8> {
             }
             if state.streaming {
                 return fail(ctl::CODE_BUSY, "stream already active");
+            }
+            state.starts += 1;
+            let pitch = body
+                .get("pitch_shift")
+                .and_then(Value::as_i64)
+                .and_then(|value| i32::try_from(value).ok());
+            let fail_by_count = state
+                .fail_start_after
+                .is_some_and(|limit| state.starts > limit);
+            let fail_by_pitch = state.fail_start_pitch.is_some() && pitch == state.fail_start_pitch;
+            if fail_by_count || fail_by_pitch {
+                if fail_by_pitch {
+                    state.fail_start_pitch = None;
+                }
+                return fail(
+                    ctl::CODE_INFERENCE_FAILED,
+                    "stub rejects StartStream (test knob)",
+                );
             }
             let kind = body
                 .get("kind")
