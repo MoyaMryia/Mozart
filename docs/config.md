@@ -183,7 +183,7 @@ path = "<资产根>/models/asr/<模型id>"
 
 ## 特殊机制说明
 
-- **RVC 会话参数**（f0_method / pitch_shift / index_rate / rms_mix_rate / protect）运行时生效经 `StopStream`→`StartStream` 带新参：实时在跑立刻用新参（短暂打断）；文件任务在跑则当前任务用旧参跑完、新参下一任务生效，不中途废弃。干净的块边界 `SetParams` 见 FUTURE。
+- **RVC 会话参数**（f0_method / pitch_shift / index_rate / rms_mix_rate / protect）：`config set rvc.<会话参数>` 写 TOML 基线并即时应用。实时：`StopStream`→`StartStream`，短暂打断（约 1–2 s）；文件：当前任务用旧参、下一任务用新参，不中断。启动失败用旧参恢复并返回错误，TOML 保留新基线（详见 [SPEC-04](SPEC/SPEC-04-daemon.md)）。`protect` / `rms_mix_rate` 在实时链路不应用，仍只对文件链路生效；实时补应用与干净块边界 `SetParams` 见 [FUTURE.md](FUTURE.md)。
 - **pre DSP 开关**经 `SetDsp`（0x0207，体含 denoise/gate/agc/limiter 四键）运行时生效：denoise 重新启用时重置 WOLA 流式状态、重新攒初始化帧，gate/agc/limiter 直接切换。
 - **逻辑上限 vs 预分配环**：`[file].queue_capacity` 是入队时查的逻辑上限（未预分配）→ R；`[pre].capture_queue_frames` 与 asr/tts/bridge 的 `*_capacity` 是预分配环/队列 → S。
 - **位置键**（storage_dir、subtitles_path）归 S：运行中改位置会使已有文件/队列分裂，需重启统一。
