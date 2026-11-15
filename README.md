@@ -19,6 +19,7 @@ tools/jetson-e2e.sh <SSH目标> [套件]      # 部署后测试
 | [docs/SETUP.md](docs/SETUP.md) | Jetson 目录规范、资产、部署与测试（唯一权威） |
 | [docs/config.md](docs/config.md) | TOML 配置 schema |
 | [docs/SPEC/SPEC.md](docs/SPEC/SPEC.md) | 模块规格索引与跨模块分工 |
+| [docs/ARCHITECTURE-HIGHLIGHTS.md](docs/ARCHITECTURE-HIGHLIGHTS.md) | 架构亮点：维护性、开发流程与 DevOps |
 | [TARGET.md](TARGET.md) | 产品目标与验收原则 |
 | [docs/FUTURE.md](docs/FUTURE.md) | 第一版之后的提升点 |
 | [AGENTS.md](AGENTS.md) | 代理与提交者工作约定 |
