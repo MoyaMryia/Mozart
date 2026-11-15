@@ -17,7 +17,8 @@ fi
 export LD_LIBRARY_PATH="$ASSETS_DIR/lib:$ASSETS_DIR/llama${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
 
 echo '== cargo test --workspace =='
-cargo test --workspace || exit 1
+# 设备端进程桩测试对时序敏感，串行执行避免并行负载造成假失败。
+cargo test --workspace -- --test-threads=1 || exit 1
 
 if ctest_list=$(ctest --test-dir build/jetson-release -N 2>&1); then
   if grep -q 'Test #' <<<"$ctest_list"; then

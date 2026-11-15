@@ -866,7 +866,9 @@ pub fn device_key_kind(key: &str) -> Option<&'static str> {
 }
 
 /// 运行时键 → owning 服务（docs/config.md 的 R 类分类）。None 表示非运行时键。
-/// daemon/file 键由 daemon 自身即时应用；pre/rvc/bridge 键需对端运行时命令下发。
+/// daemon/file 键由 daemon 自身即时应用；rvc 会话参数由 daemon 编排
+/// StopStream→StartStream 或只更新生效配置；pre/bridge 键需对端运行时命令
+/// 下发（未接入）。
 pub fn runtime_key_owner(key: &str) -> Option<&'static str> {
     match key {
         "daemon.poll_interval_ms"
@@ -920,9 +922,12 @@ pub struct KeyEffect {
     pub affected: Vec<String>,
 }
 
-/// 写单个键的持久基线（SPEC-04 模型甲，原子写）。支持重启类设备键与
-/// daemon/file 运行时键；pre/rvc/bridge 运行时键的对端下发命令未接入，明确拒绝。
-/// 设备存在性校验由 daemon 在调用前做（需 ALSA 枚举）。
+/// 写单个键的持久基线（SPEC-04 模型甲，原子写）。支持重启类设备键、
+/// daemon/file 运行时键与 rvc 会话参数键；pre/bridge 运行时键的对端下发命令
+/// 未接入，明确拒绝。设备存在性校验由 daemon 在调用前做（需 ALSA 枚举）。
+///
+/// rvc 会话参数只写 TOML 基线，返回 `restart_required=false`；实时/文件链路的
+/// 生效编排（按参数决定是否 StopStream→StartStream）归 daemon，见 SPEC-04。
 pub fn set_key(path: Option<&Path>, key: &str, value: &str) -> Result<KeyEffect, ConfigError> {
     if device_key_kind(key).is_some() {
         validate_device_name(value, key)?;
@@ -933,7 +938,7 @@ pub fn set_key(path: Option<&Path>, key: &str, value: &str) -> Result<KeyEffect,
         });
     }
     if let Some(owner) = runtime_key_owner(key) {
-        if owner != "daemon" {
+        if !matches!(owner, "daemon" | "rvc") {
             return Err(ConfigError::Invalid(format!(
                 "config set 暂不支持键 {key}（{owner} 的运行时下发命令未接入）"
             )));
@@ -946,12 +951,15 @@ pub fn set_key(path: Option<&Path>, key: &str, value: &str) -> Result<KeyEffect,
         });
     }
     Err(ConfigError::Invalid(format!(
-        "config set 暂不支持键 {key}（当前支持设备键与 daemon/file 运行时键）"
+        "config set 暂不支持键 {key}（当前支持设备键、daemon/file 运行时键与 rvc 会话参数键）"
     )))
 }
 
-/// daemon/file 运行时键的字符串值 → 带类型 TOML 值。类型按 docs/config.md：
-/// file.denoise 为 bool，file.ffmpeg_path 为 string，其余为整数。范围由整体校验把住。
+/// daemon/file 运行时键与 rvc 会话参数键的字符串值 → 带类型 TOML 值。
+/// 这里只做类型转换：file.denoise 为 bool；file.ffmpeg_path、rvc.f0_method 为
+/// string；rvc.index_rate/rms_mix_rate/protect 为 float；其余（含 rvc.pitch_shift）
+/// 为整数。取值范围与 f0_method 白名单只在 `Config::validate()` 定义，由
+/// write_runtime_key 写入前的整体校验拒绝非法值，不落盘。
 fn parse_runtime_value(key: &str, value: &str) -> Result<toml_edit::Item, ConfigError> {
     match key {
         "file.denoise" => match value {
@@ -959,7 +967,13 @@ fn parse_runtime_value(key: &str, value: &str) -> Result<toml_edit::Item, Config
             "false" => Ok(toml_edit::value(false)),
             _ => Err(ConfigError::Invalid(format!("键 {key} 需要 true/false"))),
         },
-        "file.ffmpeg_path" => Ok(toml_edit::value(value)),
+        "file.ffmpeg_path" | "rvc.f0_method" => Ok(toml_edit::value(value)),
+        "rvc.index_rate" | "rvc.rms_mix_rate" | "rvc.protect" => {
+            let number: f64 = value
+                .parse()
+                .map_err(|_| ConfigError::Invalid(format!("键 {key} 需要浮点")))?;
+            Ok(toml_edit::value(number))
+        }
         _ => {
             let number: i64 = value
                 .parse()
@@ -1185,7 +1199,10 @@ mod tests {
         let dir = temp_config_dir("reject");
         let path = dir.join("mozart.toml");
         std::fs::write(&path, "[pre]\n").unwrap();
-        assert!(set_key(Some(&path), "rvc.pitch_shift", "3").is_err());
+        // 重启类 rvc 键与未接入对端下发的 pre/bridge 运行时键仍拒绝。
+        assert!(set_key(Some(&path), "rvc.model_id", "demo").is_err());
+        assert!(set_key(Some(&path), "rvc.device", "cpu").is_err());
+        assert!(set_key(Some(&path), "bridge.translate_enabled", "false").is_err());
         assert!(set_key(Some(&path), "pre.capture_device", "").is_err());
         assert!(set_key(Some(&path), "pre.capture_device", "a\0b").is_err());
         assert!(set_key(None, "pre.capture_device", "default").is_err());
@@ -1256,7 +1273,7 @@ mod tests {
         assert!(set_key(Some(&path), "daemon.rpc_timeout_ms", "0").is_err());
         assert!(set_key(Some(&path), "daemon.rpc_timeout_ms", "abc").is_err());
         assert!(set_key(Some(&path), "file.denoise", "yes").is_err());
-        assert!(set_key(Some(&path), "rvc.pitch_shift", "3").is_err());
+        assert!(set_key(Some(&path), "rvc.models_dir", "/opt/models").is_err());
         assert!(set_key(Some(&path), "pre.dsp.denoise", "false").is_err());
         let config = Config::load_from(Some(&path)).unwrap();
         assert_eq!(config.daemon.rpc_timeout_ms, 1500, "被拒绝的 set 不得改基线");
@@ -1271,6 +1288,134 @@ mod tests {
         // max < backoff 违反跨键约束：整体校验拒绝，不落盘。
         assert!(set_key(Some(&path), "daemon.restart_backoff_max_ms", "100").is_err());
         set_key(Some(&path), "daemon.restart_backoff_max_ms", "800").unwrap();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn set_key_writes_rvc_session_keys_and_preserves_comments() {
+        let dir = temp_config_dir("rvc-set");
+        let path = dir.join("mozart.toml");
+        std::fs::write(&path, "# 基线注释\n[rvc]\npitch_shift = 0\n").unwrap();
+
+        let cases = [
+            ("rvc.pitch_shift", "-12"),
+            ("rvc.index_rate", "0.5"),
+            ("rvc.rms_mix_rate", "1"),
+            ("rvc.protect", "0.25"),
+            ("rvc.f0_method", "rmvpe"),
+        ];
+        for (key, value) in cases {
+            let effect = set_key(Some(&path), key, value).unwrap();
+            assert!(!effect.restart_required, "rvc 会话参数无需重启：{key}");
+            assert!(effect.affected.is_empty(), "{key}");
+        }
+        let text = std::fs::read_to_string(&path).unwrap();
+        assert!(text.contains("# 基线注释"), "原子写应保留注释：{text}");
+        let config = Config::load_from(Some(&path)).unwrap();
+        assert_eq!(config.rvc.pitch_shift, -12);
+        assert_eq!(config.rvc.index_rate, 0.5);
+        assert_eq!(config.rvc.rms_mix_rate, 1.0);
+        assert_eq!(config.rvc.protect, 0.25);
+        assert_eq!(config.rvc.f0_method, "rmvpe");
+
+        // 边界值合法：pitch_shift 12/-12、index_rate 0/1.0、rms_mix_rate 0、
+        // protect 0/0.5。
+        set_key(Some(&path), "rvc.pitch_shift", "12").unwrap();
+        set_key(Some(&path), "rvc.index_rate", "0").unwrap();
+        set_key(Some(&path), "rvc.rms_mix_rate", "0").unwrap();
+        set_key(Some(&path), "rvc.protect", "0.5").unwrap();
+        set_key(Some(&path), "rvc.index_rate", "1.0").unwrap();
+        set_key(Some(&path), "rvc.protect", "0").unwrap();
+        let config = Config::load_from(Some(&path)).unwrap();
+        assert_eq!(config.rvc.pitch_shift, 12);
+        assert_eq!(config.rvc.index_rate, 1.0);
+        assert_eq!(config.rvc.rms_mix_rate, 0.0);
+        assert_eq!(config.rvc.protect, 0.0);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn get_key_reads_rvc_session_baseline_after_set() {
+        let dir = temp_config_dir("rvc-get");
+        let path = dir.join("mozart.toml");
+        std::fs::write(&path, "[rvc]\n").unwrap();
+
+        // 未显式写入的键不在 TOML 基线中；config get 只读显式基线。
+        assert!(get_key(Some(&path), Some("rvc.pitch_shift")).is_err());
+
+        set_key(Some(&path), "rvc.pitch_shift", "3").unwrap();
+        set_key(Some(&path), "rvc.f0_method", "rmvpe").unwrap();
+        assert_eq!(
+            get_key(Some(&path), Some("rvc.pitch_shift"))
+                .unwrap()
+                .as_integer(),
+            Some(3)
+        );
+        assert_eq!(
+            get_key(Some(&path), Some("rvc.f0_method"))
+                .unwrap()
+                .as_str(),
+            Some("rmvpe")
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn set_key_rejects_invalid_rvc_session_values_without_writing() {
+        let dir = temp_config_dir("rvc-reject");
+        let path = dir.join("mozart.toml");
+        std::fs::write(
+            &path,
+            "[rvc]\npitch_shift = 2\nindex_rate = 0.5\nrms_mix_rate = 0.5\nprotect = 0.2\n",
+        )
+        .unwrap();
+
+        let cases = [
+            // 越界。
+            ("rvc.pitch_shift", "13"),
+            ("rvc.pitch_shift", "-13"),
+            ("rvc.index_rate", "1.01"),
+            ("rvc.index_rate", "-0.01"),
+            ("rvc.rms_mix_rate", "1.5"),
+            ("rvc.protect", "0.51"),
+            // 错类型 / 非有限值。
+            ("rvc.pitch_shift", "1.5"),
+            ("rvc.index_rate", "abc"),
+            ("rvc.protect", "NaN"),
+            ("rvc.index_rate", "inf"),
+            ("rvc.index_rate", "-inf"),
+            ("rvc.protect", "inf"),
+            ("rvc.protect", "-inf"),
+            // f0_method 仅 rmvpe。
+            ("rvc.f0_method", "harvest"),
+            ("rvc.f0_method", "RMVPE"),
+        ];
+        for (key, value) in cases {
+            assert!(
+                set_key(Some(&path), key, value).is_err(),
+                "应拒绝 {key}={value}"
+            );
+        }
+        let err = set_key(Some(&path), "rvc.f0_method", "harvest").err().unwrap();
+        assert!(err.to_string().contains("rmvpe"), "错误信息应指明 rmvpe：{err}");
+        let err = set_key(Some(&path), "rvc.pitch_shift", "13").err().unwrap();
+        assert!(
+            err.to_string().contains("-12..=12"),
+            "错误信息应带范围：{err}"
+        );
+        let err = set_key(Some(&path), "rvc.index_rate", "1.01").err().unwrap();
+        assert!(
+            err.to_string().contains("0.0..=1.0"),
+            "错误信息应带范围：{err}"
+        );
+
+        // 被拒绝的 set 不得改基线。
+        let config = Config::load_from(Some(&path)).unwrap();
+        assert_eq!(config.rvc.pitch_shift, 2);
+        assert_eq!(config.rvc.index_rate, 0.5);
+        assert_eq!(config.rvc.rms_mix_rate, 0.5);
+        assert_eq!(config.rvc.protect, 0.2);
+        assert_eq!(config.rvc.f0_method, "rmvpe");
         let _ = std::fs::remove_dir_all(&dir);
     }
 

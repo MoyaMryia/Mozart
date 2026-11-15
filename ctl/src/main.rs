@@ -20,6 +20,11 @@ const EXIT_UNREACHABLE: u8 = 3;
 const EXIT_REJECTED: u8 = 4;
 const EXIT_TIMEOUT: u8 = 5;
 
+/// config set 在 daemon 侧最多串行约 6 次 RPC（重读 TOML、状态覆盖、
+/// rvc 停流/起流/失败恢复），客户端超时必须覆盖，否则误报超时。
+const CONFIG_SET_RPC_BUDGET: u64 = 6;
+const CONFIG_SET_TIMEOUT_FLOOR_MS: u64 = 15_000;
+
 #[derive(Parser)]
 #[command(name = "mozart-ctl", version, about = "Mozart 控制面客户端")]
 struct Cli {
@@ -614,8 +619,19 @@ fn model_list(config: &Config, json_output: bool, available: bool) -> Result<(),
 
 /// 文件/模型命令共用：连接 → 发命令 → 收应答 → ok 取 data。
 fn call(config: &Config, type_: u16, body: &[u8]) -> Result<Value, CliError> {
+    call_with_timeout(config, type_, body, config.daemon.rpc_timeout_ms)
+}
+
+/// 同 `call`，客户端超时由调用方指定：config set 覆盖 daemon 的多次串行 RPC，
+/// 其他命令沿用 rpc_timeout_ms。
+fn call_with_timeout(
+    config: &Config,
+    type_: u16,
+    body: &[u8],
+    timeout_ms: u64,
+) -> Result<Value, CliError> {
     let conn = connect(config)?;
-    let response = request(&conn, type_, body, config.daemon.rpc_timeout_ms).map_err(classify_io)?;
+    let response = request(&conn, type_, body, timeout_ms).map_err(classify_io)?;
     expect_ok(response)
 }
 
@@ -672,7 +688,12 @@ fn config_set(config: &Config, key: &str, value: &str, json_output: bool) -> Res
         key: key.to_string(),
         value: value.to_string(),
     })?;
-    let data = call(config, ctl::DAEMON_CONFIG_SET, &body)?;
+    let data = call_with_timeout(
+        config,
+        ctl::DAEMON_CONFIG_SET,
+        &body,
+        config_set_timeout_ms(config),
+    )?;
     if json_output {
         println!("{data}");
         return Ok(());
@@ -936,6 +957,15 @@ fn rpc_timeout(config: &Config) -> Option<Duration> {
     Some(Duration::from_millis(config.daemon.rpc_timeout_ms))
 }
 
+/// config set 的客户端超时：覆盖 daemon 最多 6 次串行 RPC，且不低于 15 s。
+fn config_set_timeout_ms(config: &Config) -> u64 {
+    config
+        .daemon
+        .rpc_timeout_ms
+        .saturating_mul(CONFIG_SET_RPC_BUDGET)
+        .max(CONFIG_SET_TIMEOUT_FLOOR_MS)
+}
+
 fn connect(config: &Config) -> Result<Seqpacket, CliError> {
     Seqpacket::connect_timeout(&config.daemon_socket(), rpc_timeout(config)).map_err(|err| {
         if is_unreachable(&err) {
@@ -1048,6 +1078,16 @@ fn print_status(status: &Status) {
             rvc.frames_out,
             rvc.frames_dropped,
             rvc.queue_depth
+        );
+    }
+    if let Some(params) = &status.rvc_params {
+        println!(
+            "rvc params pitch={} index={} rms={} protect={} f0={}",
+            params.pitch_shift,
+            params.index_rate,
+            params.rms_mix_rate,
+            params.protect,
+            params.f0_method
         );
     }
     if let Some(asr) = &status.asr {
@@ -1337,6 +1377,15 @@ mod tests {
         ));
         assert!(parse(&["device"]).is_err());
         assert!(parse(&["device", "bogus"]).is_err());
+    }
+
+    #[test]
+    fn config_set_timeout_covers_serial_rpcs() {
+        let mut config = Config::default();
+        config.daemon.rpc_timeout_ms = 1000;
+        assert_eq!(config_set_timeout_ms(&config), 15_000, "低于下限时取 15 s");
+        config.daemon.rpc_timeout_ms = 3000;
+        assert_eq!(config_set_timeout_ms(&config), 18_000, "6 倍 RPC 超时覆盖串行调用");
     }
 
     #[test]

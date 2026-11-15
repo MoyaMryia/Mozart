@@ -12,7 +12,7 @@
 - 路径与模型由部署环境配置，不写进本手册。
 - 不用的功能整段删除对应配置。
 - 同名段只写一次；`[[models]]` 可写多块。
-- 完整字段、默认值与示例见 [config.md](config.md) 与 [SETUP.md](SETUP.md)。
+- 完整字段、默认值与示例见 [config.md](config.md)。
 
 | 功能 | 需要的配置段 | 额外依赖 |
 | --- | --- | --- |
@@ -83,6 +83,8 @@ mozart-ctl model list [--available]                # 查看已注册模型与加
 mozart-ctl config get <键>                          # 读取配置基线
 mozart-ctl restart <pre|rvc|asr|tts|bridge|llama>  # 重启单个服务
 ```
+
+`config set` 支持设备键、daemon/file 运行时键和 RVC 会话参数；完整键表见 [config.md](config.md)。
 
 日志：`<run_dir>/logs/<进程名>.log`，运行目录由配置给出，目录规范见 [SETUP.md](SETUP.md)。
 

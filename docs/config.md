@@ -183,7 +183,7 @@ path = "<资产根>/models/asr/<模型id>"
 
 ## 特殊机制说明
 
-- **RVC 会话参数**（f0_method / pitch_shift / index_rate / rms_mix_rate / protect）运行时生效经 `StopStream`→`StartStream` 带新参：实时在跑立刻用新参（短暂打断）；文件任务在跑则当前任务用旧参跑完、新参下一任务生效，不中途废弃。干净的块边界 `SetParams` 见 FUTURE。
+- **RVC 会话参数**（f0_method / pitch_shift / index_rate / rms_mix_rate / protect）：`config set rvc.<会话参数>` 写 TOML 持久基线。实时流在跑且本次写入的 `pitch_shift`、`index_rate` 或 `f0_method` 值变化时，daemon 以 `StopStream`→`StartStream` 应用新参，短暂打断。仅改 `protect` / `rms_mix_rate` 更新基线与生效配置，不打断实时流。direct/空闲只更新生效配置。文件任务不中断：当前任务用旧参、下一任务用新参。触发细则与失败恢复见 [SPEC-04](SPEC/SPEC-04-daemon.md)。`protect` / `rms_mix_rate` 在实时链路不应用，仍只对文件链路生效；实时补应用与干净块边界 `SetParams` 见 [FUTURE.md](FUTURE.md)。
 - **pre DSP 开关**经 `SetDsp`（0x0207，体含 denoise/gate/agc/limiter 四键）运行时生效：denoise 重新启用时重置 WOLA 流式状态、重新攒初始化帧，gate/agc/limiter 直接切换。
 - **逻辑上限 vs 预分配环**：`[file].queue_capacity` 是入队时查的逻辑上限（未预分配）→ R；`[pre].capture_queue_frames` 与 asr/tts/bridge 的 `*_capacity` 是预分配环/队列 → S。
 - **位置键**（storage_dir、subtitles_path）归 S：运行中改位置会使已有文件/队列分裂，需重启统一。
@@ -191,4 +191,4 @@ path = "<资产根>/models/asr/<模型id>"
 
 ## 运行时状态文件交互
 
-运行时键的改动记入 daemon 运行时状态文件（覆盖快照），重启时 TOML 基线叠加恢复；活权威在各服务，启动恢复一次、运行时不对账。v1 状态文件记录字幕开关（`bridge.translate_enabled` / `bridge.speech_enabled`）；`config set` 运行时键写基线后清该键覆盖并即时下发，`config save` 把全部覆盖提升为基线后清空。详见 SPEC-04。
+运行时状态文件记录服务端运行时命令产生的覆盖，不记录 `config set` 的改动：`config set` 写 TOML 持久基线并即时应用，同时清掉该键已有覆盖。v1 状态文件只记录字幕开关（`bridge.translate_enabled` / `bridge.speech_enabled`），将来的无中断 RVC `SetParams` 也走这里。daemon 重启时在 TOML 基线上叠加覆盖恢复；活权威在各服务，启动恢复一次、运行时不对账。`config save` 把全部覆盖提升为基线后清空。详见 SPEC-04。

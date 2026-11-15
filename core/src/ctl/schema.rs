@@ -183,6 +183,18 @@ pub struct RvcStatus {
     pub last_error: Option<String>,
 }
 
+/// RVC 会话参数当前生效值（status.rvc_params，SPEC-04 config set 编排）。
+/// 取自 daemon 生效配置而不是 rvc 进程快照：参数在 StartStream 时固定，
+/// 失败回退后 status 须显示仍在生效的旧值。
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct RvcParams {
+    pub pitch_shift: i32,
+    pub index_rate: f64,
+    pub rms_mix_rate: f64,
+    pub protect: f64,
+    pub f0_method: String,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Memory {
     pub total_bytes: u64,
@@ -213,6 +225,9 @@ pub struct Status {
     pub processes: Processes,
     pub pre: Option<PreStatus>,
     pub rvc: Option<RvcStatus>,
+    /// RVC 会话参数当前生效值（SPEC-04）。旧快照缺此字段按 None 还原。
+    #[serde(default)]
+    pub rvc_params: Option<RvcParams>,
     #[serde(default)]
     pub asr: Option<AsrStatus>,
     #[serde(default)]
@@ -695,6 +710,30 @@ mod tests {
         assert!(status.asr.is_none());
         assert!(status.tts.is_none());
         assert!(status.bridge.is_none());
+    }
+
+    #[test]
+    fn status_rvc_params_defaults_to_none_and_round_trips() {
+        // 旧 daemon 快照不含 rvc_params：按 None 还原，CLI 不显示该行。
+        let mut status: Status = serde_json::from_value(status_json()).unwrap();
+        assert!(status.rvc_params.is_none());
+
+        status.rvc_params = Some(RvcParams {
+            pitch_shift: -3,
+            index_rate: 0.5,
+            rms_mix_rate: 0.25,
+            protect: 0.33,
+            f0_method: "rmvpe".to_string(),
+        });
+        let json = serde_json::to_value(&status).unwrap();
+        let params = &json["rvc_params"];
+        assert_eq!(params["pitch_shift"], -3);
+        assert_eq!(params["index_rate"], 0.5);
+        assert_eq!(params["rms_mix_rate"], 0.25);
+        assert_eq!(params["protect"], 0.33);
+        assert_eq!(params["f0_method"], "rmvpe");
+        let back: Status = serde_json::from_value(json).unwrap();
+        assert_eq!(back.rvc_params, status.rvc_params);
     }
 
     #[test]

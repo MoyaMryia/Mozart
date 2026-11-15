@@ -127,6 +127,8 @@ impl State {
             processes: self.processes.clone(),
             pre: self.pre.clone(),
             rvc: self.rvc.clone(),
+            // rvc_params 由 server 生成 DAEMON_GET_STATUS 应答时按生效配置填入。
+            rvc_params: None,
             asr: self.asr.clone(),
             tts: self.tts.clone(),
             bridge: self.bridge.clone(),

@@ -74,7 +74,7 @@ fn spawn(name: &str, dir: &TempDir, extra: &[&str]) -> StubChild {
 }
 
 fn connect(dir: &TempDir) -> Seqpacket {
-    let deadline = Instant::now() + Duration::from_secs(3);
+    let deadline = Instant::now() + Duration::from_secs(10);
     loop {
         match Seqpacket::connect(&dir.socket()) {
             Ok(conn) => return conn,

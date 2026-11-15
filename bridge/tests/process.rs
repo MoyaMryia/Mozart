@@ -386,6 +386,9 @@ fn event_drop_counters_are_queryable() {
     assert_eq!(status["events_bad"], 1);
     assert_eq!(status["events_stale"], 1);
     // 坏事件与旧会话事件不落盘，只有首条 final。
+    wait_until("首条 final 落盘", Duration::from_secs(5), || {
+        read_lines(&dir).len() == 1
+    });
     assert_eq!(read_lines(&dir).len(), 1);
 
     sigterm(&child.0);
