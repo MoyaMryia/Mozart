@@ -395,8 +395,8 @@ fn file_reply(result: Result<serde_json::Value, (String, String)>) -> (Vec<u8>, 
 /// config set（SPEC-04）：设备键先对照当前清单校验存在（防呆），再原子写基线，
 /// 回重启提示契约 restart_required + affected，并登记待重启。daemon 运行时键与
 /// rvc 会话参数键写基线后即时应用：daemon/file 键清覆盖并重建生效配置；rvc 会话
-/// 参数按参数决定是否 StopStream→StartStream，失败保留旧生效配置。其余键由
-/// core::set_key 分类拒绝。
+/// 参数按本次设置的键决定是否 StopStream→StartStream，失败保留旧生效配置。其余
+/// 键由 core::set_key 分类拒绝。
 fn config_set_reply(ctx: &Ctx, request: &ConfigSetRequest) -> Vec<u8> {
     if let Some(kind) = device_key_kind(&request.key) {
         match device::exists(&request.value, kind) {
@@ -436,8 +436,9 @@ fn config_set_reply(ctx: &Ctx, request: &ConfigSetRequest) -> Vec<u8> {
 
 /// 运行时键即时生效（SPEC-04）：清该键状态覆盖，重读 TOML 基线叠加剩余覆盖
 /// 重建生效配置，更新共享句柄与文件队列/存储阈值。服务侧每次操作读最新快照。
-/// rvc 会话参数先按需重启实时流，成功才替换生效配置；失败保留旧值（TOML 新
-/// 基线保留，下一次 rvc 键写入或 daemon 重启再尝试）。
+/// rvc 会话键的生效配置只吸收本次写入的键（见 services::merge_session_key），
+/// 再按需重启实时流，成功才替换生效配置；失败保留旧值（TOML 新基线保留，
+/// 下一次对应键写入或 daemon 重启再尝试）。
 fn apply_runtime_key(ctx: &Ctx, key: &str, old: &Config) -> Result<(), (String, String)> {
     lock_state_file(&ctx.state_file)
         .remove_key(key)
@@ -447,7 +448,10 @@ fn apply_runtime_key(ctx: &Ctx, key: &str, old: &Config) -> Result<(), (String, 
     let overrides = lock_state_file(&ctx.state_file).overrides().clone();
     state_file::overlay(&mut fresh, &overrides);
     if runtime_key_owner(key) == Some("rvc") {
-        services::apply_rvc_session_params(&ctx.state, &ctx.services, old, &fresh)?;
+        // 未生效的 rvc 基线（如失败恢复留下的 pitch）不得混入生效配置，
+        // 否则 status 与在跑流不一致。
+        fresh.rvc = services::merge_session_key(key, &old.rvc, &fresh.rvc);
+        services::apply_rvc_session_params(&ctx.state, &ctx.services, &old.rvc, &fresh.rvc)?;
     } else {
         // 其他运行时键不得把尚未应用的 rvc 参数基线静默混入生效配置。
         fresh.rvc = old.rvc.clone();

@@ -117,7 +117,7 @@ impl Services {
         total_frames: u32,
         total_samples: u64,
     ) -> Result<(), (String, String)> {
-        let mut body = stream_body(config, model_handle);
+        let mut body = stream_body(&config.rvc, model_handle);
         body["kind"] = json!("file");
         body["total_frames"] = json!(total_frames);
         body["total_samples"] = json!(total_samples);
@@ -177,14 +177,14 @@ impl Services {
 
 /// StartStream 会话参数（SPEC-03 参数边界表）：实时与文件共用 `[rvc]` 一份。
 /// kind 与文件批处理字段由调用方补齐。
-fn stream_body(config: &Config, model_handle: u64) -> Value {
+fn stream_body(rvc: &RvcConfig, model_handle: u64) -> Value {
     json!({
         "model_handle": model_handle,
-        "pitch_shift": config.rvc.pitch_shift,
-        "index_rate": config.rvc.index_rate,
-        "rms_mix_rate": config.rvc.rms_mix_rate,
-        "protect": config.rvc.protect,
-        "f0_method": config.rvc.f0_method,
+        "pitch_shift": rvc.pitch_shift,
+        "index_rate": rvc.index_rate,
+        "rms_mix_rate": rvc.rms_mix_rate,
+        "protect": rvc.protect,
+        "f0_method": rvc.f0_method,
     })
 }
 
@@ -450,9 +450,10 @@ fn switch_rvc(
     config: &Config,
 ) -> Result<Route, (String, String)> {
     let status = services.rvc_status()?;
-    let model_id = resolve_model_id(config, &status)?;
+    let model_id = resolve_model_id(&config.rvc, &status)?;
     if !realtime_stream_matches(&status, &model_id) {
-        start_rvc_stream(services, config, &model_id, true).map_err(CallError::into_rejection)?;
+        start_rvc_stream(services, &config.rvc, &model_id, true)
+            .map_err(CallError::into_rejection)?;
     }
 
     let pre_result = {
@@ -471,9 +472,9 @@ fn switch_rvc(
     Ok(Route::Rvc)
 }
 
-fn resolve_model_id(config: &Config, status: &RvcStatus) -> Result<String, (String, String)> {
-    if !config.rvc.model_id.is_empty() {
-        return Ok(config.rvc.model_id.clone());
+fn resolve_model_id(rvc: &RvcConfig, status: &RvcStatus) -> Result<String, (String, String)> {
+    if !rvc.model_id.is_empty() {
+        return Ok(rvc.model_id.clone());
     }
     status.model_id.clone().ok_or_else(|| {
         (
@@ -493,12 +494,12 @@ fn realtime_stream_matches(status: &RvcStatus, model_id: &str) -> bool {
 
 fn start_rvc_stream(
     services: &Services,
-    config: &Config,
+    rvc: &RvcConfig,
     model_id: &str,
     busy_ok: bool,
 ) -> Result<(), CallError> {
     let handle = services.load_model_handle(model_id)?;
-    let mut body = stream_body(config, handle);
+    let mut body = stream_body(rvc, handle);
     body["kind"] = json!("realtime");
     let text = body.to_string();
     let mut rvc = services.rvc();
@@ -710,7 +711,7 @@ fn reconcile(
     let rvc_route_ready = if file_gpu || active != Route::Rvc {
         true
     } else {
-        ensure_realtime_stream(services, config, rvc_status, degraded)
+        ensure_realtime_stream(services, &config.rvc, rvc_status, degraded)
     };
 
     if let Some(status) = pre_status {
@@ -741,14 +742,14 @@ fn reconcile(
 /// rvc 缺席、模型不可解析或起流失败为 false，原因记入 degraded。
 fn ensure_realtime_stream(
     services: &Services,
-    config: &Config,
+    rvc: &RvcConfig,
     status: Option<&RvcStatus>,
     degraded: &mut Vec<String>,
 ) -> bool {
     let Some(status) = status else {
         return false;
     };
-    let model_id = match resolve_model_id(config, status) {
+    let model_id = match resolve_model_id(rvc, status) {
         Ok(model_id) => model_id,
         Err((code, reason)) => {
             degraded.push(format!("rvc stream apply: {code}: {reason}"));
@@ -758,7 +759,7 @@ fn ensure_realtime_stream(
     if realtime_stream_matches(status, &model_id) {
         return true;
     }
-    match start_rvc_stream(services, config, &model_id, true) {
+    match start_rvc_stream(services, rvc, &model_id, true) {
         Ok(()) => true,
         Err(err) => {
             degraded.push(format!("rvc stream apply: {}", err.describe()));
@@ -767,28 +768,47 @@ fn ensure_realtime_stream(
     }
 }
 
+/// config set rvc.<会话参数> 的生效配置合并（SPEC-04）：只吸收本次写入的键，
+/// 其余 rvc 键保留旧生效值。未随本次写入应用的 TOML 新基线（如失败恢复后
+/// 留下的 pitch）不得混入，否则 status 与在跑流不一致；这些基线等对应键
+/// 再次写入或 daemon 重启时应用。
+pub(crate) fn merge_session_key(key: &str, old: &RvcConfig, fresh: &RvcConfig) -> RvcConfig {
+    let mut merged = old.clone();
+    match key {
+        "rvc.pitch_shift" => merged.pitch_shift = fresh.pitch_shift,
+        "rvc.index_rate" => merged.index_rate = fresh.index_rate,
+        "rvc.f0_method" => merged.f0_method.clone_from(&fresh.f0_method),
+        "rvc.rms_mix_rate" => merged.rms_mix_rate = fresh.rms_mix_rate,
+        "rvc.protect" => merged.protect = fresh.protect,
+        other => unreachable!("runtime_key_owner 已把 {other} 归为非 rvc 会话键"),
+    }
+    merged
+}
+
 /// config set rvc.<会话参数> 的实时链路编排（SPEC-04）：写 TOML 由 core 完成，
-/// daemon 负责应用。只有 realtime 流在跑且实时链路实际使用的 `pitch_shift`、
-/// `index_rate`、`f0_method` 变化时才 StopStream→StartStream（短暂打断）；
-/// 失败用旧参恢复实时流，恢复失败返回组合错误并记录持久降级原因。
-/// GPU 归文件、路由非 rvc 或没有实时流时只更新生效配置：文件任务使用启动时
-/// 的配置快照，下一任务与下一次建流自然读到新值。
+/// daemon 负责应用。`new` 只含本次写入键的改动（见 `merge_session_key`），
+/// 因此触发判据只看当前设置的键：只有实时链路实际使用的 `pitch_shift`、
+/// `index_rate`、`f0_method` 值变化且实时流在跑时才 StopStream→StartStream
+/// （短暂打断）；只改 `protect`/`rms_mix_rate` 或其他键不触发，即使存在
+/// 未生效的其他 RVC 基线。失败用旧参恢复实时流，恢复失败返回组合错误并
+/// 记录持久降级原因；不自动重试，下一次对应键写入或 daemon 重启再应用。
+/// 路由非 rvc 或没有实时流时只更新生效配置：文件任务使用启动时的配置快照，
+/// 下一任务与下一次建流自然读到新值。
 pub(crate) fn apply_rvc_session_params(
     state: &Mutex<State>,
     services: &Services,
-    old: &Config,
-    new: &Config,
+    old: &RvcConfig,
+    new: &RvcConfig,
 ) -> Result<(), (String, String)> {
     // 仅 protect/rms_mix_rate 变化或值未变化：实时链路不应用，无需停流。
-    if !realtime_params_changed(&old.rvc, &new.rvc) {
+    if !realtime_params_changed(old, new) {
         return Ok(());
     }
     let _transition = services.transition();
-    let (route, gpu_owner) = {
-        let state = lock_state(state);
-        (state.route_active(), state.gpu_owner())
-    };
-    if gpu_owner == Some(Activity::File) || route != Route::Rvc {
+    // 文件任务只在 Direct 下启动（GPU 归文件期间 route set 只写 desired），
+    // 且 rvc 在跑 file 流时下面的 stream_kind 也不匹配：route 与 kind 已覆盖，
+    // 无需再看 gpu_owner。
+    if lock_state(state).route_active() != Route::Rvc {
         return Ok(());
     }
     let Ok(status) = services.rvc_status() else {
@@ -825,6 +845,7 @@ pub(crate) fn apply_rvc_session_params(
 
 /// 实时链路实际使用的会话参数是否变化（SPEC-03 参数边界表）：
 /// `protect`、`rms_mix_rate` 只在文件链路生效，变化不打断实时流。
+/// `new` 只含本次写入键的改动，判定等价于“只看当前设置的键”。
 fn realtime_params_changed(old: &RvcConfig, new: &RvcConfig) -> bool {
     old.pitch_shift != new.pitch_shift
         || old.index_rate != new.index_rate

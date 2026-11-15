@@ -237,9 +237,9 @@ fn unchanged_value_does_not_restart_realtime_stream() {
 }
 
 /// 新参起流失败：用旧参恢复实时流并返回错误；生效配置保留旧值，TOML 保留
-/// 新基线；下一次 rvc 键写入按新基线重试并成功（"下次建流尝试新值"）。
+/// 新基线。不自动重试：等下一次对应键写入或 daemon 重启再应用。
 #[test]
-fn start_failure_restores_old_params_and_next_attempt_uses_new_baseline() {
+fn start_failure_restores_old_params_and_keeps_toml_baseline() {
     let h = Harness::new("restore", &[("MOZART_RVC_STUB_FAIL_START_PITCH", "3")]);
     h.set_route_rvc();
     h.clear_log();
@@ -266,28 +266,60 @@ fn start_failure_restores_old_params_and_next_attempt_uses_new_baseline() {
         "失败后应用旧参恢复：{starts:?}"
     );
 
-    // TOML 保留新基线。
-    let reply = h.call(
-        ctl::DAEMON_CONFIG_GET,
-        br#"{"key":"rvc.pitch_shift"}"#,
-    );
+    // TOML 保留新基线，等待下一次对应键写入或 daemon 重启应用。
+    let reply = h.call(ctl::DAEMON_CONFIG_GET, br#"{"key":"rvc.pitch_shift"}"#);
     assert_eq!(reply.status, "ok", "reason: {}", reply.reason);
     assert_eq!(reply.data["value"], 3);
+}
 
-    // 下一次 rvc 键写入重读基线：pitch=3 再次尝试并成功（桩只失败一次）。
+/// 存在待生效的 pitch 基线时只改 rvc.protect：触发判据只看当前设置的键，
+/// 不 Stop/Start、不打断实时流，生效 pitch 仍是旧值；之后写 pitch 键才按
+/// TOML 新基线重建实时流。
+#[test]
+fn protect_write_with_pending_pitch_baseline_keeps_stream() {
+    let h = Harness::new("pending", &[("MOZART_RVC_STUB_FAIL_START_PITCH", "3")]);
+    h.set_route_rvc();
+    // 制造待生效基线：pitch=3 起流失败，旧参恢复，TOML 保留 3。
+    let reply = h.config_set("rvc.pitch_shift", "3");
+    assert_eq!(reply.status, "error", "新参起流失败必须报错");
+    h.wait_streaming();
     h.clear_log();
+
     let reply = h.config_set("rvc.protect", "0.4");
+    assert_eq!(reply.status, "ok", "reason: {}", reply.reason);
+
+    // 跨过至少一轮轮询：protect 只更新生效配置，未生效的 pitch 基线不混入。
+    std::thread::sleep(Duration::from_millis(250));
+    let params = h.rvc_params();
+    assert_eq!(params.protect, 0.4);
+    assert_eq!(params.pitch_shift, 0, "未生效的 pitch 基线不得混入生效配置");
+    assert_eq!(
+        h.status().rvc.as_ref().map(|rvc| rvc.state.as_str()),
+        Some("streaming"),
+        "protect 写入不得打断实时流"
+    );
+    assert_eq!(h.rvc_count(ctl::RVC_STOP_STREAM), 0, "protect 不得触发 StopStream");
+    assert!(
+        h.stream_starts("realtime").is_empty(),
+        "protect 不得触发 StartStream：{:?}",
+        h.stream_starts("realtime")
+    );
+
+    // 下一次对应键写入（pitch）重读基线：pitch=3 再次尝试并成功（桩只失败一次）。
+    h.clear_log();
+    let reply = h.config_set("rvc.pitch_shift", "3");
     assert_eq!(reply.status, "ok", "reason: {}", reply.reason);
     h.wait_streaming();
     let params = h.rvc_params();
     assert_eq!(params.pitch_shift, 3);
     assert_eq!(params.protect, 0.4);
     let starts = h.stream_starts("realtime");
+    assert!(!starts.is_empty(), "写 pitch 键应重建实时流：{starts:?}");
     assert!(
         starts
             .iter()
-            .any(|body| body["pitch_shift"] == 3 && body["protect"] == 0.4),
-        "下一次建流应带新基线参数：{starts:?}"
+            .all(|body| body["pitch_shift"] == 3 && body["protect"] == 0.4),
+        "所有 StartStream 都应带新值：{starts:?}"
     );
 }
 
@@ -336,9 +368,13 @@ fn direct_route_only_updates_effective_config() {
     );
 
     h.set_route_rvc();
+    // 不做精确计数：轮询对账也可能补起流；要求所有 StartStream 都带新值。
     let starts = h.stream_starts("realtime");
-    assert_eq!(starts.len(), 1, "下一次建流应只有一次 StartStream：{starts:?}");
-    assert_eq!(starts[0]["pitch_shift"], 3);
+    assert!(!starts.is_empty(), "下一次建流应下发 StartStream：{starts:?}");
+    assert!(
+        starts.iter().all(|body| body["pitch_shift"] == 3),
+        "所有 StartStream 都应带新值：{starts:?}"
+    );
 }
 
 /// 文件任务运行中：不中断、不向 rvc 发 Stop/Start；当前任务用旧快照，
@@ -378,6 +414,21 @@ fn file_job_keeps_running_and_next_job_uses_new_params() {
         "任务应进入 infer 段"
     );
 
+    // 当前任务在启动时取配置快照：它的 file StartStream 已带旧值 pitch=0。
+    let first_start = read_entries(&log)
+        .into_iter()
+        .find(|entry| {
+            entry.stub == "mozart-rvc-stub"
+                && entry.type_ == ctl::RVC_START_STREAM
+                && entry.body["kind"] == "file"
+        })
+        .expect("当前任务应有 file StartStream");
+    assert_eq!(
+        first_start.body["pitch_shift"], 0,
+        "当前任务使用启动时快照（旧值）：{:?}",
+        first_start.body
+    );
+
     // 文件起流已发生：只观察此后的命令。
     std::fs::write(&log, "").unwrap();
     let body = json!({"key": "rvc.pitch_shift", "value": "3"}).to_string();
@@ -400,7 +451,8 @@ fn file_job_keeps_running_and_next_job_uses_new_params() {
         }),
         "文件任务运行中不得重建实时流：{entries:?}"
     );
-    // status 显示新生效配置；当前任务仍可能用旧快照（SPEC-04）。
+    // status 显示新生效配置；当前任务仍用启动时快照（pitch=0），
+    // 下一任务启动时取新快照（SPEC-04）。
     let params = status(&conn).rvc_params.expect("status 应带 rvc_params");
     assert_eq!(params.pitch_shift, 3);
 
