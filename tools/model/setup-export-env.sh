@@ -31,7 +31,8 @@ else
 fi
 
 echo "== 安装导出/golden 依赖 =="
-pip install transformers onnx onnxruntime numpy scipy librosa soundfile \
+# transformers 固定 4.46.3：5.x 用本地路径 from_pretrained 会报错。
+pip install transformers==4.46.3 onnx onnxruntime numpy scipy librosa soundfile \
     faiss-cpu praat-parselmouth
 
 echo "== 校验导入 =="

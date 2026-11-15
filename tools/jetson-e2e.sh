@@ -13,9 +13,10 @@
 #   --measure <场景> [参数...]  性能测量（需要 release 构建）
 #   --all        全部功能套件（unit + smoke + file + file-models + language）
 #
-# 前置：已运行 tools/deploy-jetson.sh；~/Mozart 构建树、~/mozart-runtime/bin
-# 与 mozart.toml 存在。证据目录：/tmp/mozart-smoke、/tmp/mozart-file-test、
-# /tmp/mozart-multimodel、/tmp/mozart-language-test；measure 证据在 ~/mozart-t7。
+# 前置：已运行 tools/deploy-jetson.sh；REPO_DIR 构建树（默认 ~/Mozart）、
+# ~/mozart-runtime/bin 与 mozart.toml 存在。证据目录：/tmp/mozart-smoke、
+# /tmp/mozart-file-test、/tmp/mozart-multimodel、/tmp/mozart-language-test；
+# measure 证据在 ~/mozart-t7。
 set -euo pipefail
 
 TARGET=${MOZART_JETSON:-}
@@ -90,7 +91,7 @@ fi
 
 remote_env="MOZART_RUNTIME_DIR=$(printf '%q' "${MOZART_RUNTIME_DIR:-}")"
 remote_env+=" RUN_UNIT=$RUN_UNIT RUN_SMOKE=$RUN_SMOKE RUN_FILE=$RUN_FILE RUN_FILE_MODELS=$RUN_FILE_MODELS RUN_LANGUAGE=$RUN_LANGUAGE RUN_MEASURE=$RUN_MEASURE"
-for v in MODELS_DIR CAP_SUB PB_SUB ASSETS_DIR SAMPLE_M4A M_ROOT; do
+for v in REPO_DIR MODELS_DIR CAP_SUB PB_SUB ASSETS_DIR SAMPLE_M4A M_ROOT; do
   if [ -n "${!v:-}" ]; then
     remote_env+=" $v=$(printf '%q' "${!v}")"
   fi
@@ -119,6 +120,7 @@ RUNTIME_DIR=${MOZART_RUNTIME_DIR:-$HOME/mozart-runtime}
 CTL="$RUNTIME_DIR/bin/mozart-ctl"
 CFG="$RUNTIME_DIR/mozart.toml"
 BIN="$RUNTIME_DIR/bin"
+REPO_DIR=${REPO_DIR:-$HOME/Mozart}
 STATUS_JSON=/tmp/mozart-e2e-status.json
 ASSETS_DIR=${ASSETS_DIR:-${MOZART_ASSETS_DIR:-$HOME/mozart-assets}}
 STOPPED=0
@@ -178,12 +180,12 @@ restore() {
 }
 trap restore EXIT
 
-[ -d "$HOME/Mozart/tools" ] || fail "缺 ~/Mozart/tools，先部署"
+[ -d "$REPO_DIR/tools" ] || fail "缺 $REPO_DIR/tools，先部署"
 [ -x "$CTL" ] || fail "缺 $CTL，先部署"
 [ -f "$CFG" ] || fail "缺 $CFG"
 [ -x "$BIN/examples/rvc_stub" ] || fail "缺 examples/rvc_stub，先部署"
 
-cd "$HOME/Mozart" || fail '缺 ~/Mozart'
+cd "$REPO_DIR" || fail "缺 $REPO_DIR"
 . "$HOME/.cargo/env" 2>/dev/null || true
 if [ -e "$ASSETS_DIR/lib/libsherpa-onnx-c-api.so" ]; then
   export SHERPA_ONNX_LIB_DIR="$ASSETS_DIR/lib"
@@ -228,9 +230,9 @@ if [ "$RUN_LANGUAGE" = "1" ]; then
   tools/jetson-language-test.sh || fail 'jetson-language-test.sh'
 fi
 if [ "$RUN_MEASURE" = "1" ]; then
-  [ -x "$HOME/Mozart/target/release/mozart-daemon" ] || fail '缺 release 构建，无法测量'
+  [ -x "$REPO_DIR/target/release/mozart-daemon" ] || fail '缺 release 构建，无法测量'
   echo '== 套件：性能测量 =='
-  BIN_DIR="$HOME/Mozart/target/release" tools/jetson-measure.sh "$@" \
+  BIN_DIR="$REPO_DIR/target/release" tools/jetson-measure.sh "$@" \
     || fail 'jetson-measure.sh'
 fi
 
