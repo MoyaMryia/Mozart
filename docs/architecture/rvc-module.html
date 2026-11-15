@@ -1,0 +1,367 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>RVC 模块 · mozart-rvc</title>
+<style>
+:root {
+  --ink: #1b1f24;
+  --muted: #64707d;
+  --line: #d9dee4;
+  --soft: #f6f8fa;
+  --model: #1f5d8f;
+  --fixed: #5b6570;
+  --user: #2f6b45;
+}
+* { box-sizing: border-box; }
+body {
+  margin: 0 auto;
+  max-width: 880px;
+  padding: 40px 28px 72px;
+  color: var(--ink);
+  background: #fff;
+  font: 16px/1.9 "Noto Sans CJK SC", "PingFang SC", "Microsoft YaHei", system-ui, sans-serif;
+}
+h1 {
+  font-size: 24px;
+  line-height: 1.3;
+  margin: 0 0 12px;
+  padding-bottom: 12px;
+  border-bottom: 2px solid var(--ink);
+}
+h2 {
+  font-size: 18px;
+  line-height: 1.4;
+  margin: 44px 0 12px;
+  padding-top: 16px;
+  border-top: 1px solid var(--line);
+}
+p { margin: 0 0 12px; }
+code {
+  font-family: "JetBrains Mono", "Noto Sans Mono CJK SC", Consolas, monospace;
+  font-size: .9em;
+  background: var(--soft);
+  border: 1px solid var(--line);
+  border-radius: 3px;
+  padding: 0 4px;
+}
+.readme {
+  color: var(--muted);
+  font-size: 13px;
+  margin-bottom: 20px;
+}
+.flow {
+  margin: 14px 0;
+  padding: 12px 14px;
+  border-left: 3px solid var(--ink);
+  background: var(--soft);
+  font-size: 14px;
+}
+.src {
+  font-family: "JetBrains Mono", Consolas, monospace;
+  font-size: .85em;
+  white-space: nowrap;
+}
+.src-model { color: var(--model); }
+.src-fixed { color: var(--fixed); }
+.src-user { color: var(--user); }
+.why {
+  margin: 14px 0 20px;
+  padding: 12px 16px 12px 18px;
+  background: var(--soft);
+  border-left: 3px solid #a6b2bd;
+  font-size: 14px;
+  line-height: 1.85;
+}
+.why-label {
+  margin: 0 0 6px;
+  font-size: 12px;
+  letter-spacing: .08em;
+  color: var(--muted);
+}
+.why ul { margin: 0; padding-left: 20px; }
+.why li { margin: 4px 0; }
+.why p:last-child, .why ul:last-child { margin-bottom: 0; }
+.why strong { font-weight: 600; }
+.terms {
+  display: grid;
+  grid-template-columns: 130px minmax(0, 1fr);
+  gap: 8px 18px;
+  margin: 0 0 16px;
+}
+.terms dt { font-weight: 600; }
+.terms dd { margin: 0; }
+@media (max-width: 640px) {
+  body { padding: 24px 16px 56px; font-size: 15px; }
+  .terms { grid-template-columns: 1fr; gap: 2px; }
+  .terms dd { margin-bottom: 10px; }
+}
+@media print {
+  body { max-width: none; padding: 0; font-size: 12px; }
+  h2 { break-after: avoid; }
+  .why { break-inside: avoid; }
+}
+</style>
+</head>
+<body>
+
+<h1>模块名称声明</h1>
+
+<p class="readme">阅读方式：原文逐字保留。每站原文之后的“补充解释”是面向零基础的说明，回答三个问题：这个参数是什么、它为什么存在、改动它会影响什么。</p>
+
+<p>下文先用全称定义，之后一律复用同一名称。</p>
+
+<p>推理进程：可执行程序 mozart-rvc，C++ 编写。它把输入声音换成目标音色。下面所有流程都发生在它内部。</p>
+
+<p>内容特征网络：代码名 HuBERT。它从声音里提取“说了什么”的特征向量。</p>
+
+<p>音高提取网络：代码名 RMVPE。它从声音里提取音高随时间变化的曲线。</p>
+
+<p>合成网络：代码名 generator。它拿特征和音高，合成目标音色的声音。</p>
+
+<p>音色检索库：代码名 index。它是训练集音色向量的库，供检索混合用。</p>
+
+<p>参数来源分三种，每个参数后注明：<span class="src src-model">〔模型〕</span>来自模型文件或引擎形状，换模型就变；<span class="src src-fixed">〔写死〕</span>代码硬编码，换模型不变；<span class="src src-user">〔用户〕</span>在配置里可调。</p>
+
+<aside class="why">
+<p class="why-label">补充解释：参数来源怎么读</p>
+<ul>
+<li><strong>〔模型〕</strong>：这个值写在模型文件里，或由推理引擎的形状决定。配置改不了；换一个模型或换一个引擎，这个值就可能变。</li>
+<li><strong>〔写死〕</strong>：这是代码里的常量，换模型也不变。少数情况下由引擎导出固定，换引擎仍可能变。</li>
+<li><strong>〔用户〕</strong>：这个值在配置里可以调整，每次转换前由用户决定。</li>
+</ul>
+</aside>
+
+<h2>先认识几个词</h2>
+
+<dl class="terms">
+<dt>采样率</dt>
+<dd>每秒钟给声音“拍照”的次数，单位 Hz。16000 Hz 表示每秒记录 16000 个采样点。采样率越高，能表示的频率越高；16000 Hz 最高只能表示 8000 Hz 的声音。</dd>
+
+<dt>帧与帧移</dt>
+<dd>处理声音时不会一次看完整段，而是切成很短的片段，每一段叫一帧。帧移是相邻两帧起点相距多少个采样点，决定“隔多久看一次”。</dd>
+
+<dt>特征向量</dt>
+<dd>用一串数字概括一小段声音的特点，可以理解成这段声音的“指纹”。后面的检索和合成都按这些数字工作。</dd>
+
+<dt>音高与音分</dt>
+<dd>音高是声音听起来的高低，单位 Hz。音分是更细的相对刻度：12 个半音等于 1 个八度，等于 1200 音分；升高 12 个半音就是频率翻倍。</dd>
+
+<dt>清音</dt>
+<dd>没有稳定音高的声音，比如 s、sh、f 和气声。元音和大部分浊辅音有音高。</dd>
+
+<dt>重采样</dt>
+<dd>把音频从一个采样率转换成另一个采样率，相当于改变“每秒多少个采样点”。</dd>
+
+<dt>削波</dt>
+<dd>声音峰值超过能表示的上限，波形顶部被削平，听感是破音。归一化和限幅都是通过整体缩放来避免它。</dd>
+
+<dt>交叉淡化</dt>
+<dd>把相邻两段音频的重叠部分按权重渐变混合，让接缝听不出来。</dd>
+</dl>
+
+<h2>总流程</h2>
+
+<p class="flow">输入声音 → 重采样 → 预处理 → 内容特征网络 与 音高提取网络 → 音高映射 → 音色检索 → 合成网络 → 后处理 → 输出声音</p>
+
+<p>长音频不是一次走完。中间几站按“窗”重复执行，窗与窗重叠淡化后拼接。分窗几何单独在第 8 站讲。</p>
+
+<p>预处理、后处理只在文件转换执行。实时变声跳过这两站。</p>
+
+<aside class="why">
+<p class="why-label">补充解释：整条链路在做什么</p>
+<ul>
+<li><strong>一句话概括：</strong>先把声音统一格式，再分别提取“说了什么”和“音高怎么变”，然后把音高和音色调整到目标模型的样子，最后由合成网络生成新声音。</li>
+<li><strong>为什么分两条特征线：</strong>内容特征网络只关心内容，音高提取网络只关心高低起伏；合成网络把两者重新组合，才能既保留说话内容，又换成目标音色。</li>
+<li><strong>为什么长音频要分窗：</strong>合成网络一次只能处理固定数量的帧（第 7 站），整段太长就切成一窗一窗地处理，再把结果拼起来。</li>
+<li><strong>为什么两站只在文件转换执行：</strong>实时变声追求低延迟，跳过额外的精细处理；文件转换是离线任务，可以慢慢做归一化、滤波和音量校正。</li>
+</ul>
+</aside>
+
+<h2>第 1 站 重采样</h2>
+
+<p>把输入声音统一到 16000 Hz。</p>
+
+<p>输入采样率，16000 Hz<span class="src src-fixed">〔写死〕</span>。它决定内容特征网络和音高提取网络的工作采样率。这两个网络只认 16000 Hz，所以输入必须先转过来。换模型不变。</p>
+
+<p>模型原生采样率<span class="src src-model">〔模型〕</span>，来自模型配置文件。它决定合成网络实际吐声音的采样率，也决定每帧吐多少采样点，算法是采样率除以 100。qiqi 模型是 48000 Hz，每帧吐 480 点。换模型会变。最后第 9 站再把它转回 48000 Hz 输出。</p>
+
+<aside class="why">
+<p class="why-label">补充解释</p>
+<ul>
+<li><strong>为什么必须先统一到 16000 Hz：</strong>HuBERT 和 RMVPE 是按 16000 Hz 的声音训练的，它们“以为”每秒有 16000 个点。如果直接喂 48000 Hz 的声音，它们会把时间尺度理解错，提取出的内容和音高都会失真。</li>
+<li><strong>16000 Hz 意味着什么：</strong>每秒 16000 个采样点，最高能表示 8000 Hz 的声音。人声的主要内容都在这个范围内，所以这个采样率足够做内容和音高分析。</li>
+<li><strong>模型原生采样率怎么理解：</strong>generator 按自己的采样率直接生成波形。合成帧率固定为每秒 100 帧，所以每帧的采样点数等于采样率除以 100：48000 Hz 对应每帧 480 点，24000 Hz 对应每帧 240 点。</li>
+<li><strong>为什么最后还要转回 48000 Hz：</strong>输出接口和播放链路统一用 48000 Hz。模型如果原生是其他采样率，第 9 站会统一转换，避免下游设备再做一次重采样。</li>
+</ul>
+</aside>
+
+<h2>第 2 站 预处理</h2>
+
+<p>只做两件事，都只在文件转换执行。</p>
+
+<p>峰值归一上限，0.95<span class="src src-fixed">〔写死〕</span>。声音峰值超过 0.95 时整体缩小，不超过就不动。它防止后续处理削波。它只缩不放。换模型不变。</p>
+
+<p>高通截止频率，48 Hz<span class="src src-fixed">〔写死〕</span>。它滤掉 48 Hz 以下的低频隆隆声和直流分量。用 5 阶零相位滤波，不移动声音的时间位置。换模型不变。</p>
+
+<aside class="why">
+<p class="why-label">补充解释</p>
+<ul>
+<li><strong>峰值归一在做什么：</strong>先找出整段声音里最大的那个采样值，如果超过 0.95，就把整段声音等比例缩小，让最大值刚好是 0.95。留出 5% 的余量，是因为后面的滤波和合成可能让峰值再次变高。</li>
+<li><strong>为什么只缩不放：</strong>放大安静录音会把底噪一起放大，听起来更吵；只缩小则不会改变安静素材的噪声水平。</li>
+<li><strong>高通滤波在做什么：</strong>允许高频通过、挡住低频。48 Hz 以下的隆隆声、空调低频、直流偏移会被去掉，而人声的主要内容远高于 48 Hz，所以几乎不受影响。</li>
+<li><strong>5 阶零相位是什么意思：</strong>阶数决定滤波过渡的陡峭程度；零相位表示滤波前后波形的时间位置不变，不会让声音整体提前或延后。</li>
+</ul>
+</aside>
+
+<h2>第 3 站 内容特征网络</h2>
+
+<p>它每 20 ms 输出一帧特征向量。</p>
+
+<p>帧移，320 采样点<span class="src src-fixed">〔写死，由引擎导出固定〕</span>。在 16000 Hz 下 320 点等于 20 ms。它决定特征的时间分辨率，即每隔多久出一帧。换模型可能变，取决于引擎导出。</p>
+
+<p>特征维度，768<span class="src src-model">〔模型〕</span>。它决定每帧特征向量的长度。后续检索和合成都按这个长度对齐。换模型会变。</p>
+
+<p>上采样倍数，2<span class="src src-fixed">〔写死〕</span>。内容特征网络每秒出 50 帧，合成网络每秒要 100 帧。所以把每帧特征复制成 2 份再喂下去。它决定特征帧和合成帧的时间对齐。换模型若两者帧率比例不是 2，这里就错位。</p>
+
+<aside class="why">
+<p class="why-label">补充解释</p>
+<ul>
+<li><strong>每 20 ms 一帧是什么概念：</strong>一秒钟出 50 帧。帧移越小，时间分辨率越高，但计算量也越大。20 ms 是内容和音高分析的常用折中。</li>
+<li><strong>768 维特征表示什么：</strong>每一帧用 768 个数字描述“说了什么”，主要包含发音内容，不包含目标音色。检索库和 generator 都必须按 768 维对齐，维度不一致就无法对接。</li>
+<li><strong>为什么要复制成 2 份：</strong>内容特征网络每秒只给 50 帧，而 generator 每秒需要 100 帧。把每帧复制一份，正好补齐到 100 帧，时间上一一对应。若两者比例不是 2，复制之后就会有一半帧错位。</li>
+<li><strong>为什么标注“写死”又说可能变：</strong>这个值不是用户配置项，而是代码按引擎导出信息固定的；换一个导出方式不同的引擎，帧移可能跟着变。</li>
+</ul>
+</aside>
+
+<h2>第 4 站 音高提取网络</h2>
+
+<p>它把声音转成频谱，再从频谱里读音高。</p>
+
+<p>音高提取方法<span class="src src-user">〔用户〕</span>。目前只有 rmvpe 一个合法值，选别的方法直接报错。</p>
+
+<p>频谱前端四个量，都<span class="src src-fixed">〔写死〕</span>：mel 频带 128 个，FFT 窗长 1024 点，帧移 160 点，频率范围 30 Hz 到 8000 Hz。它们决定怎么把声音切成频谱。帧移 160 点在 16000 Hz 下是 10 ms，和合成网络帧率对齐。换模型不变。</p>
+
+<p>音高解码四个量，都<span class="src src-fixed">〔写死〕</span>：显著性谱 360 格，起点 1997 音分，每格 20 音分，显著性阈值 0.03。它们决定从频谱里挑哪个音高。低于阈值 0.03 判为清音，即没有音高。换模型不变。</p>
+
+<aside class="why">
+<p class="why-label">补充解释</p>
+<ul>
+<li><strong>RMVPE 是什么：</strong>一种神经网络音高提取器。它看一小段频谱，判断这段时间的声音有没有音高、音高是多少。用户只能选方法名，不能调整它内部的网络参数。</li>
+<li><strong>mel 频带 128 个：</strong>人耳对低频的变化更敏感，对高频更迟钝。mel 刻度按听感把频率压缩成 128 个通道，用更少的数字保留更有用的信息。</li>
+<li><strong>FFT 窗长 1024 点：</strong>每次分析 1024 个采样点，在 16000 Hz 下是 64 ms。窗越长，频率看得越精细，但时间上越模糊；1024 点是这里的固定折中。</li>
+<li><strong>帧移 160 点：</strong>在 16000 Hz 下是 10 ms，也就是每秒分析 100 次，正好和 generator 每秒 100 帧对齐，方便后续一一对应。</li>
+<li><strong>频率范围 30–8000 Hz：</strong>低于 30 Hz 多半是噪声和直流，高于 8000 Hz 在 16000 Hz 采样下本来就不存在（最高只能到 8000 Hz），所以只看这一段。</li>
+<li><strong>显著性谱与音分格：</strong>可以把音高候选想成一把梯子，从 1997 音分开始，每 20 音分一格，共 360 格。网络给每一格打分，分数最高的格子就是这一帧的音高位置。</li>
+<li><strong>阈值 0.03 的作用：</strong>如果最高分都低于 0.03，说明这一帧没有可信的音高，判为清音。阈值越低越容易把噪声也判成有声，阈值越高则更容易判成清音。</li>
+</ul>
+</aside>
+
+<h2>第 5 站 音高映射</h2>
+
+<p>它把连续音高曲线换成合成网络认识的离散编号。</p>
+
+<p>变调半音数<span class="src src-user">〔用户〕</span>，范围 -12 到 12。它把音高乘以 2 的（半音数除以 12）次方。正数升调，负数降调。这是直接的音高偏移。换模型不变。</p>
+
+<p>量化范围 50 Hz 到 1100 Hz，离散档数 255<span class="src src-fixed">〔写死〕</span>。它把连续音高按 mel 刻度换算成 1 到 255 的编号。合成网络只认这些编号。换模型不变。</p>
+
+<p>辅音保护比<span class="src src-user">〔用户〕</span>，范围 0 到 0.5，只在文件转换执行。清音帧没有音高，它把这类帧的特征向原始内容特征混合。它保护辅音和气声不被音色转换抹掉。换模型不变。</p>
+
+<aside class="why">
+<p class="why-label">补充解释</p>
+<ul>
+<li><strong>半音数怎么算：</strong>每加 1 个半音，频率乘以 2 的 1/12 次方。加 12 个半音就是升高一个八度，频率翻倍；减 12 个半音就是降低一个八度，频率减半。</li>
+<li><strong>为什么要量化成 1–255：</strong>generator 不吃连续的音高频率，只认离散的编号。按 mel 刻度分档，低音区档位更密、高音区更疏，更符合人耳对音高的感觉。50–1100 Hz 覆盖了常见人声范围。</li>
+<li><strong>清音帧为什么需要保护：</strong>s、sh、f 这类声音没有音高，直接做音色转换容易把它们抹成元音或噪声。辅音保护比控制“保留多少原始特征”：0 表示完全不保护，0.5 表示一半原始特征、一半转换特征。</li>
+<li><strong>为什么只在文件转换执行：</strong>实时路径为了低延迟不做这一步；文件转换可以离线精细处理，所以启用辅音保护。</li>
+</ul>
+</aside>
+
+<h2>第 6 站 音色检索</h2>
+
+<p>它把特征向训练集音色靠拢。</p>
+
+<p>检索混合比<span class="src src-user">〔用户〕</span>，范围 0 到 1。0 表示纯用合成网络自己的音色，1 表示纯用检索到的训练集音色。它决定音色更像模型还是更像训练样本。换模型不变。</p>
+
+<p>近邻数 8，候选表数 1，距离平方加权<span class="src src-fixed">〔写死〕</span>。每帧取 8 个最近训练样本，按距离平方反比加权。候选表数恒为 1，配置不暴露它。换模型不变。</p>
+
+<p>检索库内容<span class="src src-model">〔模型〕</span>。它是模型自带的训练集向量库。换模型就换库。</p>
+
+<aside class="why">
+<p class="why-label">补充解释</p>
+<ul>
+<li><strong>检索在做什么：</strong>index 里存着训练集声音的特征向量。对当前这一帧，在库里找最相似的几个训练样本，把它们的音色特征混合进来，让输出更接近训练集的声音。</li>
+<li><strong>混合比 0 和 1 的区别：</strong>0 完全相信模型自己学到的音色；1 完全依赖检索到的训练样本音色。中间值在两者之间过渡，通常用来微调“像模型”还是“像训练集”。</li>
+<li><strong>近邻数 8 与距离平方反比：</strong>只取最近的 8 个样本，越近的样本权重越大（权重与距离平方成反比），远处的样本几乎不影响结果。</li>
+<li><strong>候选表数 1 是什么意思：</strong>检索库只查一张表。多张表可以加快大规模检索，但当前代码固定为 1，也不开放配置。</li>
+<li><strong>为什么要和模型配套：</strong>index 的向量维度和内容必须与模型匹配。换模型时通常要同时换 index，否则检索结果无意义甚至直接报错。</li>
+</ul>
+</aside>
+
+<h2>第 7 站 合成网络</h2>
+
+<p>它拿特征和音高合成目标音色声音。</p>
+
+<p>合成帧数<span class="src src-model">〔模型，由引擎形状决定〕</span>。它决定合成网络一次合成多少帧。一帧是 10 ms 声音，所以 200 帧等于 2 s，398 帧约等于 4 s。换模型会变。第 8 站的分窗尺寸就跟着它缩放。</p>
+
+<p>说话人编号<span class="src src-model">〔模型〕</span>。多说话人模型用它选音色嵌入。换编号就换音色。换模型会变。</p>
+
+<p>随机种子，114514<span class="src src-fixed">〔写死〕</span>。合成需要噪声，种子固定噪声序列。它决定音色的细微纹理和气息，固定后可复现。换模型不变。</p>
+
+<aside class="why">
+<p class="why-label">补充解释</p>
+<ul>
+<li><strong>合成帧数为什么由引擎决定：</strong>推理引擎在导出时就固定了每次能处理的最大帧数，运行时不方便随意改变。帧率是每秒 100 帧，所以 200 帧对应 2 秒、398 帧约对应 4 秒。</li>
+<li><strong>合成帧数和分窗的关系：</strong>因为一次只能处理固定帧数，长音频必须切成多个窗（第 8 站）。引擎换成 200 帧，窗长和填充也会按比例缩小。</li>
+<li><strong>说话人编号是什么：</strong>多说话人模型内部为每个说话人准备了一组音色嵌入（可以理解成“音色身份证”）。编号决定用哪一组，从而决定输出是谁的音色。</li>
+<li><strong>随机种子为什么固定：</strong>生成过程需要随机噪声来制造气息和细节。种子固定后，每次生成同一段音频的结果一致，方便对比和排查问题；换种子只会改变细微纹理，不会改变整体音色。</li>
+</ul>
+</aside>
+
+<h2>第 8 站 分窗几何</h2>
+
+<p>长音频切窗处理。这一站全部<span class="src src-fixed">〔写死〕</span>。</p>
+
+<p>基准帧数 398。窗长和填充按“合成帧数除以 398”同比缩放。合成帧数 398 时窗 2 s、填充 1 s；合成帧数 200 时窗 1 s、填充 0.5 s。</p>
+
+<p>填充比窗等于 1 比 2。步长等于窗长除以 2，即相邻窗重叠一半。它决定窗多大、补多少上下文、推进多快。</p>
+
+<p>窗间重叠淡化，线性权重。它把相邻窗的接缝平滑过渡，避免咔哒声。</p>
+
+<p>这一站假设内容特征网络帧率是合成网络一半、帧移 160 点。换模型若帧率或帧移不同，这些写死量就失配。</p>
+
+<aside class="why">
+<p class="why-label">补充解释</p>
+<ul>
+<li><strong>为什么需要分窗：</strong>generator 一次只能处理固定帧数，长音频必须切成多段分别转换，再把结果拼接起来。窗就是每次处理的那一段。</li>
+<li><strong>基准帧数 398 的作用：</strong>它是缩放基准。实际窗长和填充都按“合成帧数除以 398”等比调整，所以 200 帧引擎的窗和填充正好是 398 帧引擎的一半。</li>
+<li><strong>填充的作用：</strong>在窗两侧补上额外上下文，让窗边缘的转换也有足够信息，减少接缝处的突变。这里填充总长度是窗长的一半。</li>
+<li><strong>为什么步长是窗长的一半：</strong>相邻两窗重叠 50%。重叠越多接缝越平滑，但重复计算也越多；一半是代码固定的折中。</li>
+<li><strong>线性权重重叠淡化：</strong>在重叠区域，前一个窗的音量从 1 渐变到 0，后一个窗从 0 渐变到 1，两者相加保持平稳，避免接缝处出现咔哒声。</li>
+<li><strong>“帧率一半、帧移 160”的假设：</strong>整个分窗几何是按内容特征每秒 50 帧、帧移 160 点设计的。换模型后如果这个比例变了，窗的位置和特征索引就会错位。</li>
+</ul>
+</aside>
+
+<h2>第 9 站 后处理</h2>
+
+<p>只在文件转换执行。</p>
+
+<p>音量包络校正，窗 1 s、步 0.5 s<span class="src src-fixed">〔写死〕</span>。它按第 7 站的音量包络混合比，逐段校正输出音量。</p>
+
+<p>重采样到 48000 Hz，窗函数 sinc 低通<span class="src src-fixed">〔写死〕</span>。它把模型原生采样率转成输出采样率，截止频率取两侧较低的奈奎斯特，上采样抗镜像、下采样抗混叠。非 48000 Hz 模型不再引入高频镜像。换模型不变。</p>
+
+<p>限幅上限 0.99<span class="src src-fixed">〔写死〕</span>。输出峰值超过 0.99 就整体缩小。它防止最终削波。换模型不变。</p>
+
+<aside class="why">
+<p class="why-label">补充解释</p>
+<ul>
+<li><strong>音量包络校正在做什么：</strong>按 1 秒一段、每 0.5 秒滑动一次，统计输出声音的音量起伏，再逐段做平滑调整，避免出现一段响、一段轻的情况。</li>
+<li><strong>为什么重采样到 48000 Hz：</strong>输出链路统一用 48000 Hz。模型原生若是其他采样率，必须转换；原生就是 48000 Hz 时这一步等于原样输出。</li>
+<li><strong>为什么用窗函数 sinc 低通：</strong>线性插值没有抗镜像滤波，非 48000 Hz 模型转换后会残留高频镜像，听起来发虚或带毛刺。窗函数 sinc 低通把截止频率卡在两侧较低的奈奎斯特，上采样抗镜像、下采样抗混叠，代价是比线性插值多一些计算。</li>
+<li><strong>限幅上限 0.99：</strong>最后一道保险。峰值超过 0.99 就整体缩小，留 1% 余量，避免写文件或播放时削波。</li>
+</ul>
+</aside>
+
+</body>
+</html>

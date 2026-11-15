@@ -53,7 +53,7 @@ Mozart 是面向 NVIDIA Jetson Orin Nano Super 8 GB 的本地语音处理系统�
 | `tests/` | 跨组件 C++ 测试与小型夹具 | CTest |
 | `cmake/` | CMake 模块 | — |
 | `tools/` | 构建、检查、部署脚本 | — |
-| `docs/` | 长期文档；`docs/SETUP.md` 设备目录与部署；`docs/SPEC/` 模块规格；`docs/FUTURE.md` | — |
+| `docs/` | 长期文档；`docs/SETUP.md` 设备目录与部署；`docs/SPEC/` 模块规格；`docs/architecture/` 架构图；`docs/FUTURE.md` | — |
 | `reports/` | 带日期的实测记录，只跟踪 Markdown | — |
 | `.claude/`、`CLAUDE.md` | 拒绝在 Claude Code 下工作的阻断配置与声明 | — |
 
@@ -64,6 +64,12 @@ Mozart 是面向 NVIDIA Jetson Orin Nano Super 8 GB 的本地语音处理系统�
 - 单元测试：Rust 放各 crate 的 `src/` 或 `tests/`；C++ 放 `tests/` 并注册 CTest。
 - 小型对拍夹具放 `tests/fixtures/`，在 `.gitignore` 白名单逐条列出。模型、音频、引擎等大型资产不进仓库。
 - 构建产物：CMake 在 `build/<preset>/`，Cargo 在 `target/`，均已 gitignore。
+
+## 架构文档
+
+`docs/architecture/` 存放自包含 HTML 架构图：`mozart-new-architecture.html` 为总体架构，`rvc-module.html` 与 `rvc-realtime-module.html` 描述推理模块。
+
+完成架构性更改后，比对代码、架构图、`docs/SPEC/` 与 `docs/ARCHITECTURE-HIGHLIGHTS.md`，确认是否需要同步更新。
 
 ## 语言与写作
 

@@ -1,0 +1,252 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Mozart 新架构 · 数据流洋葱拆解</title>
+<style>body{margin:0}</style>
+</head>
+<body>
+<div id="df">
+<style>
+#df{--bg:#f4f1ea;--paper:#fffdf9;--ink:#20242a;--muted:#66707a;--line:#e4dfd4;
+--audio:#28624f;--text:#2c5282;--ctl:#8a6420;--file:#6b4d8a;
+font:15px/1.65 "Noto Sans CJK SC","PingFang SC","Microsoft YaHei",system-ui,sans-serif;
+color:var(--ink);background:var(--bg);padding:22px 18px 60px;-webkit-font-smoothing:antialiased}
+#df *{box-sizing:border-box}
+#df .wrap{max-width:1120px;margin:0 auto}
+#df code{font-family:"JetBrains Mono","Noto Sans Mono CJK SC",Consolas,monospace;font-size:.85em;
+background:#f0ede6;padding:1px 5px;border-radius:4px}
+#df h1{font-size:22px;margin:0 0 6px}
+#df .sub{color:var(--muted);font-size:13px;margin:0 0 16px;max-width:80ch}
+#df .stage{background:var(--paper);border:1px solid var(--line);border-radius:12px;padding:16px 18px}
+#df .canvas{overflow-x:auto;margin-top:6px}
+#df .canvas svg{display:block;min-width:960px;width:100%;height:auto}
+#df .lane{fill:none;stroke:var(--line);stroke-dasharray:3 4}
+#df .lanet{font-size:10.5px;fill:#a9a49a;letter-spacing:.08em}
+#df g.node{cursor:pointer}
+#df g.node rect{fill:#fffefb;stroke:var(--line);stroke-width:1.2;transition:.25s}
+#df g.node text{font-size:11.5px;fill:var(--ink);font-weight:600}
+#df g.node text.s{font-size:9.5px;fill:var(--muted);font-weight:400}
+#df g.node:hover rect{stroke:#b9b2a4}
+#df g.node.sel rect{stroke:var(--ctl);stroke-width:2.2;fill:#fbf3df}
+#df .edge{fill:none;stroke-width:1.8;stroke-dasharray:7 5;animation:flow 1.1s linear infinite}
+@keyframes flow{to{stroke-dashoffset:-24}}
+#df .edge.c-audio{stroke:var(--audio)}#df .edge.c-text{stroke:var(--text)}
+#df .edge.c-ctl{stroke:var(--ctl)}#df .edge.c-file{stroke:var(--file)}
+#df .edge.thin{stroke-width:1.1;opacity:.5;animation:none;stroke-dasharray:3 4}
+#df .elabel{font-size:9.5px;fill:var(--muted)}
+#df .legend{display:flex;gap:14px;flex-wrap:wrap;font-size:11.5px;color:var(--muted);margin:10px 0 0}
+#df .legend i{width:16px;height:0;border-top:2.5px solid;display:inline-block;vertical-align:middle;margin-right:5px}
+#df .hint{font-size:12px;color:var(--muted);margin:8px 0 0}
+
+/* 节点悬浮窗（洋葱） */
+#df .pop{position:fixed;z-index:50;width:420px;max-width:calc(100vw - 24px);max-height:74vh;
+overflow-y:auto;background:var(--paper);border:1px solid var(--line);border-top:4px solid var(--ctl);
+border-radius:10px;box-shadow:0 10px 32px rgba(0,0,0,.16);display:none}
+#df .pop.on{display:block}
+#df .phead{position:sticky;top:0;display:flex;align-items:center;gap:9px;padding:11px 14px;
+background:#fbf3df;border-bottom:1px solid var(--line)}
+#df .phead .nm{font-size:15.5px;font-weight:700}
+#df .phead .bin{font-size:11px;color:var(--muted);font-family:"JetBrains Mono",monospace}
+#df .phead .x{margin-left:auto;cursor:pointer;font-size:13px;color:var(--muted);padding:2px 6px;border-radius:5px}
+#df .phead .x:hover{background:#f0e6cc}
+#df .pbody{padding:4px 14px 14px}
+#df .pdesc{font-size:12.5px;color:var(--muted);margin:9px 0}
+#df .pt{border:1px solid var(--line);border-radius:8px;margin:7px 0;background:#fffefb;overflow:hidden}
+#df .pt>.h{display:flex;align-items:center;gap:8px;padding:8px 11px;cursor:pointer;font-size:13px}
+#df .pt>.h:hover{background:#faf8f3}
+#df .pt .cv{width:12px;height:12px;flex:none;transition:transform .2s;color:var(--muted)}
+#df .pt.open>.h .cv{transform:rotate(90deg)}
+#df .tag{font-size:9.5px;font-weight:700;padding:1px 6px;border-radius:5px;flex:none}
+#df .tag.thread{background:#e7efe9;color:var(--audio)}
+#df .tag.sock{background:#e9eef5;color:var(--text)}
+#df .tag.proto{background:#f3ecdd;color:var(--ctl)}
+#df .tag.file{background:#efe9f3;color:var(--file)}
+#df .pt .nm2{font-weight:600}
+#df .pt .nt{font-size:11px;color:var(--muted);margin-left:auto}
+#df .pt>.b{display:none;padding:2px 12px 11px;border-top:1px dashed var(--line);font-size:12.5px}
+#df .pt.open>.b{display:block}
+#df .pt>.b p{margin:7px 0}
+#df table.kv{width:100%;border-collapse:collapse;font-size:12px;margin:7px 0}
+#df table.kv td{border:1px solid var(--line);padding:4px 8px;vertical-align:top}
+#df table.kv td:first-child{background:#f0ede6;font-family:"JetBrains Mono",monospace;white-space:nowrap;width:1%}
+#df table.kv td:last-child{color:var(--muted)}
+#df pre{background:#20242a;color:#e8e6e0;padding:9px 11px;border-radius:7px;overflow-x:auto;
+font-family:"JetBrains Mono",monospace;font-size:11.5px;line-height:1.5;margin:7px 0}
+#df pre .c{color:#8a93a0}#df pre .k{color:#9ecbff}#df pre .n{color:#f0c674}
+#df .pill{display:inline-block;font-size:10.5px;font-family:"JetBrains Mono",monospace;background:#f0ede6;
+border:1px solid var(--line);border-radius:5px;padding:1px 6px;margin:2px 3px 2px 0}
+#df .note{font-size:11.5px;color:var(--muted);border-left:3px solid var(--line);padding-left:9px;margin:8px 0}
+</style>
+
+<div class="wrap">
+<h1>Mozart 新架构 · 数据流洋葱拆解</h1>
+<p class="sub">Rust 运行时 + C++ 推理，控制面单一权威（daemon）。图上每个节点就是一个模块；
+<b>点节点</b>弹出锚定该节点的悬浮窗，窗内点组件/接口再展开字段级细节——逐层剥洋葱。✕ 或 Esc 收起。</p>
+
+<div class="stage">
+  <div class="canvas"><svg id="svg" viewBox="0 0 1020 560" role="img" aria-label="Mozart 新架构数据流"></svg></div>
+  <div class="legend">
+    <span><i style="border-color:var(--audio)"></i>音频数据</span>
+    <span><i style="border-color:var(--text)"></i>文本 / 字幕</span>
+    <span><i style="border-color:var(--ctl)"></i>控制 / 状态</span>
+    <span><i style="border-color:var(--file)"></i>文件 / 存档</span>
+    <span style="margin-left:auto">虚线流动方向 = 数据流向 · 接收方 bind / 发送方 connect</span>
+  </div>
+  <p class="hint">▸ 点任意节点展开悬浮窗。socket 路径相对 run_dir；帧契约与控制信封在相应节点的 proto 层。</p>
+</div>
+</div>
+
+<div class="pop" id="pop">
+  <div class="phead"><span class="nm" id="pnm"></span><span class="bin" id="pbin"></span><span class="x" id="px">✕</span></div>
+  <div class="pbody" id="pbody"></div>
+</div>
+
+<script>
+(function(){
+var R=document.getElementById('df'),SVGNS='http://www.w3.org/2000/svg';
+var svg=R.querySelector('#svg');
+function el(t,a,p){var e=document.createElementNS(SVGNS,t);for(var k in a)e.setAttribute(k,a[k]);(p||svg).appendChild(e);return e;}
+var N={
+ mic:{x:20,y:60,w:120,h:54,t:'麦克风',s:'ALSA 采集',c:'audio'},
+ pre:{x:200,y:60,w:170,h:54,t:'pre',s:'采集·DSP·播放·分发',c:'audio'},
+ rvc:{x:450,y:60,w:170,h:54,t:'rvc',s:'C++ 变声推理',c:'audio'},
+ spk:{x:880,y:60,w:120,h:54,t:'扬声器',s:'ALSA 播放',c:'audio'},
+ asr:{x:200,y:190,w:140,h:50,t:'asr',s:'流式识别+复核',c:'text'},
+ bridge:{x:420,y:190,w:150,h:50,t:'bridge',s:'字幕·翻译·播报',c:'text'},
+ sub:{x:650,y:190,w:120,h:50,t:'字幕文件',s:'subtitles.jsonl',c:'file'},
+ llama:{x:420,y:290,w:150,h:46,t:'llama-server',s:'C++ 翻译推理',c:'text'},
+ tts:{x:650,y:290,w:140,h:46,t:'tts',s:'合成+重采样',c:'text'},
+ ctl:{x:20,y:440,w:130,h:50,t:'ctl',s:'CLI 瘦客户端',c:'ctl'},
+ daemon:{x:230,y:440,w:170,h:50,t:'daemon',s:'控制权威·监管',c:'ctl'}
+};
+function A(id,side,f){var n=N[id];
+ if(side=='l')return[n.x,n.y+n.h*f];if(side=='r')return[n.x+n.w,n.y+n.h*f];
+ if(side=='t')return[n.x+n.w*f,n.y];return[n.x+n.w*f,n.y+n.h];}
+var E={
+ mic_pre:{a:A('mic','r',.5),b:A('pre','l',.5),c:'audio',lb:'ALSA 48kHz'},
+ pre_rvc:{a:A('pre','r',.3),b:A('rvc','l',.3),c:'audio',lb:'InputFrame 16k · rvc-in'},
+ rvc_pre:{a:A('rvc','l',.7),b:A('pre','r',.7),c:'audio',lb:'OutputFrame 48k · rvc-out'},
+ pre_spk:{a:A('pre','t',.5),m:[[285,20],[940,20]],b:A('spk','t',.5),c:'audio',lb:'ALSA 播放（实时/播报）'},
+ pre_asr:{a:A('pre','b',.5),b:A('asr','t',.5),c:'audio',lb:'InputFrame · asr-in'},
+ asr_br:{a:A('asr','r',.5),b:A('bridge','l',.5),c:'text',lb:'events · asr-events'},
+ br_sub:{a:A('bridge','r',.3),b:A('sub','l',.3),c:'file',lb:'写 jsonl · revision'},
+ br_ll:{a:A('bridge','b',.35),b:A('llama','t',.35),c:'text',lb:'HTTP · llama.sock'},
+ ll_br:{a:A('llama','t',.7),b:A('bridge','b',.7),c:'text',lb:'译文+finish_reason'},
+ br_tts:{a:A('bridge','r',.7),m:[[610,225],[610,313]],b:A('tts','l',.5),c:'text',lb:'TTS_JOB · tts-jobs'},
+ tts_pre:{a:A('tts','r',.5),m:[[830,313],[830,140],[370,140]],b:A('pre','r',.9),c:'audio',lb:'OutputFrame 48k · tts-out（播报）'},
+ ctl_da:{a:A('ctl','r',.5),b:A('daemon','l',.5),c:'ctl',lb:'daemon.sock'},
+ da_pre:{a:A('daemon','t',.2),m:[[264,400],[120,400],[120,114]],b:A('pre','l',.9),c:'ctl',thin:1},
+ da_rvc:{a:A('daemon','t',.4),m:[[298,390],[535,390],[535,114]],b:A('rvc','b',.5),c:'ctl',thin:1},
+ da_asr:{a:A('daemon','t',.6),m:[[332,410],[270,410],[270,240]],b:A('asr','b',.5),c:'ctl',thin:1},
+ da_tts:{a:A('daemon','r',.3),m:[[720,455],[720,336]],b:A('tts','b',.5),c:'ctl',thin:1},
+ da_br:{a:A('daemon','r',.6),m:[[495,470],[495,240]],b:A('bridge','b',.9),c:'ctl',thin:1},
+ da_ll:{a:A('daemon','r',.8),m:[[400,480],[400,336]],b:A('llama','b',.5),c:'ctl',thin:1,lb:'监管(无控制协议)'}
+};
+var LP={mic_pre:[160,52],pre_rvc:[410,72],rvc_pre:[410,108],pre_spk:[600,14],
+ pre_asr:[282,160,'end'],asr_br:[380,208],br_sub:[610,198],br_ll:[452,268,'end'],
+ ll_br:[520,268,'start'],br_tts:[612,270,'start'],tts_pre:[700,134],ctl_da:[180,432],da_ll:[404,380,'start']};
+[[150],[262],[402]].forEach(function(L){el('line',{class:'lane',x1:12,y1:L[0],x2:1008,y2:L[0]});});
+el('text',{class:'lanet',x:12,y:50}).textContent='硬件 I/O';
+el('text',{class:'lanet',x:12,y:168}).textContent='音频 / 推理';
+el('text',{class:'lanet',x:12,y:278}).textContent='文本 / 语言';
+el('text',{class:'lanet',x:12,y:418}).textContent='控制';
+var defs=el('defs',{});
+['audio','text','ctl','file'].forEach(function(c){
+ var m=el('marker',{id:'ar-'+c,viewBox:'0 0 10 10',refX:9,refY:5,markerWidth:6,markerHeight:6,orient:'auto-start-reverse'},defs);
+ el('path',{d:'M0 0 L10 5 L0 10 z',fill:'var(--'+c+')'},m);});
+function path(a,m,b){var p='M'+a[0]+' '+a[1];(m||[]).forEach(function(q){p+=' L'+q[0]+' '+q[1]});return p+' L'+b[0]+' '+b[1];}
+Object.keys(E).forEach(function(id){var e=E[id];
+ el('path',{class:'edge c-'+e.c+(e.thin?' thin':''),d:path(e.a,e.m,e.b),'marker-end':'url(#ar-'+e.c+')'});
+ if(e.lb){var lp=LP[id]||[(e.a[0]+e.b[0])/2,(e.a[1]+e.b[1])/2-4,'start'];
+  var t=el('text',{class:'elabel',x:lp[0],y:lp[1],'text-anchor':lp[2]||'start'});t.textContent=e.lb;}});
+var nodeEls={};
+Object.keys(N).forEach(function(id){var n=N[id];
+ var g=el('g',{class:'node','data-id':id});
+ el('rect',{x:n.x,y:n.y,width:n.w,height:n.h,rx:8},g);
+ el('text',{x:n.x+n.w/2,y:n.y+n.h/2-2,'text-anchor':'middle'},g).textContent=n.t;
+ el('text',{class:'s',x:n.x+n.w/2,y:n.y+n.h/2+13,'text-anchor':'middle'},g).textContent=n.s;
+ nodeEls[id]=g;});
+
+var CV='<svg class="cv" viewBox="0 0 16 16" fill="none"><path d="M6 4l4 4-4 4" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"/></svg>';
+var D={
+ ctl:{bin:'mozart-ctl',desc:'所有整机操作入口。连 daemon 发命令、渲染状态；自身无权威状态。退出码 0/1/2/3/4/5。',pts:[
+  ['proto','命令集','v1','<p>经 daemon.sock 转发，<code>--json</code> 稳定输出。</p><span class="pill">up</span><span class="pill">down</span><span class="pill">status</span><span class="pill">route set</span><span class="pill">mute</span><span class="pill">translate on|off</span><span class="pill">speech on|off|stop</span><span class="pill">config get|set|save</span><span class="pill">restart</span><span class="pill">file …</span><span class="pill">model list</span>'],
+  ['sock','daemon.sock','connect','<p>SEQPACKET 控制信封（见 daemon proto 层）。request_id 固定 1，超时 rpc_timeout_ms。</p>']]},
+ daemon:{bin:'mozart-daemon',desc:'唯一权威。监管 6 子进程、每秒轮询 GetStatus 汇总成派生读模型；不碰音频数据面。',pts:[
+  ['thread','server','控制连接','<p>bind daemon.sock，listen(8)，每连接独立线程，空闲 30s 断开。</p><table class="kv"><tr><td>0x0101</td><td>Hello</td></tr><tr><td>0x0102</td><td>GetStatus</td></tr><tr><td>0x0103/04</td><td>RouteSet / MuteSet</td></tr><tr><td>0x0105</td><td>Shutdown</td></tr><tr><td>0x0106/07/08</td><td>Translate/SpeechSet/Stop → 转发桥</td></tr></table>'],
+  ['thread','supervisor ×6','生命周期','<p>退避 500ms 倍增上限 10s，稳定 30s 重置；SIGTERM 2s 后 SIGKILL。llama 启动前清陈旧 socket。</p><table class="kv"><tr><td>mozart 子进程</td><td>--socket --config，各读自己段</td></tr><tr><td>llama-server</td><td>-m gguf -c 2048 -ngl 99 -np 1 -t 2 --host llama.sock --jinja</td></tr></table>'],
+  ['thread','services+poller','轮询','<p>ServiceLink 惰性 connect+Hello；每秒 poll 五服务 GetStatus。llama 不轮询，可达性由桥带报。</p>'],
+  ['thread','state+arbiter','权威','<p>Processes 6 角色 + 各 Option&lt;Status&gt; + 降级列表。GPU 实时/文件互斥；扬声器分时。mode 派生。</p>'],
+  ['proto','控制信封','SEQPACKET','<pre>magic u32 \'MCTL\'=0x4C54434D\nversion u16=1 | type u16 | request_id u32 | body_len u32\nbody JSON ≤64KiB → {status,code,reason,data}</pre><table class="kv"><tr><td>0x01xx</td><td>daemon</td></tr><tr><td>0x02xx</td><td>pre</td></tr><tr><td>0x03xx</td><td>rvc</td></tr><tr><td>0x04xx</td><td>asr</td></tr><tr><td>0x05xx</td><td>bridge</td></tr><tr><td>0x06xx</td><td>tts</td></tr></table>']]},
+ pre:{bin:'mozart-pre',desc:'一次采集供所有链路。实时线程不分配不阻塞。AI 支路恒发。',pts:[
+  ['thread','capture','ALSA 48k','<p>64 帧周期累积 960 样本 RawFrame；FL 立体声→单声道 f32。</p>'],
+  ['thread','DSP','信号链','<p>80Hz 高通→WOLA 降噪→gate/AGC/limiter(默认关)→48k trunk→33 抽头 FIR 3:1 抽取→VAD。pack 出 16k InputFrame。</p>'],
+  ['thread','ai 双路','LazySender','<p>同帧恒发 rvc+asr；惰性 connect 失败计丢弃。consumer_drops 分键 rvc/asr。</p>'],
+  ['thread','playback','扬声器分时','<p>播报优先：tts 环有帧→broadcast；空且 holdoff 200ms→realtime。</p>'],
+  ['sock','pre.sock','bind 0x02xx','<table class="kv"><tr><td>0x0201</td><td>Hello</td></tr><tr><td>0x0202/03</td><td>SetRoute/SetMute</td></tr><tr><td>0x0204</td><td>GetStatus</td></tr></table>'],
+  ['sock','数据面 ×4','DGRAM','<table class="kv"><tr><td>rvc-in</td><td>connect→rvc 发 InputFrame</td></tr><tr><td>asr-in</td><td>connect→asr 发 InputFrame</td></tr><tr><td>rvc-out</td><td>bind←rvc 收 OutputFrame</td></tr><tr><td>tts-out</td><td>bind←tts 收 OutputFrame</td></tr></table>'],
+  ['proto','帧契约','frame.h','<pre>InputFrame 1300B = magic 0x4D5A5254 + meta16 + 320×f32 (16k)\nOutputFrame 3860B = magic 0x54525A4D + meta16 + 960×f32 (48k)\nmeta: pts_ns u64|frame_idx u32|vad u8|energy u8|conf u8|seg u8</pre>']]},
+ rvc:{bin:'mozart-rvc (C++)',desc:'C++ 推理，ONNX Runtime/TensorRT。流式 1:1 泵。',pts:[
+  ['thread','StreamSession','推理','<p>hubert+rmvpe+generator。window 3840(240ms)/crossfade 2400/past 40000/sola 480/emit 11520。</p>'],
+  ['sock','rvc.sock','bind 0x03xx','<table class="kv"><tr><td>0x0301</td><td>Hello</td></tr><tr><td>0x0302</td><td>LoadModel</td></tr><tr><td>0x0303/04/05</td><td>Start/Stop/ResetStream</td></tr><tr><td>0x0306</td><td>GetStatus</td></tr></table>'],
+  ['sock','rvc-in/out','数据面','<p>rvc-in bind←pre(InputFrame)；rvc-out connect→pre(OutputFrame)。</p>']]},
+ asr:{bin:'mozart-asr',desc:'Rust 单进程 sherpa-onnx 库链入。收包/解码/复核/输出四线程+控制。每次启动随机启动号。',pts:[
+  ['thread','receiver','收包','<p>bind asr-in，push SPSC 环，不分配不阻塞；1s 空闲切句。</p>'],
+  ['thread','decoder','在线','<p>zipformer transducer greedy。端点 1.2/0.6/12.0s；700 帧(14s)上限触发进程退出。endpoint→cut final+移交复核+reset。</p>'],
+  ['thread','review','复核','<p>SenseVoice int8。队列容量 2，整句所有权移交；队满 skipped；加载失败每句 failed 不影响在线。</p>'],
+  ['thread','output','事件','<p>独占 asr-events(SEQPACKET，ASR 监听桥连接)。断连 final/refined 补发、partial 丢；超限丢最旧。</p>'],
+  ['sock','asr.sock','bind 0x04xx','<table class="kv"><tr><td>0x0401</td><td>Hello {version,startup_id}</td></tr><tr><td>0x0402</td><td>GetStatus</td></tr></table>'],
+  ['proto','识别事件','asr-events','<pre>{type: partial|final|refined,\n startup_id:"c1c71f10", utterance_id:"c1c71f10:6",\n text, refinement_status,\n asr_numeric_audit:null, asr_polarity_audit:null}</pre>']]},
+ bridge:{bin:'mozart-bridge',desc:'单进程多线程。收字/写字幕/翻译/投递都在进程内。桥是开关活权威。',pts:[
+  ['thread','events','收字','<p>connect asr-events，读循环只入队；启动号校验，断连 500ms 重连；有界通道，丢弃可查询。</p>'],
+  ['thread','subtitles','落盘','<p>记录表 LRU(128/64，保护在途)。追加 jsonl 逐行 flush。revision 创建 0 每次+1 final 粘滞。</p>'],
+  ['thread','translate','编排','<p>final→预处理→llama→质检→落字幕→投递。传输失败重试≤2。off 只发原文。</p>'],
+  ['thread','preprocess+quality','预处理/质检','<p>同音纠错表(可配置)+数字归一化，纠错作用于 zh。全套旧质检(数字/角色/否定/未翻译/截断)+长度比补充。</p>'],
+  ['thread','speech','投递','<p>有界队列队满丢最旧。connect tts-jobs 发 SUBMIT 读回执。off 停新投递；stop 发 JOB_STOP+清队列。</p>'],
+  ['sock','bridge.sock','bind 0x05xx','<table class="kv"><tr><td>0x0501</td><td>Hello</td></tr><tr><td>0x0502</td><td>GetStatus(四组)</td></tr><tr><td>0x0503/04/05</td><td>Translate/SpeechSet/Stop</td></tr></table>'],
+  ['proto','字幕记录','jsonl','<pre>{seq, utterance_id:"启动号:句号", zh, en,\n final:bool, translation_status:pending|recognizing|\n completed|failed|skipped, revision, received_at, ts,\n asr_engine, online_text, homophone_fixes,\n refinement_status, asr_numeric_audit}</pre>'],
+  ['file','状态持久化','开关','<p>TOML 基线 + 运行时覆盖写 ~/.local/state/mozart/bridge-state.json，重启恢复不回落基线。</p>']]},
+ llama:{bin:'llama-server (C++)',desc:'第三方翻译推理。系统唯一 HTTP 之处，传输仍 Unix socket。daemon 只管存活。',pts:[
+  ['proto','HTTP 接口','llama.sock','<pre>POST /v1/chat/completions\n{model, messages[system,user], max_tokens:128,\n temperature:0,\n chat_template_kwargs:{enable_thinking:false}}\n→ choices[0].message.content + finish_reason</pre><p class="note">Qwen3.5 思考模型必须关 thinking，否则译文为空。</p>'],
+  ['proto','模型参数','沿用旧','<p>Qwen3.5-0.8B Q4_K_M。-c 2048 -b 256 -ub 128 --cache-ram 128 -ngl 99 -np 1 -t 2 -tb 2 --host .sock --jinja。板端已确认支持。</p>']]},
+ tts:{bin:'mozart-tts',desc:'Rust 独立进程 sherpa TTS。参考音色合成，v1 不走变声、48k 直喂 pre。',pts:[
+  ['thread','jobs','任务通道','<p>bind tts-jobs(定长头+JSON)。SUBMIT 回 submitted/skipped/failed；STOP 清队列+中止在途。有界队列队满拒收。</p>'],
+  ['thread','synth','PocketTTS','<p>int8，参考 WAV 启动加载。num_steps5/speed1/silence_scale1/seed"42"。安全:非有限/peak&gt;4 拒、归一化、时长上限 min(45,max(4,len*0.35+2))。</p>'],
+  ['thread','resample+output','24k→48k','<p>线性插值升采样打包 OutputFrame；connect tts-out，20ms/帧节拍防溢出。经变声 16k 留 FUTURE。</p>'],
+  ['sock','tts.sock','bind 0x06xx','<table class="kv"><tr><td>0x0601/02</td><td>Hello/GetStatus</td></tr><tr><td>0x0610/11</td><td>JobSubmit/JobReply</td></tr><tr><td>0x0612</td><td>JobStop</td></tr></table>']]},
+ sub:{bin:'subtitles.jsonl',desc:'字幕发布点与存档。持久本地存储，重启保留。推流方读文件。',pts:[
+  ['file','路径','XDG','<p>默认 ~/.local/state/mozart/subtitles.jsonl，经 [bridge] subtitles_path 配置。v1 不轮转。</p>'],
+  ['proto','记录格式','沿用旧','<p>见 bridge「字幕记录」层。revision 覆盖语义；译文先于投递落盘。</p>']]},
+ mic:{bin:'ALSA',desc:'硬件输入，全系统只打开一次。',pts:[['proto','采集','48kHz','<p>48kHz 单声道 RawFrame(960 样本/20ms)。所有音频必经 pre。</p>']]},
+ spk:{bin:'ALSA',desc:'硬件输出。同一时刻一路占用（扬声器分时）。',pts:[['proto','播放','分时','<p>实时/直出在 pre 内切换；播报时静音实时、播完恢复。</p>']]}
+};
+
+var pop=R.querySelector('#pop'),curSel=null;
+function closeP(){pop.classList.remove('on');if(curSel){nodeEls[curSel].classList.remove('sel');curSel=null;}}
+R.querySelector('#px').onclick=function(e){e.stopPropagation();closeP();};
+function open(id,g){
+ if(curSel)nodeEls[curSel].classList.remove('sel');
+ curSel=id;nodeEls[id].classList.add('sel');
+ var n=N[id],d=D[id];
+ R.querySelector('#pnm').textContent=n.t;
+ R.querySelector('#pbin').textContent=d.bin;
+ pop.style.borderTopColor='var(--'+n.c+')';
+ var body=R.querySelector('#pbody');
+ body.innerHTML='<p class="pdesc">'+d.desc+'</p>'+d.pts.map(function(p){
+   return '<div class="pt"><div class="h">'+CV+'<span class="tag '+p[0]+'">'+p[0]+'</span><span class="nm2">'+p[1]+'</span><span class="nt">'+p[2]+'</span></div><div class="b">'+p[3]+'</div></div>';}).join('');
+ body.querySelectorAll('.pt>.h').forEach(function(h){h.onclick=function(e){e.stopPropagation();h.parentNode.classList.toggle('open');};});
+ pop.classList.add('on');
+ var r=g.getBoundingClientRect(),W=420,pw=Math.min(W,window.innerWidth-24);
+ var left=r.right+12; if(left+pw>window.innerWidth-12) left=Math.max(12,r.left-pw-12);
+ var top=Math.max(12,Math.min(window.innerHeight-160,r.top-20));
+ pop.style.left=left+'px'; pop.style.top=top+'px';
+}
+svg.addEventListener('click',function(ev){var g=ev.target.closest('g.node');if(g){open(g.dataset.id,g);}else closeP();});
+document.addEventListener('keydown',function(e){if(e.key==='Escape')closeP();});
+})();
+</script>
+</div>
+</body>
+</html>

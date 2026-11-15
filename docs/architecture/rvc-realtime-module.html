@@ -1,0 +1,414 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>RVC 实时模块 · mozart-rvc</title>
+<style>
+:root {
+  --ink: #1b1f24;
+  --muted: #64707d;
+  --line: #d9dee4;
+  --soft: #f6f8fa;
+  --model: #1f5d8f;
+  --fixed: #5b6570;
+  --user: #2f6b45;
+}
+* { box-sizing: border-box; }
+body {
+  margin: 0 auto;
+  max-width: 880px;
+  padding: 40px 28px 72px;
+  color: var(--ink);
+  background: #fff;
+  font: 16px/1.9 "Noto Sans CJK SC", "PingFang SC", "Microsoft YaHei", system-ui, sans-serif;
+}
+h1 {
+  font-size: 24px;
+  line-height: 1.3;
+  margin: 0 0 12px;
+  padding-bottom: 12px;
+  border-bottom: 2px solid var(--ink);
+}
+h2 {
+  font-size: 18px;
+  line-height: 1.4;
+  margin: 44px 0 12px;
+  padding-top: 16px;
+  border-top: 1px solid var(--line);
+}
+p { margin: 0 0 12px; }
+code {
+  font-family: "JetBrains Mono", "Noto Sans Mono CJK SC", Consolas, monospace;
+  font-size: .9em;
+  background: var(--soft);
+  border: 1px solid var(--line);
+  border-radius: 3px;
+  padding: 0 4px;
+}
+.readme {
+  color: var(--muted);
+  font-size: 13px;
+  margin-bottom: 20px;
+}
+.flow {
+  margin: 14px 0;
+  padding: 12px 14px;
+  border-left: 3px solid var(--ink);
+  background: var(--soft);
+  font-size: 14px;
+}
+.src {
+  font-family: "JetBrains Mono", Consolas, monospace;
+  font-size: .85em;
+  white-space: nowrap;
+}
+.src-model { color: var(--model); }
+.src-fixed { color: var(--fixed); }
+.src-user { color: var(--user); }
+.why {
+  margin: 14px 0 20px;
+  padding: 12px 16px 12px 18px;
+  background: var(--soft);
+  border-left: 3px solid #a6b2bd;
+  font-size: 14px;
+  line-height: 1.85;
+}
+.why-label {
+  margin: 0 0 6px;
+  font-size: 12px;
+  letter-spacing: .08em;
+  color: var(--muted);
+}
+.why ul { margin: 0; padding-left: 20px; }
+.why li { margin: 4px 0; }
+.why p:last-child, .why ul:last-child { margin-bottom: 0; }
+.why strong { font-weight: 600; }
+.terms {
+  display: grid;
+  grid-template-columns: 130px minmax(0, 1fr);
+  gap: 8px 18px;
+  margin: 0 0 16px;
+}
+.terms dt { font-weight: 600; }
+.terms dd { margin: 0; }
+@media (max-width: 640px) {
+  body { padding: 24px 16px 56px; font-size: 15px; }
+  .terms { grid-template-columns: 1fr; gap: 2px; }
+  .terms dd { margin-bottom: 10px; }
+}
+@media print {
+  body { max-width: none; padding: 0; font-size: 12px; }
+  h2 { break-after: avoid; }
+  .why { break-inside: avoid; }
+}
+</style>
+</head>
+<body>
+
+<h1>模块名称声明</h1>
+
+<p class="readme">阅读方式：原文逐字保留。每站原文之后的“补充解释”是面向零基础的说明，回答三个问题：这个参数是什么、它为什么存在、改动它会影响什么。本文讲实时变声路径；文件转换路径见 rvc-module.html。</p>
+
+<p>下文先用全称定义，之后一律复用同一名称。</p>
+
+<p>推理进程：可执行程序 mozart-rvc，C++ 编写。它把输入声音换成目标音色。下面所有流程都发生在它内部。</p>
+
+<p>内容特征网络：代码名 HuBERT。它从声音里提取“说了什么”的特征向量。实时路径用定长形状的实时引擎。</p>
+
+<p>音高提取网络：代码名 RMVPE。它从声音里提取音高随时间变化的曲线。实时路径用定长形状的实时引擎。</p>
+
+<p>合成网络：代码名 generator。实时路径拆成两段：前段（代码名 front）把特征和音高编码成潜变量；解码段（代码名 decoder）拿潜变量合成波形。下文简称前段、解码段。</p>
+
+<p>音色检索库：代码名 index。它是训练集音色向量的库，供检索混合用。</p>
+
+<p>帧泵：代码名 AudioWorker。它读一帧输入、回一帧输出，维持 1:1 节拍。</p>
+
+<p>流式调度器：代码名 StreamingRvc。它把帧攒成块、取分析窗、调用推理、拼接输出。</p>
+
+<p>参数来源分三种，每个参数后注明：<span class="src src-model">〔模型〕</span>来自模型文件或引擎形状，换模型就变；<span class="src src-fixed">〔写死〕</span>代码硬编码，换模型不变；<span class="src src-user">〔用户〕</span>在配置里可调。</p>
+
+<aside class="why">
+<p class="why-label">补充解释：参数来源怎么读</p>
+<ul>
+<li><strong>〔模型〕</strong>：这个值写在模型文件里，或由推理引擎的形状决定。配置改不了；换一个模型或换一个引擎，这个值就可能变。</li>
+<li><strong>〔写死〕</strong>：这是代码里的常量，换模型也不变。少数情况下由引擎导出固定，换引擎仍可能变。</li>
+<li><strong>〔用户〕</strong>：这个值在配置里可以调整，每次转换前由用户决定。</li>
+</ul>
+</aside>
+
+<h2>先认识几个词</h2>
+
+<dl class="terms">
+<dt>采样率</dt>
+<dd>每秒钟给声音“拍照”的次数，单位 Hz。16000 Hz 表示每秒记录 16000 个采样点。采样率越高，能表示的频率越高；16000 Hz 最高只能表示 8000 Hz 的声音。</dd>
+
+<dt>帧与帧移</dt>
+<dd>处理声音时不会一次看完整段，而是切成很短的片段，每一段叫一帧。帧移是相邻两帧起点相距多少个采样点，决定“隔多久看一次”。</dd>
+
+<dt>特征向量</dt>
+<dd>用一串数字概括一小段声音的特点，可以理解成这段声音的“指纹”。后面的检索和合成都按这些数字工作。</dd>
+
+<dt>音高与音分</dt>
+<dd>音高是声音听起来的高低，单位 Hz。音分是更细的相对刻度：12 个半音等于 1 个八度，等于 1200 音分；升高 12 个半音就是频率翻倍。</dd>
+
+<dt>清音</dt>
+<dd>没有稳定音高的声音，比如 s、sh、f 和气声。元音和大部分浊辅音有音高。</dd>
+
+<dt>交叉淡化</dt>
+<dd>把相邻两段音频的重叠部分按权重渐变混合，让接缝听不出来。</dd>
+
+<dt>契约帧</dt>
+<dd>进程之间约定好的定长音频消息。输入帧 320 采样点、16000 Hz；输出帧 960 采样点、48000 Hz；都是 20 ms。一帧一条消息。</dd>
+
+<dt>块与块移</dt>
+<dd>流式调度器把契约帧攒成块再推理。块移是每块推进多少新音频。实时块移等于块长，输入不重叠。</dd>
+
+<dt>过去上下文</dt>
+<dd>当前块之前保留的历史音频。特征和音高网络每块重读它，给新音频提供上下文。</dd>
+
+<dt>分析窗</dt>
+<dd>每块实际喂给网络的完整音频，等于过去上下文加当前块再加淡化余量。</dd>
+
+<dt>SOLA</dt>
+<dd>一种波形对齐算法。在块接缝处搜索一个小偏移，挑波形最相似的位置拼接，避免相位突变。</dd>
+
+<dt>潜变量</dt>
+<dd>前段输出的中间表示，代码名 z。它浓缩了历史音频的信息，解码段拿它合成新音频。</dd>
+
+<dt>音高缓存</dt>
+<dd>跨块保留的音高历史数组。每块只更新新帧，旧帧左移复用。</dd>
+
+<dt>启动缓冲</dt>
+<dd>首次出声前刻意等待的一段时间。用它吸收推理节拍抖动，换取后续稳定输出。</dd>
+</dl>
+
+<h2>总流程</h2>
+
+<p class="flow">契约帧进 → 帧泵 → 样本环攒块 → 取 2.8 s 分析窗 → 音高提取 与 内容特征 并行 → 音高映射 → 音色检索（仅新帧）→ 前段 → 解码段 → SOLA 对齐 + sin² 淡化 → 输出环 → 帧泵 → 契约帧出</p>
+
+<p>实时与文件共用同一套算法骨架：内容与音高两条线、音高映射、音色检索、合成。区别有三处：合成网络拆成前段与解码段；分窗换成 240 ms 短块加 2.5 s 过去上下文；不做预处理和后处理。</p>
+
+<p>预处理与后处理在实时路径全部不执行：峰值归一、48 Hz 高通、音量包络校正、限幅、重采样都没有。辅音保护也不执行。</p>
+
+<p>实时用另一套资产：合成网络是前段加解码段两个引擎，内容特征与音高提取用实时版定长 TensorRT 引擎。文件链路用离线单合成引擎和文件版特征引擎。两套资产放在同一个模型目录里，哪套存在就决定模型有哪些能力。</p>
+
+<p>能力门控是硬的：实时资产缺任何一项、引擎形状校验不过、或模型原生采样率不是 48000 Hz，启动实时流直接拒绝，不降级去跑文件引擎。</p>
+
+<p>会话参数在启动流时固定：变调半音数、检索混合比、音量包络混合比、辅音保护比、音高提取方法。v1 没有在线改参数命令。其中音量包络混合比与辅音保护比在实时路径不生效。</p>
+
+<aside class="why">
+<p class="why-label">补充解释：整条链路在做什么</p>
+<ul>
+<li><strong>一句话概括：</strong>每 240 ms 取一块新音频，带上 2.5 s 历史重读一遍特征和音高，只合成最新 300 ms，对齐淡化后按 20 ms 帧均匀吐出去。</li>
+<li><strong>为什么要带历史：</strong>特征、音高和合成都需要上下文。只看新 240 ms，网络无法判断内容的来龙去脉，接缝处会失真。</li>
+<li><strong>为什么合成拆两段：</strong>前段把 2.8 s 历史编码成潜变量，解码段只合成最新 300 ms。带历史计算、只输出新音频，计算量和延迟都可控。</li>
+<li><strong>为什么不做预处理和后处理：</strong>那些是离线精细处理步骤。实时追求低延迟，跳过它们；音量与滤波整形由上游音频进程负责。</li>
+<li><strong>延迟由什么构成：</strong>稳态滞后以 400 ms 启动缓冲为主，加上块节拍与排队。这是设计取舍，不是缺陷。</li>
+</ul>
+</aside>
+
+<h2>第 1 站 契约帧与帧泵</h2>
+
+<p>实时输入已经是 16000 Hz 契约帧，没有输入重采样。输出原生 48000 Hz，没有输出重采样。</p>
+
+<p>输入帧长，320 采样点<span class="src src-fixed">〔写死〕</span>。在 16000 Hz 下等于 20 ms。它决定帧泵的节拍粒度。换模型不变。</p>
+
+<p>输出帧长，960 采样点<span class="src src-fixed">〔写死〕</span>。在 48000 Hz 下等于 20 ms。一帧输入换一帧输出。换模型不变。</p>
+
+<p>模型原生采样率，必须 48000 Hz<span class="src src-model">〔模型，实时硬约束〕</span>。来自模型配置文件。不是 48000 Hz 的模型拒绝实时。换模型会变，但只有 48000 Hz 能通过。</p>
+
+<p>帧泵节拍，1:1<span class="src src-fixed">〔写死〕</span>。每收到一帧输入就回一帧输出；输出不足补零。帧泵不等推理完成。换模型不变。</p>
+
+<aside class="why">
+<p class="why-label">补充解释</p>
+<ul>
+<li><strong>1:1 泵在做什么：</strong>输出节拍完全由输入帧驱动。采集和播放共用一个时钟时，长期不会漂移，也不会越攒越多。</li>
+<li><strong>补零是什么意思：</strong>推理还没产出时，这一帧输出静音。听感是短暂安静，不是卡顿或爆音。欠载次数计入状态，可查询。</li>
+<li><strong>为什么没有重采样：</strong>上游音频进程已经把 48000 Hz 抽取成 16000 Hz。契约两端固定，推理进程不再变换采样率。</li>
+<li><strong>改动它会影响什么：</strong>帧长是跨进程契约，改它要同时改音频进程和帧契约头，否则整条链路对不上。</li>
+</ul>
+</aside>
+
+<h2>第 2 站 块调度</h2>
+
+<p>流式调度器把输入帧攒进样本环，推理线程按块取窗。推理与帧泵分线程，互不阻塞。</p>
+
+<p>块长，3840 采样点<span class="src src-fixed">〔写死〕</span>。在 16000 Hz 下等于 240 ms。它决定每次推理处理多少新音频。换模型不变。</p>
+
+<p>过去上下文，40000 采样点<span class="src src-fixed">〔写死〕</span>。等于 2.5 s。每块重读这段历史。换模型不变。</p>
+
+<p>分析窗，44800 采样点<span class="src src-fixed">〔写死〕</span>。等于 2.8 s，由过去上下文加当前块再加 960 采样点的淡化与对齐余量构成。它是特征与音高网络的完整输入。换模型不变。</p>
+
+<p>块移，等于块长<span class="src src-fixed">〔写死〕</span>。输入不重叠；输出靠淡化拼接。换模型不变。</p>
+
+<p>静音跳过，默认开<span class="src src-fixed">〔写死〕</span>。整窗没有 VAD 标记就跳过推理，输出等长静音。VAD 标记由上游音频进程写在帧元数据里，推理进程只读取。换模型不变。</p>
+
+<p>落后追最新阈值，2 块<span class="src src-fixed">〔写死〕</span>。积压超过 2 块就放弃旧块节奏，直接取最新窗，淡化尾作废。换模型不变。</p>
+
+<p>不连续重置阈值，帧号缺口大于 4 或时间戳跳变大于 200 ms<span class="src src-fixed">〔写死〕</span>。帧号重复、缺口过大、时间戳回退或大跳都触发全量重置：清样本环、清淡化尾、恢复启动缓冲。换模型不变。</p>
+
+<aside class="why">
+<p class="why-label">补充解释</p>
+<ul>
+<li><strong>为什么是 240 ms：</strong>推理必须在一块的节拍内完成，否则积压。块长就是推理的时间预算，预算留有余量。</li>
+<li><strong>为什么要 2.5 s 过去上下文：</strong>合成网络需要历史才能接上新音频。上下文太短接缝失真，太长计算量上升。2.5 s 是代码固定的折中。</li>
+<li><strong>为什么宁可重置也不接错：</strong>帧号或时间戳断裂说明上游断流或重启。旧相位接新音频会出噪声，不如清掉重新缓冲。</li>
+<li><strong>静音跳过省什么：</strong>没人说话时不跑 GPU，输出等长静音保持节拍。VAD 判断在上游完成，推理进程不重复做。</li>
+</ul>
+</aside>
+
+<h2>第 3 站 内容特征网络 · 实时引擎</h2>
+
+<p>实时引擎输入固定 44800 采样点，输出 139 帧特征<span class="src src-fixed">〔写死，校验引擎形状〕</span>。必须是健康的 TensorRT 引擎，不接受 ONNX 兜底。校验不过即关闭实时能力。</p>
+
+<p>特征维度，768<span class="src src-model">〔模型〕</span>。来自模型配置。检索和合成都按这个长度对齐。换模型会变。</p>
+
+<p>上采样倍数，2<span class="src src-fixed">〔写死〕</span>。139 帧特征按目标帧除以 2 取源帧，复制成 280 帧合成帧；末尾不足时钳到最后一帧。换模型若帧率比例不是 2，这里就错位。</p>
+
+<p>并行执行<span class="src src-fixed">〔写死〕</span>。内容特征与音高提取默认并行跑，墙钟耗时取两者中较慢的。换模型不变。</p>
+
+<aside class="why">
+<p class="why-label">补充解释</p>
+<ul>
+<li><strong>滚动窗在做什么：</strong>每块重读完整 2.8 s，特征带完整上下文，而不是只看新 240 ms。历史区域的特征每块重算，但只有新帧区域参与检索。</li>
+<li><strong>为什么必须定长 TensorRT：</strong>实时预算紧，定长引擎耗时可预期。动态形状引擎延迟不可控，所以实时特征引擎校验失败就直接关闭实时能力，不静默兜底。</li>
+<li><strong>为什么复制成 2 份：</strong>内容特征每秒 50 帧，合成网络每秒要 100 帧。复制一份正好补齐，时间上一一对应。</li>
+<li><strong>为什么能并行：</strong>两个网络都只读取音频，互相没有依赖。并行把两段耗时重叠，省的是墙钟时间。</li>
+</ul>
+</aside>
+
+<h2>第 4 站 音高提取网络 · 实时引擎</h2>
+
+<p>mel 前端四个量，都<span class="src src-fixed">〔写死〕</span>：mel 频带 128 个，FFT 窗长 1024 点，帧移 160 点，频率范围 30 Hz 到 8000 Hz。与文件转换共用。换模型不变。</p>
+
+<p>实时引擎输入 32 帧 mel，输出 32 帧乘 360 格显著性谱<span class="src src-fixed">〔写死，校验引擎形状〕</span>。必须是健康的 TensorRT 引擎。换模型不变。</p>
+
+<p>音高分析窗，4960 采样点<span class="src src-fixed">〔写死〕</span>。块长加 800 采样点，向上取整到 5120 的倍数再减 160。它覆盖当前块和重叠上下文。换模型不变。</p>
+
+<p>显著性解码四个量，都<span class="src src-fixed">〔写死〕</span>：显著性谱 360 格，起点 1997 音分，每格 20 音分，显著性阈值 0.03。低于阈值判为清音。换模型不变。</p>
+
+<p>重叠重算，4 帧<span class="src src-fixed">〔写死〕</span>。每块用新窗重算边界 4 帧，丢弃 3 个左缘帧和 1 个右缘帧，把 28 个新帧写入缓存。换模型不变。</p>
+
+<p>音高缓存，1024 帧<span class="src src-fixed">〔写死〕</span>。每块左移 24 帧，尾部接新帧。合成按帧从缓存取音高。流重置时清空。换模型不变。</p>
+
+<aside class="why">
+<p class="why-label">补充解释</p>
+<ul>
+<li><strong>音高缓存在做什么：</strong>音高曲线跨块连续。每块只更新尾部新帧，旧帧左移复用，避免整段重算带来的边界抖动。</li>
+<li><strong>为什么重叠重算：</strong>RMVPE 需要上下文。块边界那几帧单独看不可靠，用更长的窗重算一遍再取可信部分。</li>
+<li><strong>为什么丢 3 左 1 右：</strong>边缘帧上下文不足，质量差。这是上游实时实现的约定，照搬以保证行为一致。</li>
+<li><strong>改动它会影响什么：</strong>缓存长度决定音高历史的保留量。块移大于缓存长度时缓存整体清零，音高历史断档。</li>
+</ul>
+</aside>
+
+<h2>第 5 站 音高映射</h2>
+
+<p>与文件转换同一算法，共用同一实现。</p>
+
+<p>变调半音数<span class="src src-user">〔用户〕</span>，范围 -12 到 12。它把音高乘以 2 的（半音数除以 12）次方。正数升调，负数降调。换模型不变。</p>
+
+<p>量化范围 50 Hz 到 1100 Hz，离散档数 255<span class="src src-fixed">〔写死〕</span>。它把连续音高按 mel 刻度换算成 1 到 255 的编号。合成网络只认这些编号。换模型不变。</p>
+
+<p>辅音保护比<span class="src src-user">〔用户，实时不生效〕</span>。启动流接受这个参数，但实时路径不执行保护混合。传了也不起作用，不报错。</p>
+
+<aside class="why">
+<p class="why-label">补充解释</p>
+<ul>
+<li><strong>半音数怎么算：</strong>每加 1 个半音，频率乘以 2 的 1/12 次方。加 12 就是升高一个八度，频率翻倍。</li>
+<li><strong>为什么量化成 1–255：</strong>合成网络不吃连续频率，只认离散编号。按 mel 刻度分档，低音区密、高音区疏，更符合听感。</li>
+<li><strong>清音帧怎么处理：</strong>清音段用前后有声帧线性插值填补，再参与量化。实时不做辅音保护混合。</li>
+<li><strong>为什么参数收了却不生效：</strong>实时路径没有实现保护混合这一步。参数在入口统一校验，实时与文件共用同一组，个别参数只在文件路径起作用。</li>
+</ul>
+</aside>
+
+<h2>第 6 站 音色检索</h2>
+
+<p>它把新帧特征向训练集音色靠拢。</p>
+
+<p>检索混合比<span class="src src-user">〔用户〕</span>，范围 0 到 1。0 表示纯用合成网络自己的音色，1 表示纯用检索到的训练集音色。换模型不变。</p>
+
+<p>检索区域，仅新帧<span class="src src-fixed">〔写死〕</span>。跳过过去上下文对应的前 125 帧特征，只检索新音频区域。过去上下文保留原始特征。换模型不变。</p>
+
+<p>近邻数 8，候选表数 1，距离平方加权<span class="src src-fixed">〔写死〕</span>。每帧取 8 个最近训练样本，按距离平方反比加权。候选表数恒为 1，配置不暴露它。与文件转换相同。换模型不变。</p>
+
+<p>检索库内容<span class="src src-model">〔模型〕</span>。它是模型自带的训练集向量库。换模型就换库。</p>
+
+<aside class="why">
+<p class="why-label">补充解释</p>
+<ul>
+<li><strong>检索在做什么：</strong>对当前帧在库里找最相似的几个训练样本，把它们的音色特征混合进来，让输出更接近训练集的声音。</li>
+<li><strong>为什么只检索新帧：</strong>历史区域用原始特征提供内容上下文，不参与音色混合；同时也省去对历史的重复检索计算。</li>
+<li><strong>125 帧怎么来的：</strong>2.5 s 过去上下文对应 250 个合成帧，折半就是 125 个特征帧。检索从这之后开始。</li>
+<li><strong>为什么要和模型配套：</strong>库的向量维度和内容必须与模型匹配。换模型通常要同时换库，否则检索结果无意义。</li>
+</ul>
+</aside>
+
+<h2>第 7 站 合成网络 · 前段 + 解码段</h2>
+
+<p>实时合成拆成两个引擎，链式执行：前段输出直接喂解码段，中间不落盘。</p>
+
+<p>前段输入 280 帧<span class="src src-fixed">〔写死，校验引擎形状〕</span>。它拿 280 帧特征、音高编号、说话人编号和潜噪声，输出潜变量 z。换模型不变。</p>
+
+<p>解码段输出 30 帧<span class="src src-fixed">〔写死，校验引擎形状〕</span>。它拿 z 的最后 30 帧、连续音高、说话人编号、源噪声与源相位，合成 14400 采样点，等于 300 ms。换模型不变。</p>
+
+<p>潜噪声通道数与帧数<span class="src src-model">〔模型，由引擎形状决定〕</span>。从持久随机状态采样。换引擎会变。</p>
+
+<p>说话人编号<span class="src src-model">〔模型〕</span>。来自模型配置。多说话人模型用它选音色嵌入。换模型会变。</p>
+
+<p>随机种子，114514<span class="src src-fixed">〔写死〕</span>。随机状态跨块连续，只在流重置时重新播种。它决定音色的细微纹理和气息。换模型不变。</p>
+
+<p>加载预热<span class="src src-fixed">〔写死〕</span>。两个引擎加载时各跑一次零输入预热。换模型不变。</p>
+
+<aside class="why">
+<p class="why-label">补充解释</p>
+<ul>
+<li><strong>为什么拆两段：</strong>前段把 2.8 s 历史编码成潜变量，解码段只合成最新 300 ms。带历史计算、只输出新音频，这是实时低延迟的关键。</li>
+<li><strong>300 ms 怎么构成：</strong>240 ms 新输出，加 50 ms 淡化区，加 10 ms 对齐余量。后两者供第 8 站拼接用。</li>
+<li><strong>持久随机是什么意思：</strong>噪声序列跨块连续，纹理和气息不会在接缝处突变。文件路径每窗重新播种求可复现；实时依赖流历史，重置后才从头开始。</li>
+<li><strong>为什么预热：</strong>引擎首次推理有冷启动开销。加载时先跑一遍零输入，第一块真实音频就不额外慢。</li>
+</ul>
+</aside>
+
+<h2>第 8 站 块间拼接</h2>
+
+<p>每块输出 11520 采样点，等于 240 ms<span class="src src-fixed">〔写死〕</span>。等于块移乘 3。换模型不变。</p>
+
+<p>SOLA 搜索，480 采样点<span class="src src-fixed">〔写死〕</span>。等于 10 ms。在这个范围内按与淡化尾的归一化互相关挑最佳对齐偏移。换模型不变。</p>
+
+<p>交叉淡化，2400 采样点<span class="src src-fixed">〔写死〕</span>。等于 50 ms。新块淡入权重取 sin²，淡化尾权重取 1 减 sin²。换模型不变。</p>
+
+<p>淡化尾<span class="src src-fixed">〔写死〕</span>。上一块最后 50 ms。重置或落后追最新时作废，下一块直接输出。换模型不变。</p>
+
+<aside class="why">
+<p class="why-label">补充解释</p>
+<ul>
+<li><strong>为什么要 SOLA：</strong>生成波形跨块相位不连续，直接拼会有咔哒声。在小范围里搜一个最相似的位置再拼，接缝听不出来。</li>
+<li><strong>为什么用 sin²：</strong>比线性淡化更平滑，接缝处能量更稳。文件路径用线性权重，实时用 sin²，两者不同。</li>
+<li><strong>淡化尾作废会怎样：</strong>重置或追最新后没有可信的尾，下一块直接输出，从再下一块恢复淡化。宁可短暂无淡化，也不接错相位。</li>
+<li><strong>首块怎么办：</strong>首块没有淡化尾，直接输出，第二块起恢复淡化衔接。</li>
+</ul>
+</aside>
+
+<h2>第 9 站 输出缓冲与启动</h2>
+
+<p>启动缓冲，400 ms<span class="src src-fixed">〔写死〕</span>。首次出声前的等待期。v1 不暴露配置。换模型不变。</p>
+
+<p>启动次序<span class="src src-fixed">〔写死〕</span>。先消耗 400 ms 延迟，再等输出环攒满 1 个完整块，才开始出声。换模型不变。</p>
+
+<p>输出环，16 s<span class="src src-fixed">〔写死〕</span>。推理可以领先消费端数块。环满丢最旧并计数。换模型不变。</p>
+
+<p>重置恢复启动缓冲<span class="src src-fixed">〔写死〕</span>。不连续重置与控制重置都重新走启动缓冲。换模型不变。</p>
+
+<aside class="why">
+<p class="why-label">补充解释</p>
+<ul>
+<li><strong>为什么要 400 ms：</strong>推理耗时逐块有抖动。先攒一段再出声，播放端就不容易欠载。稳态滞后以它为主，是延迟换稳定的设计取舍。</li>
+<li><strong>为什么环要 16 s：</strong>推理线程偶尔领先帧泵很多块。环给领先留余地；环满说明消费端太慢，丢最旧保最新。</li>
+<li><strong>重置为什么重新缓冲：</strong>重置后输出环已清空。重新攒一段再出声，比立刻出声但断断续续更稳。</li>
+<li><strong>欠载补零在哪：</strong>在帧泵侧（第 1 站）。本站只管启动与输出环，两者配合保证任何时刻都有一帧可回。</li>
+</ul>
+</aside>
+
+</body>
+</html>
