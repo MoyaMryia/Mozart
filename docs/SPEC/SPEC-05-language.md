@@ -51,7 +51,7 @@
 - [x] 传输用 Unix socket（llama-server 的 --host 填 .sock 路径），协议沿用其原生 HTTP（OpenAI /v1/chat/completions）。这是系统唯一保留 HTTP 协议之处：不重写第三方推理服务，传输层仍统一 Unix socket。板端需确认 llama-server 支持 --host .sock，不支持则重建 llama.cpp 或暂退 TCP 本机回环。（板端确认仍未做，保留退路）
 - [x] Rust 桥当 HTTP 客户端（经 Unix socket 连接），负责推理之外的全部编排：预处理（同音字纠正、术语表、数字归一化）、质检、失败重试（最多 2 次）、上下文管理、落字幕、投递。llama-server 只做中文→英文纯推理。（`bridge/src/http.rs`、`bridge/src/translate.rs`、`bridge/src/quality.rs`）
 - [x] 同音字纠错（显式表）：显式纠错表搬成 Rust，有行为测试。（`bridge/src/preprocess.rs:13-26`、`bridge/tests/process.rs:395-427`）
-- [ ] 同音字纠错（术语同音索引，拼音匹配、词频过滤）：代码标注留 FUTURE，v1 只显式表替换（`bridge/src/preprocess.rs:2-4`）；本条原列为已确认。待决策：降级 FUTURE 或补实现。
+- [ ] 同音字纠错（术语同音索引，拼音匹配、词频过滤）：代码标注留 FUTURE（`bridge/src/preprocess.rs:2-4`），v1 只显式表替换。已定：保留为待实现，不降级。
 - [ ] 同音字纠错与旧实现逐条对拍：对拍证据在仓外 Mozart-Old（`bridge/src/checks.rs:1-4` 自述对拍旧 `test_translation_checks.py`），对拍夹具未入本仓 `tests/fixtures/`。
 - [x] 第一版整句 final 才翻译；提前断句（stable_clauses）与可选断句模型推迟到第一版之后，见 FUTURE。
 
@@ -61,7 +61,7 @@
 - [ ] 播报 TTS 为独立 Rust 进程，链 sherpa-onnx 的 TTS 库（C/C++ 接口），不链进桥，以隔离崩溃域、解耦构建；由 daemon 监管，跟随 SPEC-04。桥把合格译文发给 TTS 进程，TTS 用参考音色合成，流式喂给 pre 播放（合成一段播一段，沿用旧低延迟路径），不走变声。播报经变声用同一目标音色见 FUTURE。进程形态与不走变声已落地；「流式直播、合成一段播一段」未实现——现为整句合成完成后按 20 ms 节拍逐帧发送（`tts/src/synth.rs:249-259`、`tts/src/ffi.rs:327`，进度回调仅用于中止）。另（文档）`tts/src/output.rs:3` 注释与实现同样不符。
 - [x] 播报音频采样率：v1 不走变声，TTS 合成后重采样到播放采样率直接喂 pre 播；经变声输出（FUTURE）时在 TTS 进程内重采样到 16 kHz 契约帧喂 RVC，RVC 输入统一 16 kHz。重采样为纯算术、逐块进行，延迟可忽略；算法沿用旧实现。（v1 路径 24k→48k；16 kHz 分支为 FUTURE 死代码 `tts/src/resample.rs:32-33`）
 - [x] 桥到 TTS 接口走 Unix socket + 自有协议（定长头 + JSON），不用 HTTP：TTS 为自有 Rust 进程，区别于第三方 llama-server。任务通道默认 `tts-jobs.sock`（run_dir 下），TTS 绑定、桥连接。命令号 0x06xx（任务 0x0610/应答 0x0611）。应答信封已定改标准格式（见 SPEC-01），待实现。
-- [ ] 桥发参考音色参数：桥只发 text + utterance_id（`bridge/src/speech.rs:119-123`）；`voice_params` 仅校验不生效（`tts/src/jobs.rs:6`），音色走配置 reference_wav。
+- [ ] 桥发参考音色参数：桥只发 text + utterance_id（`bridge/src/speech.rs:119-123`）；`voice_params` 仅校验不生效（`tts/src/jobs.rs:6`），音色走配置 reference_wav。注：按句切换音色取决于 TTS 模型能力（当前 sherpa-onnx 固定参考音频），非纯接线问题；v1 单音色不受影响，通道预留待模型支持时接通。
 - [x] TTS 控制面：绑定 `tts.sock`（run_dir 下），daemon 连接；命令 `Hello` / `GetStatus`，信封见 SPEC-01。`GetStatus` 带合成成功/失败数、是否合成中、模型加载状态、任务队列深度、最近错误。配置读 `[tts]` 段，socket 路径相对 run_dir。（`tts/src/control.rs`、`tts/src/state.rs`）
 - [x] 第一版播报原速播放；灵活变速（按时长比例与积压反馈选 1.0–1.5 倍速、保留音高）推迟见 FUTURE。拉伸 DSP 用现成 C 库 libmozart-tempo，控制逻辑与时长模型待启用时搬 Rust。
 
