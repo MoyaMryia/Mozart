@@ -31,9 +31,10 @@
 ├── in/                       # 手工测试输入
 └── out/                      # 手工测试输出
 
-~/mozart-assets/              # 成品资产（只读）
+~/mozart-assets/              # 成品资产与工具链依赖（只读）
 ├── lib/                      # sherpa 等共享库
 ├── llama/                    # llama-server 与 .so
+├── RVC/                      # 上游 RVC 源码树（导出/golden 的 --rvc-source）
 └── models/
     ├── rvc/<id>/
     ├── asr/<id>/
@@ -43,7 +44,7 @@
 
 ~/rvc-pth/                    # 原料权重（pth，不参与推理）
 ~/mozart-samples/             # 测试音频样本
-~/mozart-archive/             # 归档：源码树、原始权重、基准引擎
+~/mozart-archive/             # 归档：原始权重、基准引擎
 └── legacy/                   # 历史实验目录，仅作追溯
 ```
 
@@ -194,7 +195,7 @@ Python 脚本，居仓库 `tools/model/`，直接调用，不做 CLI 封装。
 
 | 依赖 | 用于 | 传入方式 | 位置 |
 | --- | --- | --- | --- |
-| RVC 源码树 | 导出、golden | `--rvc-source` / `RVC_SOURCE` 必填 | `~/mozart-archive/RVC` |
+| RVC 源码树 | 导出、golden | `--rvc-source` / `RVC_SOURCE` 必填 | `~/mozart-assets/RVC` |
 | HuBERT base 模型 | export_hubert、run_reference | `--hubert-path` 必填 | RVC 归档 assets |
 | RMVPE 权重 | export_rmvpe、run_reference | `--rmvpe-path` 必填 | RVC 归档 assets |
 | 目标权重 | export_generator、run_reference | 位置参数 / `--model` | `~/rvc-pth/<id>.pth` |
@@ -207,11 +208,11 @@ Python 脚本，居仓库 `tools/model/`，直接调用，不做 CLI 封装。
 ```bash
 # 导出离线生成器（开发机）
 python3 tools/model/export_generator_onnx.py ~/rvc-pth/qiqi-zh.pth \
-    --rvc-source ~/mozart-archive/RVC --output qiqi-zh.onnx --frames 200
+    --rvc-source ~/mozart-assets/RVC --output qiqi-zh.onnx --frames 200
 
 # 导出实时拆分生成器（帧数须匹配实时契约：front 280 / decoder 30）
 python3 tools/model/export_generator_split_onnx.py ~/rvc-pth/qiqi-zh.pth \
-    --rvc-source ~/mozart-archive/RVC \
+    --rvc-source ~/mozart-assets/RVC \
     --front-output qiqi-zh-front.onnx --decoder-output qiqi-zh-decoder.onnx \
     --front-frames 280 --decoder-frames 30 --skip-head 250 --return-frames 30
 
@@ -219,7 +220,7 @@ python3 tools/model/export_generator_split_onnx.py ~/rvc-pth/qiqi-zh.pth \
 python3 tools/model/build_dynamic_engines.py --assets <onnx目录> --feature-assets <特征onnx目录>
 
 # golden 参考与对拍
-RVC_SOURCE=~/mozart-archive/RVC python3 tools/model/run_reference.py \
+RVC_SOURCE=~/mozart-assets/RVC python3 tools/model/run_reference.py \
     --input in.wav --model ~/rvc-pth/qiqi-zh.pth \
     --hubert-path <hubert_base目录> --rmvpe-path <rmvpe.pt> \
     --output ref.wav --tensor-dir tensors --metadata reference.json
