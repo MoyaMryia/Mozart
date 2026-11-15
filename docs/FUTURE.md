@@ -22,4 +22,3 @@
 | RVC 参数纳入 config set | `config set` 当前只支持 `pre.capture_device` / `pre.playback_device`。RVC 参数（`pitch_shift`、`index_rate`、`rms_mix_rate`、`protect`、`f0_method`）只能改 TOML 后 `restart rvc`。扩展 `config set` 支持 RVC 键。 | daemon、core、ctl | `set_key` 放开 RVC 键白名单；会话参数（R）经 `StopStream` → `StartStream` 下发，重启键（S）返回 `restart_required`；与 SetParams 协同。 |
 | RVC 配置热重载 | 改 RVC 参数当前需 `restart rvc`，断流约 1–2 s。热重载不重启进程，重读 TOML 并应用会话参数。 | rvc、daemon | 依赖 SetParams 的块边界参数快照；daemon 加热重载命令；区分可热更键（会话参数）与需重启键（模型、socket）。 |
 | protect 与 rms_mix_rate 实时对齐 | `protect`、`rms_mix_rate` 只在文件链路生效，实时链路不应用；实时还跳过峰值归一、48 Hz 高通、限幅。文件与实时听感不一致。 | rvc | 实时链路补应用辅音保护与音量包络；评估实时线程开销；板端对比文件与实时输出。 |
-| 重采样抗镜像滤波 | 模型原生采样率转 48 kHz 用纯线性插值，无抗镜像滤波。非 48 kHz 模型（如 40 kHz）上采样引入高频镜像，音质受损。 | rvc | 加抗镜像 / 抗混叠滤波（多相或 FIR）；非 48 kHz 模型频谱对拍。 |
