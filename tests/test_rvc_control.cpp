@@ -66,7 +66,7 @@ struct FakeBackend : SessionBackend {
     std::atomic<int> reset_calls{0};
     std::vector<ModelListing> listing{{"alpha", true}, {"beta", false}};
 
-    LoadResult load_model(const std::string& model_id, std::string& reason) override {
+    LoadResult load_model(const std::string& model_id, bool, std::string& reason) override {
         if (model_id == "missing") {
             reason = "model directory not found: missing";
             return LoadResult::NotFound;

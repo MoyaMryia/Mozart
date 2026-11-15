@@ -300,7 +300,7 @@ std::shared_ptr<RVCModel> ModelManager::get_model_locked(const std::string& mode
 std::shared_ptr<RVCModel> ModelManager::get_model(const std::string& model_id) {
     std::lock_guard<std::mutex> lock(mutex_);
     auto model = get_model_locked(model_id);
-    trim_cache_locked();
+    trim_cache_locked(cache_limit_);
     return model;
 }
 
@@ -311,6 +311,25 @@ bool ModelManager::load_model(const std::string& model_id) {
     {
         std::lock_guard<std::mutex> lock(mutex_);
         model = get_model_locked(model_id);
+        // 加载新模型前淘汰旧 current（空闲切换已释放 inferencer），避免新旧
+        // 模型同时占用 GPU；随后把空闲缓存压到 limit-1，给新模型留一个槽位。
+        // 正在加载的模型由局部 shared_ptr 持有，不会被选为淘汰对象。
+        if (model && !model->loaded()) {
+            const std::string previous = current_model_id_;
+            current_model_id_.clear();
+            if (!previous.empty()) {
+                auto it = models_.find(previous);
+                if (it != models_.end() && it->second.use_count() == 1) {
+                    spdlog::info("Evicting idle RVC model: {}", previous);
+                    last_used_.erase(previous);
+                    models_.erase(it);
+                }
+            }
+            trim_cache_locked(cache_limit_ - 1);
+            if (!previous.empty() && models_.count(previous)) {
+                current_model_id_ = previous;
+            }
+        }
     }
     if (!model) {
         spdlog::error("Model {} not found", model_id);
@@ -325,12 +344,12 @@ bool ModelManager::load_model(const std::string& model_id) {
         last_used_.erase(model_id);
     }
     model.reset();
-    trim_cache_locked();
+    trim_cache_locked(cache_limit_);
     return success;
 }
 
-void ModelManager::trim_cache_locked() {
-    while (models_.size() > cache_limit_) {
+void ModelManager::trim_cache_locked(size_t limit) {
+    while (models_.size() > limit) {
         auto victim = models_.end();
         for (auto candidate = models_.begin(); candidate != models_.end(); ++candidate) {
             // 推理或调用方持有的模型继续存活，不卸载其执行上下文。
@@ -348,7 +367,7 @@ void ModelManager::trim_cache_locked() {
 
 void ModelManager::trim_cache() {
     std::lock_guard<std::mutex> lock(mutex_);
-    trim_cache_locked();
+    trim_cache_locked(cache_limit_);
 }
 
 size_t ModelManager::cached_model_count() const {

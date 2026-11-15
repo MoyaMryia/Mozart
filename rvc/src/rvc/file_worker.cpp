@@ -61,6 +61,7 @@ void FileWorker::batch_loop() {
     uint64_t frames_in = 0;
     uint64_t frames_out = 0;
     size_t total_out = 0;
+    size_t output_samples = 0;
     // 整段批处理在 worker 线程内收尾所有异常：取消正常退出，其余记入
     // last_error 供 GetStatus 查询，不跨线程/进程边界（SPEC-03）。
     try {
@@ -95,6 +96,7 @@ void FileWorker::batch_loop() {
         auto output = pipeline_.process_cancellable(audio, cancelled_);
         const double elapsed = std::chrono::duration<double, std::milli>(
             std::chrono::steady_clock::now() - began).count();
+        output_samples = output.size();
         {
             std::lock_guard<std::mutex> lock(stats_mutex_);
             inference_ms_ = elapsed;
@@ -141,8 +143,10 @@ void FileWorker::batch_loop() {
         done_ = frames_out == total_out;
     }
     running_ = false;
-    spdlog::info("FileWorker finished: {} frames in, {} frames out, {} windows",
-                 frames_in, frames_out, pipeline_.offline_window_count());
+    spdlog::info("FileWorker finished: {} frames in, {} frames out, "
+                 "{} output samples, {} windows",
+                 frames_in, frames_out, output_samples,
+                 pipeline_.offline_window_count());
 }
 
 FileWorker::Stats FileWorker::stats() const {

@@ -133,9 +133,22 @@ bool RealRVCPipeline::set_parameters(const RvcParameters& parameters) {
     return true;
 }
 
+void RealRVCPipeline::release_inferencer() {
+    std::lock_guard<std::mutex> lock(mutex_);
+    inferencer_.reset();
+}
+
 bool RealRVCPipeline::switch_model(const std::string& model_id) {
-    // 先在 ModelManager 校验并加载（其内部有锁），再在锁内原子替换
-    // inferencer_；正在执行的推理持有旧 shared_ptr，不会被提前销毁。
+    // 已在目标模型上：保持现有 inferencer（含实时 pitch 缓存与随机状态）。
+    // shared_ptr 必须在本作用域释放，否则旧模型 use_count > 1，加载前无法淘汰。
+    {
+        const auto current = model_manager_->current_model();
+        if (current && current->loaded() && current->id() == model_id) {
+            return true;
+        }
+    }
+    // 空闲切换由调用方先 release_inferencer()，旧模型可在加载前淘汰；
+    // 流活动时不释放，进行中的推理与新模型换入保持旧原子语义。
     const bool success = model_manager_->load_model(model_id);
     if (success) {
         std::lock_guard<std::mutex> lock(mutex_);

@@ -1,4 +1,5 @@
-// 搬运自 Mozart-Old/rvc-backend/include/rvc/model_loader.hpp，未改动。
+// 搬运自 Mozart-Old/rvc-backend/include/rvc/model_loader.hpp；
+// 多模型适配：加载前为新模型腾出缓存槽位。
 #pragma once
 
 #include <cstdint>
@@ -94,7 +95,7 @@ public:
 
 private:
     std::shared_ptr<RVCModel> get_model_locked(const std::string& model_id);
-    void trim_cache_locked();
+    void trim_cache_locked(size_t limit);
 
     std::filesystem::path models_dir_;
     std::vector<ModelEntry> registry_;

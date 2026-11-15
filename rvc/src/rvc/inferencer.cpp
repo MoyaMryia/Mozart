@@ -235,6 +235,16 @@ std::vector<float> RVCInferencer::infer(
     audio_16k = highpass_48hz(audio_16k);
     const auto profile_preprocessed = profile::Clock::now();
 
+    // 输入时长对应的采样数；帧率固定 100 Hz。
+    const auto samples_for = [](size_t input_samples, uint32_t rate) {
+        return input_samples * rate / 16000;
+    };
+    // 文件数据面契约：输出采样数由输入时长决定（48 kHz），各推理分支统一收口。
+    const auto finalize_output = [&](std::vector<float> converted) {
+        converted.resize(samples_for(audio_16k.size(), output_sample_rate_), 0.0f);
+        return converted;
+    };
+
     const uint32_t model_sr = model_->config().sample_rate;
     // 外层 pad（整段边界）固定 kPad16k，F0 按它提取；分窗内层几何另随 T 缩放。
     const size_t pad_out = kPad16k * model_sr / 16000;
@@ -277,11 +287,16 @@ std::vector<float> RVCInferencer::infer(
                 converted.begin() + static_cast<std::ptrdiff_t>(context),
                 converted.end() - static_cast<std::ptrdiff_t>(context));
         }
+        // HuBERT 帧数按窗长取整，动态生成器输出可能比输入短一帧；文件数据面
+        // 要求输出帧数等于输入帧数，按输入时长补齐（多出部分裁掉）。
+        const size_t expected = samples_for(audio_16k.size(), model_sr);
+        converted.resize(expected, 0.0f);
         converted = apply_rms_mix(audio_16k, std::move(converted));
         if (model_sr != output_sample_rate_) {
             converted = resample(converted, model_sr, output_sample_rate_);
         }
         limit_peak(converted, 0.99f);
+        converted = finalize_output(std::move(converted));
         if (profile::enabled()) {
             const auto profile_done = profile::Clock::now();
             spdlog::info(
@@ -320,11 +335,7 @@ std::vector<float> RVCInferencer::infer(
             converted = resample(converted, model_sr, output_sample_rate_);
         }
         limit_peak(converted, 0.99f);
-        // 整段生成器输出长度由固定帧数决定，可能比输入短若干毫秒；补零到与输入
-        // 等长，满足文件数据面“输出帧数=输入帧数”契约，避免停滞看门狗误判。
-        const size_t target_out = audio_16k.size() * output_sample_rate_ / 16000;
-        converted.resize(target_out, 0.0f);
-        return converted;
+        return finalize_output(std::move(converted));
     }
 
     // 分窗/单窗内层几何随生成器 T 同比缩放（基准 T=398），并对齐到一个 HuBERT
@@ -372,7 +383,7 @@ std::vector<float> RVCInferencer::infer(
             converted = resample(converted, model_sr, output_sample_rate_);
         }
         limit_peak(converted, 0.99f);
-        return converted;
+        return finalize_output(std::move(converted));
     }
 
     std::vector<float> assembled;
@@ -420,7 +431,7 @@ std::vector<float> RVCInferencer::infer(
     if (assembled.size() > pad_out) {
         assembled.erase(assembled.begin(), assembled.begin() + static_cast<std::ptrdiff_t>(pad_out));
     }
-    const size_t expected = audio_16k.size() * model_sr / 16000;
+    const size_t expected = samples_for(audio_16k.size(), model_sr);
     if (assembled.size() > expected) assembled.resize(expected);
 
     assembled = apply_rms_mix(audio_16k, std::move(assembled));
@@ -428,7 +439,7 @@ std::vector<float> RVCInferencer::infer(
         assembled = resample(assembled, model_sr, output_sample_rate_);
     }
     limit_peak(assembled, 0.99f);
-    return assembled;
+    return finalize_output(std::move(assembled));
 }
 
 std::vector<float> RVCInferencer::infer_realtime(

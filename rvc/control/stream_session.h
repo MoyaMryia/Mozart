@@ -93,9 +93,11 @@ class SessionBackend {
 public:
     virtual ~SessionBackend() = default;
 
-    // 加载并切为当前模型；reason 给出失败原因。流活动时允许换模型
-    //（旧 RealRVCPipeline 原子换入语义；daemon 切换模型不经 StopStream）。
-    virtual LoadResult load_model(const std::string& model_id, std::string& reason) = 0;
+    // 加载并切为当前模型；reason 给出失败原因。idle=true 时先释放旧
+    // inferencer，使旧模型可在加载前淘汰；流活动（idle=false）保持旧模型
+    // 直到新模型换入的原子语义。
+    virtual LoadResult load_model(
+        const std::string& model_id, bool idle, std::string& reason) = 0;
     // 当前模型 id / 版本 / 能力；未加载时 id 与 version 为空、capabilities 空。
     virtual std::string current_model_id() const = 0;
     virtual std::string model_version() const = 0;
@@ -174,7 +176,8 @@ class InferenceBackend final : public SessionBackend {
 public:
     explicit InferenceBackend(const InferenceBackendConfig& config);
 
-    LoadResult load_model(const std::string& model_id, std::string& reason) override;
+    LoadResult load_model(
+        const std::string& model_id, bool idle, std::string& reason) override;
     std::string current_model_id() const override;
     std::string model_version() const override;
     std::vector<std::string> capabilities() const override;

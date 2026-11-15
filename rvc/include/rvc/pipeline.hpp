@@ -134,6 +134,7 @@ public:
     uint64_t offline_window_count() const override;
     void reset_offline_window_count() override;
     bool switch_model(const std::string& model_id) override;
+    void release_inferencer();
     std::string current_model_id() const override;
     bool is_mock() const override { return false; }
     std::map<std::string, std::string> model_info() const override;

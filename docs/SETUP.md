@@ -115,6 +115,7 @@ MOZART_JETSON=<SSH目标> tools/jetson-e2e.sh
 | `--unit` | `tools/jetson-unit-test.sh` | 设备端 `cargo test --workspace` + `ctest` |
 | `--smoke` | `tools/jetson-smoke.sh` | daemon + pre + rvc 三进程冒烟 |
 | `--file` | `tools/jetson-file-test.sh` | 文件转换、取消、队列与入口校验 |
+| `--file-models` | `tools/jetson-file-multimodel.sh` | `models/rvc` 下全部模型的文件转换与帧守恒 |
 | `--language` | `tools/jetson-language-test.sh` | ASR → 翻译 → TTS 播报 |
 | `--measure` | `tools/jetson-measure.sh` | 延迟、淡变、长跑、自愈测量 |
 
@@ -127,7 +128,7 @@ tools/jetson-e2e.sh <SSH目标> --measure latency
 ```
 
 功能套件开始前停止运行时，结束后自动重启。measure 需要 release 构建，部署只产 debug。
-证据目录：`/tmp/mozart-smoke`、`/tmp/mozart-file-test`、`/tmp/mozart-language-test`；measure 证据在 `~/mozart-t7`。
+证据目录：`/tmp/mozart-smoke`、`/tmp/mozart-file-test`、`/tmp/mozart-multimodel`、`/tmp/mozart-language-test`；measure 证据在 `~/mozart-t7`。
 
 ## 资产布局
 

@@ -8,7 +8,7 @@
 #   VENV=/path tools/model/setup-export-env.sh
 set -euo pipefail
 
-VENV=${VENV:-${1:-$HOME/mozart-assets/rvc-env}}
+VENV=${VENV:-${1:-$HOME/mozart-toolkit/rvc-env}}
 PY=${PYTHON:-python3}
 
 echo "== 创建 venv: $VENV =="
@@ -31,13 +31,16 @@ else
 fi
 
 echo "== 安装导出/golden 依赖 =="
-pip install transformers onnx onnxruntime numpy scipy librosa soundfile
+pip install transformers onnx onnxruntime numpy scipy librosa soundfile \
+    faiss-cpu praat-parselmouth
 
 echo "== 校验导入 =="
 python - <<'PY'
 import torch, transformers, onnx, onnxruntime, numpy, scipy, librosa, soundfile
+import faiss, parselmouth
 print("torch", torch.__version__, "| transformers", transformers.__version__,
-      "| onnx", onnx.__version__, "| onnxruntime", onnxruntime.__version__)
+      "| onnx", onnx.__version__, "| onnxruntime", onnxruntime.__version__,
+      "| faiss", faiss.__version__, "| parselmouth", parselmouth.VERSION)
 PY
 
 echo "环境就绪：$VENV"

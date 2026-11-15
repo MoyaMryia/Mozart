@@ -129,7 +129,8 @@ std::vector<uint8_t> StreamSession::handle(const CtlMessage& message) {
             put_ms("inference_ms_avg", stats.inference_ms_avg);
             put_ms("inference_ms_p95", stats.inference_ms_p95);
             data["queue_depth"] = stats.queue_depth;
-            data["last_error"] = string_or_null(stats.last_error);
+            data["last_error"] = string_or_null(
+                stats.last_error.empty() ? last_error_ : stats.last_error);
             return ok_body(std::move(data));
         }
         default:
@@ -148,12 +149,27 @@ std::vector<uint8_t> StreamSession::handle_load_model(
         return error_body(MOZART_CTL_CODE_INVALID_ARGUMENT,
                           "model_id must be a non-empty string");
     }
+    bool idle = false;
+    {
+        std::lock_guard<std::mutex> lock(mutex_);
+        idle = !worker_;
+    }
     std::string reason;
-    const LoadResult result = backend_->load_model(model_id, reason);
+    const LoadResult result = backend_->load_model(model_id, idle, reason);
     if (result == LoadResult::NotFound) {
         return error_body(MOZART_CTL_CODE_INVALID_ARGUMENT, reason);
     }
     if (result == LoadResult::Failed) {
+        // 空闲切换已释放旧 inferencer：加载失败后旧模型不再可服务，
+        // 清空会话状态，避免 GetStatus 继续报告旧模型已加载。
+        if (idle) {
+            std::lock_guard<std::mutex> lock(mutex_);
+            model_id_.clear();
+            model_version_.clear();
+            capabilities_.clear();
+            model_handle_ = 0;
+            last_error_ = reason;
+        }
         return error_body(MOZART_CTL_CODE_INFERENCE_FAILED, reason);
     }
     std::lock_guard<std::mutex> lock(mutex_);
@@ -161,6 +177,7 @@ std::vector<uint8_t> StreamSession::handle_load_model(
     model_version_ = backend_->model_version();
     capabilities_ = backend_->capabilities();
     model_handle_ = ++next_handle_;
+    last_error_.clear();
     spdlog::info("LoadModel '{}' ok (handle={}, version={}, capabilities={})",
                  model_id_, model_handle_, model_version_,
                  nlohmann::json(capabilities_).dump());
@@ -272,6 +289,7 @@ std::vector<uint8_t> StreamSession::handle_start_stream(
     worker_ = std::move(worker);
     stream_kind_ = kind;
     has_final_stats_ = false;
+    last_error_.clear();
     spdlog::info("StartStream kind={} model={} handle={}", kind, model_id_,
                  model_handle_);
     return ok_body({{"stream_kind", kind}});
@@ -448,7 +466,7 @@ InferenceBackend::InferenceBackend(const InferenceBackendConfig& config)
 }
 
 LoadResult InferenceBackend::load_model(const std::string& model_id,
-                                          std::string& reason) {
+                                          bool idle, std::string& reason) {
     // 存在性与路径解析归 ModelManager（注册表优先，空时回退 models_dir），
     // 入口不硬拼 models_dir/<id>，避免架空注册表 path（SPEC-03）。
     // get_model 未知 id 回 nullptr → NotFound（请求错误），与加载失败区分；
@@ -457,8 +475,13 @@ LoadResult InferenceBackend::load_model(const std::string& model_id,
         reason = "model not found: " + model_id;
         return LoadResult::NotFound;
     }
-    // load_mutex 串行加载；命中缓存约 1 ms，冷加载含引擎反序列化。
-    if (!models_->load_model(model_id) || !pipeline_->switch_model(model_id)) {
+    // 空闲切换先释放旧 inferencer，使旧模型可在新引擎分配前淘汰
+    //（8 GB 设备上两个大模型同时驻留会触发 TRT OOM 回退 ONNX）。
+    // 流活动或目标已是当前模型时保持旧 inferencer。
+    if (idle && pipeline_->current_model_id() != model_id) {
+        pipeline_->release_inferencer();
+    }
+    if (!pipeline_->switch_model(model_id)) {
         reason = "model load failed: " + model_id + " (see log for details)";
         return LoadResult::Failed;
     }

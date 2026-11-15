@@ -36,6 +36,7 @@
 
 - [x] 用 CLI 提交音频文件（`file submit`）能得到变声结果并取回（`file fetch`）；v1 用 CLI 验收，网页上传下载归 web 适配器（后续）。（`reports/file-chain-20261113/RESULTS.md:60-63`，`tools/jetson-file-test.sh`）
 - [x] 任务可取消；每个输入都有结果或明确失败原因。（取消清理见同报告）
+- [x] 多模型文件转换：40k/48k、静态/动态生成器共 10 个模型完成且帧守恒；`frieren-v2-40k` 与 PyTorch 参考对拍 log-mel 相关 0.9930、F0 中位偏差 10 音分、对齐 0 ms。（`reports/multi-model-file-20261115/RESULTS.md`）
 - [ ] 长文件不会耗尽内存。现按 completed + 帧守恒验收，未测峰值内存——口径偏松，需补测量。
 
 ### 音频直出
