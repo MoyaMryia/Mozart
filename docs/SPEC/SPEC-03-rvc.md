@@ -5,7 +5,7 @@
 ## 边界
 
 - [x] C++ 推理进程：HuBERT、RMVPE、Generator。
-- [ ] （文档）修正本节：输入源实时麦克风帧与文件转换帧；"翻译播报使用同一目标音色"为残留旧措辞，2026-11-12 已定稿 v1 播报不走变声（见 SPEC-05 与 SPEC.md 变更记录）。
+- [x] 输入源包括实时麦克风帧和文件任务帧。翻译播报路径见 [SPEC-05](SPEC-05-language.md#播报投递)。
 - [x] daemon 侧（Rust）：模式、队列、文件任务、状态。
 
 ## 已确认
@@ -38,11 +38,12 @@
 | --- | --- | --- |
 | 进程启动 | 部署配置 | `device`、`half`、`cache_limit`；模型路径由 `[[models]]` 注册表提供（回退 `models_dir` 扫描）；特征引擎路径可选，缺省自动发现 |
 | `LoadModel` | Rust 控制命令 | `model_id`；C++ 读 `config.json` 并报告 `capabilities` 和模型版本 |
-| `StartStream` | Rust 控制命令 | `kind`、`model_handle`、`pitch_shift`、`index_rate`、`rms_mix_rate`、`protect`、`f0_method` |
+| `StartStream` | Rust 控制命令 | `kind`、`model_handle`、`pitch_shift`、`index_rate`、`rms_mix_rate`、`protect`、`f0_method`；文件模式另带 `total_frames`、可选 `total_samples`，见下文 |
 | C++ 内部 preset | C++ | `StreamingRvc` 的分块、历史、淡化、SOLA 和启动缓冲参数 |
 | Rust / 音频进程 | Rust | 播放侧小缓冲、静音 / 旁路、数据面队列；400 ms 启动缓冲留在 C++，不重复设大缓冲 |
 
 - [x] `kind` 只分 `realtime` 和 `file`。C++ 按模型能力选择实时资产或 quality / full-history preset；缺实时资产时拒绝实时，不静默降级。
+- [x] 文件模式的 `total_frames` 必填，类型为正整数 u32，表示本次输入帧数。C++ 收齐后开始整段推理；取消仍用 `StopStream`。`total_samples` 可选，类型为 u64，表示 16 kHz 输入的有效采样数。显式传入时须在 `1..=total_frames × 320` 内；C++ 在推理前据此裁掉尾帧补零。省略时保留全部帧样本。实时模式忽略这两个字段。
 - [x] `StartStream` 会话参数取自 TOML `[rvc]` 会话默认值；不新增控制命令，`StartStream` 仍携带五个会话参数。`config set rvc.<会话参数>` 是持久基线写回（编排见 SPEC-04）；将来无中断 `SetParams` 的运行时改动才记入 daemon 运行时状态文件，重启恢复，不回写 TOML。两者不混用。
 - [x] `config set rvc.<会话参数>` 的触发、失败恢复与重试见 [SPEC-04](SPEC-04-daemon.md)。
 - [x] `protect`、`rms_mix_rate` 在实时链路不应用，仍只对文件链路生效；实时补应用留 [FUTURE.md](../FUTURE.md)。
