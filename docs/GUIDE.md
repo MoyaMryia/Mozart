@@ -84,6 +84,8 @@ mozart-ctl config get <键>                          # 读取配置基线
 mozart-ctl restart <pre|rvc|asr|tts|bridge|llama>  # 重启单个服务
 ```
 
+`config set` 支持设备键、daemon/file 运行时键和 RVC 会话参数；完整键表见 [config.md](config.md) 与 [SETUP.md](SETUP.md)。
+
 日志：`<run_dir>/logs/<进程名>.log`，运行目录由配置给出，目录规范见 [SETUP.md](SETUP.md)。
 
 退出码：

@@ -43,9 +43,9 @@
 | Rust / 音频进程 | Rust | 播放侧小缓冲、静音 / 旁路、数据面队列；400 ms 启动缓冲留在 C++，不重复设大缓冲 |
 
 - [x] `kind` 只分 `realtime` 和 `file`。C++ 按模型能力选择实时资产或 quality / full-history preset；缺实时资产时拒绝实时，不静默降级。
-- [x] `StartStream` 会话参数取自 TOML `[rvc]` 会话默认值；不新增控制命令，`StartStream` 仍携带五个会话参数。`config set rvc.<会话参数>` 是持久基线写回（接入与编排见 SPEC-04）；将来无中断 `SetParams` 的运行时改动才记入 daemon 运行时状态文件，重启恢复，不回写 TOML。两者不混用。
-- [ ] `config set rvc.<会话参数>` 写 TOML 基线；只有实时链路实际使用的 `pitch_shift`、`index_rate`、`f0_method` 变更且实时流在跑时，由 daemon `StopStream`→`StartStream` 应用，短暂打断；仅改 `protect`、`rms_mix_rate` 只更新 TOML 基线与生效配置，不打断实时流；参数值未变化不触发 Stop/Start。文件任务运行中不中断，当前任务用旧参、下一任务用新参。
-- [ ] `protect`、`rms_mix_rate` 在实时链路不应用，仍只对文件链路生效；实时补应用留 [FUTURE.md](../FUTURE.md)。
+- [x] `StartStream` 会话参数取自 TOML `[rvc]` 会话默认值；不新增控制命令，`StartStream` 仍携带五个会话参数。`config set rvc.<会话参数>` 是持久基线写回（编排见 SPEC-04）；将来无中断 `SetParams` 的运行时改动才记入 daemon 运行时状态文件，重启恢复，不回写 TOML。两者不混用。
+- [x] `config set rvc.<会话参数>` 写 TOML 基线；只有本次写入的键是 `pitch_shift`、`index_rate`、`f0_method`、该键值发生变化且实时流在跑时，由 daemon `StopStream`→`StartStream` 应用，短暂打断；仅改 `protect`、`rms_mix_rate` 只更新 TOML 基线与生效配置，不打断实时流；设置其他键或参数值未变化不触发 Stop/Start，即使存在未生效的其他 RVC 基线。文件任务运行中不中断，当前任务用旧参、下一任务用新参。启动失败用旧参恢复并返回错误，不自动重试；下一次同键写入或 daemon 重启时应用 TOML 新基线（`status.rvc_params` 语义见 SPEC-04）。
+- [x] `protect`、`rms_mix_rate` 在实时链路不应用，仍只对文件链路生效；实时补应用留 [FUTURE.md](../FUTURE.md)。
 - [x] `filter_radius` 在旧 C++ 里只保存、未参与计算，v1 不放进 `StartStream`、不暴露死参数；保留为 FUTURE 提升项，推迟实现 F0 中值滤波，见 [FUTURE.md](../FUTURE.md)。
 - [ ] 若板端实测小缓冲扛不住抖动或时钟漂移，再把大缓冲搬到音频进程，同时把 `startup_delay_out` 设为 0 并重测首帧。条件项，未触发。
 
