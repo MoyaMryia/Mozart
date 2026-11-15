@@ -181,3 +181,48 @@ mozart-ctl restart <pre|rvc|asr|tts|bridge|llama>     # 重启单个服务使 TO
 - **日志**：`<run_dir>/logs/<进程名>.log`。
 - **检查语言链非 stub**：`ldd ~/mozart/bin/mozart-asr | grep sherpa` 有输出且无 `not found`。
 - **退出码**：`0` 成功 / `1` 一般错误 / `2` 参数错 / `3` 连不上 daemon / `4` 被拒绝 / `5` 超时。
+
+---
+
+## 四、开发构建与检查
+
+源码目录约定见 [AGENTS.md](../AGENTS.md) 的"文件系统组织"。
+
+| 项 | 要求 |
+| --- | --- |
+| 语言 | Rust（edition 2021，`core`、`pre`、`daemon`）与 C++20（`rvc`） |
+| 编译标准 | C++20，关闭编译器扩展 |
+| 构建系统 | Rust：Cargo workspace；C++：CMake ≥ 3.22 + Ninja + CTest |
+| 编译器缓存 | ccache，检测到即自动启用 |
+| 预设 | `host-debug`、`host-asan`、`host-tsan`、`jetson-release` |
+
+构建目录只使用预设名，不再手写构建参数：
+
+```bash
+cmake --preset host-debug
+cmake --build --preset host-debug --parallel 4
+ctest --preset host-debug
+```
+
+`host-tsan` 在 Linux 6.x 上需要先降低 ASLR 熵，否则 ThreadSanitizer 报
+`unexpected memory mapping`：`sudo sysctl vm.mmap_rnd_bits=28`。
+
+本地安装 hook：
+
+```bash
+tools/install-hooks.sh
+```
+
+完整检查与 CI 使用同一脚本：
+
+```bash
+tools/ci-local.sh repo      # 仓库卫生：体积上限、索引与忽略规则一致
+tools/ci-local.sh lint      # 暂存区的行尾空白、报告“适用范围”一节
+tools/ci-local.sh native    # 配置、构建与 CTest
+tools/ci-local.sh rust      # cargo check 与 cargo test
+tools/ci-local.sh web       # 前端测试与构建
+tools/ci-local.sh all       # 依次运行全部阶段
+tools/ci-local.sh --staged  # 提交前检查，pre-commit hook 调用
+```
+
+CI 与本地 pre-commit 调用同一脚本的对应阶段。没有对应组件的阶段会跳过并说明原因。

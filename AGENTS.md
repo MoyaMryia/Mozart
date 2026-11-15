@@ -33,6 +33,11 @@ Mozart 是面向 NVIDIA Jetson Orin Nano Super 8 GB 的本地语音处理系统�
 `~/Projects/MozartfromSeeck/Mozart-Old/` 中作为归档参考，不作为依赖。
 运行时主体用 Rust，推理层保留 C++ 进程。离线模型导出可以使用 Python，但不进入构建与部署路径。
 
+## 开发环境
+
+目标设备上已有的资产、模型、库与工具见 [docs/SETUP.md](docs/SETUP.md)。
+涉及模型、资产或板端运行的工作前先读它。设备连接方式不在本仓库记录。
+
 ## 文件系统组织
 
 运行时 Rust + C++ 推理，Cargo 与 CMake 并存。
@@ -146,4 +151,4 @@ Mozart 是面向 NVIDIA Jetson Orin Nano Super 8 GB 的本地语音处理系统�
 
 - 对外控制面（HTTP/SSE）的范围。
 - 文档长度与限制句检查尚未实现（旧实现依赖 Python 脚本），当前只检查行尾空白与报告的“适用范围”一节。
-- 仓外资产的目录约定与环境变量名。
+- 仓外资产目录约定见 [docs/SETUP.md](docs/SETUP.md)；环境变量名待定。
