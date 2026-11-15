@@ -238,7 +238,7 @@ python3 tools/model/build_realtime_engines.py \
     --output-dir <成品目录>
 ```
 
-`build_realtime_engines.py` 从 onnx 读回定长形状再调 trtexec，模型相关维度（inter_channels、source_dim）不写死。`build_dynamic_engines.py` 只管文件路径动态引擎，不覆盖实时。
+`build_realtime_engines.py` 先校验 onnx 输入为定长，再由 trtexec 从模型读取形状；模型相关维度（inter_channels、source_dim）不写死。`build_dynamic_engines.py` 只管文件路径动态引擎，不覆盖实时。
 
 ## 加新模型流程
 

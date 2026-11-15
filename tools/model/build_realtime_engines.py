@@ -1,14 +1,16 @@
 #!/usr/bin/env python3
 """Build fixed-shape TensorRT engines for the realtime RVC chain.
 
-Reads each ONNX input shape and runs trtexec with fixed --shapes. Covers the
-realtime generator front/decoder and the realtime HuBERT/RMVPE feature engines.
-The file-path dynamic engines are built by build_dynamic_engines.py instead.
+Validates that each ONNX input has fixed dimensions, then runs trtexec. Covers
+the realtime generator front/decoder and the realtime HuBERT/RMVPE feature
+engines. The file-path dynamic engines are built by build_dynamic_engines.py
+instead.
 
 Realtime contract (rvc/src/rvc/pipeline.cpp): front feats 1x280x768, decoder
 z 1x192x30, hubert-realtime audio 1x44800, rmvpe-realtime mel 1x128x32. The
-exported ONNX already carries these fixed shapes; this script reads them back
-so model-specific dimensions (inter_channels, source_dim) are not hard-coded.
+exported ONNX already carries these fixed shapes; trtexec reads them from the
+model, so model-specific dimensions (inter_channels, source_dim) are not
+hard-coded. TensorRT rejects --shapes for a static model.
 """
 import argparse
 import subprocess
@@ -17,9 +19,8 @@ from pathlib import Path
 import onnx
 
 
-def fixed_input_shapes(model_path: Path) -> str:
+def validate_fixed_shapes(model_path: Path) -> None:
     model = onnx.load(str(model_path))
-    parts = []
     for inp in model.graph.input:
         dims = [d.dim_value for d in inp.type.tensor_type.shape.dim]
         if any(d <= 0 for d in dims):
@@ -27,17 +28,14 @@ def fixed_input_shapes(model_path: Path) -> str:
                 f"{model_path.name} input {inp.name} has a dynamic dim; "
                 "realtime engines require fixed shapes"
             )
-        parts.append(f"{inp.name}:" + "x".join(str(d) for d in dims))
-    return ",".join(parts)
 
 
 def build(model_path: Path, engine_path: Path, extra: list) -> None:
-    shapes = fixed_input_shapes(model_path)
+    validate_fixed_shapes(model_path)
     command = [
         "/usr/bin/trtexec",
         f"--onnx={model_path}",
         f"--saveEngine={engine_path}",
-        f"--shapes={shapes}",
         *extra,
     ]
     print("[realtime-engine]", " ".join(command), flush=True)
