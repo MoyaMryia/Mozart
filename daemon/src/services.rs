@@ -492,23 +492,32 @@ fn realtime_stream_matches(status: &RvcStatus, model_id: &str) -> bool {
         && status.model_id.as_deref() == Some(model_id)
 }
 
+/// StartStream 结果：`Started` 为本次按请求起流；`Running` 为 Busy 被
+/// `busy_ok` 入口当作已有流。rvc 不回报在跑流的参数，`Running` 时无法确认。
+enum StartOutcome {
+    Started,
+    Running,
+}
+
 fn start_rvc_stream(
     services: &Services,
     rvc: &RvcConfig,
     model_id: &str,
     busy_ok: bool,
-) -> Result<(), CallError> {
+) -> Result<StartOutcome, CallError> {
     let handle = services.load_model_handle(model_id)?;
     let mut body = stream_body(rvc, handle);
     body["kind"] = json!("realtime");
     let text = body.to_string();
     let mut rvc = services.rvc();
     match rvc.call_ok(ctl::RVC_START_STREAM, text.as_bytes()) {
-        Ok(_) => Ok(()),
+        Ok(_) => Ok(StartOutcome::Started),
         // 路由切换/对账时已有流视为就绪；config set 重启链路要求确认新参生效，
         // Busy 说明流未按新参重建，按失败处理。
         Err(err) => match &err {
-            CallError::Remote(response) if busy_ok && response.code == ctl::CODE_BUSY => Ok(()),
+            CallError::Remote(response) if busy_ok && response.code == ctl::CODE_BUSY => {
+                Ok(StartOutcome::Running)
+            }
             _ => Err(err),
         },
     }
@@ -760,7 +769,7 @@ fn ensure_realtime_stream(
         return true;
     }
     match start_rvc_stream(services, rvc, &model_id, true) {
-        Ok(()) => true,
+        Ok(_) => true,
         Err(err) => {
             degraded.push(format!("rvc stream apply: {}", err.describe()));
             false
@@ -771,8 +780,13 @@ fn ensure_realtime_stream(
 /// config set rvc.<会话参数> 的生效配置合并（SPEC-04）：只吸收本次写入的键，
 /// 其余 rvc 键保留旧生效值。未随本次写入应用的 TOML 新基线（如失败恢复后
 /// 留下的 pitch）不得混入，否则 status 与在跑流不一致；这些基线等对应键
-/// 再次写入或 daemon 重启时应用。
-pub(crate) fn merge_session_key(key: &str, old: &RvcConfig, fresh: &RvcConfig) -> RvcConfig {
+/// 再次写入或 daemon 重启时应用。未知会话键返回错误而不是 panic：core 新增
+/// RVC 运行时键时控制线程保持可用。
+pub(crate) fn merge_session_key(
+    key: &str,
+    old: &RvcConfig,
+    fresh: &RvcConfig,
+) -> Result<RvcConfig, (String, String)> {
     let mut merged = old.clone();
     match key {
         "rvc.pitch_shift" => merged.pitch_shift = fresh.pitch_shift,
@@ -780,21 +794,27 @@ pub(crate) fn merge_session_key(key: &str, old: &RvcConfig, fresh: &RvcConfig) -
         "rvc.f0_method" => merged.f0_method.clone_from(&fresh.f0_method),
         "rvc.rms_mix_rate" => merged.rms_mix_rate = fresh.rms_mix_rate,
         "rvc.protect" => merged.protect = fresh.protect,
-        other => unreachable!("runtime_key_owner 已把 {other} 归为非 rvc 会话键"),
+        other => {
+            return Err((
+                ctl::CODE_INTERNAL.to_string(),
+                format!("rvc session params: no orchestration for key {other}"),
+            ));
+        }
     }
-    merged
+    Ok(merged)
 }
 
 /// config set rvc.<会话参数> 的实时链路编排（SPEC-04）：写 TOML 由 core 完成，
-/// daemon 负责应用。`new` 只含本次写入键的改动（见 `merge_session_key`），
-/// 因此触发判据只看当前设置的键：只有实时链路实际使用的 `pitch_shift`、
-/// `index_rate`、`f0_method` 值变化且实时流在跑时才 StopStream→StartStream
-/// （短暂打断）；只改 `protect`/`rms_mix_rate` 或其他键不触发，即使存在
-/// 未生效的其他 RVC 基线。失败用旧参恢复实时流，恢复失败返回组合错误并
-/// 记录持久降级原因；不自动重试，下一次对应键写入或 daemon 重启再应用。
-/// 路由非 rvc 或没有实时流时只更新生效配置：文件任务使用启动时的配置快照，
-/// 下一任务与下一次建流自然读到新值。
-pub(crate) fn apply_rvc_session_params(
+/// daemon 负责应用。调用方须持 transition 锁，并在返回 Ok 后、释放锁前替换
+/// 生效配置，避免轮询在替换前用旧快照起流。`new` 只含本次写入键的改动
+/// （见 `merge_session_key`），因此触发判据只看当前设置的键：只有实时链路
+/// 实际使用的 `pitch_shift`、`index_rate`、`f0_method` 值变化且实时流在跑时
+/// 才 StopStream→StartStream（短暂打断）；只改 `protect`/`rms_mix_rate` 或
+/// 其他键不触发，即使存在未生效的其他 RVC 基线。失败用旧参恢复实时流，
+/// 恢复失败返回组合错误并记录持久降级原因；不自动重试，下一次对应键写入
+/// 或 daemon 重启再应用。路由非 rvc、rvc 不可达或没有实时流时只更新生效
+/// 配置：文件任务使用启动时的配置快照，下一任务与下一次建流自然读到新值。
+pub(crate) fn apply_rvc_session_params_locked(
     state: &Mutex<State>,
     services: &Services,
     old: &RvcConfig,
@@ -804,7 +824,6 @@ pub(crate) fn apply_rvc_session_params(
     if !realtime_params_changed(old, new) {
         return Ok(());
     }
-    let _transition = services.transition();
     // 文件任务只在 Direct 下启动（GPU 归文件期间 route set 只写 desired），
     // 且 rvc 在跑 file 流时下面的 stream_kind 也不匹配：route 与 kind 已覆盖，
     // 无需再看 gpu_owner。
@@ -812,7 +831,12 @@ pub(crate) fn apply_rvc_session_params(
         return Ok(());
     }
     let Ok(status) = services.rvc_status() else {
-        // rvc 不可达时无法确认实时流；不打断，下一次建流用新快照。
+        // rvc 不可达时无法确认实时流：不打断，下一次建流用新快照。
+        // 生效配置仍更新，但无法验证在跑流，留可查询降级原因。
+        lock_state(state).push_degraded(
+            "rvc session params: rvc status unavailable; config updated, stream not verified"
+                .to_string(),
+        );
         return Ok(());
     };
     if status.state != "streaming" || status.stream_kind.as_deref() != Some("realtime") {
@@ -825,18 +849,26 @@ pub(crate) fn apply_rvc_session_params(
         let (code, reason) = err.into_rejection();
         let original = format!("rvc stop stream: {reason}");
         return match start_rvc_stream(services, old, &model_id, true) {
-            Ok(()) => Err((code, original)),
+            Ok(_) => Err((code, original)),
             Err(restore) => Err(restore_failure(state, code, original, restore)),
         };
     }
     // 停流成功：先按新参重建，失败再按旧参恢复。
     match start_rvc_stream(services, new, &model_id, false) {
-        Ok(()) => Ok(()),
+        Ok(_) => Ok(()),
         Err(err) => {
             let (code, reason) = err.into_rejection();
             let original = format!("rvc start with new params: {reason}");
             match start_rvc_stream(services, old, &model_id, true) {
-                Ok(()) => Err((code, original)),
+                Ok(StartOutcome::Started) => Err((code, original)),
+                Ok(StartOutcome::Running) => {
+                    // 旧参恢复遇 Busy：流仍在跑，但 rvc 不回报其参数，
+                    // 记录持久降级原因供 status 查询。
+                    lock_state(state).push_degraded(
+                        "rvc session params: recovery busy; running params unknown".to_string(),
+                    );
+                    Err((code, format!("{original}; restore busy, running params unknown")))
+                }
                 Err(restore) => Err(restore_failure(state, code, original, restore)),
             }
         }
@@ -865,4 +897,19 @@ fn restore_failure(
     );
     lock_state(state).push_degraded(format!("rvc session params: {reason}"));
     (code, reason)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// core 新增 RVC 运行时键但 daemon 未实现编排时返回错误，不 panic 控制线程。
+    #[test]
+    fn merge_session_key_rejects_unknown_key_without_panicking() {
+        let old = RvcConfig::default();
+        let fresh = RvcConfig::default();
+        let (code, reason) = merge_session_key("rvc.future_key", &old, &fresh).unwrap_err();
+        assert_eq!(code, ctl::CODE_INTERNAL);
+        assert!(reason.contains("rvc.future_key"), "{reason}");
+    }
 }

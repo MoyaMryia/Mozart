@@ -337,6 +337,11 @@ fn failed_restore_returns_combined_error_and_records_degraded() {
         "错误应组合新参与旧参两段失败：{}",
         reply.reason
     );
+    assert!(
+        reply.reason.contains("TOML baseline kept"),
+        "错误应提示 TOML 已保留新基线及恢复方式：{}",
+        reply.reason
+    );
     assert_eq!(h.rvc_params().pitch_shift, 0, "失败后生效配置保留旧值");
     assert!(
         wait_until(POLL_TIMEOUT, || {
@@ -347,6 +352,72 @@ fn failed_restore_returns_combined_error_and_records_degraded() {
         }),
         "恢复失败必须留可查询降级原因：{:?}",
         h.status().degraded
+    );
+}
+
+/// 停流未生效（StopStream 应答成功但流仍在）：新参起流失败，旧参恢复遇
+/// Busy 被视为已恢复，但在跑参数不确定，留可查询的持久降级原因。
+#[test]
+fn recovery_busy_records_unknown_running_params() {
+    let h = Harness::new("busyrestore", &[("MOZART_RVC_STUB_STOP_KEEP_STREAM", "1")]);
+    h.set_route_rvc();
+    h.clear_log();
+
+    let reply = h.config_set("rvc.pitch_shift", "3");
+    assert_eq!(reply.status, "error", "流未停时新参无法起流，必须报错");
+    assert!(
+        reply.reason.contains("restore busy") && reply.reason.contains("running params unknown"),
+        "错误应说明恢复遇 Busy、在跑参数未知：{}",
+        reply.reason
+    );
+    assert_eq!(h.rvc_params().pitch_shift, 0, "失败后生效配置保留旧值");
+    assert!(
+        wait_until(POLL_TIMEOUT, || {
+            h.status()
+                .degraded
+                .iter()
+                .any(|reason| reason.contains("recovery busy; running params unknown"))
+        }),
+        "恢复遇 Busy 必须留可查询降级原因：{:?}",
+        h.status().degraded
+    );
+}
+
+/// rvc 不可达：无法确认实时流，不打断，生效配置更新并留可查询降级原因。
+#[test]
+fn rvc_unreachable_updates_config_and_records_degraded() {
+    let dir =
+        std::env::temp_dir().join(format!("mozart-rvc-params-{}-statusdown", std::process::id()));
+    let marker = dir.join("status.fail");
+    let h = Harness::new(
+        "statusdown",
+        &[(
+            "MOZART_RVC_STUB_STATUS_FAIL_FILE",
+            marker.to_str().unwrap(),
+        )],
+    );
+    h.set_route_rvc();
+    h.clear_log();
+
+    // 标记文件出现后 GetStatus 回错，模拟 rvc 不可达。
+    std::fs::write(&marker, "").unwrap();
+    let reply = h.config_set("rvc.pitch_shift", "3");
+    assert_eq!(
+        reply.status, "ok",
+        "rvc 不可达时只更新生效配置：{}",
+        reply.reason
+    );
+    assert_eq!(h.rvc_params().pitch_shift, 3, "生效配置应更新");
+    assert!(
+        h.status().degraded.iter().any(|reason| reason
+            .contains("rvc status unavailable; config updated, stream not verified")),
+        "rvc 不可达必须留可查询降级原因：{:?}",
+        h.status().degraded
+    );
+    assert_eq!(
+        h.rvc_count(ctl::RVC_STOP_STREAM),
+        0,
+        "rvc 不可达时不得下发 StopStream"
     );
 }
 

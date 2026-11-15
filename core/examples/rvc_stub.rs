@@ -15,6 +15,10 @@
 //! pitch_shift 等于该值时回 InferenceFailed（仅一次），模拟新参起流失败。
 //! 测试旋钮 `MOZART_RVC_STUB_FAIL_START_AFTER=<n>`：前 n 次 StartStream 成功，
 //! 之后全部回 InferenceFailed，模拟新参与旧参恢复都失败。
+//! 测试旋钮 `MOZART_RVC_STUB_STOP_KEEP_STREAM=1`：StopStream 应答成功但保持
+//! 流在跑，模拟停流未实际生效（恢复起流会收到 Busy）。
+//! 测试旋钮 `MOZART_RVC_STUB_STATUS_FAIL_FILE=<path>`：该文件存在时 GetStatus
+//! 回 NotReady，模拟 rvc 不可达。
 
 mod stub_common;
 
@@ -69,6 +73,10 @@ struct State {
     fail_start_pitch: Option<i32>,
     /// 前 n 次 StartStream 成功，之后全部失败。
     fail_start_after: Option<u32>,
+    /// 置位时 StopStream 应答成功但不结束流，模拟停流未生效。
+    stop_keep_stream: bool,
+    /// 文件存在时 GetStatus 回错，模拟 rvc 不可达。
+    status_fail_file: Option<PathBuf>,
     starts: u32,
 }
 
@@ -97,6 +105,9 @@ fn main() {
     let fail_start_after = std::env::var("MOZART_RVC_STUB_FAIL_START_AFTER")
         .ok()
         .and_then(|value| value.parse::<u32>().ok());
+    let stop_keep_stream =
+        std::env::var("MOZART_RVC_STUB_STOP_KEEP_STREAM").is_ok_and(|value| value == "1");
+    let status_fail_file = std::env::var_os("MOZART_RVC_STUB_STATUS_FAIL_FILE").map(PathBuf::from);
     let mut state = State {
         model: None,
         streaming: false,
@@ -109,6 +120,8 @@ fn main() {
         feed_pace,
         fail_start_pitch,
         fail_start_after,
+        stop_keep_stream,
+        status_fail_file,
         starts: 0,
     };
     serve(args, move |msg| handle(msg, &mut state));
@@ -196,6 +209,10 @@ fn handle(msg: &Message, state: &mut State) -> Vec<u8> {
             ok(json!({"stream_kind": kind}))
         }
         ctl::RVC_STOP_STREAM | ctl::RVC_RESET_STREAM => {
+            // 测试旋钮：应答成功但保持流在跑，模拟停流未实际生效。
+            if state.stop_keep_stream && state.kind.as_deref() == Some("realtime") {
+                return ok(json!({}));
+            }
             // 只置取消：批处理线程在下一个检查点退出，控制面不等它
             // （回帧可能正阻塞在对端缓冲上，join 会与对端互等）。
             if let Some(batch) = state.batch.as_ref() {
@@ -206,6 +223,14 @@ fn handle(msg: &Message, state: &mut State) -> Vec<u8> {
             ok(json!({}))
         }
         ctl::RVC_GET_STATUS => {
+            // 测试旋钮：标记文件存在时模拟 rvc 状态不可达。
+            if state
+                .status_fail_file
+                .as_ref()
+                .is_some_and(|path| path.exists())
+            {
+                return fail(ctl::CODE_NOT_READY, "stub status unavailable (test knob)");
+            }
             let state_name = if state.streaming {
                 "streaming"
             } else if state.model.is_some() {

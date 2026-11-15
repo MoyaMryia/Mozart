@@ -191,4 +191,4 @@ path = "<资产根>/models/asr/<模型id>"
 
 ## 运行时状态文件交互
 
-运行时键的改动记入 daemon 运行时状态文件（覆盖快照），重启时 TOML 基线叠加恢复；活权威在各服务，启动恢复一次、运行时不对账。v1 状态文件记录字幕开关（`bridge.translate_enabled` / `bridge.speech_enabled`）；`config set` 运行时键写基线后清该键覆盖并即时下发，`config save` 把全部覆盖提升为基线后清空。详见 SPEC-04。
+运行时状态文件记录服务端运行时命令产生的覆盖，不记录 `config set` 的改动：`config set` 写 TOML 持久基线并即时应用，同时清掉该键已有覆盖。v1 状态文件只记录字幕开关（`bridge.translate_enabled` / `bridge.speech_enabled`），将来的无中断 RVC `SetParams` 也走这里。daemon 重启时在 TOML 基线上叠加覆盖恢复；活权威在各服务，启动恢复一次、运行时不对账。`config save` 把全部覆盖提升为基线后清空。详见 SPEC-04。

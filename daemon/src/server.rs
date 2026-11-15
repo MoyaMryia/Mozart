@@ -437,8 +437,8 @@ fn config_set_reply(ctx: &Ctx, request: &ConfigSetRequest) -> Vec<u8> {
 /// 运行时键即时生效（SPEC-04）：清该键状态覆盖，重读 TOML 基线叠加剩余覆盖
 /// 重建生效配置，更新共享句柄与文件队列/存储阈值。服务侧每次操作读最新快照。
 /// rvc 会话键的生效配置只吸收本次写入的键（见 services::merge_session_key），
-/// 再按需重启实时流，成功才替换生效配置；失败保留旧值（TOML 新基线保留，
-/// 下一次对应键写入或 daemon 重启再尝试）。
+/// 再按需重启实时流；编排与替换同处 transition 临界区，失败不替换生效配置
+/// （TOML 新基线保留，下一次对应键写入或 daemon 重启再尝试）。
 fn apply_runtime_key(ctx: &Ctx, key: &str, old: &Config) -> Result<(), (String, String)> {
     lock_state_file(&ctx.state_file)
         .remove_key(key)
@@ -450,14 +450,27 @@ fn apply_runtime_key(ctx: &Ctx, key: &str, old: &Config) -> Result<(), (String, 
     if runtime_key_owner(key) == Some("rvc") {
         // 未生效的 rvc 基线（如失败恢复留下的 pitch）不得混入生效配置，
         // 否则 status 与在跑流不一致。
-        fresh.rvc = services::merge_session_key(key, &old.rvc, &fresh.rvc);
-        services::apply_rvc_session_params(&ctx.state, &ctx.services, &old.rvc, &fresh.rvc)?;
+        fresh.rvc = services::merge_session_key(key, &old.rvc, &fresh.rvc)?;
+        // 替换与 Stop/Start 同处临界区：释放锁后再替换会给轮询留下用旧快照
+        // 起流的窄窗口。失败路径不替换，TOML 新基线保留。
+        let _transition = ctx.services.transition();
+        services::apply_rvc_session_params_locked(&ctx.state, &ctx.services, &old.rvc, &fresh.rvc)
+            .map_err(|(code, reason)| {
+                (
+                    code,
+                    format!(
+                        "{reason}; TOML baseline kept; retry config set for the same key or restart daemon to apply"
+                    ),
+                )
+            })?;
+        ctx.file.apply_file_config(&fresh);
+        ctx.config.replace(fresh);
     } else {
         // 其他运行时键不得把尚未应用的 rvc 参数基线静默混入生效配置。
         fresh.rvc = old.rvc.clone();
+        ctx.file.apply_file_config(&fresh);
+        ctx.config.replace(fresh);
     }
-    ctx.file.apply_file_config(&fresh);
-    ctx.config.replace(fresh);
     Ok(())
 }
 
