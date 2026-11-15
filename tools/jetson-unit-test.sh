@@ -3,12 +3,14 @@
 # 前置：仓库已同步到 ~/Mozart 并完成构建（tools/deploy-jetson.sh）。
 # 正常由 tools/jetson-e2e.sh 通过 ssh 调用，也可在设备上直接运行。
 #   ASSETS_DIR  仓外资产根（默认 $HOME/mozart-assets）
+#   REPO_DIR    仓库目录（默认 $HOME/Mozart）
 set -uo pipefail
 
 ASSETS_DIR=${ASSETS_DIR:-${MOZART_ASSETS_DIR:-$HOME/mozart-assets}}
+REPO_DIR=${REPO_DIR:-$HOME/Mozart}
 
-[ -d "$HOME/Mozart" ] || { echo "缺 ~/Mozart，先部署" >&2; exit 1; }
-cd "$HOME/Mozart" || exit 1
+[ -d "$REPO_DIR" ] || { echo "缺 $REPO_DIR，先部署" >&2; exit 1; }
+cd "$REPO_DIR" || exit 1
 . "$HOME/.cargo/env" 2>/dev/null || true
 
 if [ -e "$ASSETS_DIR/lib/libsherpa-onnx-c-api.so" ]; then

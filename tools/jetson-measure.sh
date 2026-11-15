@@ -17,13 +17,15 @@
 #       旧信号缆位失同步（重开的 pre 只能采到静默），受控信号下才能验证恢复链。
 # 环境变量：
 #   MODELS_DIR  模型资产目录（默认 $HOME/mozart-assets/models/rvc/qiqi-zh）
-#   BIN_DIR     部署二进制目录（默认 $HOME/Mozart/target/release）
+#   BIN_DIR     部署二进制目录（默认 $REPO_DIR/target/release）
+#   REPO_DIR    仓库目录（默认 $HOME/Mozart）
 #   M_ROOT      产物根目录（默认 $HOME/mozart-t7）
 #   CAP_SUB/PB_SUB  loopback 子设备号（默认 2/3，避开被占用的 0/1）
 set -u
 
 MODELS_DIR=${MODELS_DIR:-$HOME/mozart-assets/models/rvc/qiqi-zh}
-BIN_DIR=${BIN_DIR:-$HOME/Mozart/target/release}
+REPO_DIR=${REPO_DIR:-$HOME/Mozart}
+BIN_DIR=${BIN_DIR:-$REPO_DIR/target/release}
 M_ROOT=${M_ROOT:-$HOME/mozart-t7}
 CAP_SUB=${CAP_SUB:-2}
 PB_SUB=${PB_SUB:-3}

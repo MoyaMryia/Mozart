@@ -242,8 +242,12 @@ def reproduce_standard(
         else:
             input_path = (base / context["input"]).resolve()
         output = temp_dir / expected.name
+        hubert_path = (base / context["assets"]["hubert"]["path"]).resolve().parent
+        rmvpe_path = (base / context["assets"]["rmvpe"]["path"]).resolve()
         command = [sys.executable, str(runner), "--input", str(input_path),
-                   "--model", str(model)]
+                   "--model", str(model),
+                   "--hubert-path", str(hubert_path),
+                   "--rmvpe-path", str(rmvpe_path)]
         if streaming:
             settings = standard["streaming"]
             raw_output = temp_dir / f"{standard['id']}-raw.wav"

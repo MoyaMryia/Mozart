@@ -11,7 +11,8 @@
 # 证据留在 $SMOKE_DIR：配置、样本、各阶段 status 与逐秒 progress-*.jsonl、
 #   取回 WAV、audio stats、measure.json、summary.tsv。
 #   MODELS_DIR   模型资产目录（默认 $HOME/mozart-assets/models/rvc/qiqi-zh）
-#   BIN_DIR      部署二进制目录（默认 $HOME/Mozart/target/debug）
+#   BIN_DIR      部署二进制目录（默认 $REPO_DIR/target/debug）
+#   REPO_DIR     仓库目录（默认 $HOME/Mozart）
 #   SMOKE_DIR    产物目录（默认 /tmp/mozart-file-test）
 #   MODEL_ID     转换模型（默认 qiqi-zh）
 #   SAMPLE_M4A   真实压缩样本（默认 $HOME/mozart-samples/jieshe.m4a）
@@ -21,7 +22,8 @@
 set -u
 
 MODELS_DIR=${MODELS_DIR:-$HOME/mozart-assets/models/rvc/qiqi-zh}
-BIN_DIR=${BIN_DIR:-$HOME/Mozart/target/debug}
+REPO_DIR=${REPO_DIR:-$HOME/Mozart}
+BIN_DIR=${BIN_DIR:-$REPO_DIR/target/debug}
 SMOKE_DIR=${SMOKE_DIR:-/tmp/mozart-file-test}
 CAP_SUB=${CAP_SUB:-2}
 PB_SUB=${PB_SUB:-3}

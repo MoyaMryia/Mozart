@@ -9,7 +9,8 @@
 # 场景：六进程 running → 播放中文语音 → ASR final → 翻议落字幕 → TTS 合成
 #   → 回录非静音 → 关停无残留。
 #   ASSETS_DIR  仓外资产根（默认 $HOME/mozart-assets）
-#   BIN_DIR     部署二进制目录（默认 $HOME/Mozart/target/debug）
+#   BIN_DIR     部署二进制目录（默认 $REPO_DIR/target/debug）
+#   REPO_DIR    仓库目录（默认 $HOME/Mozart）
 #   SMOKE_DIR   产物目录（默认 /tmp/mozart-language-test）
 #   SAMPLE_M4A  真实语音样本（默认 $HOME/mozart-samples/jieshe.m4a）
 #   SS_S / T_S  截取起点与时长秒（默认 60 / 30）
@@ -19,7 +20,8 @@
 set -u
 
 ASSETS_DIR=${ASSETS_DIR:-${MOZART_ASSETS_DIR:-$HOME/mozart-assets}}
-BIN_DIR=${BIN_DIR:-$HOME/Mozart/target/debug}
+REPO_DIR=${REPO_DIR:-$HOME/Mozart}
+BIN_DIR=${BIN_DIR:-$REPO_DIR/target/debug}
 SMOKE_DIR=${SMOKE_DIR:-/tmp/mozart-language-test}
 SAMPLE_M4A=${SAMPLE_M4A:-$HOME/mozart-samples/jieshe.m4a}
 SS_S=${SS_S:-60}

@@ -171,6 +171,7 @@ Python 脚本，居仓库 `tools/model/`，直接调用，不做 CLI 封装。
 | `build_dynamic_engines.py` | 文件路径动态 onnx → engine（trtexec 包装，须在设备上） |
 | `build_realtime_engines.py` | 实时定长 onnx → engine（front/decoder/hubert/rmvpe，设备上） |
 | `run_reference.py` | PyTorch 参考推理，保存各模型输入张量 |
+| `run_streaming_reference.py` | 流式 PyTorch 参考（golden 流式对拍，24 帧窗） |
 | `verify_golden.py` | golden 对拍校验 |
 | `compare_streaming_quality.py` | 流式输出质量对比（verify_golden 调用） |
 
@@ -181,8 +182,8 @@ Python 脚本，居仓库 `tools/model/`，直接调用，不做 CLI 封装。
 | 依赖 | 用于 | 传入方式 | 位置 |
 | --- | --- | --- | --- |
 | RVC 源码树 | 导出、golden | `--rvc-source` / `RVC_SOURCE` 必填 | `~/mozart-assets/RVC` |
-| HuBERT base 模型 | export_hubert、run_reference | `--hubert-path` 必填 | RVC 归档 assets |
-| RMVPE 权重 | export_rmvpe、run_reference | `--rmvpe-path` 必填 | RVC 归档 assets |
+| HuBERT base 模型 | export_hubert、run_reference、run_streaming_reference | `--hubert-path` 必填 | RVC 归档 assets |
+| RMVPE 权重 | export_rmvpe、run_reference、run_streaming_reference | `--rmvpe-path` 必填 | RVC 归档 assets |
 | 目标权重 | export_generator、run_reference | 位置参数 / `--model` | `~/rvc-pth/<id>.pth` |
 | golden 参考 | run_reference、verify_golden | `--input` / `--manifest` 等必填 | 仓外 |
 
@@ -212,6 +213,12 @@ RVC_SOURCE=~/mozart-assets/RVC python3 tools/model/run_reference.py \
     --hubert-path <hubert_base目录> --rmvpe-path <rmvpe.pt> \
     --output ref.wav --tensor-dir tensors --metadata reference.json
 python3 tools/model/verify_golden.py --manifest golden_manifest.json
+
+# 流式参考（RVC_SOURCE 必填；24 帧窗，输出与 tensor 目录由参数指定）
+RVC_SOURCE=~/mozart-assets/RVC python3 tools/model/run_streaming_reference.py \
+    --input in.wav --model ~/rvc-pth/qiqi-zh.pth \
+    --hubert-path <hubert_base目录> --rmvpe-path <rmvpe.pt> \
+    --output stream.wav --tensor-dir tensors
 ```
 
 ### 实时链路资产生成

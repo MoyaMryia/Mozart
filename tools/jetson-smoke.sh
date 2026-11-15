@@ -8,12 +8,14 @@
 #   pre 播放 DEV=0,SUBDEV=$PB_SUB → arecord DEV=1,SUBDEV=$PB_SUB 回录
 # 结果文件留在 $SMOKE_DIR：rec.raw（回录）、st-*.json/txt（各阶段 status）。
 #   MODELS_DIR  模型资产目录（默认 $HOME/mozart-assets/models/rvc/qiqi-zh）
-#   BIN_DIR     部署二进制目录（默认 $HOME/Mozart/target/debug）
+#   BIN_DIR     部署二进制目录（默认 $REPO_DIR/target/debug）
+#   REPO_DIR    仓库目录（默认 $HOME/Mozart）
 #   SMOKE_DIR   产物目录（默认 /tmp/mozart-smoke）
 set -u
 
 MODELS_DIR=${MODELS_DIR:-$HOME/mozart-assets/models/rvc/qiqi-zh}
-BIN_DIR=${BIN_DIR:-$HOME/Mozart/target/debug}
+REPO_DIR=${REPO_DIR:-$HOME/Mozart}
+BIN_DIR=${BIN_DIR:-$REPO_DIR/target/debug}
 SMOKE_DIR=${SMOKE_DIR:-/tmp/mozart-smoke}
 CAP_SUB=${CAP_SUB:-2}
 PB_SUB=${PB_SUB:-3}
