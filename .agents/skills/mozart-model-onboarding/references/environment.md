@@ -1,7 +1,7 @@
 # 导出环境搭建
 
 导出（pth→onnx）和 golden 参考都在 **CPU** 上跑，不需要 GPU 版 PyTorch。
-环境在 `~/mozart-toolkit/rvc-env`，全链路在 Jetson 完成。设备目录见 [SETUP.md](../../../../docs/SETUP.md) §目录规范，本文只补搭建步骤、版本与已知状态。
+环境在 `~/mozart-toolkit/rvc-env`，全链路在 Jetson 完成。设备目录见 [SETUP.md](../../../../docs/SETUP.md) §目录规范，本文只补搭建步骤、版本与使用前检查。
 
 ## 搭建
 
@@ -32,11 +32,11 @@ python3 -m venv ~/mozart-toolkit/rvc-env
 
 固定版本后写入 `requirements.txt`，新机器按它复现。
 
-## 已知状态（2026-11-15 板端）
+## 使用前检查
 
-- torch 可从 NJU PyPI 镜像装（aarch64 有轮子），无需 NVIDIA 特供包。
-- **HuBERT base 权重缺失**：全盘未找到 `pytorch_model.bin`。重导 HuBERT 或跑 golden 前需补 `~/mozart-assets/RVC/assets/hubert_base/pytorch_model.bin`（含 config.json）。运行时已有 hubert engine，不影响推理。
-- 生成器/ RMVPE 导出需要 `.pth` / `rmvpe.pt`（均在板端），但**尚未端到端实跑验证**——首次使用先跑一个最小导出确认。
+- 确认 `~/mozart-assets/RVC/assets/hubert_base/` 含 `pytorch_model.bin` 与 `config.json`；缺失时补齐。
+- 确认目标权重 `.pth` 与 `rmvpe.pt` 已就位。
+- 首次使用先跑一个最小导出，确认导出链路可用。
 
 ## 自检
 

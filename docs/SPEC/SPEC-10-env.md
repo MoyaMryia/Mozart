@@ -21,14 +21,16 @@
 
 两层分离：原料层放待处理内容，成品层放可直接推理的整套资产。
 
-- [x] 原料层 `~/rvc-pth/`：原始权重与下载后待本地处理的内容，按 `<id>.pth` 命名，可选配 `<id>.index`。板端已就位 7 个去重权重（qiqi-zh/en/ja/ko、mike-tyson、de-narrator、liuying）。
-- [x] 成品层 `~/mozart-assets/models/rvc/<id>/`：目录名 = 模型 id = 文件前缀，已去掉 `-run` 后缀（板端 qiqi-zh / qiqi-en / de-narrator）。
+- [x] 原料层 `~/rvc-pth/`：原始权重与下载后待本地处理的内容，按 `<id>.pth` 命名，可选配 `<id>.index`。
+- [x] 成品层 `~/mozart-assets/models/rvc/<id>/`：目录名 = 模型 id = 文件前缀，不带 `-run` 后缀。
 - [x] 成品目录契约：`config.json` + `<id>.onnx`/`.engine`（离线生成器）+ `<id>-front.*`/`<id>-decoder.*`（实时，可选）+ `<id>.index`（可选）。加载器按 `<id>` 前缀找文件（`rvc/src/rvc/model_loader.cpp:103-120`）。
 - [x] 引擎优先：同名 `.engine` 存在则优先于 `.onnx`（`rvc/src/rvc/model_loader.cpp:167-178`）。
-- [x] 共享特征引擎（HuBERT/RMVPE）放一处，各模型引用，不每份复制。现共享于 qiqi-zh 目录，其余模型符号链接引用，`[rvc]` 全局路径显式指向它（`rvc/config/rvc_config.cpp:112-116`）。
-- [x] 成品层资产自包含，不依赖旧仓库符号链接（de-narrator 资产已复制为真实文件）。
+- [x] 共享特征引擎（HuBERT/RMVPE）放一处，各模型引用，不每份复制；`[rvc]` 全局路径显式指向共享目录（`rvc/config/rvc_config.cpp:112-116`）。
+- [x] 成品层资产自包含，不依赖旧仓库符号链接。
 
-命名统一用小写连字符（`qiqi-zh`、`de-narrator`）。下划线变体（`qiqi_zh` 等）在迁移时归并。
+设备上现有模型以 `mozart-ctl model list --available` 为准，不在文档中维护清单。
+
+命名统一用小写连字符（`qiqi-zh`、`de-narrator`）。
 
 ## 工具链脚本
 

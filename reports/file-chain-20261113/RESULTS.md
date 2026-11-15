@@ -15,7 +15,7 @@ SPEC-08「长文件不会耗尽内存」的内存与完成部分均通过。详�
 修复方案已演进：本报告记录的初版修复采用独立文件 socket（D2），后经用户否决
 （偏离 SPEC-03 字面交接）回退；现行实现为 Task 9 状态门控交接（`PRE_SET_FILE_MODE`
 令 pre 暂停 rvc 发送并释放输出 socket，daemon 复用同一对 socket），见
-「Task 9 状态门控交接（取代 D2）」与 `docs/plans/file-chain.md` D2。下文 D2 相关
+「Task 9 状态门控交接（取代 D2）」。下文 D2 相关
 数值为该历史方案实测，现行方案复测见 Task 9 一节。
 
 ## 配置
@@ -208,7 +208,7 @@ D2 独立 socket 方案经用户否决回退后，按 SPEC-03 字面「复用帧
 `rvc-out.sock`（接收线程握手确认后才应答），daemon 复用同一对 `rvc-in.sock`/
 `rvc-out.sock` 跑文件数据面；收尾 `active=false` 恢复 pre。asr 字幕支路恒发不受影响。
 长文件死锁根因（pre 恒发实时帧污染整段攒帧）由状态门控消除，不再靠分离 socket。
-设计详见 `docs/plans/file-chain.md` D2。
+设计详见本节。
 
 板端复测（实测，设备与模型同「配置」一节；数据面改为复用 `[rvc]` 默认
 `rvc-in.sock`/`rvc-out.sock`，无独立文件 socket，缓冲 8 帧）：部署

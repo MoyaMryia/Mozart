@@ -58,7 +58,7 @@ description: 在 Mozart 里接入新的 RVC 音色模型：从原始 .pth 权重
 
 ## 常见坑（细节见 references）
 
-- **transformers 锁 4.46.3**：导出脚本面向 4.x；5.x 用本地路径 `from_pretrained` 直接报错。另，HuBERT 导出需 `hubert_base` 含 `pytorch_model.bin`（板端当前缺失，见 environment.md）。
+- **transformers 锁 4.46.3**：导出脚本面向 4.x；5.x 用本地路径 `from_pretrained` 直接报错。HuBERT 导出的前置检查见 [environment.md](references/environment.md)。
 - **id 对齐**：加载器按 `<id>.onnx` 找文件，目录名/文件名前缀不一致会 `exists` 为假。
 - **动态 vs 定长**：文件链动态形状，实时链定长形状，别混导混编。
 - **引擎绑设备**：只在目标 Jetson 上 trtexec，别拿别处的 engine。

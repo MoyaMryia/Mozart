@@ -4,7 +4,7 @@ Mozart 是面向 NVIDIA Jetson Orin Nano Super 8 GB 的本地语音处理系统�
 麦克风输入经预处理后，同时用于实时变声与翻译字幕；另一种输出使用参考音色播报译文。
 全部计算在设备本地完成。
 
-本文件定义目标与验收原则。实现现状见 [README.md](README.md)，工作约定见 [AGENTS.md](AGENTS.md)。
+本文件定义目标与验收原则。文档索引见 [README.md](README.md)，工作约定见 [AGENTS.md](AGENTS.md)。
 
 ## 功能路径
 

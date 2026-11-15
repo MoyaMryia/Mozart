@@ -139,29 +139,11 @@ tools/jetson-e2e.sh <SSH目标> --measure latency
 | 成品 | `~/mozart-assets/models/rvc/<id>/` | config + 生成器 + 特征引擎引用 + index |
 
 成品目录名 = 模型 id = 文件前缀。加载器按 `<id>` 前缀找文件，同名 `.engine` 优先于 `.onnx`。
-
-### RVC 模型清单
-
-成品层 `~/mozart-assets/models/rvc/`：
-
-| 模型 | 离线 | 实时 | 备注 |
-| --- | --- | --- | --- |
-| qiqi-zh | 齐全 | 齐全 | 主模型，特征引擎共享源 |
-| qiqi-en | 齐全 | 缺 | 无 front/decoder |
-| de-narrator | 待编译 | 齐全 | 离线生成器 engine 缺，现回退 onnx |
-
-原料层 `~/rvc-pth/` 另有 qiqi-ja、qiqi-ko、mike-tyson、liuying 权重，未导出编译。
+设备上现有模型以 `mozart-ctl model list --available` 为准，不在文档中维护清单。
 
 ### 共享特征引擎
 
-HuBERT/RMVPE 所有 v2 模型共用，存于 qiqi-zh 目录，其余模型符号链接引用：
-
-- `hubert_base_dynamic.onnx`/`.engine`：离线 HuBERT，engine 链接到 `hubert_base_64k.engine`。
-- `hubert-realtime.onnx`/`.engine`：实时 HuBERT。
-- `rmvpe_dynamic.onnx`/`.engine`：离线 RMVPE。
-- `rmvpe-realtime.onnx`/`.engine`：实时 RMVPE。
-
-`[rvc]` 的 `hubert_path` 等显式指向 qiqi-zh 目录。换模型只换生成器，特征引擎不动。
+HuBERT/RMVPE 所有 v2 模型共用，放一处，其余模型引用，不每份复制。文件名约定与自动发现规则见 [config.md](config.md) 与 [SPEC-03](SPEC/SPEC-03-rvc.md)；`[rvc]` 的 `hubert_path` 等显式指向共享目录。换模型只换生成器，特征引擎不动。
 
 ### 其他资产
 
@@ -268,8 +250,5 @@ python3 tools/model/build_realtime_engines.py \
 
 ## 适用范围
 
-- 模型状态与资产布局为 2026-11-15 板端核对。模型切换经 qiqi-en、de-narrator 短文件转换实测通过。
-- asr、tts、llm 资产内容未逐项核对。
-- de-narrator 离线 engine、qiqi-en 实时资产未补齐。
-- 工具链脚本已迁入并通过语法检查；功能运行需 PyTorch 与 RVC 源码树，未在本文档环境实跑。
-- 目录规范与部署、测试流程于 2026-11-15 调整；历史目录归集后旧报告中的路径不再对应设备现状。
+- 工具链脚本只做语法检查；功能运行需 PyTorch 与 RVC 源码树，未在本文档环境实跑。
+- 目录规范与部署、测试流程于 2026-11-15 调整；旧报告中的路径不对应设备现状。

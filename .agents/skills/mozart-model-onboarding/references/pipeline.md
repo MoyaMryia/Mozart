@@ -26,5 +26,5 @@
 ## 已知缺口
 
 - `export_rmvpe` 未设 `dynamic_axes`，文件链动态 RMVPE 导不出，需先补 `--dynamic`。
-- 板端缺 `hubert_base/pytorch_model.bin`，重导 HuBERT 前要补齐（运行时已有 hubert engine，不影响推理）。
+- HuBERT 导出前确认 `hubert_base/pytorch_model.bin` 与 `config.json` 已就位（检查见 [environment.md](environment.md)）。
 - 生成器/RMVPE 导出尚未端到端实跑，先跑一个最小导出（小 `--frames`）验证再批量。
