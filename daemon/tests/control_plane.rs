@@ -228,11 +228,11 @@ fn config_set_validates_and_get_reads_baseline() {
     );
     let conn = daemon.connect();
 
-    // 不支持的键：core 分类拒绝。
+    // 不支持 config set 的键（重启类）：core 分类拒绝。
     let reply = call(
         &conn,
         ctl::DAEMON_CONFIG_SET,
-        br#"{"key":"rvc.pitch_shift","value":"3"}"#,
+        br#"{"key":"rvc.model_id","value":"other"}"#,
     );
     assert_eq!(reply.status, "error", "reason: {}", reply.reason);
 
