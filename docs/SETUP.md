@@ -43,6 +43,8 @@
     └── llm/<file>.gguf
 
 ~/rvc-pth/                    # 原料权重（pth，不参与推理）
+~/mozart-toolkit/             # 导出/golden 的 Python 环境与固定依赖
+└── rvc-env/                  # venv（torch/transformers/onnx 等）
 ~/mozart-samples/             # 测试音频样本
 ~/mozart-archive/             # 归档：原始权重、基准引擎
 └── legacy/                   # 历史实验目录，仅作追溯
@@ -175,6 +177,7 @@ HuBERT/RMVPE 所有 v2 模型共用，存于 qiqi-zh 目录，其余模型符号
 ## 工具链
 
 Python 脚本，居仓库 `tools/model/`，直接调用，不做 CLI 封装。
+导出/golden 在 `~/mozart-toolkit/rvc-env` 的 venv 里跑（固定版本，transformers 4.46.3；首次搭建见 skill `mozart-model-onboarding` 的 references/environment.md）。
 原则：**逻辑在仓库，资产在仓外，路径全部由参数或环境变量注入**，脚本不写死资产位置。
 
 | 脚本 | 作用 |
