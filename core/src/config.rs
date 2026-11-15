@@ -1335,6 +1335,32 @@ mod tests {
     }
 
     #[test]
+    fn get_key_reads_rvc_session_baseline_after_set() {
+        let dir = temp_config_dir("rvc-get");
+        let path = dir.join("mozart.toml");
+        std::fs::write(&path, "[rvc]\n").unwrap();
+
+        // 未显式写入的键不在 TOML 基线中；config get 只读显式基线。
+        assert!(get_key(Some(&path), Some("rvc.pitch_shift")).is_err());
+
+        set_key(Some(&path), "rvc.pitch_shift", "3").unwrap();
+        set_key(Some(&path), "rvc.f0_method", "rmvpe").unwrap();
+        assert_eq!(
+            get_key(Some(&path), Some("rvc.pitch_shift"))
+                .unwrap()
+                .as_integer(),
+            Some(3)
+        );
+        assert_eq!(
+            get_key(Some(&path), Some("rvc.f0_method"))
+                .unwrap()
+                .as_str(),
+            Some("rmvpe")
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
     fn set_key_rejects_invalid_rvc_session_values_without_writing() {
         let dir = temp_config_dir("rvc-reject");
         let path = dir.join("mozart.toml");
