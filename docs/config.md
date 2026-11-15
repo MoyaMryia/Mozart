@@ -183,7 +183,7 @@ path = "<资产根>/models/asr/<模型id>"
 
 ## 特殊机制说明
 
-- **RVC 会话参数**（f0_method / pitch_shift / index_rate / rms_mix_rate / protect）：`config set rvc.<会话参数>` 写 TOML 基线并即时应用。实时：`StopStream`→`StartStream`，短暂打断（约 1–2 s）；文件：当前任务用旧参、下一任务用新参，不中断。启动失败用旧参恢复并返回错误，TOML 保留新基线（详见 [SPEC-04](SPEC/SPEC-04-daemon.md)）。`protect` / `rms_mix_rate` 在实时链路不应用，仍只对文件链路生效；实时补应用与干净块边界 `SetParams` 见 [FUTURE.md](FUTURE.md)。
+- **RVC 会话参数**（f0_method / pitch_shift / index_rate / rms_mix_rate / protect）：`config set rvc.<会话参数>` 写 TOML 基线并更新生效配置。实时：只有实时链路实际使用的 `pitch_shift` / `index_rate` / `f0_method` 变更且实时流在跑时触发 `StopStream`→`StartStream`，短暂打断；启动失败用旧参恢复并返回错误，TOML 保留新基线、生效配置保留旧值（详见 [SPEC-04](SPEC/SPEC-04-daemon.md)）。仅改 `protect` / `rms_mix_rate` 只更新 TOML 基线与生效配置，不打断实时流；参数值未变化不触发 Stop/Start。文件：当前任务用旧参、下一任务用新参，不中断。`protect` / `rms_mix_rate` 在实时链路不应用，仍只对文件链路生效；实时补应用与干净块边界 `SetParams` 见 [FUTURE.md](FUTURE.md)。
 - **pre DSP 开关**经 `SetDsp`（0x0207，体含 denoise/gate/agc/limiter 四键）运行时生效：denoise 重新启用时重置 WOLA 流式状态、重新攒初始化帧，gate/agc/limiter 直接切换。
 - **逻辑上限 vs 预分配环**：`[file].queue_capacity` 是入队时查的逻辑上限（未预分配）→ R；`[pre].capture_queue_frames` 与 asr/tts/bridge 的 `*_capacity` 是预分配环/队列 → S。
 - **位置键**（storage_dir、subtitles_path）归 S：运行中改位置会使已有文件/队列分裂，需重启统一。

@@ -14,7 +14,7 @@
 - [x] 非推理逻辑归 Rust。
 - [x] C++ 进程只保留推理：`StreamSession` 封装 `StreamingRvc` 和 `RVCInferencer`；`RealtimeRvcWorker` 与 `AudioWorker` 的外层传输、队列、模式、统计归 Rust。
 - [x] 静音和旁路归音频进程；C++ 不实现这两个概念。
-- [x] 参数在 `StartStream` 时固定；v1 运行时调参经 `config set rvc.<会话参数>` → `StopStream`→`StartStream`；块边界 `SetParams` 仍推迟，见 [FUTURE.md](../FUTURE.md)。
+- [x] 参数在 `StartStream` 时固定；v1 运行时调参经 `config set rvc.<会话参数>` 写持久基线：只有实时链路实际使用的 `pitch_shift`、`index_rate`、`f0_method` 变更由 daemon `StopStream`→`StartStream` 应用，仅改 `protect`、`rms_mix_rate` 只更新 TOML 基线与生效配置、不打断实时流；块边界 `SetParams` 仍推迟，见 [FUTURE.md](../FUTURE.md)。
 - [x] 输出节拍由输入帧驱动：C++ 每收到一帧输入就回一帧输出，输出环不足时补零。400 ms 启动缓冲留在 `StreamingRvc.startup_delay_out`，音频进程只保留小缓冲吸收送达抖动。大缓冲只有一个主人。
 - [ ] 1:1 泵假设采集与播放时钟同源；使用不同声卡时，长期漂移会导致周期性欠载或缓冲增长，需时钟漂移补偿（见 [FUTURE.md](../FUTURE.md)）。推迟项，未实现。
 - [x] 板端实测确认小缓冲布局成立：同源 60 s 长跑 49.86 帧/s 1:1、丢弃与欠载零增长，rvc 端到端净滞后约 0.5 s（400 ms 启动缓冲为主）。维持启动缓冲留 C++、音频进程小缓冲的现状；数据见 `reports/realtime-pipeline-20261112/RESULTS.md`。
@@ -43,8 +43,8 @@
 | Rust / 音频进程 | Rust | 播放侧小缓冲、静音 / 旁路、数据面队列；400 ms 启动缓冲留在 C++，不重复设大缓冲 |
 
 - [x] `kind` 只分 `realtime` 和 `file`。C++ 按模型能力选择实时资产或 quality / full-history preset；缺实时资产时拒绝实时，不静默降级。
-- [x] `StartStream` 会话参数取自 TOML `[rvc]` 会话默认值；不新增控制命令，`StartStream` 仍携带五个会话参数。`config set rvc.<会话参数>` 是持久基线写回；将来无中断 `SetParams` 的运行时改动才记入 daemon 运行时状态文件（见 SPEC-04），重启恢复，不回写 TOML。两者不混用。
-- [ ] `config set rvc.<会话参数>` 写 TOML 基线；实时流运行中由 daemon `StopStream`→`StartStream` 应用，短暂打断（约 1–2 s）；文件任务运行中不中断，当前任务用旧参、下一任务用新参。
+- [x] `StartStream` 会话参数取自 TOML `[rvc]` 会话默认值；不新增控制命令，`StartStream` 仍携带五个会话参数。`config set rvc.<会话参数>` 是持久基线写回（接入与编排见 SPEC-04）；将来无中断 `SetParams` 的运行时改动才记入 daemon 运行时状态文件，重启恢复，不回写 TOML。两者不混用。
+- [ ] `config set rvc.<会话参数>` 写 TOML 基线；只有实时链路实际使用的 `pitch_shift`、`index_rate`、`f0_method` 变更且实时流在跑时，由 daemon `StopStream`→`StartStream` 应用，短暂打断；仅改 `protect`、`rms_mix_rate` 只更新 TOML 基线与生效配置，不打断实时流；参数值未变化不触发 Stop/Start。文件任务运行中不中断，当前任务用旧参、下一任务用新参。
 - [ ] `protect`、`rms_mix_rate` 在实时链路不应用，仍只对文件链路生效；实时补应用留 [FUTURE.md](../FUTURE.md)。
 - [x] `filter_radius` 在旧 C++ 里只保存、未参与计算，v1 不放进 `StartStream`、不暴露死参数；保留为 FUTURE 提升项，推迟实现 F0 中值滤波，见 [FUTURE.md](../FUTURE.md)。
 - [ ] 若板端实测小缓冲扛不住抖动或时钟漂移，再把大缓冲搬到音频进程，同时把 `startup_delay_out` 设为 0 并重测首帧。条件项，未触发。
