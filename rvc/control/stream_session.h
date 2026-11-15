@@ -185,9 +185,6 @@ public:
         bool realtime, const RvcParameters& params,
         const FileBatchOptions& file_options, std::string& reason) override;
 
-    // 测试与诊断入口：当前模型目录是否存在（LoadModel 前置探测）。
-    bool model_dir_exists(const std::string& model_id) const;
-
 private:
     InferenceBackendConfig config_;
     std::shared_ptr<ModelManager> models_;

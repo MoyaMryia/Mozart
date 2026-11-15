@@ -6,7 +6,7 @@
 //   3. StartStream：NotLoaded / 参数边界 / 句柄校验 / Busy / 能力不足拒绝；
 //      kind=file 的 total_frames / output_socket 入口校验（D1/D2）
 //   4. ListModels：清单字段与 loaded 按当前模型 id 判定；真实 ModelManager
-//      目录扫描（InferenceBackend，无 GPU）
+//      目录扫描与 LoadModel 注册表路径解析（InferenceBackend，无 GPU）
 //   5. GetStatus：流式与停流后的原子快照字段（字段名 = RvcStatus 契约）
 //   6. StopStream 幂等、ResetStream 断续重置透传
 //   7. 线上往返：应答信封回显 type/request_id；版本不兼容拒绝并断链；
@@ -407,6 +407,38 @@ int main() {
               "complete assets report exists and unloaded");
         CHECK(models[1].at("id") == "beta" && models[1].at("exists") == false,
               "empty directory reports missing assets");
+        std::filesystem::remove_all(dir);
+    }
+
+    std::printf("test_load_model_registry_resolution\n");
+    {
+        // 注册表 path 在 models_dir 之外且 models_dir 未配置：入口不预检目录，
+        // 加载交给 ModelManager。无 ORT 主机停在引擎加载，reason 必须是
+        // ModelManager 路径的失败口径，而非入口预检的拒绝口径。
+        const auto dir = std::filesystem::temp_directory_path()
+            / ("mozart-rvc-registry-" + std::to_string(::getpid()));
+        std::filesystem::remove_all(dir);
+        std::filesystem::create_directories(dir / "qiqi");
+        { std::ofstream(dir / "qiqi" / "config.json") << "{}"; }
+        { std::ofstream(dir / "qiqi" / "qiqi.onnx"); }
+
+        InferenceBackendConfig config;
+        config.models = {{"qiqi", "rvc", dir / "qiqi"}};
+        StreamSession session(std::make_unique<InferenceBackend>(config));
+        const Reply reply = parse_reply(session.handle(make_message(
+            MOZART_CTL_RVC_LOAD_MODEL, {{"model_id", "qiqi"}})));
+        CHECK(reply.code == MOZART_CTL_CODE_INFERENCE_FAILED
+              && reply.reason.rfind("model load failed", 0) == 0,
+              "registry path reaches ModelManager without models_dir precheck");
+
+        // 注册表与 models_dir 皆空：明确报错，不静默成功。
+        StreamSession empty(std::make_unique<InferenceBackend>(
+            InferenceBackendConfig{}));
+        const Reply none = parse_reply(empty.handle(make_message(
+            MOZART_CTL_RVC_LOAD_MODEL, {{"model_id", "qiqi"}})));
+        CHECK(none.status == "error"
+              && none.reason.rfind("model load failed", 0) == 0,
+              "empty registry and models_dir fail with a reason");
         std::filesystem::remove_all(dir);
     }
 

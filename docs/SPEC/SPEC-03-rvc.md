@@ -66,7 +66,7 @@
 
 TOML 顶层 `[[models]]` 数组声明可用模型，每项含 `id`、`type`（rvc/asr/tts/llm）、`path`。
 
-- [ ] `LoadModel(model_id)` 在注册表中按 id + type=rvc 查找 path，不再拼 `models_dir/model_id`。被入口预检架空：加载前强制 `models_dir` 非空且 `models_dir/model_id` 目录存在，注册表 path 指向 models_dir 之外即无法加载；ModelManager 本身已注册表优先。（`rvc/control/stream_session.cpp:452-459`、`rvc/model/model_loader.cpp:262-274`）
+- [x] `LoadModel(model_id)` 在注册表中按 id + type=rvc 查找 path，不再拼 `models_dir/model_id`；注册表为空时回退 `models_dir/model_id`。入口不预检目录，路径解析与报错归 ModelManager。（`rvc/control/stream_session.cpp:450-460`、`rvc/src/rvc/model_loader.cpp:262-292`）
 - [x] `ListModels` 返回注册表中 type=rvc 的全部条目；注册表为空时回退扫描 `models_dir` 子目录。（`rvc/model/model_loader.cpp:220-243`）
 - [x] 注册表为空时保持旧行为，向后兼容。
 - [x] 特征引擎路径（hubert_path / rmvpe_path / realtime_hubert_path / realtime_rmvpe_path）可选；缺省时从 `models_dir` 按约定文件名自动发现（`hubert_base_dynamic.onnx`、`rmvpe_dynamic.onnx`、`hubert-realtime.onnx`、`rmvpe-realtime.onnx`），找到即用，找不到报错。显式配置优先。（`rvc/config/rvc_config.cpp:77-116`）
@@ -75,4 +75,4 @@ TOML 顶层 `[[models]]` 数组声明可用模型，每项含 `id`、`type`（rv
 
 - [x] 模型加载移出控制锁。（`rvc/control/stream_session.cpp:152,159`）
 - [ ] 长文件改分块，限制内存。正文已定推迟（分块流式见 FUTURE），本条未同步；（文档）二选一：标推迟或启动实现。
-- [ ] 配置项必须与实际行为一致。现存已知违背：LoadModel 入口预检与注册表定稿冲突（见模型注册表第一节）。
+- [x] 配置项必须与实际行为一致。原 LoadModel 入口预检与注册表定稿冲突已修复（见模型注册表第一节）。

@@ -449,26 +449,14 @@ InferenceBackend::InferenceBackend(const InferenceBackendConfig& config)
 
 LoadResult InferenceBackend::load_model(const std::string& model_id,
                                           std::string& reason) {
-    if (config_.models_dir.empty()) {
-        reason = "models_dir is not configured";
-        return LoadResult::Failed;
-    }
-    if (!model_dir_exists(model_id)) {
-        reason = "model directory not found: " + model_id;
-        return LoadResult::NotFound;
-    }
+    // 路径解析归 ModelManager（注册表优先，空时回退 models_dir），
+    // 入口不预检目录，避免架空注册表 path（SPEC-03）。
     // load_mutex 串行加载；命中缓存约 1 ms，冷加载含引擎反序列化。
     if (!models_->load_model(model_id) || !pipeline_->switch_model(model_id)) {
         reason = "model load failed: " + model_id + " (see log for details)";
         return LoadResult::Failed;
     }
     return LoadResult::Ok;
-}
-
-bool InferenceBackend::model_dir_exists(const std::string& model_id) const {
-    if (config_.models_dir.empty()) return false;
-    std::error_code error;
-    return std::filesystem::is_directory(config_.models_dir / model_id, error);
 }
 
 std::string InferenceBackend::current_model_id() const {
