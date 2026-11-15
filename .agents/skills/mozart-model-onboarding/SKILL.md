@@ -53,7 +53,7 @@ description: 在 Mozart 里接入新的 RVC 音色模型：从原始 .pth 权重
 - 设备：Jetson。SSH 目标由参数或 `MOZART_JETSON` 提供，不写死。
 - RVC 源码树：`~/mozart-assets/RVC`（`--rvc-source` / `RVC_SOURCE` 必填）。
 - 基础模型：`~/mozart-assets/RVC/assets/{hubert_base,rmvpe}`（导出 HuBERT/RMVPE 时用；生成器导出不需要）。
-- trtexec：`/usr/bin/trtexec`（系统自带，编译引擎用）。
+- trtexec：PATH 中的 `trtexec`（可用 `TRTEXEC` 或 `--trtexec` 指定路径，编译引擎用）。
 - 原始权重：`~/rvc-pth/<id>.pth`。
 
 ## 常见坑（细节见 references）

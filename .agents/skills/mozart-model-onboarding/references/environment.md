@@ -19,7 +19,7 @@ python3 -m venv ~/mozart-toolkit/rvc-env
 导出用到的非仓内资源（SETUP 目录树之外由本文约定）：
 - RVC 源码：`~/mozart-assets/RVC`（`--rvc-source`）
 - 基础模型：`~/mozart-assets/RVC/assets/{hubert_base,rmvpe}`
-- trtexec：`/usr/bin/trtexec`（系统自带，编译引擎用）
+- trtexec：PATH 中的 `trtexec`（可用 `TRTEXEC` 或 `--trtexec` 指定路径，编译引擎用）
 
 ## 版本推荐
 

@@ -18,6 +18,8 @@ from pathlib import Path
 
 import onnx
 
+from trtexec import resolve as resolve_trtexec
+
 
 def validate_fixed_shapes(model_path: Path) -> None:
     model = onnx.load(str(model_path))
@@ -30,10 +32,10 @@ def validate_fixed_shapes(model_path: Path) -> None:
             )
 
 
-def build(model_path: Path, engine_path: Path, extra: list) -> None:
+def build(trtexec: str, model_path: Path, engine_path: Path, extra: list) -> None:
     validate_fixed_shapes(model_path)
     command = [
-        "/usr/bin/trtexec",
+        trtexec,
         f"--onnx={model_path}",
         f"--saveEngine={engine_path}",
         *extra,
@@ -54,6 +56,8 @@ def main() -> None:
                         help="rmvpe-realtime.onnx")
     parser.add_argument("--output-dir", type=Path, required=True)
     parser.add_argument("--fp16", action="store_true")
+    parser.add_argument("--trtexec", type=Path,
+                        help="trtexec path (default: TRTEXEC or PATH)")
     args = parser.parse_args()
 
     args.output_dir.mkdir(parents=True, exist_ok=True)
@@ -62,9 +66,10 @@ def main() -> None:
     if args.fp16:
         extra.append("--fp16")
 
+    trtexec = resolve_trtexec(args.trtexec)
     for model in (args.front, args.decoder, args.hubert, args.rmvpe):
         engine = args.output_dir / model.with_suffix(".engine").name
-        build(model, engine, extra)
+        build(trtexec, model, engine, extra)
 
 
 if __name__ == "__main__":

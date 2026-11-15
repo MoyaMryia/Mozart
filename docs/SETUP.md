@@ -186,7 +186,7 @@ Python 脚本，居仓库 `tools/model/`，直接调用，不做 CLI 封装。
 | 目标权重 | export_generator、run_reference | 位置参数 / `--model` | `~/rvc-pth/<id>.pth` |
 | golden 参考 | run_reference、verify_golden | `--input` / `--manifest` 等必填 | 仓外 |
 
-导出依赖 PyTorch，在开发机运行；编译依赖 trtexec，在设备运行。RVC 源码树是上游实现，不是旧仓库代码。
+导出依赖 PyTorch，在开发机运行；编译依赖 trtexec，在设备运行。RVC 源码树是上游实现，不是旧仓库代码。`build_dynamic_engines.py` 从生成器 ONNX 读取 emb/latent/source 维度；`trtexec` 可用 `TRTEXEC` 或 `--trtexec` 指定，两个构建脚本相同。
 
 ### 调用示例
 
@@ -201,8 +201,10 @@ python3 tools/model/export_generator_split_onnx.py ~/rvc-pth/qiqi-zh.pth \
     --front-output qiqi-zh-front.onnx --decoder-output qiqi-zh-decoder.onnx \
     --front-frames 280 --decoder-frames 30 --skip-head 250 --return-frames 30
 
-# 编译引擎（设备）
-python3 tools/model/build_dynamic_engines.py --assets <onnx目录> --feature-assets <特征onnx目录>
+# 编译引擎（设备；--sample-rate 决定每帧输出样本数：48000→480，40000→400）
+python3 tools/model/build_dynamic_engines.py \
+    --generator qiqi-zh-dynamic.onnx --generator-engine qiqi-zh.engine \
+    --feature-assets <特征onnx目录> --sample-rate 48000
 
 # golden 参考与对拍
 RVC_SOURCE=~/mozart-assets/RVC python3 tools/model/run_reference.py \

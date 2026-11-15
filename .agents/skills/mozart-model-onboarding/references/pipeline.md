@@ -13,15 +13,11 @@
 - torch 用 CPU 轮子（导出/golden 都在 CPU），避免 JetPack CUDA 版本不匹配。
 - transformers 锁 4.46.3（5.x 用本地路径 `from_pretrained` 报错）。
 
-## 产物改名（SETUP 未提）
+## 产物命名
 
-`build_dynamic_engines.py` 输出固定占位名，成品目录要运行时名，需改名/复制：
-
-- `qiqi-dynamic-explicit.engine` → `<id>.engine`
-- `hubert-file.engine` → `hubert_base_dynamic.engine`（共享）
-- `rmvpe-file.engine` → `rmvpe_dynamic.engine`（共享）
-
-实时 `build_realtime_engines.py` 输出名已匹配运行时，无需改名。
+- `build_dynamic_engines.py` 用 `--generator-engine <id>.engine` 直接输出运行时名；特征引擎按输入名输出 `hubert_base_dynamic.engine` 与 `rmvpe_dynamic.engine`，无需改名。
+- `--sample-rate` 决定每帧输出样本数：48000 → 480，40000 → 400。跨采样率模型必须显式传入。
+- 实时 `build_realtime_engines.py` 输出名已匹配运行时，无需改名。
 
 ## 已知缺口
 
