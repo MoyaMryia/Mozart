@@ -1,7 +1,8 @@
-//! 合成工作线程：从任务队列取句 → 文本预处理 → PocketTTS 合成 →
-//! 重采样 48 kHz → 契约帧输出（v1 不走变声，直接喂 pre 播放）。模型加载失败为
-//! 致命错误（进程退出由 daemon 重启）；单句合成失败计数并记录原因，不影响后续
-//! 任务。SIGTERM 放弃在途合成与队列剩余。
+//! 合成工作线程：从任务队列取句 → 文本预处理 → PocketTTS 流式合成（生成回调每段
+//! 交付 PCM）→ 逐段重采样 48 kHz → 经有界通道交输出线程按节拍发契约帧（v1 不走
+//! 变声，直接喂 pre 播放，合成一段播一段）。模型加载失败为致命错误（进程退出由
+//! daemon 重启）；单句合成失败计数并记录原因，不影响后续任务。SIGTERM 放弃在途
+//! 合成与队列剩余。
 
 use crate::ffi::{self, Synthesizer};
 use crate::jobs::Job;
@@ -11,11 +12,15 @@ use crate::state::Shared;
 use mozart_core::OUTPUT_SAMPLE_RATE;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering::Relaxed};
-use std::sync::mpsc::{Receiver, RecvTimeoutError};
+use std::sync::mpsc::{self, Receiver, RecvTimeoutError};
 use std::time::Duration;
 
 /// 队列轮询步长：让停止标志在百毫秒级生效（daemon 宽限 2 s）。
 const QUEUE_POLL: Duration = Duration::from_millis(100);
+
+/// 合成段通道容量（段数）：输出线程按实时节拍消费，通道满时 sink 阻塞反压，
+/// 把引擎解码节流到播放速率，内存上限约 容量 × 单段时长 × 48 kHz × 4 字节。
+const SEG_BUFFER: usize = 4;
 
 /// 每句时长上限（沿用旧 speech_service.py:520，中文按字符）：
 /// min(45, max(4, 字符数 × 0.35 + 2)) 秒。超限拒绝计 failed。
@@ -246,24 +251,60 @@ pub fn run_with(
         shared.set_synthesizing(true);
         let text = precondition(&job.text);
         let cap_s = duration_cap_s(job.text.chars().count());
-        let result = engine
-            .synthesize(&text, ref_samples, ref_rate, &abort)
-            .and_then(|samples| to_48k(samples, engine.sample_rate()))
-            .and_then(|mut pcm| sanitize(&mut pcm, OUTPUT_SAMPLE_RATE, cap_s).map(|()| pcm));
+        let rate = engine.sample_rate();
+
+        // 流式：synth 线程经生成回调逐段交付，sink 重采样 + 安全校验后送有界通道；
+        //  scoped 输出线程独占 writer 按节拍发帧。通道满时 sink 阻塞反压引擎解码。
+        let (seg_tx, seg_rx) = mpsc::sync_channel::<Vec<f32>>(SEG_BUFFER);
+        // 时长上限按累计样本核算：sanitize 逐段以「剩余配额」为上限，段时长超剩余
+        // 等价于累计超整句上限。归一化随之逐段进行（流式无法预知整句峰值）。
+        let mut remaining_s = cap_s;
+        let mut total_samples = 0usize;
+        let mut stream_err: Option<String> = None;
+
+        let result = std::thread::scope(|scope| {
+            let output = scope.spawn(|| crate::output::write_stream(seg_rx, writer, &abort));
+            let result = {
+                let mut sink = |segment: &[f32]| -> bool {
+                    let mut pcm = match to_48k(segment.to_vec(), rate) {
+                        Ok(pcm) => pcm,
+                        Err(reason) => {
+                            stream_err = Some(reason);
+                            return false;
+                        }
+                    };
+                    let seg_s = pcm.len() as f64 / OUTPUT_SAMPLE_RATE as f64;
+                    if let Err(reason) = sanitize(&mut pcm, OUTPUT_SAMPLE_RATE, remaining_s) {
+                        stream_err = Some(reason);
+                        return false;
+                    }
+                    remaining_s -= seg_s;
+                    total_samples += pcm.len();
+                    seg_tx.send(pcm).is_ok()
+                };
+                engine.synthesize(&text, ref_samples, ref_rate, &abort, &mut sink)
+            };
+            // sink 按引用借用 seg_tx（send 取 &self），析构不关闭通道；显式 drop
+            // 关闭通道，输出线程排空后退出，再回收 writer 供下一句复用。
+            drop(seg_tx);
+            output.join().expect("输出线程 panic");
+            result
+        });
+
         if abort.aborted() {
             // TTS_JOB_STOP 或 SIGTERM 在途到达：取消本句，不投递、不计失败。
             shared.add_stopped(1);
+        } else if let Some(reason) = stream_err {
+            shared.add_failed(1);
+            shared.set_last_error(&format!("{}: {reason}", job.utterance_id));
+        } else if let Err(reason) = result {
+            shared.add_failed(1);
+            shared.set_last_error(&format!("{}: {reason}", job.utterance_id));
+        } else if total_samples == 0 {
+            shared.add_failed(1);
+            shared.set_last_error(&format!("{}: 引擎返回空音频", job.utterance_id));
         } else {
-            match result {
-                Ok(pcm) => {
-                    writer.write_utterance(&pcm, &abort);
-                    shared.add_synthesized(1);
-                }
-                Err(reason) => {
-                    shared.add_failed(1);
-                    shared.set_last_error(&format!("{}: {reason}", job.utterance_id));
-                }
-            }
+            shared.add_synthesized(1);
         }
         shared.set_synthesizing(false);
     }
@@ -425,11 +466,16 @@ mod tests {
         fn sample_rate(&self) -> u32 {
             self.rate
         }
-        fn synthesize(&self, _text: &str, _reference: &[f32], _ref_rate: u32, _abort: &Abort<'_>) -> Result<Vec<f32>, String> {
+        fn synthesize(&self, _text: &str, _reference: &[f32], _ref_rate: u32, abort: &Abort<'_>, sink: &mut dyn FnMut(&[f32]) -> bool) -> Result<(), String> {
             if let Some(hook) = &self.hook {
                 hook();
             }
-            self.outcome.clone()
+            let pcm = self.outcome.clone()?;
+            if abort.aborted() {
+                return Ok(());
+            }
+            sink(&pcm);
+            Ok(())
         }
     }
 
@@ -640,6 +686,75 @@ mod tests {
         let status = shared.status();
         assert_eq!(status.synthesized, 1, "停止后的新任务必须正常合成");
         assert_eq!(status.stopped, 0);
+        cleanup(&path);
+    }
+
+    /// 流式直播：引擎分三段交付（段间睡眠模拟解码耗时），首帧须在整句合成完成前
+    /// 送达接收方（边合成边发），帧序号跨段连续。整句批量实现会在此超时失败。
+    #[test]
+    fn streaming_outputs_first_segment_before_synthesis_completes() {
+        use std::sync::atomic::AtomicU64;
+        use std::time::Instant;
+
+        let (path, mut writer, shared, rx) = writer_fixture("stream");
+        let stop = AtomicBool::new(false);
+        let start = Instant::now();
+        let first_frame_ms = Arc::new(AtomicU64::new(u64::MAX));
+        let synth_done_ms = Arc::new(AtomicU64::new(u64::MAX));
+
+        let receiver = {
+            let first = first_frame_ms.clone();
+            std::thread::spawn(move || {
+                for idx in 0..3u32 {
+                    let frame = rx.recv(Some(Duration::from_secs(5))).unwrap();
+                    if idx == 0 {
+                        first.store(start.elapsed().as_millis() as u64, Relaxed);
+                    }
+                    let mozart_core::FrameMeta { frame_idx, .. } = frame.meta;
+                    assert_eq!(frame_idx, idx, "帧序号须跨段连续");
+                }
+            })
+        };
+
+        struct SegEngine {
+            start: Instant,
+            done: Arc<AtomicU64>,
+        }
+        impl Synthesizer for SegEngine {
+            fn sample_rate(&self) -> u32 {
+                OUTPUT_SAMPLE_RATE
+            }
+            fn synthesize(&self, _t: &str, _r: &[f32], _rr: u32, abort: &Abort<'_>, sink: &mut dyn FnMut(&[f32]) -> bool) -> Result<(), String> {
+                for i in 0..3 {
+                    if abort.aborted() {
+                        return Ok(());
+                    }
+                    if !sink(&vec![0.25; mozart_core::OUTPUT_SAMPLES]) {
+                        return Ok(());
+                    }
+                    if i < 2 {
+                        std::thread::sleep(Duration::from_millis(150));
+                    }
+                }
+                self.done.store(self.start.elapsed().as_millis() as u64, Relaxed);
+                Ok(())
+            }
+        }
+        let engine = SegEngine { start, done: synth_done_ms.clone() };
+
+        let (tx, jobs_rx) = mpsc::sync_channel(1);
+        tx.send(job("a:1")).unwrap();
+        shared.queue_push();
+        drop(tx);
+        run_with(jobs_rx, &engine, None, &mut writer, &shared, &stop);
+        receiver.join().unwrap();
+
+        let first = first_frame_ms.load(Relaxed);
+        let done = synth_done_ms.load(Relaxed);
+        assert!(first < done, "首帧 {first} ms 须早于整句合成完成 {done} ms（边合成边发）");
+        let status = shared.status();
+        assert_eq!(status.synthesized, 1);
+        assert_eq!(status.frames_out, 3);
         cleanup(&path);
     }
 }

@@ -1,5 +1,6 @@
 #!/bin/bash
 # Jetson 语言链路板端实测：daemon + 真 pre + 真 ASR/TTS/bridge/llama，CLI 驱动。
+# 正常由 tools/jetson-e2e.sh 调用，也可在设备上直接运行。
 # 前置：本仓库已 rsync 到设备并完成构建（tools/deploy-jetson.sh）；构建须链接
 #   sherpa（SHERPA_ONNX_LIB_DIR 指向资产根 lib），否则 asr/tts 是 stub。
 # 拓扑（snd-aloop）：aplay 语音 → Loopback DEV=0,SUBDEV=$CAP_SUB → pre 采集

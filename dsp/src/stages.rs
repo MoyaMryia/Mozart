@@ -58,6 +58,12 @@ impl Gate {
         }
     }
 
+    /// 运行时开关（SPEC-02 SetDsp）：禁用时 process 无操作；内部状态保留，
+    /// 重新启用从当前增益继续，不做重置。
+    pub fn set_enabled(&mut self, enabled: bool) {
+        self.enabled = enabled;
+    }
+
     /// 就地处理一块；禁用时无操作。
     pub fn process(&mut self, x: &mut [f32]) {
         if !self.enabled {
@@ -132,6 +138,11 @@ impl Agc {
         }
     }
 
+    /// 运行时开关（SPEC-02 SetDsp）：禁用时 process 无操作；内部增益保留。
+    pub fn set_enabled(&mut self, enabled: bool) {
+        self.enabled = enabled;
+    }
+
     /// 就地处理一块；禁用时无操作。
     pub fn process(&mut self, x: &mut [f32]) {
         if !self.enabled {
@@ -179,6 +190,11 @@ impl Limiter {
             env: 0.0,
             gain: 1.0,
         }
+    }
+
+    /// 运行时开关（SPEC-02 SetDsp）：禁用时 process 无操作；包络与增益保留。
+    pub fn set_enabled(&mut self, enabled: bool) {
+        self.enabled = enabled;
     }
 
     /// 就地处理一块；禁用时无操作。

@@ -1,6 +1,8 @@
 // 控制信封契约：C 头的尺寸、字节序与命令号分段必须与 Rust 镜像一致。
 #include <cstdio>
 #include <cstring>
+#include <filesystem>
+#include <fstream>
 
 #include "mozart/ctl.h"
 
@@ -52,6 +54,35 @@ int main() {
         std::fprintf(stderr, "header field layout mismatch\n");
         return 2;
     }
+
+    // 共享夹具对拍：ctl_hello.bin（DAEMON_HELLO 请求，已知 request_id，体 {}）
+    // 与 Rust 侧 core/tests/frame_fixture.rs 读同一文件；gen_frame_fixture 生成。
+    const mozart_ctl_header_t hello{
+        MOZART_CTL_MAGIC, MOZART_CTL_VERSION, MOZART_CTL_DAEMON_HELLO, 0x01020304u, 2};
+    unsigned char expect[MOZART_CTL_HEADER_BYTES + 2];
+    std::memcpy(expect, &hello, MOZART_CTL_HEADER_BYTES);
+    expect[MOZART_CTL_HEADER_BYTES] = '{';
+    expect[MOZART_CTL_HEADER_BYTES + 1] = '}';
+    const std::filesystem::path fixture =
+        std::filesystem::path(MOZART_FRAME_FIXTURE_DIR) / "ctl_hello.bin";
+    std::ifstream file(fixture, std::ios::binary | std::ios::ate);
+    if (!file) {
+        std::fprintf(stderr, "cannot open fixture %s\n", fixture.c_str());
+        return 3;
+    }
+    const std::streamoff size = file.tellg();
+    if (size != static_cast<std::streamoff>(sizeof(expect))) {
+        std::fprintf(stderr, "ctl_hello.bin size mismatch\n");
+        return 3;
+    }
+    unsigned char got[sizeof(expect)];
+    file.seekg(0);
+    file.read(reinterpret_cast<char*>(got), size);
+    if (std::memcmp(got, expect, sizeof(expect)) != 0) {
+        std::fprintf(stderr, "ctl_hello.bin does not match C header serialization\n");
+        return 3;
+    }
+
     std::printf("mozart-control-contract\n");
     return 0;
 }

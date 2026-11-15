@@ -78,6 +78,20 @@ impl Dsp {
         }
     }
 
+    /// 运行时级开关（SPEC-02 SetDsp）。gate/agc/limiter 直接切换；
+    /// denoise 重新启用时重置 WOLA 流式状态（噪声估计与增益重新攒初始化帧），
+    /// 避免陈旧状态作用于新流产生伪影；禁用整级跳过（同启动配置语义）。
+    /// 定长状态写入，零分配，可在实时线程调用。
+    pub fn set_switches(&mut self, denoise: bool, gate: bool, agc: bool, limiter: bool) {
+        if denoise && !self.denoise {
+            self.ns.reset();
+        }
+        self.denoise = denoise;
+        self.gate.set_enabled(gate);
+        self.agc.set_enabled(agc);
+        self.limiter.set_enabled(limiter);
+    }
+
     /// 就地处理一帧主干（960 样本），返回本帧语音置信度（0..1）。
     /// 置信度语义同旧实现：自上次查询以来的功率加权平均，查询即清零；禁用
     /// 降噪时恒 0。VAD 与 16 kHz 打包经 `pack_frame` 按帧消费该值。
@@ -199,6 +213,93 @@ mod tests {
         let enabled = enabled.pcm;
         assert_eq!(enabled[896..], [0.0; 64], "启用时首块尾部应为补零");
         assert_ne!(enabled[..896], expected[..896]);
+    }
+
+    #[test]
+    fn set_switches_denoise_toggle_resets_wola_state() {
+        // 运行中切换 denoise（SPEC-02 SetDsp）：禁用整级跳过（输出 = 高通，
+        // 置信度恒 0）；重新启用重置 WOLA 状态，首块重新攒初始化帧。
+        let mut dsp = Dsp::new(true, false, false, false);
+        let mut hp = Highpass80::new();
+        // 暖机：NS 就绪并发射满帧；参考高通与 dsp 内部高通吃同样的输入。
+        for i in 0..8u32 {
+            let mut frame = test_frame(0x4D5A5254u32.wrapping_add(i));
+            let mut reference = frame.pcm;
+            hp.process(&mut reference);
+            dsp.process_frame(&mut frame);
+        }
+        // 禁用：输出与参考高通逐位一致，置信度恒 0。
+        dsp.set_switches(false, false, false, false);
+        let mut frame = test_frame(100);
+        let mut expected = frame.pcm;
+        hp.process(&mut expected);
+        let conf = dsp.process_frame(&mut frame);
+        assert_eq!(conf, 0.0, "禁用降噪后置信度必须恒 0");
+        // packed 字段按值整块搬出比较，不取引用。
+        let actual = frame.pcm;
+        assert_eq!(actual, expected, "禁用后必须与高通输出逐位一致");
+        // 重新启用：WOLA 状态重置，首块发射 896、尾部 64 补零（同启动首块）；
+        // 不重置则 NS 就绪立即发射满 960，此断言失败。
+        dsp.set_switches(true, false, false, false);
+        let mut frame = test_frame(101);
+        let mut reference = frame.pcm;
+        hp.process(&mut reference);
+        let conf = dsp.process_frame(&mut frame);
+        assert!((0.0..=1.0).contains(&conf));
+        let pcm = frame.pcm;
+        assert_eq!(
+            pcm[896..],
+            [0.0; 64],
+            "重新启用首块必须重新攒初始化帧（WOLA 状态已重置）"
+        );
+    }
+
+    #[test]
+    fn set_switches_shaping_stages_toggle_at_runtime() {
+        // 各整形级：启用时输出与对照不同；禁用后与从未启用的对照实例
+        // 逐位一致（同输入序列、同高通历史），证明开关运行时生效。
+        for stage in 0..3u8 {
+            let (gate, agc, limiter) = (stage == 0, stage == 1, stage == 2);
+            // 信号幅度按级选取：AGC 只放大用弱信号；limiter 上限 -1 dB，
+            // 高通去直流后峰值仍需超上限；gate 用满幅噪声开门。
+            let amplitude = if agc {
+                0.05
+            } else if limiter {
+                2.0
+            } else {
+                1.0
+            };
+            let mut dsp = Dsp::new(false, gate, agc, limiter);
+            let mut reference = Dsp::new(false, false, false, false);
+            let mut differs = false;
+            for i in 0..8u32 {
+                let mut a = test_frame(0x4D5A5254u32.wrapping_add(i));
+                // packed 字段按值整块搬出改写，不取引用。
+                let mut pcm = a.pcm;
+                for v in pcm.iter_mut() {
+                    *v *= amplitude;
+                }
+                a.pcm = pcm;
+                let mut b = a;
+                dsp.process_frame(&mut a);
+                reference.process_frame(&mut b);
+                let (pa, pb) = (a.pcm, b.pcm);
+                differs |= pa != pb;
+            }
+            assert!(differs, "级 {stage}：启用必须改变输出");
+            dsp.set_switches(false, false, false, false);
+            let mut a = test_frame(999);
+            let mut pcm = a.pcm;
+            for v in pcm.iter_mut() {
+                *v *= amplitude;
+            }
+            a.pcm = pcm;
+            let mut b = a;
+            dsp.process_frame(&mut a);
+            reference.process_frame(&mut b);
+            let (pa, pb) = (a.pcm, b.pcm);
+            assert_eq!(pa, pb, "级 {stage}：禁用后必须与从未启用实例逐位一致");
+        }
     }
 
     #[test]

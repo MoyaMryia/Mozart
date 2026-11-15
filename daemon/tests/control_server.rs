@@ -151,6 +151,7 @@ fn second_instance_is_refused() {
         .arg("--config")
         .arg(daemon.dir.join("config.toml"))
         .env("MOZART_RUN_DIR", &daemon.dir)
+        .env("MOZART_STATE_DIR", daemon.dir.join("state"))
         .stdout(Stdio::null())
         .stderr(Stdio::null())
         .spawn()

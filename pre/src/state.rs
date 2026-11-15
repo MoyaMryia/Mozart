@@ -1,6 +1,7 @@
 //! 引擎共享状态：命令目标与计数全部走原子，控制线程写、音频线程只读；
 //! `last_error` 用互斥锁保护，只在降级事件写入，不跨任何 I/O 持有。
 
+use mozart_core::config::{PreConsumerConfig, PreDspConfig};
 use mozart_core::ctl::schema::{PreStatus, Route};
 use std::collections::BTreeMap;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicU8, Ordering};
@@ -68,6 +69,69 @@ pub struct QueueReadout {
     pub tts_dropped: u64,
 }
 
+/// 消费者运行时槽位（SPEC-02 分发配置化）：声明启动时固定，发送丢弃
+/// 计数由处理线程发布绝对值。一个消费者一个 socket，计数互相独立。
+pub struct Consumer {
+    /// 消费者名：GetStatus consumer_drops 的键。
+    pub name: String,
+    /// 是否受文件接管影响：true 按 rvc_ai_active 门控发送（rvc 语义），
+    /// false 恒发（asr 语义）。
+    pub file_mode_affected: bool,
+    send_dropped: AtomicU64,
+}
+
+impl Consumer {
+    fn from_config(config: PreConsumerConfig) -> Self {
+        Self {
+            name: config.name,
+            file_mode_affected: config.file_mode_affected,
+            send_dropped: AtomicU64::new(0),
+        }
+    }
+
+    /// 发布输入帧发送丢弃的累计绝对值（处理线程调用）。
+    pub fn set_send_dropped(&self, total: u64) {
+        self.send_dropped.store(total, Ordering::Relaxed);
+    }
+}
+
+/// DSP 级开关目标（[pre.dsp] 基线 / SetDsp 运行时命令）。打包为一个字节
+/// 原子发布：四个开关作为一致快照生效，处理线程逐帧读、变化时应用。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DspSwitches {
+    pub denoise: bool,
+    pub gate: bool,
+    pub agc: bool,
+    pub limiter: bool,
+}
+
+impl DspSwitches {
+    pub fn from_config(dsp: &PreDspConfig) -> Self {
+        Self {
+            denoise: dsp.denoise,
+            gate: dsp.gate,
+            agc: dsp.agc,
+            limiter: dsp.limiter,
+        }
+    }
+
+    fn code(self) -> u8 {
+        u8::from(self.denoise)
+            | (u8::from(self.gate) << 1)
+            | (u8::from(self.agc) << 2)
+            | (u8::from(self.limiter) << 3)
+    }
+
+    fn from_code(code: u8) -> Self {
+        Self {
+            denoise: code & 1 != 0,
+            gate: code & 2 != 0,
+            agc: code & 4 != 0,
+            limiter: code & 8 != 0,
+        }
+    }
+}
+
 pub struct Shared {
     route_target: AtomicU8,
     mute_target: AtomicBool,
@@ -83,10 +147,11 @@ pub struct Shared {
     output_released: AtomicBool,
     frames_captured: AtomicU64,
     frames_played: AtomicU64,
-    /// AI 输入帧发送丢弃（含未建链期），处理线程发布绝对值。
-    ai_send_dropped: AtomicU64,
-    /// asr 输入帧发送丢弃（含未建链期），处理线程发布绝对值。
-    asr_send_dropped: AtomicU64,
+    /// 消费者列表（启动时按配置固定）：每个消费者一个输入发送丢弃计数槽，
+    /// 处理线程发布绝对值，控制线程组装 status 时读取。
+    consumers: Vec<Consumer>,
+    /// DSP 级开关目标：控制线程（SetDsp）写，处理线程逐帧读、变化时应用。
+    dsp_target: AtomicU8,
     /// AI 输出帧坏包丢弃，接收线程发布绝对值。
     ai_recv_dropped: AtomicU64,
     /// TTS 播报帧坏包丢弃，接收线程发布绝对值。
@@ -105,7 +170,13 @@ pub struct Shared {
 }
 
 impl Shared {
-    pub fn new(capture_device: String, playback_device: String, startup_id: String) -> Self {
+    pub fn new(
+        capture_device: String,
+        playback_device: String,
+        startup_id: String,
+        consumers: Vec<PreConsumerConfig>,
+        dsp: DspSwitches,
+    ) -> Self {
         Self {
             route_target: AtomicU8::new(route_code(Route::Direct)),
             mute_target: AtomicBool::new(false),
@@ -114,8 +185,8 @@ impl Shared {
             output_released: AtomicBool::new(false),
             frames_captured: AtomicU64::new(0),
             frames_played: AtomicU64::new(0),
-            ai_send_dropped: AtomicU64::new(0),
-            asr_send_dropped: AtomicU64::new(0),
+            consumers: consumers.into_iter().map(Consumer::from_config).collect(),
+            dsp_target: AtomicU8::new(dsp.code()),
             ai_recv_dropped: AtomicU64::new(0),
             tts_recv_dropped: AtomicU64::new(0),
             ai_skipped: AtomicU64::new(0),
@@ -187,14 +258,20 @@ impl Shared {
         self.frames_played.fetch_add(frames, Ordering::Relaxed);
     }
 
-    /// 发布 AI 输入帧发送丢弃的累计绝对值（发送线程调用）。
-    pub fn set_ai_send_dropped(&self, total: u64) {
-        self.ai_send_dropped.store(total, Ordering::Relaxed);
+    /// 消费者列表（启动时固定）：处理线程按索引读文件接管语义、发布
+    /// 发送丢弃计数；控制线程读名字与计数组装 status。
+    pub fn consumers(&self) -> &[Consumer] {
+        &self.consumers
     }
 
-    /// 发布 asr 输入帧发送丢弃的累计绝对值（发送线程调用）。
-    pub fn set_asr_send_dropped(&self, total: u64) {
-        self.asr_send_dropped.store(total, Ordering::Relaxed);
+    /// DSP 级开关目标；处理线程逐帧读，与已应用值比较，变化时应用。
+    pub fn dsp_target(&self) -> DspSwitches {
+        DspSwitches::from_code(self.dsp_target.load(Ordering::Relaxed))
+    }
+
+    /// SetDsp 命令目标：控制线程写，处理线程在一帧内应用。
+    pub fn set_dsp_target(&self, dsp: DspSwitches) {
+        self.dsp_target.store(dsp.code(), Ordering::Relaxed);
     }
 
     /// 发布 AI 输出帧坏包丢弃的累计绝对值（接收线程调用）。
@@ -238,27 +315,25 @@ impl Shared {
 
     /// 组装 GetStatus 快照：只读原子与队列读数，不阻塞音频线程。
     pub fn status(&self, queue: QueueReadout) -> PreStatus {
-        // consumer_drops 口径（SPEC-02 / SPEC-05）：
+        // consumer_drops 口径（SPEC-02 / SPEC-05）：键随配置消费者列表动态
+        // 生成，每个消费者报告输入发送丢弃（含未建链期）。名为 "rvc" 的
+        // 消费者额外聚合输出链路：
         // - "rvc"：AI 链路异常丢弃 = 输入发送丢弃 + 输出坏包丢弃 + 接收环满；
         // - "rvc.skipped"：direct 路由期间丢弃的输出帧（旧 skipped_replies，
         //   设计内丢弃，恒发链路在 direct 下必然增长）；
-        // - "asr"：识别支路输入发送丢弃（含未建链期，asr 未起时增长属正常）；
-        // - "tts"：播报链路异常丢弃 = 播报帧坏包丢弃 + 播报接收环满。
+        // - "tts"：播报链路固定键 = 播报帧坏包丢弃 + 播报接收环满。
         let mut consumer_drops = BTreeMap::new();
-        consumer_drops.insert(
-            "rvc".to_string(),
-            self.ai_send_dropped.load(Ordering::Relaxed)
-                + self.ai_recv_dropped.load(Ordering::Relaxed)
-                + queue.rvc_dropped,
-        );
-        consumer_drops.insert(
-            "rvc.skipped".to_string(),
-            self.ai_skipped.load(Ordering::Relaxed),
-        );
-        consumer_drops.insert(
-            "asr".to_string(),
-            self.asr_send_dropped.load(Ordering::Relaxed),
-        );
+        for consumer in &self.consumers {
+            let mut dropped = consumer.send_dropped.load(Ordering::Relaxed);
+            if consumer.name == "rvc" {
+                dropped += self.ai_recv_dropped.load(Ordering::Relaxed) + queue.rvc_dropped;
+                consumer_drops.insert(
+                    "rvc.skipped".to_string(),
+                    self.ai_skipped.load(Ordering::Relaxed),
+                );
+            }
+            consumer_drops.insert(consumer.name.clone(), dropped);
+        }
         consumer_drops.insert(
             "tts".to_string(),
             self.tts_recv_dropped.load(Ordering::Relaxed) + queue.tts_dropped,
@@ -290,6 +365,20 @@ impl Shared {
     }
 }
 
+/// 测试便利构造：默认消费者列表（rvc+asr）与默认 DSP 开关。
+/// 默认列表的唯一定义源是 Config::pre_consumers，此处不重复定义。
+#[cfg(test)]
+pub(crate) fn test_shared(capture: &str, playback: &str, startup: &str) -> Shared {
+    use mozart_core::config::Config;
+    Shared::new(
+        capture.to_string(),
+        playback.to_string(),
+        startup.to_string(),
+        Config::default().pre_consumers(),
+        DspSwitches::from_config(&PreDspConfig::default()),
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -310,7 +399,7 @@ mod tests {
 
     #[test]
     fn status_reports_speaker_state_and_tts_frames() {
-        let shared = Shared::new("cap".to_string(), "play".to_string(), "startup".to_string());
+        let shared = test_shared("cap", "play", "startup");
         // 默认实时、零播报帧。
         let status = shared.status(QueueReadout { depth: 0, dropped: 0, rvc_dropped: 0, tts_dropped: 0 });
         assert_eq!(status.speaker_state, "realtime");
@@ -326,7 +415,7 @@ mod tests {
 
     #[test]
     fn status_reports_targets_and_counters() {
-        let shared = Shared::new("cap".to_string(), "play".to_string(), "startup".to_string());
+        let shared = test_shared("cap", "play", "startup");
         shared.set_route_target(Route::Rvc);
         shared.set_mute_target(true);
         shared.add_captured(3);
@@ -355,7 +444,7 @@ mod tests {
     /// daemon 断言实时态后激活；文件接管断言后释放；startup_id 随快照上报。
     #[test]
     fn rvc_ai_active_gated_by_assertion_and_file_mode() {
-        let shared = Shared::new("cap".to_string(), "play".to_string(), "boot-1".to_string());
+        let shared = test_shared("cap", "play", "boot-1");
         let readout = QueueReadout { depth: 0, dropped: 0, rvc_dropped: 0, tts_dropped: 0 };
         // 启动：未断言，AI 支路静默（即便 file_mode=false）。
         assert!(!shared.mode_asserted());
@@ -384,11 +473,11 @@ mod tests {
         // 口径（SPEC-02 / SPEC-05）："rvc" = 发送丢弃 + 坏包丢弃 + 接收环满（异常）；
         // "rvc.skipped" = direct 路由丢弃的输出帧（设计内，旧 skipped_replies）；
         // "asr" = 识别支路输入发送丢弃；"tts" = 播报坏包丢弃 + 播报接收环满。
-        let shared = Shared::new("cap".to_string(), "play".to_string(), "startup".to_string());
-        shared.set_ai_send_dropped(2);
+        let shared = test_shared("cap", "play", "startup");
+        shared.consumers()[0].set_send_dropped(2);
         shared.set_ai_recv_dropped(3);
         shared.add_ai_skipped(4);
-        shared.set_asr_send_dropped(6);
+        shared.consumers()[1].set_send_dropped(6);
         shared.set_tts_recv_dropped(7);
         let status = shared.status(QueueReadout {
             depth: 0,
@@ -401,8 +490,8 @@ mod tests {
         assert_eq!(status.consumer_drops["asr"], 6);
         assert_eq!(status.consumer_drops["tts"], 15, "7+8 坏包与环满合计");
 
-        // 默认零值：四个键恒存在，daemon 可稳定解析。
-        let status = Shared::new("c".to_string(), "p".to_string(), "startup".to_string()).status(QueueReadout {
+        // 默认零值：默认列表的四个键恒存在，daemon 可稳定解析。
+        let status = test_shared("c", "p", "startup").status(QueueReadout {
             depth: 0,
             dropped: 0,
             rvc_dropped: 0,
@@ -417,5 +506,91 @@ mod tests {
                 ("tts".to_string(), 0),
             ])
         );
+    }
+
+    #[test]
+    fn consumer_drops_follow_configured_list() {
+        // 键随配置列表动态生成：自定义消费者出现在快照，未配置的不出现；
+        // "rvc" 口径（聚合输出链路 + rvc.skipped）只跟随名为 rvc 的消费者。
+        let consumers = vec![
+            PreConsumerConfig {
+                name: "rvc".to_string(),
+                socket: "rvc-in.sock".to_string(),
+                file_mode_affected: true,
+            },
+            PreConsumerConfig {
+                name: "extra".to_string(),
+                socket: "extra-in.sock".to_string(),
+                file_mode_affected: false,
+            },
+        ];
+        let shared = Shared::new(
+            "cap".to_string(),
+            "play".to_string(),
+            "startup".to_string(),
+            consumers,
+            DspSwitches::from_config(&PreDspConfig::default()),
+        );
+        shared.consumers()[1].set_send_dropped(9);
+        shared.set_ai_recv_dropped(1);
+        let status = shared.status(QueueReadout {
+            depth: 0,
+            dropped: 0,
+            rvc_dropped: 2,
+            tts_dropped: 0,
+        });
+        assert_eq!(
+            status.consumer_drops,
+            BTreeMap::from([
+                ("rvc".to_string(), 3),
+                ("rvc.skipped".to_string(), 0),
+                ("extra".to_string(), 9),
+                ("tts".to_string(), 0),
+            ]),
+            "自定义列表：无 asr 键，extra 独立计数"
+        );
+
+        // 空列表：只剩播报链路固定键。
+        let empty = Shared::new(
+            "cap".to_string(),
+            "play".to_string(),
+            "startup".to_string(),
+            Vec::new(),
+            DspSwitches::from_config(&PreDspConfig::default()),
+        );
+        let status = empty.status(QueueReadout {
+            depth: 0,
+            dropped: 0,
+            rvc_dropped: 0,
+            tts_dropped: 0,
+        });
+        assert_eq!(
+            status.consumer_drops,
+            BTreeMap::from([("tts".to_string(), 0)])
+        );
+    }
+
+    #[test]
+    fn dsp_switches_code_roundtrip_and_target() {
+        // 打包编码封闭：16 种组合往返一致。
+        for code in 0u8..16 {
+            let switches = DspSwitches::from_code(code);
+            assert_eq!(switches.code(), code);
+        }
+        // SetDsp 目标：控制线程写、处理线程读。
+        let shared = test_shared("cap", "play", "startup");
+        assert_eq!(
+            shared.dsp_target(),
+            DspSwitches::from_config(&PreDspConfig::default()),
+            "启动目标来自 [pre.dsp] 基线"
+        );
+        let target = DspSwitches {
+            denoise: false,
+            gate: true,
+            agc: true,
+            limiter: false,
+        };
+        shared.set_dsp_target(target);
+        assert_eq!(shared.dsp_target(), target);
     }
 }

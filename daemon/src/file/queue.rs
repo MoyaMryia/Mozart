@@ -108,6 +108,11 @@ impl FileQueue {
         Ok(queue)
     }
 
+    /// 运行时键 file.queue_capacity 即时生效（逻辑上限，未预分配，SPEC-04）。
+    pub fn set_capacity(&mut self, capacity: u32) {
+        self.capacity = capacity;
+    }
+
     /// 生成候选 job_id（`job_<epoch_us>`）。并发提交由协调器串行化，
     /// 这里只避开与既有任务的碰撞。
     pub fn reserve_job_id(&self) -> String {

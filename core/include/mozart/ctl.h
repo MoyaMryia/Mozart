@@ -61,6 +61,7 @@ enum {
     MOZART_CTL_DAEMON_DEVICE_LIST = 0x0119,  // 体 {"all"?}，data {"devices":[{"id","label","kind"}]}
     MOZART_CTL_DAEMON_CONFIG_SET  = 0x011A,  // 体 {"key","value"}，data {"key","value","restart_required","affected"}
     MOZART_CTL_DAEMON_CONFIG_GET  = 0x011B,  // 体 {"key"?}，data {"value"}（缺省 key 回整份基线）
+    MOZART_CTL_DAEMON_CONFIG_SAVE = 0x011C,  // 体 {}（空），data {"saved"}；状态覆盖批量写回基线后清空
 
     MOZART_CTL_PRE_HELLO      = 0x0201,
     MOZART_CTL_PRE_SET_ROUTE  = 0x0202,
@@ -71,6 +72,10 @@ enum {
     // active=true 暂停 rvc AI 发送并释放 output_socket（应答前确认释放完成），
     // active=false 恢复发送并重绑 output_socket。asr 支路不受影响。
     MOZART_CTL_PRE_SET_FILE_MODE = 0x0206,
+    // 体 {"denoise": bool, "gate": bool, "agc": bool, "limiter": bool}（四键必需）；
+    // 运行中切换 DSP 级（SPEC-02）：denoise 重新启用时重置 WOLA 流式状态，
+    // gate/agc/limiter 直接切换。应答 data 回显四个开关。
+    MOZART_CTL_PRE_SET_DSP = 0x0207,
 
     MOZART_CTL_RVC_HELLO        = 0x0301,
     MOZART_CTL_RVC_LOAD_MODEL   = 0x0302,

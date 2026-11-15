@@ -1,5 +1,5 @@
-//! 数据面接线：16 kHz InputFrame 恒定发送（rvc AI 支路 + asr 识别支路）与
-//! OutputFrame 接收（rvc AI 支路 + tts 播报支路）。
+//! 数据面接线：16 kHz InputFrame 按配置消费者列表恒定发送（每个消费者
+//! 一个 socket，背压互不影响）与 OutputFrame 接收（rvc AI 支路 + tts 播报支路）。
 //! 发送侧惰性建链：pre 启动不依赖对端生命周期；对端未绑定 socket 时发送
 //! 丢弃计数（旧 main.c L840-842「发送失败只计数继续」），对端就绪后下一帧
 //! 自动接通。接收侧小缓冲只吸收送达抖动，满丢最旧计数（SPEC-03：大缓冲与
@@ -22,67 +22,49 @@ pub const RVC_QUEUE_FRAMES: usize = 8;
 /// 满丢最旧计数；播放线程播报优先消费。
 pub const TTS_QUEUE_FRAMES: usize = 8;
 
-/// 输入支路发送缓冲帧数（SPEC-02 数据面 4–8 帧取上沿）：rvc 与 asr 共用。
+/// 输入支路发送缓冲帧数（SPEC-02 数据面 4–8 帧取上沿）：各消费者共用。
 const SEND_BUFFER_FRAMES: usize = 8;
 
 /// 接收线程 recv 轮询步长：超时后检查停止标志，保证秒级内退出。
 const RECV_POLL: Duration = Duration::from_millis(100);
 
-/// 丢弃计数发布目标：rvc 与 asr 两条输入支路共用同一惰性发送机制，
-/// 只有计数发布位置与错误标签不同。
-#[derive(Clone, Copy)]
-enum SendTarget {
-    Rvc,
-    Asr,
-}
-
-impl SendTarget {
-    fn publish(self, shared: &Shared, total: u64) {
-        match self {
-            SendTarget::Rvc => shared.set_ai_send_dropped(total),
-            SendTarget::Asr => shared.set_asr_send_dropped(total),
-        }
-    }
-
-    fn label(self) -> &'static str {
-        match self {
-            SendTarget::Rvc => "rvc input socket",
-            SendTarget::Asr => "asr input socket",
-        }
-    }
-}
-
-/// 惰性建链 + 恒定发送的共享机制。发送不随路由停发（旧 main.c L11「AI 路径
-/// 永不停」）；丢弃计数以绝对值发布到 Shared，控制线程只读原子。
-struct LazySender {
-    /// 对端 `input_socket` 路径；连接失败可恢复，路径固定。
+/// 输入支路发送端（SPEC-02 分发配置化）：一个消费者一个实例，惰性建链 +
+/// 恒定发送。发送不随路由停发（旧 main.c L11「AI 路径永不停」）；丢弃计数
+/// 以绝对值发布到 Shared 对应消费者槽位，控制线程只读原子。各消费者
+/// socket 与计数独立，背压互不影响。
+pub struct Sender {
+    /// 对端输入 socket 路径；连接失败可恢复，路径固定。
     path: PathBuf,
     socket: Option<FrameSocket<InputFrame>>,
     /// 未建链期（对端未绑定）与通道弃用后的发送丢弃合计；建链后的过载丢弃
     /// 由 FrameSocket 内部计数，发布时两者相加。
     dropped: u64,
-    target: SendTarget,
+    /// Shared 消费者列表索引（丢弃计数发布槽位），启动时固定。
+    consumer: usize,
+    /// 错误标签（消费者名）。
+    label: String,
 }
 
-impl LazySender {
-    fn new(path: PathBuf, target: SendTarget) -> Self {
+impl Sender {
+    pub fn new(path: PathBuf, consumer: usize, name: &str) -> Self {
         Self {
             path,
             socket: None,
             dropped: 0,
-            target,
+            consumer,
+            label: format!("{name} input socket"),
         }
     }
 
     /// 恒定发送一帧。对端不在、过载、通道坏：丢弃计数继续，不阻塞不重试。
-    fn send(&mut self, frame: &InputFrame, shared: &Shared) {
+    pub fn send(&mut self, frame: &InputFrame, shared: &Shared) {
         if self.socket.is_none() {
             match FrameSocket::connect(&self.path, SEND_BUFFER_FRAMES) {
                 Ok(socket) => self.socket = Some(socket),
                 // 对端未绑定 socket（对端未起）：计入丢弃，下一帧再试建链。
                 Err(_) => {
                     self.dropped += 1;
-                    self.target.publish(shared, self.dropped);
+                    shared.consumers()[self.consumer].set_send_dropped(self.dropped);
                     return;
                 }
             }
@@ -93,44 +75,17 @@ impl LazySender {
                 Ok(()) => {
                     let total = self.dropped + socket.stats().send_dropped;
                     self.socket = Some(socket);
-                    self.target.publish(shared, total);
+                    shared.consumers()[self.consumer].set_send_dropped(total);
                 }
                 Err(err) => {
                     // 未预期错误（超出过载与对端不在的恢复集）：旧语义计数继续，
                     // 原因可经状态查询；内部计数并入后弃用通道。
                     self.dropped += 1 + socket.stats().send_dropped;
-                    self.target.publish(shared, self.dropped);
-                    shared.set_last_error(&format!("{}: {err}", self.target.label()));
+                    shared.consumers()[self.consumer].set_send_dropped(self.dropped);
+                    shared.set_last_error(&format!("{}: {err}", self.label));
                 }
             }
         }
-    }
-}
-
-/// rvc AI 支路发送端：连接 rvc `input_socket`，恒定发送 16 kHz InputFrame。
-pub struct Sender(LazySender);
-
-impl Sender {
-    pub fn new(path: PathBuf) -> Self {
-        Self(LazySender::new(path, SendTarget::Rvc))
-    }
-
-    pub fn send(&mut self, frame: &InputFrame, shared: &Shared) {
-        self.0.send(frame, shared);
-    }
-}
-
-/// asr 识别支路发送端：连接 asr `input_socket`，与 rvc 同帧恒发。
-/// asr 未起时建链失败丢弃计数，不阻塞 pre（SPEC-05 识别服务）。
-pub struct AsrSender(LazySender);
-
-impl AsrSender {
-    pub fn new(path: PathBuf) -> Self {
-        Self(LazySender::new(path, SendTarget::Asr))
-    }
-
-    pub fn send(&mut self, frame: &InputFrame, shared: &Shared) {
-        self.0.send(frame, shared);
     }
 }
 
@@ -237,6 +192,8 @@ pub fn tts_recv_loop(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::state::test_shared;
+    use mozart_core::config::PreConsumerConfig;
     use mozart_core::{FrameMeta, INPUT_SAMPLES};
     use std::path::Path;
     use std::time::Instant;
@@ -295,8 +252,8 @@ mod tests {
         // 惰性建链：对端未起 → 丢弃计数；对端绑定 → 送达且计数不再增长。
         let dir = socket_dir("lazy");
         let path = dir.join("rvc-in.sock");
-        let shared = Shared::new("cap".to_string(), "play".to_string(), "startup".to_string());
-        let mut sender = Sender::new(path.clone());
+        let shared = test_shared("cap", "play", "startup");
+        let mut sender = Sender::new(path.clone(), 0, "rvc");
 
         for idx in 0..3u32 {
             sender.send(&sample_frame(idx), &shared);
@@ -327,8 +284,8 @@ mod tests {
         // FrameSocket 内部计数并入（绝对值单调不回退）。
         let dir = socket_dir("restart");
         let path = dir.join("rvc-in.sock");
-        let shared = Shared::new("cap".to_string(), "play".to_string(), "startup".to_string());
-        let mut sender = Sender::new(path.clone());
+        let shared = test_shared("cap", "play", "startup");
+        let mut sender = Sender::new(path.clone(), 0, "rvc");
 
         let rx1 = FrameSocket::<InputFrame>::bind(&path, RVC_QUEUE_FRAMES).unwrap();
         sender.send(&sample_frame(1), &shared);
@@ -356,8 +313,8 @@ mod tests {
         // 对端绑定后送达且计数不再增长；与 rvc 计数互不串扰。
         let dir = socket_dir("asr");
         let path = dir.join("asr-in.sock");
-        let shared = Shared::new("cap".to_string(), "play".to_string(), "startup".to_string());
-        let mut sender = AsrSender::new(path.clone());
+        let shared = test_shared("cap", "play", "startup");
+        let mut sender = Sender::new(path.clone(), 1, "asr");
 
         for idx in 0..3u32 {
             sender.send(&sample_frame(idx), &shared);
@@ -388,11 +345,74 @@ mod tests {
     }
 
     #[test]
+    fn consumer_senders_count_drops_independently() {
+        // 配置化多支路：三个消费者各自 socket 与丢弃计数，背压互不影响。
+        // 只绑定中间一个：其余两个计丢弃，中间送达。
+        let dir = socket_dir("multi");
+        let consumers = vec![
+            PreConsumerConfig {
+                name: "rvc".to_string(),
+                socket: "a.sock".to_string(),
+                file_mode_affected: true,
+            },
+            PreConsumerConfig {
+                name: "asr".to_string(),
+                socket: "b.sock".to_string(),
+                file_mode_affected: false,
+            },
+            PreConsumerConfig {
+                name: "extra".to_string(),
+                socket: "c.sock".to_string(),
+                file_mode_affected: false,
+            },
+        ];
+        let shared = Shared::new(
+            "cap".to_string(),
+            "play".to_string(),
+            "startup".to_string(),
+            consumers,
+            crate::state::DspSwitches {
+                denoise: true,
+                gate: false,
+                agc: false,
+                limiter: false,
+            },
+        );
+        let mut senders: Vec<Sender> = ["a.sock", "b.sock", "c.sock"]
+            .iter()
+            .enumerate()
+            .map(|(index, name)| Sender::new(dir.join(name), index, name))
+            .collect();
+        let rx = FrameSocket::<InputFrame>::bind(&dir.join("b.sock"), SEND_BUFFER_FRAMES).unwrap();
+
+        for idx in 0..3u32 {
+            for sender in &mut senders {
+                sender.send(&sample_frame(idx), &shared);
+            }
+        }
+        let status = shared.status(crate::state::QueueReadout {
+            depth: 0,
+            dropped: 0,
+            rvc_dropped: 0,
+            tts_dropped: 0,
+        });
+        assert_eq!(status.consumer_drops["rvc"], 3, "未绑定支路独立计丢弃");
+        assert_eq!(status.consumer_drops["asr"], 0, "已绑定支路送达不计丢弃");
+        assert_eq!(status.consumer_drops["extra"], 3, "第三支路不受前两支影响");
+        for idx in 0..3u32 {
+            let got = rx.recv(Some(Duration::from_secs(1))).unwrap();
+            let FrameMeta { frame_idx, .. } = got.meta;
+            assert_eq!(frame_idx, idx);
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
     fn recv_loop_pushes_frames_and_stops_on_flag() {
         let dir = socket_dir("recv");
         let path = dir.join("rvc-out.sock");
         let ring = Arc::new(Ring::<OutputFrame>::new(RVC_QUEUE_FRAMES));
-        let shared = Arc::new(Shared::new("cap".to_string(), "play".to_string(), "startup".to_string()));
+        let shared = Arc::new(test_shared("cap", "play", "startup"));
         // daemon 断言实时态后接收线程才惰性绑定（启动门控）。
         shared.set_mode_asserted(true);
         let stop: &'static AtomicBool = Box::leak(Box::new(AtomicBool::new(false)));
@@ -433,7 +453,7 @@ mod tests {
         let dir = socket_dir("handoff");
         let path = dir.join("rvc-out.sock");
         let ring = Arc::new(Ring::<OutputFrame>::new(RVC_QUEUE_FRAMES));
-        let shared = Arc::new(Shared::new("cap".to_string(), "play".to_string(), "startup".to_string()));
+        let shared = Arc::new(test_shared("cap", "play", "startup"));
         shared.set_mode_asserted(true);
         let stop: &'static AtomicBool = Box::leak(Box::new(AtomicBool::new(false)));
         let worker = {
@@ -504,7 +524,7 @@ mod tests {
         let dir = socket_dir("startup-gate");
         let path = dir.join("rvc-out.sock");
         let ring = Arc::new(Ring::<OutputFrame>::new(RVC_QUEUE_FRAMES));
-        let shared = Arc::new(Shared::new("cap".to_string(), "play".to_string(), "startup".to_string()));
+        let shared = Arc::new(test_shared("cap", "play", "startup"));
         let stop: &'static AtomicBool = Box::leak(Box::new(AtomicBool::new(false)));
         let worker = {
             let ring = ring.clone();
@@ -548,7 +568,7 @@ mod tests {
         let rx = FrameSocket::<OutputFrame>::bind(&path, TTS_QUEUE_FRAMES).unwrap();
         let tx = FrameSocket::<OutputFrame>::connect(&path, TTS_QUEUE_FRAMES).unwrap();
         let ring = Arc::new(Ring::<OutputFrame>::new(TTS_QUEUE_FRAMES));
-        let shared = Arc::new(Shared::new("cap".to_string(), "play".to_string(), "startup".to_string()));
+        let shared = Arc::new(test_shared("cap", "play", "startup"));
         let stop: &'static AtomicBool = Box::leak(Box::new(AtomicBool::new(false)));
         let worker = {
             let ring = ring.clone();

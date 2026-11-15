@@ -35,8 +35,9 @@ Mozart 是面向 NVIDIA Jetson Orin Nano Super 8 GB 的本地语音处理系统�
 
 ## 开发环境
 
-目标设备上已有的资产、模型、库与工具见 [docs/SETUP.md](docs/SETUP.md)。
-涉及模型、资产或板端运行的工作前先读它。设备连接方式不在本仓库记录。
+设备目录、资产、部署与板端测试见 [docs/SETUP.md](docs/SETUP.md)，涉及模型、资产或板端运行的工作前先读它。
+本机全量检查用 `tools/ci-local.sh all`。部署用 `tools/deploy-jetson.sh <SSH目标>`，部署不跑测试。
+部署后测试用 `tools/jetson-e2e.sh <SSH目标> [套件]`。SSH 目标由参数或 `MOZART_JETSON` 提供，仓库不保存设备地址。
 
 ## 文件系统组织
 
@@ -52,7 +53,7 @@ Mozart 是面向 NVIDIA Jetson Orin Nano Super 8 GB 的本地语音处理系统�
 | `tests/` | 跨组件 C++ 测试与小型夹具 | CTest |
 | `cmake/` | CMake 模块 | — |
 | `tools/` | 构建、检查、部署脚本 | — |
-| `docs/` | 长期文档；`docs/SPEC/` 模块规格；`docs/FUTURE.md` | — |
+| `docs/` | 长期文档；`docs/SETUP.md` 设备目录与部署；`docs/SPEC/` 模块规格；`docs/FUTURE.md` | — |
 | `reports/` | 带日期的实测记录，只跟踪 Markdown | — |
 | `.claude/`、`CLAUDE.md` | 拒绝在 Claude Code 下工作的阻断配置与声明 | — |
 
@@ -82,6 +83,8 @@ Mozart 是面向 NVIDIA Jetson Orin Nano Super 8 GB 的本地语音处理系统�
 - State the claim before the limit. Write each limit once.
 
 技术准确性优先。命令、路径、标识符、接口字段和日志保持原文。句长检查不能替代技术审查。
+
+`docs/GUIDE.md` 是使用手册，不写机器绝对路径和具体模型名；目录、资产与部署细节放 `docs/SETUP.md`。
 
 ## 证据、限制与未验证项
 
@@ -117,6 +120,7 @@ Mozart 是面向 NVIDIA Jetson Orin Nano Super 8 GB 的本地语音处理系统�
 ## 提交
 
 提交前运行 `tools/ci-local.sh --staged`。pre-commit hook 调用同一命令。
+交付前运行 `tools/ci-local.sh all` 做本机全量检查。
 首次使用时运行 `tools/install-hooks.sh` 安装 hook，不要用 `--no-verify` 跳过。
 
 - 检查命令只定义在 `tools/ci-local.sh`；CI 与本地 pre-commit 调用同一脚本的对应阶段。
@@ -143,7 +147,7 @@ Mozart 是面向 NVIDIA Jetson Orin Nano Super 8 GB 的本地语音处理系统�
 - 构建：Rust 用 Cargo workspace；C++ 用 CMake ≥ 3.22 + Ninja + CTest，构建目录只使用 `CMakePresets.json` 中的预设名。
 - 音频路径使用 ALSA；实时线程不得分配内存或阻塞。
 - 推理后端为 ONNX Runtime 或 TensorRT；所选部署链路不依赖 PyTorch。
-- 主机（x86_64）用于构建与单元测试，声学与延迟验收在目标设备上完成。
+- 主机（x86_64）用于日常构建与单元测试；集成、功能与声学/延迟验收在目标设备上完成。
 
 ## 待定事项
 

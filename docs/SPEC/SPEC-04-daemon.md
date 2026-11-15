@@ -4,7 +4,7 @@
 
 ## 职责
 
-配置、生命周期、HTTP/SSE、控制命令。（`HTTP/SSE` 为残留措辞，v1 不含，见改进点）
+配置、生命周期、控制命令。（v1 不含 HTTP/SSE，对外接口归 web 适配器）
 
 ## 已确认
 
@@ -21,20 +21,20 @@
 - [x] 实现：clap + serde_json；`mozart-ctl` 独立 crate，与 daemon 共用 core 的协议定义。网页适配器、硬件控制以后经同一 CLI 与 socket 协议接入。
 - [x] 启动方式：CLI 直接 spawn 控制 daemon；daemon 拉起并监管 pre、rvc 等服务进程。不依赖 systemd，systemd 部署留到流水线阶段再议。daemon spawn 子进程时传 `--socket`（控制面）与 `--config`（同一 TOML），子进程各读自己的配置段。（`daemon/src/supervisor.rs`）
 - [x] `--config` 传的是 daemon 自己解析出的 TOML 路径；内置默认启动（无配置文件）时不传，子进程按同一解析顺序得到同一默认值。（`daemon/src/supervisor.rs:260-269`）
-- [x] 部署布局：pre/rvc 二进制默认按 daemon 可执行文件同目录解析（`process.*_bin` 为裸名时）；rvc 的 CMake 构建产物复制到该目录，或用 `MOZART_RVC_BIN` 指绝对路径。（`core/src/config.rs:504`、`tools/deploy-jetson.sh:220`）
+- [x] 部署布局：所有运行时二进制安装到 `~/mozart-runtime/bin`，daemon 按自身可执行文件同目录解析 pre/rvc（`process.*_bin` 为裸名时）；rvc 的 CMake 产物复制到同一目录，或用 `MOZART_RVC_BIN` 指绝对路径。目录规范见 [SETUP.md](../SETUP.md)。（`core/src/config.rs:504`）
 - [x] 控制 socket 固定在 `run_dir`（默认 `/run/mozart`）：`daemon.sock`、`pre.sock`、`rvc.sock`、`asr.sock`、`bridge.sock`、`tts.sock`；daemon 用 `daemon.lock` 独占实例。运行目录由 daemon 收敛为 0700。（`core/src/config.rs`）
 - [x] daemon 平面命令：`Hello`、`GetStatus`、`RouteSet`、`MuteSet`、`Shutdown`。配置读 TOML：`--config` > `MOZART_CONFIG` > `./mozart.toml` > 内置默认；`MOZART_RUN_DIR`、`MOZART_PRE_BIN`、`MOZART_RVC_BIN`、`MOZART_DAEMON_BIN`、`MOZART_POLL_INTERVAL_MS` 覆盖。（`daemon/src/server.rs`）
 - [x] 配置持久化（模型甲）：TOML 是持久基线，运行时改动不自动写 TOML；只有显式写回动作（`config set` / `config save`）写 TOML，原子写。用户手改 TOML 随意，不做防冲突保护；手改在重启时被读取。（toml_edit 原子写）
-- [ ] 运行时状态文件：daemon 在持久数据目录（默认 `~/.local/state/mozart/`）维护运行时状态文件，记录运行时改动（字幕开关，将来 RVC 会话参数）。每次改动原子写（临时文件 + rename），崩溃也保留。启动时读 TOML 基线叠加运行时状态，得到生效配置再拉起服务下发。运行时状态文件是存档快照，不是第二份活权威；活权威在各服务，启动恢复一次，运行时不对账。已定：daemon 统一管，桥改读写方（现桥自写 `bridge-state.json` 需迁移）。未实现。
-- [ ] 配置写回动作（均经 daemon，原子写 TOML）：`config set <键> <值>` 改单个键的持久基线——已实现（仅设备两键）；`config save` 把状态文件的全部运行时覆盖批量写进 TOML 成基线，随后清空状态文件覆盖——未实现（`ctl/src/main.rs:184-197` 无子命令），且依赖未实现的状态文件。
-- [x] config set 实现范围（v1 第一步）：先落地重启类设备键 `pre.capture_device` / `pre.playback_device`——原子写基线（toml_edit 保留注释）、对照当前设备清单校验存在（防呆，设备级；子设备号范围由 pre 打开时验证）、回 `restart_required` + `affected`；设备键分类单一来源 `core::config::device_key_kind`。其余键的运行时即时下发、`config save`、运行时状态文件，以及写重启键后 `status` 的待重启显示，后续实现。`config get` 读 TOML 基线（不含环境变量覆盖与运行时状态）。（`core/src/config.rs:795-815`、`daemon/src/server.rs:370-394`）
-- [x] 配置键分类按机制 + 切换成本，能即时生效就归运行时：键值每次操作才读（阈值/上限/开关/超时）或 owning 服务有运行中应用命令 → 运行时；启动时固化进长活结构（打开的设备、绑定的 socket、预分配的环、加载的模型、spawn 的二进制、存储目录）→ 重启。`config set` 运行时键：写 TOML 基线、清该键状态覆盖、立即下发生效；重启键：只写 TOML、不动运行进程、返回需重启提示。逐键分类与机制依据见 [docs/config.md](../config.md)。（分类已定稿入库；运行时键的下发通道未实现，见上两条）
+- [x] 运行时状态文件：daemon 在持久数据目录（默认 `~/.local/state/mozart/`，`MOZART_STATE_DIR` 可覆盖）维护 `state.json`，记录运行时改动（v1 字幕开关，将来 RVC 会话参数）。每次改动原子写（临时文件 + rename），崩溃也保留。启动时读 TOML 基线叠加运行时状态，得到生效配置再拉起服务下发（字幕开关覆盖待桥就绪后下发一次）。运行时状态文件是存档快照，不是第二份活权威；活权威在各服务，启动恢复一次，运行时不对账。daemon 侧已实现（`daemon/src/state_file.rs`）；桥改读写方（现桥自写 `bridge-state.json` 需迁移）另做。
+- [x] 配置写回动作（均经 daemon，原子写 TOML）：`config set <键> <值>` 改单个键的持久基线（设备两键 + daemon/file 运行时键）；`config save` 把状态文件的全部运行时覆盖批量写进 TOML 成基线，随后清空状态文件覆盖，不改生效值、无需重启（`ctl/src/main.rs` ConfigAction::Save、`daemon/src/server.rs` config_save_reply、命令号 0x011C）。
+- [x] config set 实现范围：重启类设备键 `pre.capture_device` / `pre.playback_device`——原子写基线（toml_edit 保留注释）、对照当前设备清单校验存在（防呆，设备级；子设备号范围由 pre 打开时验证）、回 `restart_required` + `affected`；设备键分类单一来源 `core::config::device_key_kind`。daemon/file 运行时键写基线后清该键状态覆盖并即时下发（见下条）。`config get` 读 TOML 基线（不含环境变量覆盖与运行时状态）。（`core/src/config.rs` set_key、`daemon/src/server.rs` config_set_reply）
+- [x] 配置键分类按机制 + 切换成本，能即时生效就归运行时：键值每次操作才读（阈值/上限/开关/超时）或 owning 服务有运行中应用命令 → 运行时；启动时固化进长活结构（打开的设备、绑定的 socket、预分配的环、加载的模型、spawn 的二进制、存储目录）→ 重启。`config set` 运行时键：写 TOML 基线、清该键状态覆盖、立即下发生效；重启键：只写 TOML、不动运行进程、返回需重启提示。逐键分类与机制依据见 [docs/config.md](../config.md)。（分类已定稿入库；daemon/file 运行时键的下发已实现：写基线后重建生效配置共享句柄，服务侧每次操作读最新快照；pre/rvc/bridge 运行时键的对端下发命令未接入，`config set` 明确拒绝，待对端命令就绪）
 - [x] RVC 会话参数运行时生效经 `StopStream`→`StartStream` 带新参：实时在跑立刻用新参（短暂打断）；文件任务在跑则当前任务用旧参跑完、新参下一任务生效，不中途废弃文件任务。干净的块边界 `SetParams` 仍见 [FUTURE.md](../FUTURE.md)。
-- [x] 重启提示契约：`config set` 重启生效键的响应带稳定字段 `restart_required` 与 `affected`（受影响服务）；daemon 判定，CLI 与以后 HTTP 适配器读同一字段提示，不各自实现。写了重启键后 TOML 与运行值分歧，`status` 显示该服务待重启。（前半已实现：`ctl/src/main.rs:670-683`；后半 status 待重启显示未实现，见下条）
-- [ ] 写重启键后 `status` 的待重启显示：`daemon/src/state.rs:105-142` 的 Status 无 pending 字段。
+- [x] 重启提示契约：`config set` 重启生效键的响应带稳定字段 `restart_required` 与 `affected`（受影响服务）；daemon 判定，CLI 与以后 HTTP 适配器读同一字段提示，不各自实现。写了重启键后 TOML 与运行值分歧，`status` 显示该服务待重启。（已实现：`ctl/src/main.rs` config_set 与 print_status；待重启集合见下条）
+- [x] 写重启键后 `status` 的待重启显示：daemon 维护 `pending_restart` 集合（写重启键加入、`restart` 该服务受理后清除），`GetStatus` 应答带 `pending_restart` 字段，CLI 人读输出显示待重启提示（`daemon/src/state.rs`、`core/src/ctl/schema.rs` Status）。
 - [x] 重启两粒度：`restart <service>` 重启单个服务（小模块）；整栈重启（大模块）用 `down`/`up`。重启重读配置生效。
 - [x] 控制连接由独立线程处理，空闲 30 s 断开，慢客户端不阻塞其他命令；daemon 退出时先向子进程发 SIGTERM，2 s 后 SIGKILL。
-- [x] `mozart-ctl` v1 命令：`up`、`down`、`status`、`route set <direct|rvc>`、`mute on|off`、`config get|set|save`、`restart <service>`、`translate on|off`、`speech on|off|stop`、`file submit <path> [--model <id>]`、`file pause`、`file resume`、`file cancel <job_id>`、`file fetch <job_id> [-o path]`、`file status <job_id>`、`file list`、`model list`、`device list`；`--json` 输出稳定数据；退出码：0 成功、1 其他错误、2 参数错、3 daemon 不可达、4 请求被拒、5 超时。（`ctl/src/main.rs:121-155`；`config save` 缺，见上）
+- [x] `mozart-ctl` v1 命令：`up`、`down`、`status`、`route set <direct|rvc>`、`mute on|off`、`config get|set|save`、`restart <service>`、`translate on|off`、`speech on|off|stop`、`file submit <path> [--model <id>]`、`file pause`、`file resume`、`file cancel <job_id>`、`file fetch <job_id> [-o path]`、`file status <job_id>`、`file list`、`model list`、`device list`；`--json` 输出稳定数据；退出码：0 成功、1 其他错误、2 参数错、3 daemon 不可达、4 请求被拒、5 超时。（`ctl/src/main.rs`）
 - [x] 控制面命令覆盖字幕链路：字幕开关命令经 daemon 转发到桥执行，命令契约见 SPEC-05。daemon 不持有桥的活状态，只转发命令并轮询汇总。（`daemon/tests/language.rs`）
 - [x] 模式建模用资源仲裁，不用大模式枚举：资源为 GPU 与扬声器；活动（实时变声、文件转换、翻译播报、直出）声明占用，daemon 仲裁，冲突按裁决判据处理；mode 是派生状态。继承旧原则：控制面不碰音频、GPU 互斥、文件队列串行加取消检查点、上限 50。（`daemon/src/file/arbitrate.rs`、`daemon/src/services.rs:327-333`）
 - [x] v1 资源仲裁范围：GPU 仲裁（实时 / 文件互斥）+ 扬声器分时（播报时静音实时、播完恢复，沿用旧实现）；播报经变声占 GPU 的仲裁与混音见 [FUTURE.md](../FUTURE.md)。

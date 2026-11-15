@@ -68,8 +68,28 @@ pub struct PreConfig {
     pub playback_device: String,
     /// 采集 → DSP 环形队列容量（帧），1..=1024。
     pub capture_queue_frames: u32,
+    /// 消费者列表（[[pre.consumers]]）：未设置时回退 rvc+asr 两支路，
+    /// socket 沿用 [rvc]/[asr] 的 input_socket（经 Config::pre_consumers 取用）。
+    pub consumers: Option<Vec<PreConsumerConfig>>,
     /// DSP 阶段开关（[pre.dsp] 段）。
     pub dsp: PreDspConfig,
+}
+
+/// 输入支路消费者声明（[[pre.consumers]]，SPEC-02 分发）：一个消费者一个
+/// socket，背压互不影响。socket 为纯文件名，相对 run_dir；对端绑定收帧，
+/// pre 连接发送（与 [rvc]/[asr] 的 input_socket 方向约定一致）。
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PreConsumerConfig {
+    /// 消费者名：GetStatus consumer_drops 的键，列表内唯一。
+    /// "rvc" 额外聚合输出链路丢弃（SPEC-02 口径）；"tts" 与含点名为保留键。
+    pub name: String,
+    /// 输入 socket 路径（纯文件名）。
+    pub socket: String,
+    /// 是否受文件接管影响（SetFileMode）：true 时接管期间停发、启动等
+    /// daemon 断言（rvc 语义）；false 恒发（asr 语义）。默认 false。
+    #[serde(default)]
+    pub file_mode_affected: bool,
 }
 
 /// DSP 阶段配置。开关默认沿用旧 main.c 的代码默认（生产脚本曾用 --no-denoise
@@ -107,6 +127,7 @@ impl Default for PreConfig {
             capture_file: None,
             playback_device: "default".to_string(),
             capture_queue_frames: 8,
+            consumers: None,
             dsp: PreDspConfig::default(),
         }
     }
@@ -441,6 +462,27 @@ impl Config {
         self.daemon.run_dir.join(&self.pre.socket)
     }
 
+    /// 生效消费者列表（SPEC-02 分发）：显式 [[pre.consumers]] 优先；未设置
+    /// 回退 rvc+asr 两支路，socket 沿用 [rvc]/[asr] 的 input_socket，
+    /// 文件接管语义 rvc 受影响、asr 不受影响（向后兼容默认）。
+    pub fn pre_consumers(&self) -> Vec<PreConsumerConfig> {
+        if let Some(consumers) = &self.pre.consumers {
+            return consumers.clone();
+        }
+        vec![
+            PreConsumerConfig {
+                name: "rvc".to_string(),
+                socket: self.rvc.input_socket.clone(),
+                file_mode_affected: true,
+            },
+            PreConsumerConfig {
+                name: "asr".to_string(),
+                socket: self.asr.input_socket.clone(),
+                file_mode_affected: false,
+            },
+        ]
+    }
+
     pub fn rvc_socket(&self) -> PathBuf {
         self.daemon.run_dir.join(&self.rvc.socket)
     }
@@ -564,6 +606,37 @@ impl Config {
             return Err(ConfigError::Invalid(
                 "pre.capture_queue_frames must be within 1..=1024".to_string(),
             ));
+        }
+        if let Some(consumers) = &self.pre.consumers {
+            let mut names = std::collections::HashSet::new();
+            let mut sockets = std::collections::HashSet::new();
+            for consumer in consumers {
+                if consumer.name.is_empty() {
+                    return Err(ConfigError::Invalid(
+                        "pre.consumers[].name must not be empty".to_string(),
+                    ));
+                }
+                // "tts" 是播报链路固定键，点名留给 rvc.skipped 这类子键。
+                if consumer.name == "tts" || consumer.name.contains('.') {
+                    return Err(ConfigError::Invalid(format!(
+                        "pre.consumers name '{}' is reserved (tts or dotted sub-key)",
+                        consumer.name
+                    )));
+                }
+                validate_socket_name(&consumer.socket, "pre.consumers[].socket")?;
+                if !names.insert(&consumer.name) {
+                    return Err(ConfigError::Invalid(format!(
+                        "pre.consumers duplicate name '{}'",
+                        consumer.name
+                    )));
+                }
+                if !sockets.insert(&consumer.socket) {
+                    return Err(ConfigError::Invalid(format!(
+                        "pre.consumers duplicate socket '{}'",
+                        consumer.socket
+                    )));
+                }
+            }
         }
         validate_socket_name(&self.rvc.socket, "rvc.socket")?;
         validate_socket_name(&self.rvc.input_socket, "rvc.input_socket")?;
@@ -792,36 +865,162 @@ pub fn device_key_kind(key: &str) -> Option<&'static str> {
     }
 }
 
+/// 运行时键 → owning 服务（docs/config.md 的 R 类分类）。None 表示非运行时键。
+/// daemon/file 键由 daemon 自身即时应用；pre/rvc/bridge 键需对端运行时命令下发。
+pub fn runtime_key_owner(key: &str) -> Option<&'static str> {
+    match key {
+        "daemon.poll_interval_ms"
+        | "daemon.rpc_timeout_ms"
+        | "daemon.start_timeout_ms"
+        | "daemon.restart_backoff_ms"
+        | "daemon.restart_backoff_max_ms"
+        | "daemon.restart_stable_ms"
+        | "file.queue_capacity"
+        | "file.storage_limit_bytes"
+        | "file.denoise"
+        | "file.max_duration_seconds"
+        | "file.max_upload_bytes"
+        | "file.ffmpeg_path"
+        | "file.ffmpeg_timeout_ms" => Some("daemon"),
+        "pre.dsp.denoise" | "pre.dsp.gate" | "pre.dsp.agc" | "pre.dsp.limiter" => Some("pre"),
+        "rvc.f0_method"
+        | "rvc.pitch_shift"
+        | "rvc.index_rate"
+        | "rvc.rms_mix_rate"
+        | "rvc.protect" => Some("rvc"),
+        "bridge.translate_enabled" | "bridge.speech_enabled" => Some("bridge"),
+        _ => None,
+    }
+}
+
+/// 运行时状态文件可记录的键（SPEC-04，daemon 统一管）。
+/// v1 只有字幕开关；RVC 会话参数待运行时改参通道接入后加入。
+pub fn is_state_key(key: &str) -> bool {
+    matches!(key, "bridge.translate_enabled" | "bridge.speech_enabled")
+}
+
+/// 运行时状态文件路径（SPEC-04 持久数据目录）：
+/// `MOZART_STATE_DIR` > `~/.local/state/mozart`，文件名 `state.json`。
+/// HOME 缺失时回退相对目录 `.local/state/mozart`。
+pub fn state_file_path() -> PathBuf {
+    let dir = std::env::var_os("MOZART_STATE_DIR")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| {
+            std::env::var_os("HOME")
+                .map(PathBuf::from)
+                .unwrap_or_default()
+                .join(".local/state/mozart")
+        });
+    dir.join("state.json")
+}
+
 /// config set 的结果（SPEC-04 重启提示契约：restart_required + affected）。
 pub struct KeyEffect {
     pub restart_required: bool,
     pub affected: Vec<String>,
 }
 
-/// 写单个键的持久基线（SPEC-04 模型甲，原子写）。当前支持重启类设备键，
-/// 其余键返回明确错误。设备存在性校验由 daemon 在调用前做（需 ALSA 枚举）。
+/// 写单个键的持久基线（SPEC-04 模型甲，原子写）。支持重启类设备键与
+/// daemon/file 运行时键；pre/rvc/bridge 运行时键的对端下发命令未接入，明确拒绝。
+/// 设备存在性校验由 daemon 在调用前做（需 ALSA 枚举）。
 pub fn set_key(path: Option<&Path>, key: &str, value: &str) -> Result<KeyEffect, ConfigError> {
     if device_key_kind(key).is_some() {
         validate_device_name(value, key)?;
-        write_toml_key(path, key, value)?;
+        write_toml_key(path, key, toml_edit::value(value))?;
         return Ok(KeyEffect {
             restart_required: true,
             affected: vec!["pre".to_string()],
         });
     }
+    if let Some(owner) = runtime_key_owner(key) {
+        if owner != "daemon" {
+            return Err(ConfigError::Invalid(format!(
+                "config set 暂不支持键 {key}（{owner} 的运行时下发命令未接入）"
+            )));
+        }
+        let typed = parse_runtime_value(key, value)?;
+        write_runtime_key(path, key, typed)?;
+        return Ok(KeyEffect {
+            restart_required: false,
+            affected: Vec::new(),
+        });
+    }
     Err(ConfigError::Invalid(format!(
-        "config set 暂不支持键 {key}（当前支持 pre.capture_device / pre.playback_device）"
+        "config set 暂不支持键 {key}（当前支持设备键与 daemon/file 运行时键）"
     )))
 }
 
-/// 原子写 TOML 单键：toml_edit 保留注释与排版，临时文件 + rename。
-fn write_toml_key(path: Option<&Path>, key: &str, value: &str) -> Result<(), ConfigError> {
-    let path = path.ok_or_else(|| {
+/// daemon/file 运行时键的字符串值 → 带类型 TOML 值。类型按 docs/config.md：
+/// file.denoise 为 bool，file.ffmpeg_path 为 string，其余为整数。范围由整体校验把住。
+fn parse_runtime_value(key: &str, value: &str) -> Result<toml_edit::Item, ConfigError> {
+    match key {
+        "file.denoise" => match value {
+            "true" => Ok(toml_edit::value(true)),
+            "false" => Ok(toml_edit::value(false)),
+            _ => Err(ConfigError::Invalid(format!("键 {key} 需要 true/false"))),
+        },
+        "file.ffmpeg_path" => Ok(toml_edit::value(value)),
+        _ => {
+            let number: i64 = value
+                .parse()
+                .map_err(|_| ConfigError::Invalid(format!("键 {key} 需要整数")))?;
+            Ok(toml_edit::value(number))
+        }
+    }
+}
+
+/// config save（SPEC-04）：状态文件覆盖批量写进 TOML 基线（原子写，保留注释）。
+/// 返回写入键数；空覆盖不动 TOML。写入前整体校验，失败不写（状态文件由调用方保留）。
+pub fn save_overrides(
+    path: Option<&Path>,
+    overrides: &std::collections::BTreeMap<String, serde_json::Value>,
+) -> Result<usize, ConfigError> {
+    if overrides.is_empty() {
+        return Ok(0);
+    }
+    let path = require_path(path)?;
+    let mut doc = load_doc(path)?;
+    for (key, value) in overrides {
+        set_doc_key(&mut doc, key, json_to_toml(value)?)?;
+    }
+    validate_doc(path, &doc)?;
+    atomic_write(path, &doc.to_string())?;
+    Ok(overrides.len())
+}
+
+/// 状态文件标量值 → TOML 值。null/数组/对象不是配置值，拒绝。
+fn json_to_toml(value: &serde_json::Value) -> Result<toml_edit::Item, ConfigError> {
+    use serde_json::Value;
+    match value {
+        Value::Bool(flag) => Ok(toml_edit::value(*flag)),
+        Value::Number(number) => {
+            if let Some(int) = number.as_i64() {
+                Ok(toml_edit::value(int))
+            } else if let Some(float) = number.as_f64() {
+                Ok(toml_edit::value(float))
+            } else {
+                Err(ConfigError::Invalid("状态文件数值超出范围".to_string()))
+            }
+        }
+        Value::String(text) => Ok(toml_edit::value(text.clone())),
+        _ => Err(ConfigError::Invalid(
+            "状态文件值必须是标量（bool/整数/浮点/字符串）".to_string(),
+        )),
+    }
+}
+
+/// 写回需要配置文件基线；内置默认启动（无文件）时明确拒绝。
+fn require_path(path: Option<&Path>) -> Result<&Path, ConfigError> {
+    path.ok_or_else(|| {
         ConfigError::Invalid(
-            "config set 需要配置文件基线；daemon 当前以内置默认启动（无配置文件），请以配置文件重启 daemon"
+            "配置写回需要配置文件基线；daemon 当前以内置默认启动（无配置文件），请以配置文件重启 daemon"
                 .to_string(),
         )
-    })?;
+    })
+}
+
+/// 读 TOML 为可编辑文档；文件缺失按空文档（写回时新建）。
+fn load_doc(path: &Path) -> Result<toml_edit::DocumentMut, ConfigError> {
     let text = match std::fs::read_to_string(path) {
         Ok(text) => text,
         Err(err) if err.kind() == io::ErrorKind::NotFound => String::new(),
@@ -832,11 +1031,19 @@ fn write_toml_key(path: Option<&Path>, key: &str, value: &str) -> Result<(), Con
             })
         }
     };
-    let mut doc = text.parse::<toml_edit::DocumentMut>().map_err(|err| {
+    text.parse::<toml_edit::DocumentMut>().map_err(|err| {
         ConfigError::Invalid(format!("parse config {}: {err}", path.display()))
-    })?;
+    })
+}
+
+/// 在文档里按点分键路径设值，保留注释与排版；中间段不是表则拒绝。
+fn set_doc_key(
+    doc: &mut toml_edit::DocumentMut,
+    key: &str,
+    value: toml_edit::Item,
+) -> Result<(), ConfigError> {
     let mut parts: Vec<&str> = key.split('.').collect();
-    let leaf = parts.pop().expect("设备键非空（set_key 已分类）");
+    let leaf = parts.pop().expect("键非空（调用方已分类）");
     let mut table = doc.as_table_mut();
     for part in parts {
         let item = table
@@ -846,12 +1053,47 @@ fn write_toml_key(path: Option<&Path>, key: &str, value: &str) -> Result<(), Con
             .as_table_mut()
             .ok_or_else(|| ConfigError::Invalid(format!("键 {key} 的路径 {part} 不是表")))?;
     }
-    table[leaf] = toml_edit::value(value);
+    table[leaf] = value;
+    Ok(())
+}
+
+/// 整体校验编辑后的文档：复用 Config 的单一校验源（含跨键约束）。
+fn validate_doc(path: &Path, doc: &toml_edit::DocumentMut) -> Result<(), ConfigError> {
+    let config: Config = toml::from_str(&doc.to_string()).map_err(|source| ConfigError::Parse {
+        path: path.to_path_buf(),
+        source,
+    })?;
+    config.validate()
+}
+
+/// 原子写 TOML 单键（设备键）：toml_edit 保留注释与排版，临时文件 + rename。
+fn write_toml_key(
+    path: Option<&Path>,
+    key: &str,
+    value: toml_edit::Item,
+) -> Result<(), ConfigError> {
+    let path = require_path(path)?;
+    let mut doc = load_doc(path)?;
+    set_doc_key(&mut doc, key, value)?;
     atomic_write(path, &doc.to_string())
 }
 
-/// 临时文件名含进程号与序号，避免并发写回撞名；rename 原子替换基线。
-fn atomic_write(path: &Path, text: &str) -> Result<(), ConfigError> {
+/// 原子写运行时键：写前整体校验，非法值不落盘。
+fn write_runtime_key(
+    path: Option<&Path>,
+    key: &str,
+    value: toml_edit::Item,
+) -> Result<(), ConfigError> {
+    let path = require_path(path)?;
+    let mut doc = load_doc(path)?;
+    set_doc_key(&mut doc, key, value)?;
+    validate_doc(path, &doc)?;
+    atomic_write(path, &doc.to_string())
+}
+
+/// 临时文件名含进程号与序号，避免并发写回撞名；rename 原子替换。
+/// 配置基线与运行时状态文件共用此原子写。
+pub fn atomic_write(path: &Path, text: &str) -> Result<(), ConfigError> {
     use std::sync::atomic::{AtomicU64, Ordering};
     static SEQ: AtomicU64 = AtomicU64::new(0);
     let dir = path.parent().unwrap_or_else(|| Path::new("."));
@@ -964,6 +1206,100 @@ mod tests {
     }
 
     #[test]
+    fn runtime_key_owner_matches_config_md() {
+        assert_eq!(runtime_key_owner("daemon.rpc_timeout_ms"), Some("daemon"));
+        assert_eq!(runtime_key_owner("file.queue_capacity"), Some("daemon"));
+        assert_eq!(runtime_key_owner("file.denoise"), Some("daemon"));
+        assert_eq!(runtime_key_owner("pre.dsp.denoise"), Some("pre"));
+        assert_eq!(runtime_key_owner("rvc.pitch_shift"), Some("rvc"));
+        assert_eq!(runtime_key_owner("bridge.translate_enabled"), Some("bridge"));
+        // 重启类与未知键不是运行时键。
+        assert_eq!(runtime_key_owner("pre.capture_device"), None);
+        assert_eq!(runtime_key_owner("file.storage_dir"), None);
+        assert_eq!(runtime_key_owner("daemon.run_dir"), None);
+        assert_eq!(runtime_key_owner("nope"), None);
+    }
+
+    #[test]
+    fn state_keys_are_bridge_switches_only() {
+        assert!(is_state_key("bridge.translate_enabled"));
+        assert!(is_state_key("bridge.speech_enabled"));
+        assert!(!is_state_key("daemon.rpc_timeout_ms"));
+        assert!(!is_state_key("rvc.pitch_shift"));
+    }
+
+    #[test]
+    fn state_file_path_ends_with_state_json() {
+        assert_eq!(state_file_path().file_name().unwrap(), "state.json");
+    }
+
+    #[test]
+    fn set_key_writes_runtime_key_and_validates_range() {
+        let dir = temp_config_dir("runtime-set");
+        let path = dir.join("mozart.toml");
+        std::fs::write(&path, "# 基线\n[daemon]\nrpc_timeout_ms = 2000\n").unwrap();
+        let effect = set_key(Some(&path), "daemon.rpc_timeout_ms", "1500").unwrap();
+        assert!(!effect.restart_required);
+        assert!(effect.affected.is_empty());
+        let text = std::fs::read_to_string(&path).unwrap();
+        assert!(text.contains("# 基线"), "原子写回应保留注释：{text}");
+        assert!(text.contains("rpc_timeout_ms = 1500"), "{text}");
+
+        // bool 与 string 运行时键。
+        set_key(Some(&path), "file.denoise", "true").unwrap();
+        set_key(Some(&path), "file.ffmpeg_path", "/usr/bin/ffmpeg").unwrap();
+        let config = Config::load_from(Some(&path)).unwrap();
+        assert!(config.file.denoise);
+        assert_eq!(config.file.ffmpeg_path, "/usr/bin/ffmpeg");
+
+        // 非法值不落盘：超范围、错类型、非 daemon owning。
+        assert!(set_key(Some(&path), "daemon.rpc_timeout_ms", "0").is_err());
+        assert!(set_key(Some(&path), "daemon.rpc_timeout_ms", "abc").is_err());
+        assert!(set_key(Some(&path), "file.denoise", "yes").is_err());
+        assert!(set_key(Some(&path), "rvc.pitch_shift", "3").is_err());
+        assert!(set_key(Some(&path), "pre.dsp.denoise", "false").is_err());
+        let config = Config::load_from(Some(&path)).unwrap();
+        assert_eq!(config.daemon.rpc_timeout_ms, 1500, "被拒绝的 set 不得改基线");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn set_key_runtime_backoff_cross_key_constraint() {
+        let dir = temp_config_dir("runtime-cross");
+        let path = dir.join("mozart.toml");
+        std::fs::write(&path, "[daemon]\nrestart_backoff_ms = 500\n").unwrap();
+        // max < backoff 违反跨键约束：整体校验拒绝，不落盘。
+        assert!(set_key(Some(&path), "daemon.restart_backoff_max_ms", "100").is_err());
+        set_key(Some(&path), "daemon.restart_backoff_max_ms", "800").unwrap();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn save_overrides_batch_writes_and_preserves_comments() {
+        let dir = temp_config_dir("save");
+        let path = dir.join("mozart.toml");
+        std::fs::write(&path, "# 顶部注释\n[bridge]\ntranslate_enabled = true\n").unwrap();
+        let mut overrides = std::collections::BTreeMap::new();
+        overrides.insert("bridge.translate_enabled".to_string(), serde_json::json!(false));
+        overrides.insert("bridge.speech_enabled".to_string(), serde_json::json!(false));
+        let saved = save_overrides(Some(&path), &overrides).unwrap();
+        assert_eq!(saved, 2);
+        let text = std::fs::read_to_string(&path).unwrap();
+        assert!(text.contains("# 顶部注释"), "{text}");
+        let config = Config::load_from(Some(&path)).unwrap();
+        assert!(!config.bridge.translate_enabled);
+        assert!(!config.bridge.speech_enabled);
+
+        // 空覆盖不动 TOML，无配置文件也可空写回。
+        let empty = std::collections::BTreeMap::new();
+        assert_eq!(save_overrides(Some(&path), &empty).unwrap(), 0);
+        assert_eq!(save_overrides(None, &empty).unwrap(), 0);
+        // 非空覆盖无配置文件：拒绝。
+        assert!(save_overrides(None, &overrides).is_err());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
     fn defaults_match_confirmed_paths() {
         let config = Config::default();
         assert_eq!(config.daemon.run_dir, PathBuf::from("/run/mozart"));
@@ -1023,6 +1359,96 @@ mod tests {
         assert!(stages_on.pre.dsp.agc);
         assert!(stages_on.pre.dsp.limiter);
         assert!(stages_on.pre.dsp.denoise, "未写的键沿用默认");
+    }
+
+    #[test]
+    fn pre_consumers_default_falls_back_to_rvc_and_asr() {
+        // 未写 [[pre.consumers]]：回退两支路，socket 沿用 [rvc]/[asr]。
+        let config = Config::default();
+        let consumers = config.pre_consumers();
+        assert_eq!(consumers.len(), 2);
+        assert_eq!(consumers[0].name, "rvc");
+        assert_eq!(consumers[0].socket, "rvc-in.sock");
+        assert!(consumers[0].file_mode_affected, "rvc 受文件接管影响");
+        assert_eq!(consumers[1].name, "asr");
+        assert_eq!(consumers[1].socket, "asr-in.sock");
+        assert!(!consumers[1].file_mode_affected, "asr 不受文件接管影响");
+
+        // 自定义 [rvc]/[asr] socket 时回退列表跟随（向后兼容）。
+        let custom: Config = toml::from_str(
+            "[rvc]\ninput_socket = \"voice-in.sock\"\n[asr]\ninput_socket = \"listen-in.sock\"\n",
+        )
+        .unwrap();
+        let consumers = custom.pre_consumers();
+        assert_eq!(consumers[0].socket, "voice-in.sock");
+        assert_eq!(consumers[1].socket, "listen-in.sock");
+        assert!(custom.validate().is_ok());
+    }
+
+    #[test]
+    fn pre_consumers_toml_overrides() {
+        let config: Config = toml::from_str(
+            r#"
+            [[pre.consumers]]
+            name = "rvc"
+            socket = "rvc-in.sock"
+            file_mode_affected = true
+            [[pre.consumers]]
+            name = "asr"
+            socket = "asr-in.sock"
+            [[pre.consumers]]
+            name = "extra"
+            socket = "extra-in.sock"
+            "#,
+        )
+        .unwrap();
+        let consumers = config.pre_consumers();
+        assert_eq!(consumers.len(), 3);
+        assert_eq!(consumers[2].name, "extra");
+        assert_eq!(consumers[2].socket, "extra-in.sock");
+        assert!(
+            !consumers[2].file_mode_affected,
+            "file_mode_affected 缺省 false（恒发）"
+        );
+        assert!(config.validate().is_ok());
+
+        // 显式列表优先于 [rvc]/[asr] 回退；空列表合法（不分发）。
+        let empty: Config = toml::from_str("[pre]\nconsumers = []\n").unwrap();
+        assert!(empty.pre_consumers().is_empty());
+        assert!(empty.validate().is_ok());
+
+        let unknown: Result<Config, _> = toml::from_str(
+            "[[pre.consumers]]\nname = \"x\"\nsocket = \"x.sock\"\nunknown_key = 1\n",
+        );
+        assert!(unknown.is_err());
+    }
+
+    #[test]
+    fn pre_consumers_invalid_values_are_rejected() {
+        let cases = [
+            // 空名 / 保留名 / 点名。
+            "[[pre.consumers]]\nname = \"\"\nsocket = \"x.sock\"\n",
+            "[[pre.consumers]]\nname = \"tts\"\nsocket = \"x.sock\"\n",
+            "[[pre.consumers]]\nname = \"rvc.skipped\"\nsocket = \"x.sock\"\n",
+            // socket 非纯文件名。
+            "[[pre.consumers]]\nname = \"x\"\nsocket = \"a/b.sock\"\n",
+            "[[pre.consumers]]\nname = \"x\"\nsocket = \"\"\n",
+            // 重名 / 重 socket。
+            "[[pre.consumers]]\nname = \"x\"\nsocket = \"a.sock\"\n\
+             [[pre.consumers]]\nname = \"x\"\nsocket = \"b.sock\"\n",
+            "[[pre.consumers]]\nname = \"x\"\nsocket = \"a.sock\"\n\
+             [[pre.consumers]]\nname = \"y\"\nsocket = \"a.sock\"\n",
+        ];
+        for text in cases {
+            let config: Config = toml::from_str(text).unwrap();
+            assert!(config.validate().is_err(), "应拒绝：{text}");
+        }
+
+        // 开关类型错误：解析期即拒绝。
+        let bad_type: Result<Config, _> = toml::from_str(
+            "[[pre.consumers]]\nname = \"x\"\nsocket = \"x.sock\"\nfile_mode_affected = \"yes\"\n",
+        );
+        assert!(bad_type.is_err());
     }
 
     #[test]

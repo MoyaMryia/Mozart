@@ -18,7 +18,7 @@
 - [x] 数据包沿用旧格式：4 字节魔数 + 16 字节元数据 + PCM；输入 1300 字节，输出 3860 字节。（`core/src/lib.rs:60-61` 编译期断言）
 - [x] 帧契约以 C 头文件为单一来源；Rust 用 `#[repr(C)]` 镜像，加编译期大小断言。（`core/src/lib.rs:56-61`）
 - [ ] 帧契约偏移断言：仅有 `size_of`，无字段偏移断言；对照控制头已具备。（`core/src/ctl.rs:153-157`）
-- [ ] 双方用同一组字节夹具对拍：`tests/fixtures/` 无帧夹具文件；C++ 与 Rust 各自硬编码字节断言，对拍有效但不共享同一组字节。（`tests/test_rvc_transport.cpp:129-154`、`core/src/dgram.rs:565-627`）已定：`tests/fixtures/frame/` 放共享二进制夹具（InputFrame、OutputFrame、控制信封各一条），两侧测试读同一文件比对字节。
+- [x] 双方用同一组字节夹具对拍：`tests/fixtures/frame/` 放共享二进制夹具（InputFrame、OutputFrame、控制信封各一条），两侧测试读同一文件比对字节；原硬编码字节断言保留为额外校验。（`core/examples/gen_frame_fixture.rs`、`core/tests/frame_fixture.rs`、`tests/test_rvc_transport.cpp:356-402`、`tests/test_control_contract.cpp:58-84`）
 - [x] 环形队列用于进程内（采集 → DSP）；Unix 数据报用于进程间（音频 ↔ 推理）。
 - [ ] （文档）代码已有 RAW 48 kHz 帧（`frame.h:54-62`、`core/src/lib.rs:51-54`），本规格未列；属一致扩展，回写。
 

@@ -1,18 +1,19 @@
 #!/bin/bash
 # Jetson 三进程冒烟：daemon + 真 pre + 真 rvc，在目标设备上执行。
-# 前置：本仓库已 rsync 到设备并完成构建（cargo build --release +
-#   cmake --build --preset jetson-release，rvc 产物已复制到 target/release）。
+# 前置：本仓库已同步到设备并完成构建（tools/deploy-jetson.sh），
+#   BIN_DIR 内有 mozart-ctl/daemon/pre/rvc 与 examples/rvc_stub。
+# 正常由 tools/jetson-e2e.sh 调用，也可在设备上直接运行。
 # 拓扑（snd-aloop，SUBDEV 0 可能被 root 遗留进程占用，默认用空闲的 2/3）：
 #   aplay 正弦 → Loopback DEV=0,SUBDEV=$CAP_SUB → pre 采集 DEV=1,SUBDEV=$CAP_SUB
 #   pre 播放 DEV=0,SUBDEV=$PB_SUB → arecord DEV=1,SUBDEV=$PB_SUB 回录
 # 结果文件留在 $SMOKE_DIR：rec.raw（回录）、st-*.json/txt（各阶段 status）。
-#   MODELS_DIR  模型资产目录（默认 $HOME/mozart-assets/models/rvc/qiqi-zh-run）
-#   BIN_DIR     部署二进制目录（默认 $HOME/Mozart/target/release）
+#   MODELS_DIR  模型资产目录（默认 $HOME/mozart-assets/models/rvc/qiqi-zh）
+#   BIN_DIR     部署二进制目录（默认 $HOME/Mozart/target/debug）
 #   SMOKE_DIR   产物目录（默认 /tmp/mozart-smoke）
 set -u
 
-MODELS_DIR=${MODELS_DIR:-$HOME/mozart-assets/models/rvc/qiqi-zh-run}
-BIN_DIR=${BIN_DIR:-$HOME/Mozart/target/release}
+MODELS_DIR=${MODELS_DIR:-$HOME/mozart-assets/models/rvc/qiqi-zh}
+BIN_DIR=${BIN_DIR:-$HOME/Mozart/target/debug}
 SMOKE_DIR=${SMOKE_DIR:-/tmp/mozart-smoke}
 CAP_SUB=${CAP_SUB:-2}
 PB_SUB=${PB_SUB:-3}

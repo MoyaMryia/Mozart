@@ -40,6 +40,11 @@ path = "examples/bridge_stub.rs"
 name = "llama_stub"
 path = "examples/llama_stub.rs"
 
+# 帧字节共享夹具生成器（tests/fixtures/frame/，C++/Rust 对拍用）。
+[[example]]
+name = "gen_frame_fixture"
+path = "examples/gen_frame_fixture.rs"
+
 [dependencies]
 libc = "0.2"
 serde = { version = "1", features = ["derive"] }

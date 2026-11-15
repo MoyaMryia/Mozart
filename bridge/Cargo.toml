@@ -11,3 +11,6 @@ serde_json = "1"
 clap = { version = "4", features = ["derive"] }
 libc = "0.2"
 fancy-regex = "0.20.2"
+# 同音索引的无声调拼音转换。与 pypinyin 同源 mozillazg/pinyin-data；
+# 只启用 plain（无声调），零传递依赖。
+pinyin = { version = "0.11", default-features = false, features = ["plain"] }

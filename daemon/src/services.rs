@@ -2,7 +2,9 @@
 //! 对账以 daemon 的期望状态为准，切路由与轮询共用同一把 transition 锁。
 //! llama-server 无控制协议，不建 ServiceLink，只由 supervisor 监管进程。
 
+use crate::runtime::SharedConfig;
 use crate::state::{lock_state, State};
+use crate::state_file::BridgeRestore;
 use mozart_core::config::Config;
 use mozart_core::ctl::schema::{
     Activity, AsrStatus, BridgeStatus, ModelEntry, PreStatus, Response, Route, RvcStatus, TtsStatus,
@@ -24,33 +26,32 @@ pub struct Services {
 }
 
 impl Services {
-    pub fn new(config: &Config) -> Self {
-        let timeout = Duration::from_millis(config.daemon.rpc_timeout_ms);
+    pub fn new(config: &SharedConfig) -> Self {
         Self {
             pre: Mutex::new(ServiceLink::new(
                 ctl::PRE_HELLO,
-                config.pre_socket(),
-                timeout,
+                config.snapshot().pre_socket(),
+                config.clone(),
             )),
             rvc: Mutex::new(ServiceLink::new(
                 ctl::RVC_HELLO,
-                config.rvc_socket(),
-                timeout,
+                config.snapshot().rvc_socket(),
+                config.clone(),
             )),
             asr: Mutex::new(ServiceLink::new(
                 ctl::ASR_HELLO,
-                config.asr_socket(),
-                timeout,
+                config.snapshot().asr_socket(),
+                config.clone(),
             )),
             tts: Mutex::new(ServiceLink::new(
                 ctl::TTS_HELLO,
-                config.tts_socket(),
-                timeout,
+                config.snapshot().tts_socket(),
+                config.clone(),
             )),
             bridge: Mutex::new(ServiceLink::new(
                 ctl::BRIDGE_HELLO,
-                config.bridge_socket(),
-                timeout,
+                config.snapshot().bridge_socket(),
+                config.clone(),
             )),
             transition: Mutex::new(()),
         }
@@ -214,20 +215,25 @@ impl CallError {
 struct ServiceLink {
     hello: u16,
     socket: PathBuf,
-    timeout: Duration,
+    /// RPC 超时是运行时键：每次调用读最新生效值（SPEC-04）。
+    config: SharedConfig,
     conn: Option<Seqpacket>,
     next_request: u32,
 }
 
 impl ServiceLink {
-    fn new(hello: u16, socket: PathBuf, timeout: Duration) -> Self {
+    fn new(hello: u16, socket: PathBuf, config: SharedConfig) -> Self {
         Self {
             hello,
             socket,
-            timeout,
+            config,
             conn: None,
             next_request: 0,
         }
+    }
+
+    fn timeout(&self) -> Duration {
+        Duration::from_millis(self.config.snapshot().daemon.rpc_timeout_ms)
     }
 
     fn call_ok(&mut self, type_: u16, body: &[u8]) -> Result<Response, CallError> {
@@ -255,7 +261,7 @@ impl ServiceLink {
     }
 
     fn connect_and_hello(&mut self) -> io::Result<()> {
-        let conn = Seqpacket::connect_timeout(&self.socket, Some(self.timeout))?;
+        let conn = Seqpacket::connect_timeout(&self.socket, Some(self.timeout()))?;
         self.conn = Some(conn);
         let response = match self.roundtrip(self.hello, b"{}") {
             Ok(response) => response,
@@ -281,8 +287,8 @@ impl ServiceLink {
             .expect("control link must be connected before roundtrip");
         self.next_request = self.next_request.wrapping_add(1);
         let request_id = self.next_request;
-        conn.send_timeout(type_, request_id, body, Some(self.timeout))?;
-        let msg = conn.recv(Some(self.timeout))?;
+        conn.send_timeout(type_, request_id, body, Some(self.timeout()))?;
+        let msg = conn.recv(Some(self.timeout()))?;
         let reply_type = msg.header.type_;
         let reply_id = msg.header.request_id;
         if reply_type != type_ {
@@ -381,6 +387,31 @@ pub fn speech_stop(state: &Mutex<State>, services: &Services) -> Result<Value, (
         lock_state(state).push_degraded(format!("pre speech stop: {}", err.describe()));
     }
     Ok(response.data)
+}
+
+/// 启动恢复（SPEC-04）：把状态文件的字幕开关覆盖一次性下发到桥。
+/// 成功一项清一项；桥未就绪下一轮重试。活权威在桥，运行时不对账。
+pub fn restore_bridge_switches(services: &Services, pending: &Mutex<BridgeRestore>) {
+    let (translate, speech) = {
+        let guard = pending.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        (guard.translate, guard.speech)
+    };
+    if let Some(enabled) = translate {
+        if translate_set(services, enabled).is_ok() {
+            pending
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .translate = None;
+        }
+    }
+    if let Some(enabled) = speech {
+        if speech_set(services, enabled).is_ok() {
+            pending
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .speech = None;
+        }
+    }
 }
 
 fn switch_direct(state: &Mutex<State>, services: &Services) -> Result<Route, (String, String)> {

@@ -11,6 +11,7 @@ mod queue;
 mod storage;
 pub mod worker;
 
+use crate::runtime::SharedConfig;
 use crate::services::{self, Services};
 use crate::state::{lock_state, State};
 use mozart_core::config::Config;
@@ -111,7 +112,7 @@ pub struct FileCoordinator {
     worker: Arc<dyn Worker>,
     state: Arc<Mutex<State>>,
     services: Arc<Services>,
-    config: Arc<Config>,
+    config: SharedConfig,
     running: Arc<AtomicBool>,
     /// 串行化 submit 与 finish 驱逐：submit 全程（reserve_job_id → 复制 → 入队）
     /// 持此锁，finish 快照保护集合并驱逐时也持此锁。两者互斥，新排队任务的
@@ -127,14 +128,15 @@ pub struct FileCoordinator {
 
 impl FileCoordinator {
     pub fn new(
-        config: Arc<Config>,
+        config: SharedConfig,
         state: Arc<Mutex<State>>,
         services: Arc<Services>,
         running: Arc<AtomicBool>,
         worker: Arc<dyn Worker>,
     ) -> io::Result<Self> {
-        let storage = Arc::new(Storage::new(&config)?);
-        let queue = FileQueue::load(storage.dir(), config.file.queue_capacity)?;
+        let snapshot = config.snapshot();
+        let storage = Arc::new(Storage::new(&snapshot)?);
+        let queue = FileQueue::load(storage.dir(), snapshot.file.queue_capacity)?;
         Ok(Self {
             queue: Arc::new(Mutex::new(queue)),
             storage,
@@ -154,6 +156,14 @@ impl FileCoordinator {
     /// 权威对账在此窗口内让位给 FileHandoff，避免与起停流争用 pre 模式。
     pub fn handoff_active(&self) -> bool {
         self.handoff_active.load(Ordering::Acquire)
+    }
+
+    /// 运行时键即时生效（SPEC-04）：[file] 容量与大小阈值更新到队列与存储。
+    /// denoise/时长上限/ffmpeg 等键由 worker 每任务读配置快照，无需在此处理。
+    pub fn apply_file_config(&self, config: &Config) {
+        lock_queue(&self.queue).set_capacity(config.file.queue_capacity);
+        self.storage
+            .set_limits(config.file.max_upload_bytes, config.file.storage_limit_bytes);
     }
 
     /// poller 每 tick 驱动一次仲裁。
@@ -177,9 +187,12 @@ impl FileCoordinator {
         match arbitrate::next_action(owner, paused, next.as_deref(), desired, active, rvc_ready) {
             arbitrate::Action::StartJob(job_id) => self.start_job(&job_id),
             arbitrate::Action::ApplyRoute(route) => {
-                if let Err((code, reason)) =
-                    services::route_set_locked(&self.state, &self.services, &self.config, route)
-                {
+                if let Err((code, reason)) = services::route_set_locked(
+                    &self.state,
+                    &self.services,
+                    &self.config.snapshot(),
+                    route,
+                ) {
                     lock_state(&self.state)
                         .push_degraded(format!("file arbiter route apply: {code}: {reason}"));
                 }
@@ -414,7 +427,7 @@ impl FileCoordinator {
             queue: self.queue.clone(),
             services: self.services.clone(),
             state: self.state.clone(),
-            config: self.config.clone(),
+            config: self.config.snapshot(),
             running: self.running.clone(),
             handoff_active: self.handoff_active.clone(),
         };
@@ -627,7 +640,7 @@ mod tests {
         let dir = temp_dir(tag);
         let mut config = Config::default();
         config.file.storage_dir = dir.clone();
-        let config = Arc::new(config);
+        let config = SharedConfig::new(config);
         let state = Arc::new(Mutex::new(State::new()));
         lock_state(&state).set_rvc_status(Some(fake_rvc_status()));
         let services = Arc::new(Services::new(&config));
@@ -689,7 +702,7 @@ mod tests {
         let route = services::route_set(
             &coordinator.state,
             &coordinator.services,
-            &coordinator.config,
+            &coordinator.config.snapshot(),
             Route::Rvc,
         )
         .unwrap();
@@ -705,7 +718,7 @@ mod tests {
         services::route_set(
             &coordinator.state,
             &coordinator.services,
-            &coordinator.config,
+            &coordinator.config.snapshot(),
             Route::Direct,
         )
         .unwrap();
@@ -716,7 +729,7 @@ mod tests {
         services::route_set(
             &coordinator.state,
             &coordinator.services,
-            &coordinator.config,
+            &coordinator.config.snapshot(),
             Route::Rvc,
         )
         .unwrap();
@@ -901,7 +914,7 @@ mod tests {
         let dir = temp_dir("worker-panic");
         let mut config = Config::default();
         config.file.storage_dir = dir.clone();
-        let config = Arc::new(config);
+        let config = SharedConfig::new(config);
         let state = Arc::new(Mutex::new(State::new()));
         lock_state(&state).set_rvc_status(Some(fake_rvc_status()));
         let services = Arc::new(Services::new(&config));
@@ -1071,8 +1084,8 @@ mod tests {
         config.rvc.socket = "rvc.sock".to_string();
         config.file.storage_dir = dir.clone();
         config.file.storage_limit_bytes = 100;
-        let config = Arc::new(config);
-        spawn_rvc_stub(&config.rvc_socket());
+        let config = SharedConfig::new(config);
+        spawn_rvc_stub(&config.snapshot().rvc_socket());
 
         let state = Arc::new(Mutex::new(State::new()));
         lock_state(&state).set_rvc_status(Some(fake_rvc_status()));

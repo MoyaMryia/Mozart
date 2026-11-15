@@ -1,12 +1,16 @@
-//! 翻译预处理（SPEC-05）：显式同音字纠错 → 术语表 → 数字归一化。
-//! v1 只搬显式纠错表（内置常见同音误写 + 可选配置文件，词条级替换，长词优先）。
-//! 术语同音索引（拼音匹配、词频过滤，旧 homophones.py）留 FUTURE：依赖 pypinyin/jieba
-//! 的 Rust 复现方式未定，v1 不做拼音索引，仅显式表替换。
+//! 翻译预处理（SPEC-05）：显式同音字纠错 → 术语同音索引 → 术语表 → 数字归一化。
+//! 显式纠错表：内置常见同音误写 + 可选配置文件，词条级替换，长词优先。
+//! 术语同音索引（旧 homophones.py）：术语表生成无声调拼音索引，识别文本里与术语
+//! 同音、写法不同的 2–4 字中文片段换成术语写法；词频不低于 MIN_FREQ 的真词不替换。
+//! 拼音用 pinyin crate 逐字 plain 读音，与旧实现把文本拆成单字列表喂 pypinyin 一致
+//! （两者同源 mozillazg/pinyin-data，均不做词组多音字消歧）。词频表内嵌 jieba 子集。
 //! 数字归一化只处理常见明确模式，成语与单字不改动。
 
+use pinyin::ToPinyin;
 use serde::Serialize;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::Path;
+use std::sync::OnceLock;
 
 /// 显式纠错表：ASR 常见同音误写 → 正确写法。
 /// 只收词条级、无歧义的替换；上下文相关的「在/再」「做/作」不逐字替换。
@@ -27,6 +31,16 @@ const CORRECTIONS: &[(&str, &str)] = &[
 
 /// 数字归一化排除表：含数字字符的常见成语/副词，整体不替换。
 const NUMBER_EXCLUSIONS: &[&str] = &["万一", "千万", "三七", "一五一十"];
+
+/// 同音索引片段长度范围（旧 homophones.MIN_SPAN / MAX_SPAN）。
+const MIN_SPAN: usize = 2;
+const MAX_SPAN: usize = 4;
+/// 词频不低于该值的片段按真词处理，不做同音替换（旧 homophones.MIN_FREQ）。
+const MIN_FREQ: u32 = 10;
+
+/// 内置纠错术语（旧 subtitle_bridge.CORRECTION_TERMS 的键）：供同音索引使用。
+/// 释义只用于翻译提示，不参与替换，故此处只存术语本身。
+const CORRECTION_TERMS: &[&str] = &["大妈", "大爷", "麻醉剂"];
 
 /// 术语表：v1 为空，加载接口留前端适配器（SPEC-05：glossary 编辑缓）。
 pub struct Glossary {
@@ -52,28 +66,34 @@ impl Glossary {
     }
 }
 
-/// 预处理管线：纠错 → 术语 → 数字归一化。
+/// 内置纠错术语集（旧 CORRECTION_TERMS 的键）。
+pub fn builtin_correction_terms() -> HashSet<String> {
+    CORRECTION_TERMS.iter().map(|s| s.to_string()).collect()
+}
+
+/// 同音索引的术语集：内置纠错术语 + 术语表键（旧 correction_glossary）。
+pub fn correction_terms(glossary: &Glossary) -> HashSet<String> {
+    let mut terms = builtin_correction_terms();
+    terms.extend(glossary.terms.keys().cloned());
+    terms
+}
+
+/// 预处理管线：显式纠错 → 同音索引 → 术语表 → 数字归一化。
 pub fn process(text: &str, glossary: &Glossary) -> String {
-    let corrected = apply_corrections(text, CORRECTIONS);
+    let terms = correction_terms(glossary);
+    let (corrected, _fixes) = correct_with_terms(text, &terms, &builtin_corrections());
     let glossed = glossary.apply(&corrected);
     normalize_numbers(&glossed)
 }
 
-/// 按显式纠错表替换，长词优先（沿用旧实现 apply_corrections 的顺序语义）。
-pub fn apply_corrections(text: &str, table: &[(&str, &str)]) -> String {
-    let owned: Vec<(String, String)> = table
-        .iter()
-        .map(|(from, to)| (from.to_string(), to.to_string()))
-        .collect();
-    correct(text, &owned).0
-}
-
-/// 一条纠错记录（沿用旧 homophone_fixes 形态：from/to/count）。
+/// 一条纠错记录（沿用旧 homophone_fixes 形态）。
+/// 显式替换带 count；同音索引替换无 count（旧实现同音记录只有 from/to）。
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct CorrectionFix {
     pub from: String,
     pub to: String,
-    pub count: usize,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub count: Option<usize>,
 }
 
 /// 内置纠错表的 owned 形态，供字幕记录与配置加载共用。
@@ -143,11 +163,139 @@ pub fn correct(text: &str, table: &[(String, String)]) -> (String, Vec<Correctio
             fixes.push(CorrectionFix {
                 from: from.clone(),
                 to: to.clone(),
-                count,
+                count: Some(count),
             });
         }
     }
     (out, fixes)
+}
+
+/// 单字无声调拼音；非中文字符返回自身（对应 pypinyin 对非中文字符的默认处理）。
+/// 旧实现把文本拆成单字列表喂 pypinyin，逐字取默认读音、不做词组多音字消歧，
+/// 与本函数逐字 plain 读音一致。pypinyin 默认把 ü 写成 v（吕→lv），此处同样归一化。
+fn char_pinyin(c: char) -> String {
+    match c.to_pinyin() {
+        Some(pinyin) => pinyin.plain().replace('ü', "v"),
+        None => c.to_string(),
+    }
+}
+
+/// 内嵌词频表（jieba 0.42.1 的 2–4 字纯中文、词频 ≥ MIN_FREQ 子集，离线生成）。
+/// 只有不低于 MIN_FREQ 的词会触发保护，故低于阈值的词条无需收录；查询缺省为 0。
+/// 懒加载：术语表为空时不初始化（沿用旧实现「术语表为空时不加载 jieba」）。
+static WORD_FREQ: OnceLock<HashMap<String, u32>> = OnceLock::new();
+
+fn word_freq() -> &'static HashMap<String, u32> {
+    WORD_FREQ.get_or_init(|| {
+        let mut map = HashMap::new();
+        for line in include_str!("../data/word_freq.txt").lines() {
+            let mut parts = line.split(' ');
+            if let (Some(word), Some(freq)) = (parts.next(), parts.next()) {
+                if let Ok(freq) = freq.parse::<u32>() {
+                    map.insert(word.to_string(), freq);
+                }
+            }
+        }
+        map
+    })
+}
+
+/// 片段是常用词时返回 true，避免把真词改成同音术语（旧 homophones.is_common_word）。
+fn is_common_word(span: &str) -> bool {
+    word_freq().get(span).copied().unwrap_or(0) >= MIN_FREQ
+}
+
+/// 术语同音索引：无声调拼音键 → 排序后的术语候选（旧 homophones.build_index）。
+pub struct HomophoneIndex {
+    index: HashMap<String, Vec<String>>,
+    terms: HashSet<String>,
+}
+
+impl HomophoneIndex {
+    /// 术语表建索引：只收 2–4 字纯中文术语；同键候选去重排序，命中取最小者。
+    pub fn build(terms: &HashSet<String>) -> Self {
+        let mut index: HashMap<String, Vec<String>> = HashMap::new();
+        for term in terms {
+            let len = term.chars().count();
+            if !is_chinese(term) || len < MIN_SPAN || len > MAX_SPAN {
+                continue;
+            }
+            let key: String = term.chars().map(char_pinyin).collect();
+            index.entry(key).or_default().push(term.clone());
+        }
+        for candidates in index.values_mut() {
+            candidates.sort();
+            candidates.dedup();
+        }
+        Self {
+            index,
+            terms: terms.clone(),
+        }
+    }
+
+    /// 从最长候选扫描，命中后跳过该片段，避免重叠替换（旧 homophones.correct 的扫描）。
+    /// 术语本身与常用词不替换；无命中时逐字保留。
+    pub fn correct(&self, text: &str) -> (String, Vec<CorrectionFix>) {
+        if self.index.is_empty() || text.is_empty() {
+            return (text.to_string(), Vec::new());
+        }
+        let chars: Vec<char> = text.chars().collect();
+        let pinyin: Vec<String> = chars.iter().map(|&c| char_pinyin(c)).collect();
+        let mut out = String::new();
+        let mut fixes = Vec::new();
+        let mut position = 0;
+        while position < chars.len() {
+            let mut matched = false;
+            for size in (MIN_SPAN..=MAX_SPAN).rev() {
+                if position + size > chars.len() {
+                    continue;
+                }
+                let span: String = chars[position..position + size].iter().collect();
+                if !is_chinese(&span) || self.terms.contains(&span) {
+                    continue;
+                }
+                let key: String = pinyin[position..position + size].concat();
+                let Some(candidates) = self.index.get(&key) else {
+                    continue;
+                };
+                if is_common_word(&span) {
+                    continue;
+                }
+                // 候选必来自术语集；span 若等于候选即术语，已在上面 terms.contains 跳过。
+                let term = &candidates[0];
+                out.push_str(term);
+                fixes.push(CorrectionFix {
+                    from: span,
+                    to: term.clone(),
+                    count: None,
+                });
+                position += size;
+                matched = true;
+                break;
+            }
+            if !matched {
+                out.push(chars[position]);
+                position += 1;
+            }
+        }
+        (out, fixes)
+    }
+}
+
+/// 显式纠错 + 同音索引（旧 homophones.correct）：先按显式表替换，再按拼音索引匹配。
+/// 返回纠正后文本与替换记录（显式记录带 count，同音记录不带）。
+pub fn correct_with_terms(
+    text: &str,
+    terms: &HashSet<String>,
+    corrections: &[(String, String)],
+) -> (String, Vec<CorrectionFix>) {
+    let (text, explicit) = correct(text, corrections);
+    let index = HomophoneIndex::build(terms);
+    // 空索引/空文本由 index.correct 恒等返回，此处不重复判空。
+    let (text, homophone) = index.correct(&text);
+    let mut fixes = explicit;
+    fixes.extend(homophone);
+    (text, fixes)
 }
 
 fn digit_value(c: char) -> Option<u64> {
@@ -309,8 +457,11 @@ mod tests {
 
     #[test]
     fn custom_table_is_applied() {
-        let table = [("王独", "网赌"), ("王", "网")];
-        assert_eq!(apply_corrections("王独说王", &table), "网赌说网");
+        let table = vec![
+            ("王独".to_string(), "网赌".to_string()),
+            ("王".to_string(), "网".to_string()),
+        ];
+        assert_eq!(correct("王独说王", &table).0, "网赌说网");
     }
 
     #[test]
@@ -422,5 +573,149 @@ mod tests {
             process("以经二十一万了", &Glossary::empty()),
             "已经210000了"
         );
+    }
+
+    fn terms(list: &[&str]) -> HashSet<String> {
+        list.iter().map(|s| s.to_string()).collect()
+    }
+
+    #[test]
+    fn char_pinyin_uses_per_char_default_reading() {
+        // 逐字默认读音，不做词组多音字消歧（与旧实现单字列表喂 pypinyin 一致）。
+        assert_eq!(char_pinyin('网'), "wang");
+        assert_eq!(char_pinyin('赌'), "du");
+        assert_eq!(char_pinyin('姐'), "jie");
+        assert_eq!(char_pinyin('戒'), "jie");
+        assert_eq!(char_pinyin('重'), "zhong"); // 非词组「重庆」的 chong
+        assert_eq!(char_pinyin('大'), "da");
+        assert_eq!(char_pinyin('爷'), "ye");
+        // pypinyin 默认 ü→v。
+        assert_eq!(char_pinyin('吕'), "lv");
+        assert_eq!(char_pinyin('女'), "nv");
+        assert_eq!(char_pinyin('略'), "lve");
+        // 非中文字符返回自身。
+        assert_eq!(char_pinyin('2'), "2");
+        assert_eq!(char_pinyin(' '), " ");
+        assert_eq!(char_pinyin('w'), "w");
+    }
+
+    #[test]
+    fn homophone_replaces_misspelled_terms() {
+        let t = terms(&["网赌", "网贷", "戒赌"]);
+        let (text, fixes) = correct_with_terms("碰到王独的人", &t, &[]);
+        assert_eq!(text, "碰到网赌的人");
+        assert_eq!(fixes.len(), 1);
+        assert_eq!(fixes[0].from, "王独");
+        assert_eq!(fixes[0].to, "网赌");
+        assert_eq!(fixes[0].count, None);
+        let (text, _) = correct_with_terms("他借往代了", &t, &[]);
+        assert_eq!(text, "他借网贷了");
+    }
+
+    #[test]
+    fn homophone_leaves_correct_text_unchanged() {
+        let t = terms(&["网赌", "网贷", "戒赌"]);
+        for text in ["他和网赌没关系", "我们一起去公园散步", "这就是麻醉剂"] {
+            let (out, fixes) = correct_with_terms(text, &t, &[]);
+            assert_eq!(out, text, "输入：{text}");
+            assert!(fixes.is_empty());
+        }
+    }
+
+    #[test]
+    fn homophone_protects_common_words_by_frequency() {
+        // 姐姐/哥哥/妈妈 词频 ≥ MIN_FREQ，是真词，不替换成同音术语。
+        let t = terms(&["格格", "戒戒"]);
+        for text in ["我和姐姐一起去的", "我和哥哥一起去的", "妈妈说要回家"] {
+            let (out, fixes) = correct_with_terms(text, &t, &[]);
+            assert_eq!(out, text, "输入：{text}");
+            assert!(fixes.is_empty());
+        }
+        assert!(is_common_word("姐姐"));
+        assert!(!is_common_word("王独"));
+    }
+
+    #[test]
+    fn homophone_explicit_corrections_win_over_frequency() {
+        // 显式表优先：姐姐 虽是常用词，显式纠错仍替换。
+        let corrections = vec![("姐姐".to_string(), "戒戒".to_string())];
+        let (text, fixes) = correct_with_terms("我和姐姐一起去的", &terms(&[]), &corrections);
+        assert_eq!(text, "我和戒戒一起去的");
+        assert_eq!(fixes.len(), 1);
+        assert_eq!(fixes[0].count, Some(1));
+    }
+
+    #[test]
+    fn homophone_empty_terms_is_identity() {
+        let (text, fixes) = correct_with_terms("碰到王独的人", &terms(&[]), &[]);
+        assert_eq!(text, "碰到王独的人");
+        assert!(fixes.is_empty());
+    }
+
+    #[test]
+    fn homophone_ignores_non_chinese_spans() {
+        let t = terms(&["网赌", "网贷", "戒赌"]);
+        let (text, _) = correct_with_terms("2026 年 wangdu 王独", &t, &[]);
+        assert_eq!(text, "2026 年 wangdu 网赌");
+    }
+
+    #[test]
+    fn homophone_prefers_longest_span_and_skips_overlap() {
+        // 4 字候选优先于 2 字；命中后跳过整个片段，不重叠替换。
+        let t = terms(&["网赌", "网络赌博"]);
+        let (text, fixes) = correct_with_terms("王独网络赌博", &t, &[]);
+        // 「网络赌博」本身是术语不替换；「王独」→「网赌」。
+        assert_eq!(text, "网赌网络赌博");
+        assert_eq!(fixes.len(), 1);
+        assert_eq!(fixes[0].from, "王独");
+    }
+
+    #[test]
+    fn homophone_index_filters_invalid_terms() {
+        // 单字、超 4 字、非中文术语不入索引。
+        let t = terms(&["网", "网络赌博平台", "abc", "网赌"]);
+        let index = HomophoneIndex::build(&t);
+        let (text, _) = index.correct("碰到王独的人");
+        assert_eq!(text, "碰到网赌的人");
+        // 单字「网」不在索引：同音单字不替换。
+        let (text, _) = index.correct("往");
+        assert_eq!(text, "往");
+    }
+
+    #[test]
+    fn process_applies_builtin_correction_terms() {
+        // 内置术语「麻醉剂」的同音误写「麻醉济」被纠正（剂/济 同音 ji）。
+        let glossary = Glossary::empty();
+        assert_eq!(process("这就是麻醉济", &glossary), "这就是麻醉剂");
+    }
+
+    /// 与旧实现逐条对拍（SPEC-05）：夹具由旧 tools/tests/test_homophones.py 的用例
+    /// 经旧 homophones.correct 实际运行提取，断言新实现输出与期望一致。
+    #[test]
+    fn fixtures_match_old_implementation() {
+        let path = concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../tests/fixtures/preprocess/homophones.json"
+        );
+        let data = std::fs::read_to_string(path).expect("对拍夹具应存在");
+        let cases: serde_json::Value = serde_json::from_str(&data).expect("夹具是合法 JSON");
+        let cases = cases.as_array().expect("夹具是数组");
+        assert!(!cases.is_empty(), "夹具不应为空");
+        for case in cases {
+            let name = case["name"].as_str().unwrap();
+            let text = case["text"].as_str().unwrap();
+            let terms: HashSet<String> =
+                case["terms"].as_object().unwrap().keys().cloned().collect();
+            let corrections: Vec<(String, String)> = case["corrections"]
+                .as_object()
+                .unwrap()
+                .iter()
+                .map(|(k, v)| (k.clone(), v.as_str().unwrap().to_string()))
+                .collect();
+            let (out, fixes) = correct_with_terms(text, &terms, &corrections);
+            assert_eq!(out, case["expected"].as_str().unwrap(), "用例 {name} 文本");
+            let fixes_json = serde_json::to_value(&fixes).unwrap();
+            assert_eq!(fixes_json, case["fixes"], "用例 {name} 替换记录");
+        }
     }
 }

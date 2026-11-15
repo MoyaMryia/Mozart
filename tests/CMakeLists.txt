@@ -16,6 +16,13 @@ target_link_libraries(t_rvc_transport PRIVATE mozart_rvc_runtime mozart_warnings
 add_test(NAME rvc_transport COMMAND t_rvc_transport)
 set_tests_properties(rvc_transport PROPERTIES LABELS "unit" TIMEOUT 30)
 
+# 帧字节共享夹具目录：C++ 与 Rust（core/tests/frame_fixture.rs）读同一组文件。
+set(MOZART_FRAME_FIXTURE_DIR "${CMAKE_CURRENT_SOURCE_DIR}/fixtures/frame")
+target_compile_definitions(t_control_contract PRIVATE
+    MOZART_FRAME_FIXTURE_DIR="${MOZART_FRAME_FIXTURE_DIR}")
+target_compile_definitions(t_rvc_transport PRIVATE
+    MOZART_FRAME_FIXTURE_DIR="${MOZART_FRAME_FIXTURE_DIR}")
+
 # rvc 泵接线：AudioWorker × 新数据面 × StreamingRvc（确定性假管线，无 GPU 依赖）。
 add_executable(t_rvc_pump test_rvc_pump.cpp)
 target_link_libraries(t_rvc_pump PRIVATE mozart_rvc_runtime mozart_warnings)

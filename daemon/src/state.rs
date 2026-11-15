@@ -69,6 +69,9 @@ pub struct State {
     /// 持久降级：push_degraded 追加去重，跨轮询存活。停流/恢复失败等
     /// 一次性事件的原因走这里，不被下一秒轮询覆写（AGENTS「降级记可查原因」）。
     degraded_persistent: Vec<String>,
+    /// 写了重启键但尚未重启的服务（SPEC-04 待重启显示）：config set 重启键加入，
+    /// restart 该服务后清除。崩溃重启复用旧配置快照，不清（分歧仍在）。
+    pending_restart: std::collections::BTreeSet<String>,
     shutting_down: bool,
 }
 
@@ -98,6 +101,7 @@ impl State {
             hw: None,
             degraded: Vec::new(),
             degraded_persistent: Vec::new(),
+            pending_restart: std::collections::BTreeSet::new(),
             shutting_down: false,
         }
     }
@@ -138,6 +142,7 @@ impl State {
                 )
                 .cloned()
                 .collect(),
+            pending_restart: self.pending_restart.iter().cloned().collect(),
         }
     }
 
@@ -264,6 +269,18 @@ impl State {
         }
     }
 
+    /// 写重启键后登记受影响服务待重启（SPEC-04）。
+    pub fn mark_pending_restart(&mut self, affected: &[String]) {
+        for service in affected {
+            self.pending_restart.insert(service.clone());
+        }
+    }
+
+    /// 单服务重启受理后清除其待重启标记（重读 TOML，分歧消除）。
+    pub fn clear_pending_restart(&mut self, service: &str) {
+        self.pending_restart.remove(service);
+    }
+
     pub fn process_starting(&mut self, role: Role) {
         let info = self.process_mut(role);
         info.state = ProcessState::Starting;
@@ -375,6 +392,19 @@ mod tests {
         );
         assert!(degraded.iter().any(|reason| reason.contains("rvc status: new")));
         assert!(!degraded.iter().any(|reason| reason.contains("rvc status: old")));
+    }
+
+    #[test]
+    fn pending_restart_marks_and_clears_per_service() {
+        let mut state = State::new();
+        assert!(state.status().pending_restart.is_empty());
+        state.mark_pending_restart(&["pre".to_string()]);
+        state.mark_pending_restart(&["pre".to_string(), "rvc".to_string()]);
+        assert_eq!(state.status().pending_restart, vec!["pre", "rvc"]);
+        state.clear_pending_restart("pre");
+        assert_eq!(state.status().pending_restart, vec!["rvc"]);
+        state.clear_pending_restart("rvc");
+        assert!(state.status().pending_restart.is_empty());
     }
 
     #[test]

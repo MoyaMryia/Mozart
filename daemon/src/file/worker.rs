@@ -380,6 +380,7 @@ mod tests {
     use crate::file::queue::FileQueue;
     use crate::file::storage::Storage;
     use crate::file::testutil::temp_dir;
+    use crate::runtime::SharedConfig;
     use crate::services::Services;
     use crate::state::State;
     use mozart_core::config::Config;
@@ -420,7 +421,7 @@ mod tests {
             source: dir.join("a.wav"),
             storage,
             queue: queue.clone(),
-            services: Arc::new(Services::new(&config)),
+            services: Arc::new(Services::new(&SharedConfig::new(config.as_ref().clone()))),
             state: Arc::new(Mutex::new(State::new())),
             config: config.clone(),
             running: running.clone(),

@@ -1,11 +1,13 @@
 //! 控制面服务端（SPEC-02）：Unix SEQPACKET + core 信封，复用 schema 的应答封装。
-//! Hello/SetRoute/SetMute/GetStatus。命令解析与执行只读写原子，不阻塞音频线程；
-//! GetStatus 只读原子快照与队列读数（AGENTS「GetStatus 只读原子快照」精神），
-//! 并限频上报环丢帧增量（SPEC-01：热路径只计数，日志在控制线程）。
-//! 连接逐个服务：daemon 持单连接每秒轮询，断开后回到 accept。
+//! Hello/SetRoute/SetMute/SetFileMode/SetDsp/GetStatus。命令解析与执行只读写
+//! 原子，不阻塞音频线程；GetStatus 只读原子快照与队列读数（AGENTS「GetStatus
+//! 只读原子快照」精神），并限频上报环丢帧增量（SPEC-01：热路径只计数，日志在
+//! 控制线程）。连接逐个服务：daemon 持单连接每秒轮询，断开后回到 accept。
 
-use crate::state::{QueueReadout, Shared, VERSION};
-use mozart_core::ctl::schema::{error_body, ok_body, FileModeSetRequest, MuteSetRequest, RouteSetRequest};
+use crate::state::{DspSwitches, QueueReadout, Shared, VERSION};
+use mozart_core::ctl::schema::{
+    error_body, ok_body, DspSetRequest, FileModeSetRequest, MuteSetRequest, RouteSetRequest,
+};
 use mozart_core::ctl::{self, Message, Seqpacket, ACCEPT_POLL, IDLE_TIMEOUT, RECV_POLL};
 use mozart_core::ring::Ring;
 use mozart_core::{OutputFrame, RawFrame};
@@ -209,6 +211,27 @@ fn dispatch(
             }
             Err(err) => error_body(ctl::CODE_INVALID_ARGUMENT, &err.to_string()),
         },
+        ctl::PRE_SET_DSP => match serde_json::from_value::<DspSetRequest>(body) {
+            Ok(request) => {
+                // 入口校验由 serde 完成（四键必需、bool 类型、拒未知键）；
+                // 执行只写目标原子，处理线程在一帧内应用（denoise 重新启用
+                // 在 Dsp 内重置 WOLA 状态），与 SetRoute/SetMute 同纪律。
+                let switches = DspSwitches {
+                    denoise: request.denoise,
+                    gate: request.gate,
+                    agc: request.agc,
+                    limiter: request.limiter,
+                };
+                shared.set_dsp_target(switches);
+                ok_body(json!({
+                    "denoise": switches.denoise,
+                    "gate": switches.gate,
+                    "agc": switches.agc,
+                    "limiter": switches.limiter,
+                }))
+            }
+            Err(err) => error_body(ctl::CODE_INVALID_ARGUMENT, &err.to_string()),
+        },
         ctl::PRE_SPEECH_STOP => {
             // speech stop 经 daemon 转发：清播报环，丢弃已送达未播的播报帧。
             // 播放线程下一帧见环空，holdoff 后恢复实时；计数经应答可查。
@@ -266,7 +289,7 @@ mod tests {
         DropLog,
     ) {
         (
-            Arc::new(Shared::new("cap-dev".to_string(), "play-dev".to_string(), "test".to_string())),
+            Arc::new(crate::state::test_shared("cap-dev", "play-dev", "test")),
             Arc::new(Ring::new(2)),
             Arc::new(Ring::new(2)),
             Arc::new(Ring::new(2)),
@@ -415,6 +438,90 @@ mod tests {
             &mut log,
         );
         assert_eq!(error_code(&reply), ctl::CODE_INVALID_ARGUMENT);
+    }
+
+    #[test]
+    fn set_dsp_roundtrip_and_updates_target() {
+        let (shared, cap, trunk, rvc, tts, mut log) = context();
+        let reply = dispatch(
+            &message(
+                ctl::PRE_SET_DSP,
+                br#"{"denoise":false,"gate":true,"agc":true,"limiter":false}"#,
+            ),
+            &shared,
+            &cap,
+            &trunk,
+            &rvc,
+            &tts,
+            &mut log,
+        );
+        let applied = data(&reply);
+        assert_eq!(applied["denoise"], false);
+        assert_eq!(applied["gate"], true);
+        assert_eq!(applied["agc"], true);
+        assert_eq!(applied["limiter"], false);
+        assert_eq!(
+            shared.dsp_target(),
+            DspSwitches {
+                denoise: false,
+                gate: true,
+                agc: true,
+                limiter: false,
+            },
+            "命令目标必须写入共享状态供处理线程应用"
+        );
+
+        // 再切回：目标随命令更新。
+        let reply = dispatch(
+            &message(
+                ctl::PRE_SET_DSP,
+                br#"{"denoise":true,"gate":false,"agc":false,"limiter":true}"#,
+            ),
+            &shared,
+            &cap,
+            &trunk,
+            &rvc,
+            &tts,
+            &mut log,
+        );
+        assert_eq!(data(&reply)["denoise"], true);
+        assert_eq!(
+            shared.dsp_target(),
+            DspSwitches {
+                denoise: true,
+                gate: false,
+                agc: false,
+                limiter: true,
+            }
+        );
+    }
+
+    #[test]
+    fn set_dsp_rejects_bad_body() {
+        let (shared, cap, trunk, rvc, tts, mut log) = context();
+        let before = shared.dsp_target();
+        for body in [
+            &b"{}"[..],
+            // 缺键。
+            br#"{"denoise":true,"gate":false,"agc":false}"#,
+            // 类型错误。
+            br#"{"denoise":"yes","gate":false,"agc":false,"limiter":false}"#,
+            // 未知键。
+            br#"{"denoise":true,"gate":false,"agc":false,"limiter":false,"x":1}"#,
+            b"not json",
+        ] {
+            let reply = dispatch(
+                &message(ctl::PRE_SET_DSP, body),
+                &shared,
+                &cap,
+                &trunk,
+                &rvc,
+                &tts,
+                &mut log,
+            );
+            assert_eq!(error_code(&reply), ctl::CODE_INVALID_ARGUMENT);
+            assert_eq!(shared.dsp_target(), before, "坏体不得改变 DSP 目标");
+        }
     }
 
     #[test]
@@ -633,6 +740,29 @@ mod tests {
         assert_eq!(stopped["stopped"], true);
         assert_eq!(stopped["frames_cleared"], 2);
         assert_eq!(tts.depth(), 0, "停止后播报环必须清空");
+
+        // SetDsp 经线缆往返：应答回显开关，目标写入共享状态。
+        conn.send(
+            ctl::PRE_SET_DSP,
+            5,
+            br#"{"denoise":false,"gate":false,"agc":false,"limiter":true}"#,
+        )
+        .unwrap();
+        let reply = conn.recv(Some(Duration::from_secs(2))).unwrap();
+        let reply_type = reply.header.type_;
+        assert_eq!(reply_type, ctl::PRE_SET_DSP);
+        let dsp = data(&reply.body);
+        assert_eq!(dsp["denoise"], false);
+        assert_eq!(dsp["limiter"], true);
+        assert_eq!(
+            shared.dsp_target(),
+            DspSwitches {
+                denoise: false,
+                gate: false,
+                agc: false,
+                limiter: true,
+            }
+        );
 
         // 停止标志结束服务循环。
         stop.store(true, Ordering::Relaxed);

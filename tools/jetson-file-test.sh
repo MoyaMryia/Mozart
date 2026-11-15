@@ -1,5 +1,6 @@
 #!/bin/bash
 # Jetson 文件转换板端实测：daemon + 真 pre + 真 rvc，CLI 驱动文件链路。
+# 正常由 tools/jetson-e2e.sh 调用，也可在设备上直接运行。
 # 前置：本仓库已 rsync 到设备并完成构建（tools/deploy-jetson.sh），BIN_DIR 内
 #   有 mozart-ctl/daemon/pre/rvc；snd-aloop 已加载；MODELS_DIR 内有模型资产；
 #   设备有 python3 + numpy、ffmpeg、ffprobe。
@@ -9,7 +10,7 @@
 #   GPU 互斥与路由等待槽 / 重启续转 / 入口拒绝 / 时长上限。
 # 证据留在 $SMOKE_DIR：配置、样本、各阶段 status 与逐秒 progress-*.jsonl、
 #   取回 WAV、audio stats、measure.json、summary.tsv。
-#   MODELS_DIR   模型资产目录（默认 $HOME/mozart-assets/models/rvc/qiqi-zh-run）
+#   MODELS_DIR   模型资产目录（默认 $HOME/mozart-assets/models/rvc/qiqi-zh）
 #   BIN_DIR      部署二进制目录（默认 $HOME/Mozart/target/debug）
 #   SMOKE_DIR    产物目录（默认 /tmp/mozart-file-test）
 #   MODEL_ID     转换模型（默认 qiqi-zh）
@@ -19,7 +20,7 @@
 #   LONG_BUDGET_S  近时长上限的长文件秒数，>0 时追加内存兜底场景（默认 0＝跳过）
 set -u
 
-MODELS_DIR=${MODELS_DIR:-$HOME/mozart-assets/models/rvc/qiqi-zh-run}
+MODELS_DIR=${MODELS_DIR:-$HOME/mozart-assets/models/rvc/qiqi-zh}
 BIN_DIR=${BIN_DIR:-$HOME/Mozart/target/debug}
 SMOKE_DIR=${SMOKE_DIR:-/tmp/mozart-file-test}
 CAP_SUB=${CAP_SUB:-2}

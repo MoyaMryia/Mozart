@@ -1,6 +1,6 @@
 # Mozart 配置规范（TOML schema）
 
-状态：定稿中。最后更新：2026-11-13。
+状态：定稿中。最后更新：2026-11-15。
 
 本文件是 TOML 配置的唯一 schema 依据：段、键、类型、默认、范围、运行时/重启分类。配置模型（TOML 基线 + 运行时状态文件、`config set`/`config save`、`restart_required` 契约）见 [SPEC-04](SPEC/SPEC-04-daemon.md)，本文件不复述。解析与校验实现于 `core/src/config.rs`，须与本文件一致。
 
@@ -13,7 +13,7 @@
 
 ## 配置来源与优先级
 
-`--config` > `MOZART_CONFIG` > `./mozart.toml` > 内置默认。环境变量覆盖：`MOZART_RUN_DIR`、`MOZART_*_BIN`、`MOZART_POLL_INTERVAL_MS`。详见 SPEC-04。
+`--config` > `MOZART_CONFIG` > `./mozart.toml` > 内置默认。环境变量覆盖：`MOZART_RUN_DIR`、`MOZART_*_BIN`、`MOZART_POLL_INTERVAL_MS`。运行时状态文件目录：`MOZART_STATE_DIR` > `~/.local/state/mozart`（文件名 `state.json`）。详见 SPEC-04。
 
 ## 段与键
 
@@ -44,7 +44,7 @@
 
 ```toml
 [process.env]
-LD_LIBRARY_PATH = "/home/user/mozart/assets/lib:/home/user/mozart/assets/llama"
+LD_LIBRARY_PATH = "<资产根>/lib:<资产根>/llama"
 ```
 
 | 键 | 类型 | 默认 | 范围 | 类别 |
@@ -62,6 +62,7 @@ LD_LIBRARY_PATH = "/home/user/mozart/assets/lib:/home/user/mozart/assets/llama"
 | capture_file | path | 空 | WAV PCM16、48000 Hz、至少 1 声道；pre 启动时校验；设置后替代 ALSA 采集 | S |
 | playback_device | string | default | 非空、无 NUL | S |
 | capture_queue_frames | int | 8 | 1..=1024 | S |
+| consumers | array | rvc+asr 两支路 | 见 [[pre.consumers]]；未设置时 socket 沿用 [rvc]/[asr] 的 input_socket | S |
 
 ### [pre.dsp]
 
@@ -71,6 +72,18 @@ LD_LIBRARY_PATH = "/home/user/mozart/assets/lib:/home/user/mozart/assets/llama"
 | gate | bool | false | — | R |
 | agc | bool | false | — | R |
 | limiter | bool | false | — | R |
+
+### [[pre.consumers]]
+
+输入支路消费者列表（SPEC-02 分发）：一个消费者一个 socket，背压互不影响。未设置时回退 rvc+asr 两支路，socket 沿用 `[rvc].input_socket` / `[asr].input_socket`（rvc 受文件接管影响、asr 不受）；显式声明后列表整体生效，空列表表示不分发。
+
+| 键 | 类型 | 必需 | 说明 |
+| --- | --- | --- | --- |
+| name | string | 是 | 消费者名，列表内唯一；GetStatus consumer_drops 的键。名为 rvc 时额外聚合输出链路丢弃；tts 与含点名为保留键 |
+| socket | string | 是 | 输入 socket，纯文件名，相对 run_dir；对端绑定收帧，pre 连接发送 |
+| file_mode_affected | bool | 否（默认 false） | 是否受文件接管影响：true 时接管期间停发、启动等 daemon 断言；false 恒发 |
+
+类别 S：消费者 socket 启动时固化进发送端，修改需重启 pre。
 
 ### [[models]]
 
@@ -84,15 +97,17 @@ LD_LIBRARY_PATH = "/home/user/mozart/assets/lib:/home/user/mozart/assets/llama"
 
 ```toml
 [[models]]
-id = "qiqi-zh"
+id = "<模型id>"
 type = "rvc"
-path = "/home/user/mozart/assets/models/rvc/qiqi-zh-run"
+path = "<资产根>/models/rvc/<模型id>"
 
 [[models]]
-id = "zipformer-zh"
+id = "<模型id>"
 type = "asr"
-path = "/home/user/mozart/assets/models/asr/zipformer-zh-14M"
+path = "<资产根>/models/asr/<模型id>"
 ```
+
+示例中的 `<资产根>` 与 `<模型id>` 由部署环境提供；设备路径规范见 [SETUP.md](SETUP.md)。
 
 注册表为空时回退现有行为：rvc 扫描 `[rvc].models_dir` 子目录。类别 S。
 
@@ -169,11 +184,11 @@ path = "/home/user/mozart/assets/models/asr/zipformer-zh-14M"
 ## 特殊机制说明
 
 - **RVC 会话参数**（f0_method / pitch_shift / index_rate / rms_mix_rate / protect）运行时生效经 `StopStream`→`StartStream` 带新参：实时在跑立刻用新参（短暂打断）；文件任务在跑则当前任务用旧参跑完、新参下一任务生效，不中途废弃。干净的块边界 `SetParams` 见 FUTURE。
-- **pre DSP 开关**经新增 `SetDsp` 命令运行时生效；denoise 运行中切换需处理 WOLA 滤波状态避免伪影。
+- **pre DSP 开关**经 `SetDsp`（0x0207，体含 denoise/gate/agc/limiter 四键）运行时生效：denoise 重新启用时重置 WOLA 流式状态、重新攒初始化帧，gate/agc/limiter 直接切换。
 - **逻辑上限 vs 预分配环**：`[file].queue_capacity` 是入队时查的逻辑上限（未预分配）→ R；`[pre].capture_queue_frames` 与 asr/tts/bridge 的 `*_capacity` 是预分配环/队列 → S。
 - **位置键**（storage_dir、subtitles_path）归 S：运行中改位置会使已有文件/队列分裂，需重启统一。
 - **model_id** 是基线（S）；运行时换模型走控制命令，不经 `config set`。
 
 ## 运行时状态文件交互
 
-运行时键的改动记入 daemon 运行时状态文件（覆盖快照），重启时 TOML 基线叠加恢复；活权威在各服务，启动恢复一次、运行时不对账。详见 SPEC-04。
+运行时键的改动记入 daemon 运行时状态文件（覆盖快照），重启时 TOML 基线叠加恢复；活权威在各服务，启动恢复一次、运行时不对账。v1 状态文件记录字幕开关（`bridge.translate_enabled` / `bridge.speech_enabled`）；`config set` 运行时键写基线后清该键覆盖并即时下发，`config save` 把全部覆盖提升为基线后清空。详见 SPEC-04。

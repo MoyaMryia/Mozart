@@ -125,6 +125,27 @@ impl NoiseSuppressor {
         value
     }
 
+    /// 重置流式状态（SPEC-02 SetDsp 运行中切换 denoise）：噪声估计、频谱
+    /// 队列、滑窗、WOLA 叠加与置信度全部回到初始，重新攒初始化帧后再发射，
+    /// 避免陈旧噪声谱与增益作用于新流产生伪影。窗为常量，保留。
+    /// 队列与滑窗的残留内容由后续写入覆盖（入队先写后读、in_len 归零），
+    /// 不需清数组。定长数组赋值，零分配，可在实时线程调用。
+    pub(super) fn reset(&mut self) {
+        self.ready = false;
+        self.init_count = 0;
+        self.init_power = [0.0; NS_BINS];
+        self.power_slow = [0.0; NS_BINS];
+        self.noise = [0.0; NS_BINS];
+        self.gain_prev = [1.0; NS_BINS];
+        self.queue_len = 0;
+        self.in_len = 0;
+        self.ola = [0.0; NS_FRAME];
+        self.norm = [0.0; NS_FRAME];
+        self.conf_sum = 0.0;
+        self.conf_count = 0;
+        self.emitted = 0;
+    }
+
     /// 分析一帧：加窗 FFT、频谱入队、更新噪声估计（旧 ns_update，L126-170）。
     fn analyze(&mut self) {
         for i in 0..NS_FRAME {
@@ -304,6 +325,36 @@ mod tests {
         assert_eq!(ns.push(&zeros, &mut out[..512]), 64);
         // 静音不累积置信度
         assert_eq!(ns.speech_confidence(), 0.0);
+    }
+
+    #[test]
+    fn reset_restores_fresh_stream_behavior() {
+        // 运行中切换 denoise 的重置合同：重置后与全新实例逐位一致，
+        // 置信度累积清零，重新攒初始化帧（首段不发射）。
+        let mut input = [0f32; 9600];
+        for (i, v) in input.iter_mut().enumerate() {
+            let t = i as f32 / 48000.0;
+            *v = 0.3 * (2.0 * core::f32::consts::PI * 300.0 * t).sin()
+                + 0.02 * ((i as i32).wrapping_mul(1103515245) as f32 / 1e7);
+        }
+        let mut ns = NoiseSuppressor::new();
+        let mut scratch = [0f32; 4096];
+        // 先跑一段脏化状态（噪声估计、队列、增益、置信度累积）。
+        ns.push(&input[..4800], &mut scratch);
+        ns.reset();
+        assert_eq!(ns.speech_confidence(), 0.0, "重置必须清零置信度累积");
+        assert_eq!(ns.push(&input[..512], &mut scratch), 0, "重置后重新攒初始化帧");
+
+        // 上一步已推进 512 样本：再重置一次，与全新实例从同一起点逐位对比。
+        ns.reset();
+        let mut fresh = NoiseSuppressor::new();
+        let mut a = [0f32; 9600];
+        let mut b = [0f32; 9600];
+        let wa = ns.push(&input, &mut a);
+        let wb = fresh.push(&input, &mut b);
+        assert_eq!(wa, wb, "重置后发射总数必须与全新实例一致");
+        assert_eq!(a[..wa], b[..wb], "重置后输出必须与全新实例逐位一致");
+        assert_eq!(ns.speech_confidence(), fresh.speech_confidence());
     }
 
     #[test]

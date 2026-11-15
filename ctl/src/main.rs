@@ -194,6 +194,8 @@ enum ConfigAction {
         /// 配置键；缺省读整份
         key: Option<String>,
     },
+    /// 把运行时状态覆盖批量写回基线并清空状态文件（无需重启）
+    Save,
 }
 
 struct CliError {
@@ -249,6 +251,7 @@ fn run(cli: Cli) -> Result<(), CliError> {
         Action::Config { action } => match action {
             ConfigAction::Set { key, value } => config_set(&config, &key, &value, cli.json),
             ConfigAction::Get { key } => config_get(&config, key.as_deref(), cli.json),
+            ConfigAction::Save => config_save(&config, cli.json),
         },
     }
 }
@@ -702,6 +705,20 @@ fn config_get(config: &Config, key: Option<&str>, json_output: bool) -> Result<(
     Ok(())
 }
 
+fn config_save(config: &Config, json_output: bool) -> Result<(), CliError> {
+    let data = call(config, ctl::DAEMON_CONFIG_SAVE, b"{}")?;
+    if json_output {
+        println!("{data}");
+        return Ok(());
+    }
+    let saved = data
+        .get("saved")
+        .and_then(Value::as_u64)
+        .ok_or_else(|| CliError::new(EXIT_ERROR, "invalid config save payload: missing saved"))?;
+    println!("config saved: {saved} keys");
+    Ok(())
+}
+
 fn body_json<T: serde::Serialize>(value: &T) -> Result<Vec<u8>, CliError> {
     serde_json::to_vec(value).map_err(|err| CliError::new(EXIT_ERROR, err.to_string()))
 }
@@ -1078,6 +1095,12 @@ fn print_status(status: &Status) {
     } else {
         println!("degraded {}", status.degraded.join("; "));
     }
+    if !status.pending_restart.is_empty() {
+        println!(
+            "pending  {}（待重启：mozart-ctl restart 生效）",
+            status.pending_restart.join(" ")
+        );
+    }
 }
 
 fn route_name(route: Route) -> &'static str {
@@ -1320,6 +1343,10 @@ mod tests {
         assert!(matches!(
             cli.command,
             Action::Config { action: ConfigAction::Get { key: None } }
+        ));
+        assert!(matches!(
+            parse(&["config", "save"]).unwrap().command,
+            Action::Config { action: ConfigAction::Save }
         ));
         assert!(parse(&["config"]).is_err());
         assert!(parse(&["config", "set", "onlykey"]).is_err());

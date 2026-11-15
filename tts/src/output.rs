@@ -1,6 +1,7 @@
-//! 播报音频输出：48 kHz PCM 打包为 OutputFrame（960 samples / 20 ms），按
-//! FRAME_MS 节拍经 tts-out.sock 逐帧发送（SPEC-05 合成一段播一段）。v1 不走
-//! 变声：pre 绑定该 socket 收帧播放，TTS 连接发送（SPEC-05 播报投递）。惰性
+//! 播报音频输出（SPEC-05 合成一段播一段）：synth 线程经生成回调把每段 PCM 重采样
+//! 到 48 kHz 后送入有界通道，本模块的输出线程收一段即打包为 OutputFrame
+//! （960 samples / 20 ms）按 FRAME_MS 节拍经 tts-out.sock 逐帧发送，不等整句合成完。
+//! v1 不走变声：pre 绑定该 socket 收帧播放，TTS 连接发送（SPEC-05 播报投递）。惰性
 //! 建链：pre 未绑定时发送丢弃计数，不阻塞合成路径，pre 就绪后下一帧自动接通
 //! （与 pre 侧 AsrSender 同一纪律）。
 
@@ -8,34 +9,40 @@ use crate::state::{Abort, Shared};
 use mozart_core::dgram::FrameSocket;
 use mozart_core::{FrameMeta, OutputFrame, FRAME_MS, OUTPUT_SAMPLES};
 use std::path::PathBuf;
+use std::sync::mpsc::Receiver;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 /// 输出 socket 缓冲帧数（SPEC-02 数据面上限 4–8 帧取上界）。
 const OUTPUT_BUFFER_FRAMES: usize = 8;
 
-/// 把整句 48 kHz PCM 打包为契约帧：每帧 960 samples，末帧不足补零。
+/// 把一段 PCM 打包为单帧：不足 960 samples 补零。
 /// meta：pts_ns 与 frame_idx 按句内 20 ms 步进，vad_flag 恒 1（合成语音），
 /// energy_db/conf/segment_id 置 0（播报帧不做能量/置信度标注）。
+fn make_frame(chunk: &[f32], idx: u32) -> OutputFrame {
+    // packed 字段不能取引用：先在本地数组填充，再按值赋入。
+    let mut pcm = [0f32; OUTPUT_SAMPLES];
+    pcm[..chunk.len()].copy_from_slice(chunk);
+    OutputFrame {
+        meta: FrameMeta {
+            pts_ns: idx as u64 * FRAME_MS as u64 * 1_000_000,
+            frame_idx: idx,
+            vad_flag: 1,
+            energy_db: 0,
+            conf: 0,
+            segment_id: 0,
+        },
+        pcm,
+    }
+}
+
+/// 把整句 48 kHz PCM 打包为契约帧：每帧 960 samples，末帧不足补零。
+/// 测试夹具：生产路径经 write_stream 逐段打包。
+#[cfg(test)]
 pub fn pack_utterance(pcm: &[f32]) -> Vec<OutputFrame> {
     pcm.chunks(OUTPUT_SAMPLES)
         .enumerate()
-        .map(|(idx, chunk)| {
-            // packed 字段不能取引用：先在本地数组填充，再按值赋入。
-            let mut pcm = [0f32; OUTPUT_SAMPLES];
-            pcm[..chunk.len()].copy_from_slice(chunk);
-            OutputFrame {
-                meta: FrameMeta {
-                    pts_ns: idx as u64 * FRAME_MS as u64 * 1_000_000,
-                    frame_idx: idx as u32,
-                    vad_flag: 1,
-                    energy_db: 0,
-                    conf: 0,
-                    segment_id: 0,
-                },
-                pcm,
-            }
-        })
+        .map(|(idx, chunk)| make_frame(chunk, idx as u32))
         .collect()
 }
 
@@ -62,26 +69,14 @@ impl FrameWriter {
         }
     }
 
-    /// 发送整句帧：按 FRAME_MS 节拍逐帧投递（合成一段播一段），突发会超出
-    /// 接收方 8 帧缓冲造成丢帧。中止判定置真（SIGTERM 或 TTS_JOB_STOP）即放弃
-    /// 剩余帧。每帧计入 frames_out（含丢弃）；丢弃累计绝对值发布到 output_dropped，
-    /// 意外错误记录原因后继续，不打断合成路径。
+    /// 发送整句帧：把整句作为单段经流式路径投递（测试夹具）。
+    /// 生产路径由 synth 线程逐段喂入 write_stream，见该函数。
+    #[cfg(test)]
     pub fn write_utterance(&mut self, pcm: &[f32], abort: &Abort<'_>) {
-        let frame_duration = Duration::from_millis(FRAME_MS as u64);
-        let mut next = Instant::now();
-        for (idx, frame) in pack_utterance(pcm).iter().enumerate() {
-            if abort.aborted() {
-                break;
-            }
-            if idx > 0 {
-                // 单调时钟节拍：发送耗时计入周期；落后时从当前时刻重新起算，
-                // 不追赶补发。合成线程非实时，睡眠让出 CPU。
-                next = next.max(Instant::now()) + frame_duration;
-                std::thread::sleep(next.saturating_duration_since(Instant::now()));
-            }
-            self.send_frame(frame);
-            self.shared.add_frames_out(1);
-        }
+        let (tx, rx) = std::sync::mpsc::sync_channel(1);
+        let _ = tx.send(pcm.to_vec());
+        drop(tx);
+        write_stream(rx, self, abort);
     }
 
     /// 恒定发送一帧。对端不在、过载、通道坏：丢弃计数继续，不阻塞不重试。
@@ -115,6 +110,51 @@ impl FrameWriter {
                 }
             }
         }
+    }
+}
+
+/// 按 FRAME_MS 节拍发送一帧并计数。首帧立即发送；其后单调时钟节拍：发送耗时
+/// 计入周期，落后时从当前时刻重新起算，不追赶补发。输出线程非实时，睡眠让出 CPU。
+fn emit_frame(writer: &mut FrameWriter, frame: &OutputFrame, next: &mut Instant, started: &mut bool) {
+    if *started {
+        let frame_duration = Duration::from_millis(FRAME_MS as u64);
+        *next = (*next).max(Instant::now()) + frame_duration;
+        std::thread::sleep(next.saturating_duration_since(Instant::now()));
+    }
+    *started = true;
+    writer.send_frame(frame);
+    writer.shared.add_frames_out(1);
+}
+
+/// 流式输出（SPEC-05 合成一段播一段）：从通道收 synth 线程逐段交付的 48 kHz PCM，
+/// 收一段即按 FRAME_MS 节拍发帧，不等整句。帧序号与 pts_ns 跨段连续累计，段边界
+/// 不足一帧的样本缓存到下一段拼接，句末不足一帧补零。中止判定置真（SIGTERM 或
+/// TTS_JOB_STOP）即放弃剩余帧并返回（丢弃接收端，反压使 synth 侧 sink 发送失败、
+/// 引擎中止）。通道关闭（synth 完成或中止）后退出。每帧计入 frames_out（含丢弃）。
+pub fn write_stream(rx: Receiver<Vec<f32>>, writer: &mut FrameWriter, abort: &Abort<'_>) {
+    let mut next = Instant::now();
+    let mut started = false;
+    let mut frame_idx: u32 = 0;
+    let mut pending: Vec<f32> = Vec::new();
+    while let Ok(segment) = rx.recv() {
+        if abort.aborted() {
+            return;
+        }
+        pending.extend_from_slice(&segment);
+        while pending.len() >= OUTPUT_SAMPLES {
+            if abort.aborted() {
+                return;
+            }
+            let frame = make_frame(&pending[..OUTPUT_SAMPLES], frame_idx);
+            pending.drain(..OUTPUT_SAMPLES);
+            emit_frame(writer, &frame, &mut next, &mut started);
+            frame_idx += 1;
+        }
+    }
+    // 句末不足一帧补零（与 pack_utterance 一致）。
+    if !pending.is_empty() && !abort.aborted() {
+        let frame = make_frame(&pending, frame_idx);
+        emit_frame(writer, &frame, &mut next, &mut started);
     }
 }
 
@@ -316,6 +356,51 @@ mod tests {
         let frames_out = shared.status().frames_out;
         assert!(frames_out >= 2, "已送达的 2 帧必须计入：{frames_out}");
         assert!(frames_out < 16, "停止后剩余帧必须放弃：{frames_out}");
+        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_dir(&dir);
+    }
+
+    /// 跨段拼接：段长不对齐帧边界时缓存拼接，帧序号连续，句末不足一帧补零。
+    #[test]
+    fn stream_buffers_partial_frames_across_segments() {
+        let dir = socket_dir("streampartial");
+        let path = dir.join("tts-out.sock");
+        let rx = FrameSocket::<OutputFrame>::bind(&path, OUTPUT_BUFFER_FRAMES).unwrap();
+        let shared = Arc::new(Shared::new());
+        let mut writer = FrameWriter::new(path.clone(), shared.clone());
+        let stop = no_stop();
+        let abort = shared.abort(&stop);
+
+        // 两段各 1000 样本（共 2000）→ 2 整帧（1920）+ 80 样本末帧补零。
+        let seg1: Vec<f32> = (0..1000).map(|i| i as f32).collect();
+        let seg2: Vec<f32> = (1000..2000).map(|i| i as f32).collect();
+        let (tx, seg_rx) = std::sync::mpsc::sync_channel(2);
+        tx.send(seg1).unwrap();
+        tx.send(seg2).unwrap();
+        drop(tx);
+        write_stream(seg_rx, &mut writer, &abort);
+
+        let f0 = rx.recv(Some(Duration::from_secs(1))).unwrap();
+        let f1 = rx.recv(Some(Duration::from_secs(1))).unwrap();
+        let f2 = rx.recv(Some(Duration::from_secs(1))).unwrap();
+        // packed 字段经按值拷贝/解构读取，不能取引用。
+        let FrameMeta { frame_idx: idx0, .. } = f0.meta;
+        let FrameMeta { frame_idx: idx1, .. } = f1.meta;
+        let FrameMeta { frame_idx: idx2, .. } = f2.meta;
+        let p1 = f1.pcm;
+        let p2 = f2.pcm;
+        assert_eq!(idx0, 0);
+        assert_eq!(idx1, 1);
+        assert_eq!(idx2, 2);
+        // 帧 1 跨段边界：全局 960..1000 来自 seg1，1000..1920 来自 seg2。
+        assert_eq!(p1[0], 960.0);
+        assert_eq!(p1[40], 1000.0, "seg2 首样本须拼接到帧 1");
+        assert_eq!(p1[959], 1919.0);
+        // 末帧 80 样本 + 补零。
+        assert_eq!(p2[0], 1920.0);
+        assert_eq!(p2[79], 1999.0);
+        assert!(p2[80..].iter().all(|&v| v == 0.0));
+        assert_eq!(shared.status().frames_out, 3);
         let _ = std::fs::remove_file(&path);
         let _ = std::fs::remove_dir(&dir);
     }

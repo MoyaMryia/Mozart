@@ -1,8 +1,10 @@
 #!/bin/bash
 # Jetson 端到端测量运行器：配合 tools/analyze_measure.py 使用（Task 7 实测）。
-# 前置与 tools/jetson-smoke.sh 相同：仓库已 rsync 到设备并完成构建，
-#   mozart-daemon/mozart-pre/mozart-ctl 在 $BIN_DIR（cargo release），
-#   mozart-rvc 已复制到 $BIN_DIR。
+# 正常由 tools/jetson-e2e.sh --measure 调用，也可在设备上直接运行。
+# 前置：$BIN_DIR 内有 release 构建的 mozart-daemon/pre/ctl 与 rvc。
+#   tools/deploy-jetson.sh 只产 debug；正式测量前需另建 release：
+#   cargo build --release --workspace --bins --examples，
+#   并把 build/jetson-release/rvc/mozart-rvc 复制到 target/release。
 # 场景（evidence 留在 $M_ROOT/<scenario>/，供 analyze_measure.py 汇总）：
 #   floor <writer_period> <reader_period> <sub>  回录地板校准：aplay→loopback→arecord，
 #       无 pre。参数为 aplay/arecord 周期帧数与 SUBDEV 号。同参数跑两次看抖动。
@@ -14,13 +16,13 @@
 #       heal pre 在 pre 重启后重启测试信号源：snd-aloop 的采集端随 pre 死亡断缆，
 #       旧信号缆位失同步（重开的 pre 只能采到静默），受控信号下才能验证恢复链。
 # 环境变量：
-#   MODELS_DIR  模型资产目录（默认 $HOME/mozart-assets/models/rvc/qiqi-zh-run）
+#   MODELS_DIR  模型资产目录（默认 $HOME/mozart-assets/models/rvc/qiqi-zh）
 #   BIN_DIR     部署二进制目录（默认 $HOME/Mozart/target/release）
 #   M_ROOT      产物根目录（默认 $HOME/mozart-t7）
 #   CAP_SUB/PB_SUB  loopback 子设备号（默认 2/3，避开被占用的 0/1）
 set -u
 
-MODELS_DIR=${MODELS_DIR:-$HOME/mozart-assets/models/rvc/qiqi-zh-run}
+MODELS_DIR=${MODELS_DIR:-$HOME/mozart-assets/models/rvc/qiqi-zh}
 BIN_DIR=${BIN_DIR:-$HOME/Mozart/target/release}
 M_ROOT=${M_ROOT:-$HOME/mozart-t7}
 CAP_SUB=${CAP_SUB:-2}

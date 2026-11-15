@@ -54,6 +54,13 @@ node_modules/
 # 小型对拍夹具可以入库，必须显式列出。
 !tests/fixtures/**/*.onnx
 !tests/fixtures/**/*.bin
+# 帧字节共享夹具（core/examples/gen_frame_fixture.rs 生成，C++/Rust 读同一组字节对拍）：
+# input.bin 输入线包（1300 B：魔数 + 金标 meta + 320 点递增 f32）
+!tests/fixtures/frame/input.bin
+# output.bin 输出线包（3860 B：魔数 + 金标 meta + 960 点递增 f32）
+!tests/fixtures/frame/output.bin
+# ctl_hello.bin 控制信封（DAEMON_HELLO 请求：16 B 头 + 体 {}）
+!tests/fixtures/frame/ctl_hello.bin
 
 # ---- 音频、视频与交付物 ----
 *.wav
@@ -90,6 +97,13 @@ node_modules/
 !tests/fixtures/dsp/dec.f32
 # meta.txt 旧 C 打包链每帧 meta 参考（frame_idx/vad/energy/conf/segment 对拍验收）
 !tests/fixtures/dsp/meta.txt
+# 翻译预处理（SPEC-05 同音纠错）：
+# homophones.json 同音纠错对拍夹具，旧 tools/tests/test_homophones.py 用例经旧
+# homophones.correct 实际运行提取（输入→期望输出），bridge 逐条断言一致。
+!tests/fixtures/preprocess/homophones.json
+# word_freq.txt 同音索引词频表，jieba 0.42.1 的 2–4 字纯中文、词频≥10 子集，
+# 离线生成、编译期 include_str! 内嵌；仅 freq≥10 的词触发真词保护，故无需全量词典。
+!bridge/data/word_freq.txt
 
 # ---- 日志与本地数据 ----
 *.log

@@ -10,6 +10,8 @@
 //!
 //! 生成走 SherpaOnnxOfflineTtsGenerateWithConfig：旧 SherpaOnnxOfflineTtsGenerate
 //! 只带 sid/speed，无法携带 reference_audio 与 num_steps（上游已弃用）。
+//! 流式：该 API 的进度回调每合成一段 PCM 调一次（samples 仅回调期间有效），
+//! 据此边合成边经 sink 交付，不必等整句返回（SPEC-05 合成一段播一段）。
 
 use crate::state::Abort;
 use std::path::Path;
@@ -18,16 +20,18 @@ use std::path::Path;
 pub trait Synthesizer: Send {
     /// 引擎原生输出采样率（Hz）。
     fn sample_rate(&self) -> u32;
-    /// 合成整句文本，返回原生采样率单声道 f32 PCM（[-1, 1]）。
-    /// reference 为空表示无参考音频。abort 为中止判定：进程停止或 TTS_JOB_STOP
-    /// 推进任务代际时置真，真实 FFI 经生成进度回调据此中止在途合成。
+    /// 流式合成整句文本：每产出一段原生采样率单声道 f32 PCM（[-1, 1]）调一次
+    /// sink。段仅在调用期间有效，sink 需自行拷贝。sink 返回 false 或 abort 置真
+    /// （进程停止或 TTS_JOB_STOP 推进任务代际）时中止生成。reference 为空表示无
+    /// 参考音频。正常完成（含中止）返回 Ok(())，引擎错误返回 Err。
     fn synthesize(
         &self,
         text: &str,
         reference: &[f32],
         ref_rate: u32,
         abort: &Abort<'_>,
-    ) -> Result<Vec<f32>, String>;
+        sink: &mut dyn FnMut(&[f32]) -> bool,
+    ) -> Result<(), String>;
 }
 
 /// 加载 PocketTTS 引擎。model_dir 为空或加载失败返回 Err（进程启动路径据此退出）。
@@ -265,20 +269,35 @@ mod real {
         Ok(Box::new(PocketTts { handle }))
     }
 
-    /// 生成进度回调：中止判定置真（进程停止或 TTS_JOB_STOP）时返回 0，
-    /// 让引擎中止在途合成。
-    extern "C" fn abort_on_stop(
-        _samples: *const f32,
-        _n: c_int,
+    /// 流式回调上下文：abort 判定 + 下游 sink。synthesize 栈上对象，生成调用期间有效。
+    struct StreamCtx<'a> {
+        abort: &'a Abort<'a>,
+        sink: &'a mut dyn FnMut(&[f32]) -> bool,
+    }
+
+    /// 生成进度回调：引擎每合成一段 PCM 调一次。abort 置真（进程停止或
+    /// TTS_JOB_STOP）返回 0 中止在途合成；否则把本段交给 sink，sink 返回 false
+    /// （下游错误或通道关闭）同样返回 0 中止。samples 仅回调期间有效，sink 内拷贝。
+    extern "C" fn stream_callback(
+        samples: *const f32,
+        n: c_int,
         _progress: f32,
         arg: *mut c_void,
     ) -> c_int {
-        // SAFETY: arg 指向 synthesize 栈上的 Abort，生成调用期间始终有效。
-        let abort = unsafe { &*(arg as *const Abort<'_>) };
-        if abort.aborted() {
-            0
-        } else {
+        // SAFETY: arg 指向 synthesize 栈上的 StreamCtx，生成调用期间始终有效。
+        let ctx = unsafe { &mut *(arg as *mut StreamCtx<'_>) };
+        if ctx.abort.aborted() {
+            return 0;
+        }
+        if n <= 0 {
+            return 1;
+        }
+        // SAFETY: samples 指向引擎本段 PCM，长度 n，仅回调期间有效。
+        let segment = unsafe { std::slice::from_raw_parts(samples, n as usize) };
+        if (ctx.sink)(segment) {
             1
+        } else {
+            0
         }
     }
 
@@ -307,7 +326,8 @@ mod real {
             reference: &[f32],
             ref_rate: u32,
             abort: &Abort<'_>,
-        ) -> Result<Vec<f32>, String> {
+            sink: &mut dyn FnMut(&[f32]) -> bool,
+        ) -> Result<(), String> {
             let text = CString::new(text).map_err(|_| "文本含 NUL 字节".to_string())?;
             let extra = CString::new(EXTRA).unwrap();
             // SAFETY: 全零位模式合法；随后逐字段赋值。
@@ -321,28 +341,24 @@ mod real {
                 config.reference_audio_len = reference.len() as i32;
                 config.reference_sample_rate = ref_rate as i32;
             }
+            let mut ctx = StreamCtx { abort, sink };
             // SAFETY: handle 有效；text/config 指向的缓冲在本调用期间存活；
-            // 回调 arg 指向本栈帧的 abort（生成调用期间存活）；结果对象用后释放。
+            // 回调 arg 指向本栈帧的 ctx（生成调用期间存活）；PCM 段经回调即时交付，
+            // 返回的整句结果对象不再使用，用后释放。
             unsafe {
                 let audio = sys::SherpaOnnxOfflineTtsGenerateWithConfig(
                     self.handle,
                     text.as_ptr(),
                     &config,
-                    Some(abort_on_stop),
-                    (abort as *const Abort<'_>).cast::<c_void>().cast_mut(),
+                    Some(stream_callback),
+                    (&mut ctx as *mut StreamCtx<'_>).cast::<c_void>(),
                 );
                 if audio.is_null() {
                     return Err("PocketTTS 生成失败".to_string());
                 }
-                let n = (*audio).n;
-                if n <= 0 {
-                    sys::SherpaOnnxDestroyOfflineTtsGeneratedAudio(audio);
-                    return Err("PocketTTS 返回空音频".to_string());
-                }
-                let samples = std::slice::from_raw_parts((*audio).samples, n as usize).to_vec();
                 sys::SherpaOnnxDestroyOfflineTtsGeneratedAudio(audio);
-                Ok(samples)
             }
+            Ok(())
         }
     }
 }
@@ -383,14 +399,20 @@ mod stub {
             _text: &str,
             _reference: &[f32],
             _ref_rate: u32,
-            _abort: &Abort<'_>,
-        ) -> Result<Vec<f32>, String> {
-            Ok((0..STUB_SAMPLES)
+            abort: &Abort<'_>,
+            sink: &mut dyn FnMut(&[f32]) -> bool,
+        ) -> Result<(), String> {
+            if abort.aborted() {
+                return Ok(());
+            }
+            let segment: Vec<f32> = (0..STUB_SAMPLES)
                 .map(|i| {
                     let t = i as f64 / TTS_NATIVE_SAMPLE_RATE as f64;
                     STUB_AMPLITUDE * (2.0 * std::f64::consts::PI * STUB_FREQ_HZ * t).sin() as f32
                 })
-                .collect())
+                .collect();
+            sink(&segment);
+            Ok(())
         }
     }
 }

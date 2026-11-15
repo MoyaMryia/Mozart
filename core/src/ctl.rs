@@ -58,6 +58,8 @@ pub const DAEMON_DEVICE_LIST: u16 = 0x0119;
 pub const DAEMON_CONFIG_SET: u16 = 0x011A;
 /// 体：schema::ConfigGetRequest {"key"?}；data {"value"}（缺省 key 回整份基线）。
 pub const DAEMON_CONFIG_GET: u16 = 0x011B;
+/// 体：{}（空）；data {"saved":u64}。状态文件覆盖批量写回 TOML 基线后清空（SPEC-04）。
+pub const DAEMON_CONFIG_SAVE: u16 = 0x011C;
 
 pub const PRE_HELLO: u16 = 0x0201;
 pub const PRE_SET_ROUTE: u16 = 0x0202;
@@ -69,6 +71,10 @@ pub const PRE_SPEECH_STOP: u16 = 0x0205;
 /// （SPEC-03 复用 + 状态门控交接）。active=true：pre 暂停 rvc AI 发送并释放
 /// output_socket，应答前确认释放完成；active=false：恢复发送并重绑。asr 不受影响。
 pub const PRE_SET_FILE_MODE: u16 = 0x0206;
+/// 体：schema::DspSetRequest {"denoise","gate","agc","limiter"}（均 bool，四键必需）；
+/// 运行中切换 DSP 级（SPEC-02）。denoise 重新启用时重置 WOLA 流式状态，
+/// gate/agc/limiter 直接切换；应答 data 回显四个开关。
+pub const PRE_SET_DSP: u16 = 0x0207;
 
 pub const RVC_HELLO: u16 = 0x0301;
 pub const RVC_LOAD_MODEL: u16 = 0x0302;
@@ -624,8 +630,10 @@ mod tests {
         assert_eq!(DAEMON_DEVICE_LIST, 0x0119);
         assert_eq!(DAEMON_CONFIG_SET, 0x011A);
         assert_eq!(DAEMON_CONFIG_GET, 0x011B);
+        assert_eq!(DAEMON_CONFIG_SAVE, 0x011C);
         assert_eq!(RVC_LIST_MODELS, 0x0307);
         assert_eq!(PRE_SET_FILE_MODE, 0x0206);
+        assert_eq!(PRE_SET_DSP, 0x0207);
     }
 
     /// 全部命令号清单：唯一性与分段检查用，新增命令必须登记。
@@ -650,12 +658,14 @@ mod tests {
         ("DAEMON_DEVICE_LIST", DAEMON_DEVICE_LIST),
         ("DAEMON_CONFIG_SET", DAEMON_CONFIG_SET),
         ("DAEMON_CONFIG_GET", DAEMON_CONFIG_GET),
+        ("DAEMON_CONFIG_SAVE", DAEMON_CONFIG_SAVE),
         ("PRE_HELLO", PRE_HELLO),
         ("PRE_SET_ROUTE", PRE_SET_ROUTE),
         ("PRE_SET_MUTE", PRE_SET_MUTE),
         ("PRE_GET_STATUS", PRE_GET_STATUS),
         ("PRE_SPEECH_STOP", PRE_SPEECH_STOP),
         ("PRE_SET_FILE_MODE", PRE_SET_FILE_MODE),
+        ("PRE_SET_DSP", PRE_SET_DSP),
         ("RVC_HELLO", RVC_HELLO),
         ("RVC_LOAD_MODEL", RVC_LOAD_MODEL),
         ("RVC_START_STREAM", RVC_START_STREAM),

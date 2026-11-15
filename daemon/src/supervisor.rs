@@ -1,5 +1,6 @@
 //! 子进程监管：拉起、收集日志、崩溃后退避重启、单服务重启、退出时终止。
 
+use crate::runtime::SharedConfig;
 use crate::state::{lock_state, now_unix_ms, Role, State};
 use mozart_core::config::Config;
 use mozart_core::ctl::schema::ExitInfo;
@@ -43,7 +44,7 @@ impl RestartHandle {
 impl Supervisor {
     pub fn spawn(
         role: Role,
-        config: Arc<Config>,
+        config: SharedConfig,
         config_path: Option<PathBuf>,
         state: Arc<Mutex<State>>,
         running: Arc<AtomicBool>,
@@ -78,19 +79,22 @@ impl Supervisor {
 
 fn supervise(
     role: Role,
-    mut config: Arc<Config>,
+    shared: SharedConfig,
     config_path: Option<&Path>,
     state: &Mutex<State>,
     running: &AtomicBool,
     restart_rx: &mpsc::Receiver<Arc<Config>>,
 ) {
+    // spawn 配置是快照：只在显式重启时重读（重启类键不动运行进程）。
+    let mut config = shared.snapshot();
     let mut backoff = Duration::from_millis(config.daemon.restart_backoff_ms);
 
     while running.load(Ordering::Acquire) {
-        // 重启重读配置（SPEC-04）：spawn 参数每轮跟随当前配置。
-        let base = Duration::from_millis(config.daemon.restart_backoff_ms);
-        let max = Duration::from_millis(config.daemon.restart_backoff_max_ms);
-        let stable = Duration::from_millis(config.daemon.restart_stable_ms);
+        // 退避参数是运行时键（SPEC-04）：每轮读最新生效值，即时生效。
+        let tuning = shared.snapshot();
+        let base = Duration::from_millis(tuning.daemon.restart_backoff_ms);
+        let max = Duration::from_millis(tuning.daemon.restart_backoff_max_ms);
+        let stable = Duration::from_millis(tuning.daemon.restart_stable_ms);
         let bin = match role {
             Role::Pre => &config.process.pre_bin,
             Role::Rvc => &config.process.rvc_bin,
@@ -118,7 +122,7 @@ fn supervise(
                     Backoff::Stopped => break,
                     Backoff::Restart(new) => {
                         config = new;
-                        backoff = Duration::from_millis(config.daemon.restart_backoff_ms);
+                        backoff = base;
                     }
                     Backoff::Elapsed => backoff = next_backoff(backoff, max),
                 }
@@ -156,7 +160,7 @@ fn supervise(
         };
 
         if restart_now {
-            backoff = Duration::from_millis(config.daemon.restart_backoff_ms);
+            backoff = base;
             continue;
         }
         if let Some(exit) = exit {
@@ -169,7 +173,7 @@ fn supervise(
             Backoff::Stopped => break,
             Backoff::Restart(new) => {
                 config = new;
-                backoff = Duration::from_millis(config.daemon.restart_backoff_ms);
+                backoff = base;
             }
             Backoff::Elapsed => backoff = next_backoff(backoff, max),
         }

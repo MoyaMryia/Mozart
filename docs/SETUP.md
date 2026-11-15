@@ -1,7 +1,8 @@
-# Jetson 开发环境
+# Jetson 开发环境与部署
 
-最后更新：2026-11-15。本文描述目标设备上已有的资产、模型、库与工具，供快速上手。
-连接方式不在本仓库记录。资产与工具链的设计规范见 [SPEC/SPEC-10-env.md](SPEC/SPEC-10-env.md)。
+最后更新：2026-11-15。本文是 Jetson 目录、资产、部署与测试的唯一权威。
+连接方式不在仓库记录；部署时用参数或 `MOZART_JETSON` 提供 SSH 目标。
+资产分层与工具链的设计规范见 [SPEC/SPEC-10-env.md](SPEC/SPEC-10-env.md)，TOML 字段见 [config.md](config.md)。
 
 ## 平台
 
@@ -9,7 +10,123 @@
 - 推理后端：TensorRT 10.16.2 与 ONNX Runtime。引擎绑设备，须在设备上编译。
 - 音频：ALSA。无物理声卡时用 snd-aloop。
 
-## 资产两层布局
+## 目录规范
+
+设备只使用下列活动目录。新增目录先写入本文。
+
+```text
+~/Mozart/                     # 部署源码与设备构建；deploy 管理，不手改
+├── target/debug/             # Rust 构建（含 examples/rvc_stub）
+├── build/jetson-release/     # C++/CTest 产物
+└── tools/                    # 板端测试脚本（随源码同步）
+
+~/.mozart-prev/               # 部署前源码快照（回滚锚点）
+
+~/mozart-runtime/             # 运行时根；同一时间只跑这一份
+├── mozart.toml               # 运行配置（唯一手改入口）
+├── bin/                      # deploy 安装：7 个程序 + examples/rvc_stub
+├── bin.prev/                 # 上一次成功部署的二进制（deploy 管理）
+├── run/                      # socket、daemon.lock、logs/
+├── state/                    # 持久状态（字幕、文件任务缓存）
+├── in/                       # 手工测试输入
+└── out/                      # 手工测试输出
+
+~/mozart-assets/              # 成品资产（只读）
+├── lib/                      # sherpa 等共享库
+├── llama/                    # llama-server 与 .so
+└── models/
+    ├── rvc/<id>/
+    ├── asr/<id>/
+    ├── asr-review/<id>/
+    ├── tts/<id>/
+    └── llm/<file>.gguf
+
+~/rvc-pth/                    # 原料权重（pth，不参与推理）
+~/mozart-samples/             # 测试音频样本
+~/mozart-archive/             # 归档：源码树、原始权重、基准引擎
+└── legacy/                   # 历史实验目录，仅作追溯
+```
+
+规则：
+
+- `~/Mozart` 由部署脚本管理，不在设备上手改源码。
+- `~/mozart-runtime` 是唯一运行实例；配置只改 `mozart.toml`。
+- `~/mozart-assets` 只读；测试只写 `/tmp/mozart-*` 与 `~/mozart-runtime/{run,state,out}`。
+- 历史实验目录只放 `~/mozart-archive/legacy/`；旧报告中的路径视为历史记录。
+
+## 工作流
+
+本机执行，三条命令职责分开：
+
+```bash
+# 本机全量即时测试
+tools/ci-local.sh all
+
+# 部署：同步 → 构建 → 安装 → 重启；不跑测试
+MOZART_JETSON=<SSH目标> tools/deploy-jetson.sh
+
+# 部署后测试：设备端单测 + 功能测试，按套件可选
+MOZART_JETSON=<SSH目标> tools/jetson-e2e.sh
+```
+
+提交前运行 `tools/ci-local.sh --staged`；pre-commit hook 调用同一脚本。
+
+### 本机检查阶段
+
+`tools/ci-local.sh` 按阶段拆分，也可单独运行：
+
+| 阶段 | 内容 |
+| --- | --- |
+| `repo` | 仓库卫生：忽略规则一致、单文件不超过 5 MiB |
+| `lint` | 文档行尾空白、报告“适用范围”一节 |
+| `native` | `host-debug` 预设构建 + CTest |
+| `rust` | `cargo check` + `cargo test`（全 workspace） |
+| `web` | 前端测试与构建；`web/` 未建时跳过 |
+
+### 部署行为
+
+`tools/deploy-jetson.sh` 按以下顺序执行，任一步失败自动恢复：
+
+1. 快照 `~/Mozart` 源码到 `~/.mozart-prev`。
+2. rsync 本机仓库到 `~/Mozart`，排除 `target/`、`build/`、`.git/`。
+3. 前拨源码 mtime 并删除 workspace 成员的 cargo 指纹，强制全量重编。
+4. 构建 Rust 全部二进制与示例；构建 `jetson-release` C++ 产物；rvc 对齐到 `target/debug`。
+5. 停止运行时并确认无残留进程。
+6. 备份 `~/mozart-runtime/bin` 到 `bin.prev`；安装 7 个程序与 `examples/rvc_stub`。
+7. 用 `~/mozart-runtime/mozart.toml` 重启，等待 `pre` 与 rvc 健康。
+8. 写 `~/mozart-runtime/deploy.json`。
+
+失败恢复分两段：
+
+- 构建失败：恢复源码快照，清理 `target/debug` 部署产物，不打断正在运行的运行时。
+- 安装或重启失败：从 `bin.prev` 恢复上一代二进制，重启旧栈。
+
+`deploy.json` 记录提交号、是否有未提交改动、时间、构建预设和安装清单。
+
+### 部署后测试
+
+`tools/jetson-e2e.sh` 支持套件选择；不指定时默认 unit + smoke + file + language。
+
+| 套件 | 脚本 | 内容 |
+| --- | --- | --- |
+| `--unit` | `tools/jetson-unit-test.sh` | 设备端 `cargo test --workspace` + `ctest` |
+| `--smoke` | `tools/jetson-smoke.sh` | daemon + pre + rvc 三进程冒烟 |
+| `--file` | `tools/jetson-file-test.sh` | 文件转换、取消、队列与入口校验 |
+| `--language` | `tools/jetson-language-test.sh` | ASR → 翻译 → TTS 播报 |
+| `--measure` | `tools/jetson-measure.sh` | 延迟、淡变、长跑、自愈测量 |
+
+示例：
+
+```bash
+tools/jetson-e2e.sh <SSH目标> --unit
+tools/jetson-e2e.sh <SSH目标> --smoke --file
+tools/jetson-e2e.sh <SSH目标> --measure latency
+```
+
+功能套件开始前停止运行时，结束后自动重启。measure 需要 release 构建，部署只产 debug。
+证据目录：`/tmp/mozart-smoke`、`/tmp/mozart-file-test`、`/tmp/mozart-language-test`；measure 证据在 `~/mozart-t7`。
+
+## 资产布局
 
 原料层放待处理内容，成品层放可直接推理的整套资产。
 
@@ -20,7 +137,7 @@
 
 成品目录名 = 模型 id = 文件前缀。加载器按 `<id>` 前缀找文件，同名 `.engine` 优先于 `.onnx`。
 
-## RVC 模型清单
+### RVC 模型清单
 
 成品层 `~/mozart-assets/models/rvc/`：
 
@@ -32,7 +149,7 @@
 
 原料层 `~/rvc-pth/` 另有 qiqi-ja、qiqi-ko、mike-tyson、liuying 权重，未导出编译。
 
-## 共享特征引擎
+### 共享特征引擎
 
 HuBERT/RMVPE 所有 v2 模型共用，存于 qiqi-zh 目录，其余模型符号链接引用：
 
@@ -43,28 +160,16 @@ HuBERT/RMVPE 所有 v2 模型共用，存于 qiqi-zh 目录，其余模型符号
 
 `[rvc]` 的 `hubert_path` 等显式指向 qiqi-zh 目录。换模型只换生成器，特征引擎不动。
 
-## 其他资产目录
+### 其他资产
 
 `~/mozart-assets/models/` 下另有 `asr/`、`asr-review/`、`tts/`、`llm/`，供语言链（识别、播报、翻译）使用。
 
-## runtime 配置
+## 运行配置
 
-`~/mozart-runtime/`：
+`~/mozart-runtime/mozart.toml` 是唯一手改入口。字段定义见 [config.md](config.md)。
+手动文件变声 harness：`~/mozart-runtime/run-remote.sh`，执行 `ctl up → file submit → file fetch`。
 
-- `mozart.toml`：运行配置。注册 qiqi-zh、qiqi-en、de-narrator 三模型，`models_dir` 指成品层父目录。
-- `bin/`：mozart-ctl、daemon、pre、rvc，同目录解析。
-- `in/`、`out/`：手动测试输入输出。
-- `run-remote.sh`：手动文件变声 harness（ctl up → submit → fetch）。
-- `run/`、`state/files/`：运行时 socket、日志与文件任务缓存。
-
-## 运行与测试
-
-两套，都在设备上：
-
-- 手动 harness：`~/mozart-runtime/run-remote.sh`，用 `mozart.toml`，跑固定输入。
-- 自动测试：仓库 `tools/jetson-{file-test,smoke,measure,language-test}.sh`，自生成配置到 `/tmp/mozart-*`，用 `~/Mozart/target/debug` 二进制。
-
-常用命令见 [GUIDE.md](GUIDE.md)。模型切换：`mozart-ctl file submit <wav> --model <id>`。
+当前运行配置只启用 pre、rvc 与文件转换。未配置 `[process.env]`、`[asr]`、`[tts]`、`[bridge]` 时，`status` 显示 asr/tts/llama 降级属预期；语言链由 e2e 的临时配置验证。
 
 ## 工具链
 
@@ -134,3 +239,4 @@ python3 tools/model/verify_golden.py --manifest golden_manifest.json
 - asr、tts、llm 资产内容未逐项核对。
 - de-narrator 离线 engine、qiqi-en 实时资产未补齐。
 - 工具链脚本已迁入并通过语法检查；功能运行需 PyTorch 与 RVC 源码树，未在本文档环境实跑。
+- 目录规范与部署、测试流程于 2026-11-15 调整；历史目录归集后旧报告中的路径不再对应设备现状。

@@ -7,6 +7,7 @@ use mozart_core::ctl;
 use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 
 /// 入口扩展名白名单（SPEC-04 文件转换入口），唯一定义处。
 const SOURCE_EXTENSIONS: [&str; 6] = ["wav", "mp3", "m4a", "aac", "flac", "ogg"];
@@ -47,8 +48,9 @@ impl StorageError {
 
 pub struct Storage {
     dir: PathBuf,
-    max_upload_bytes: u64,
-    storage_limit_bytes: u64,
+    /// 运行时键（SPEC-04）：config set 后经 set_limits 即时更新。
+    max_upload_bytes: AtomicU64,
+    storage_limit_bytes: AtomicU64,
 }
 
 impl Storage {
@@ -57,13 +59,20 @@ impl Storage {
         fs::create_dir_all(&dir)?;
         Ok(Self {
             dir,
-            max_upload_bytes: config.file.max_upload_bytes,
-            storage_limit_bytes: config.file.storage_limit_bytes,
+            max_upload_bytes: AtomicU64::new(config.file.max_upload_bytes),
+            storage_limit_bytes: AtomicU64::new(config.file.storage_limit_bytes),
         })
     }
 
     pub fn dir(&self) -> &Path {
         &self.dir
+    }
+
+    /// 运行时更新大小阈值（file.max_upload_bytes / file.storage_limit_bytes）。
+    pub fn set_limits(&self, max_upload_bytes: u64, storage_limit_bytes: u64) {
+        self.max_upload_bytes.store(max_upload_bytes, Ordering::Relaxed);
+        self.storage_limit_bytes
+            .store(storage_limit_bytes, Ordering::Relaxed);
     }
 
     /// 入口校验一次：扩展名白名单、大小预检，然后复制到 `<job_id>.input<ext>`。
@@ -83,10 +92,11 @@ impl Storage {
                 "not a regular file",
             )));
         }
-        if meta.len() > self.max_upload_bytes {
+        let max_upload_bytes = self.max_upload_bytes.load(Ordering::Relaxed);
+        if meta.len() > max_upload_bytes {
             return Err(StorageError::TooLarge {
                 size: meta.len(),
-                limit: self.max_upload_bytes,
+                limit: max_upload_bytes,
             });
         }
         let dest = self.dir.join(format!("{job_id}.input.{ext}"));
@@ -165,10 +175,11 @@ impl Storage {
             total += meta.len();
             entries.push((name, meta.len()));
         }
-        if total <= self.storage_limit_bytes {
+        let storage_limit_bytes = self.storage_limit_bytes.load(Ordering::Relaxed);
+        if total <= storage_limit_bytes {
             return Ok(());
         }
-        let target = self.storage_limit_bytes * EVICT_TARGET_PERCENT / 100;
+        let target = storage_limit_bytes * EVICT_TARGET_PERCENT / 100;
         entries.sort();
         for (name, size) in entries {
             if total <= target {
@@ -196,8 +207,8 @@ mod tests {
     fn storage(dir: &Path, limit: u64) -> Storage {
         Storage {
             dir: dir.to_path_buf(),
-            max_upload_bytes: 1024,
-            storage_limit_bytes: limit,
+            max_upload_bytes: AtomicU64::new(1024),
+            storage_limit_bytes: AtomicU64::new(limit),
         }
     }
 

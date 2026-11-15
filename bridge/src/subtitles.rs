@@ -212,7 +212,11 @@ pub fn apply(
                 .unwrap_or(&event.text)
                 .trim()
                 .to_string();
-            let (zh, fixes) = preprocess::correct(&raw_text, corrections);
+            let (zh, fixes) = preprocess::correct_with_terms(
+                &raw_text,
+                &preprocess::builtin_correction_terms(),
+                corrections,
+            );
             let is_final = event.kind == EventKind::Final;
             let received_at = now_ms as f64 / 1000.0;
             let mut record = SubtitleRecord {
@@ -265,7 +269,11 @@ pub fn apply(
             if let Some(refined) = event.refined_text.as_deref() {
                 let trimmed = refined.trim();
                 if !trimmed.is_empty() {
-                    let (zh, fixes) = preprocess::correct(trimmed, corrections);
+                    let (zh, fixes) = preprocess::correct_with_terms(
+                        trimmed,
+                        &preprocess::builtin_correction_terms(),
+                        corrections,
+                    );
                     record.zh = zh;
                     if !fixes.is_empty() {
                         record.zh_raw = Some(trimmed.to_string());

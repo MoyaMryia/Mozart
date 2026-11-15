@@ -7,6 +7,7 @@
 // 5. 对端接收停摆时发送丢弃计数
 // 6. ReadFrame 阻塞可被 Close 解除
 // 7. 对端重启后自动重连，后续帧恢复送达
+// 8. 共享帧夹具对拍：读 tests/fixtures/frame/，与 Rust 侧比对同一组字节
 #include "transport/unix_dgram_stream.h"
 
 #include <atomic>
@@ -15,8 +16,10 @@
 #include <cstdio>
 #include <cstring>
 #include <filesystem>
+#include <fstream>
 #include <string>
 #include <thread>
+#include <vector>
 
 #include <sys/socket.h>
 #include <sys/un.h>
@@ -108,6 +111,23 @@ bool same_meta(const mozart_frame_meta_t& a, const mozart_frame_meta_t& b) {
     return a.pts_ns == b.pts_ns && a.frame_idx == b.frame_idx
         && a.vad_flag == b.vad_flag && a.energy_db == b.energy_db
         && a.conf == b.conf && a.segment_id == b.segment_id;
+}
+
+// 读共享夹具（tests/fixtures/frame/，gen_frame_fixture 生成；Rust 侧
+// core/tests/frame_fixture.rs 读同一组文件）。路径由 CMake 注入。
+std::vector<uint8_t> read_fixture(const char* name) {
+    const std::filesystem::path path =
+        std::filesystem::path(MOZART_FRAME_FIXTURE_DIR) / name;
+    std::ifstream file(path, std::ios::binary | std::ios::ate);
+    if (!file) {
+        std::fprintf(stderr, "cannot open fixture %s\n", path.c_str());
+        std::exit(1);
+    }
+    const std::streamoff size = file.tellg();
+    std::vector<uint8_t> bytes(static_cast<size_t>(size));
+    file.seekg(0);
+    file.read(reinterpret_cast<char*>(bytes.data()), size);
+    return bytes;
 }
 
 } // namespace
@@ -331,6 +351,54 @@ int main() {
               && got.meta.frame_idx == 5, "post-restart frame arrives");
         CHECK(stream.stats().send_dropped == 3,
               "first post-restart send still drops (window semantics)");
+    }
+
+    std::printf("test_shared_frame_fixture\n");
+    {
+        // 金标值与生成器 gen_frame_fixture.rs 及 Rust 对拍测试同值：
+        // 固定 meta + 递增 PCM（输入 i×0.5、输出 i×0.25）。
+        mozart_input_frame_t frame{};
+        frame.meta.pts_ns = 0x8877'6655'4433'2211ull;
+        frame.meta.frame_idx = 0xD4D3'D2D1u;
+        frame.meta.vad_flag = 1;
+        frame.meta.energy_db = 2;
+        frame.meta.conf = 3;
+        frame.meta.segment_id = 4;
+        for (int i = 0; i < MOZART_INPUT_SAMPLES; ++i) {
+            frame.pcm[i] = i * 0.5f;
+        }
+        const std::vector<uint8_t> input_bytes = read_fixture("input.bin");
+        CHECK(input_bytes.size() == kInputPacketBytes, "input.bin is 1300 bytes");
+        uint8_t packet[kInputPacketBytes];
+        CHECK(encode_input_packet(frame, packet, sizeof(packet)) == kInputPacketBytes,
+              "input fixture frame encodes");
+        CHECK(std::memcmp(input_bytes.data(), packet, kInputPacketBytes) == 0,
+              "input.bin matches C++ serialization");
+        mozart_input_frame_t decoded{};
+        CHECK(decode_input_packet(input_bytes.data(), input_bytes.size(), decoded),
+              "input.bin decodes");
+        CHECK(same_meta(decoded.meta, frame.meta)
+              && std::memcmp(decoded.pcm, frame.pcm, sizeof(frame.pcm)) == 0,
+              "decoded input fixture matches known values");
+
+        mozart_output_frame_t out{};
+        out.meta = frame.meta;
+        for (int i = 0; i < MOZART_OUTPUT_SAMPLES; ++i) {
+            out.pcm[i] = i * 0.25f;
+        }
+        const std::vector<uint8_t> output_bytes = read_fixture("output.bin");
+        CHECK(output_bytes.size() == kOutputPacketBytes, "output.bin is 3860 bytes");
+        uint8_t out_packet[kOutputPacketBytes];
+        CHECK(encode_output_packet(out, out_packet, sizeof(out_packet)) == kOutputPacketBytes,
+              "output fixture frame encodes");
+        CHECK(std::memcmp(output_bytes.data(), out_packet, kOutputPacketBytes) == 0,
+              "output.bin matches C++ serialization");
+        mozart_output_frame_t out_decoded{};
+        CHECK(decode_output_packet(output_bytes.data(), output_bytes.size(), out_decoded),
+              "output.bin decodes");
+        CHECK(same_meta(out_decoded.meta, out.meta)
+              && std::memcmp(out_decoded.pcm, out.pcm, sizeof(out.pcm)) == 0,
+              "decoded output fixture matches known values");
     }
 
     if (g_fail) {

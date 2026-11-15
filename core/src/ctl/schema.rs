@@ -221,6 +221,9 @@ pub struct Status {
     pub bridge: Option<BridgeStatus>,
     pub hw: Option<HardwareStatus>,
     pub degraded: Vec<String>,
+    /// 写了重启键但尚未重启的服务名（SPEC-04 待重启显示）。旧快照缺此字段按空还原。
+    #[serde(default)]
+    pub pending_restart: Vec<String>,
 }
 
 /// ASR 进程状态快照（ASR_GET_STATUS 的 data）。
@@ -398,6 +401,17 @@ pub struct MuteSetRequest {
 #[serde(deny_unknown_fields)]
 pub struct FileModeSetRequest {
     pub active: bool,
+}
+
+/// DSP 级开关请求体（PRE_SET_DSP）：四个开关全部必需，显式完整状态，
+/// 不做部分更新（SPEC-02 运行中切换 DSP 级）。
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct DspSetRequest {
+    pub denoise: bool,
+    pub gate: bool,
+    pub agc: bool,
+    pub limiter: bool,
 }
 
 /// 字幕链路开关请求体（DAEMON_TRANSLATE_SET / DAEMON_SPEECH_SET）：{"enabled": bool}。
@@ -746,6 +760,26 @@ mod tests {
             "not json",
         ] {
             assert!(serde_json::from_str::<FileModeSetRequest>(bad).is_err(), "应拒绝：{bad}");
+        }
+    }
+
+    #[test]
+    fn dsp_set_request_parses_four_switches_and_rejects_extras() {
+        let request: DspSetRequest =
+            serde_json::from_str(r#"{"denoise":false,"gate":true,"agc":true,"limiter":false}"#)
+                .unwrap();
+        assert!(!request.denoise);
+        assert!(request.gate);
+        assert!(request.agc);
+        assert!(!request.limiter);
+        for bad in [
+            "{}",
+            r#"{"denoise":true,"gate":false,"agc":false}"#,
+            r#"{"denoise":"yes","gate":false,"agc":false,"limiter":false}"#,
+            r#"{"denoise":true,"gate":false,"agc":false,"limiter":false,"x":1}"#,
+            "not json",
+        ] {
+            assert!(serde_json::from_str::<DspSetRequest>(bad).is_err(), "应拒绝：{bad}");
         }
     }
 

@@ -71,8 +71,27 @@ impl DaemonProcess {
         llama_bin: &Path,
         config_body: &str,
     ) -> Self {
+        Self::start_full_fresh(
+            tag, pre_bin, rvc_bin, asr_bin, tts_bin, bridge_bin, llama_bin, config_body, true,
+        )
+    }
+
+    /// `fresh=false` 保留运行目录与状态目录，用于 daemon 重启恢复测试。
+    pub fn start_full_fresh(
+        tag: &str,
+        pre_bin: &Path,
+        rvc_bin: &Path,
+        asr_bin: &Path,
+        tts_bin: &Path,
+        bridge_bin: &Path,
+        llama_bin: &Path,
+        config_body: &str,
+        fresh: bool,
+    ) -> Self {
         let dir = std::env::temp_dir().join(format!("mozart-daemon-{}-{tag}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
+        if fresh {
+            let _ = std::fs::remove_dir_all(&dir);
+        }
         std::fs::create_dir_all(&dir).unwrap();
         let config = dir.join("config.toml");
         std::fs::write(&config, config_body).unwrap();
@@ -80,6 +99,7 @@ impl DaemonProcess {
             .arg("--config")
             .arg(&config)
             .env("MOZART_RUN_DIR", &dir)
+            .env("MOZART_STATE_DIR", dir.join("state"))
             .env("MOZART_PRE_BIN", pre_bin)
             .env("MOZART_RVC_BIN", rvc_bin)
             .env("MOZART_ASR_BIN", asr_bin)
@@ -125,6 +145,7 @@ impl DaemonProcess {
             .arg("--config")
             .arg(&config)
             .env("MOZART_RUN_DIR", &dir)
+            .env("MOZART_STATE_DIR", dir.join("state"))
             .env("MOZART_PRE_BIN", example("pre_stub"))
             .env("MOZART_RVC_BIN", example("rvc_stub"))
             .env("MOZART_ASR_BIN", example("asr_stub"))

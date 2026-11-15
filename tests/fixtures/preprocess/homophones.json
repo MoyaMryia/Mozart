@@ -1,0 +1,90 @@
+[
+  {
+    "name": "misspelled_wangdu",
+    "text": "碰到王独的人",
+    "terms": { "网赌": "online gambling", "网贷": "online lending", "戒赌": "quit gambling" },
+    "corrections": {},
+    "expected": "碰到网赌的人",
+    "fixes": [ { "from": "王独", "to": "网赌" } ]
+  },
+  {
+    "name": "misspelled_wangdai",
+    "text": "他借往代了",
+    "terms": { "网赌": "online gambling", "网贷": "online lending", "戒赌": "quit gambling" },
+    "corrections": {},
+    "expected": "他借网贷了",
+    "fixes": [ { "from": "往代", "to": "网贷" } ]
+  },
+  {
+    "name": "unchanged_term_present",
+    "text": "他和网赌没关系",
+    "terms": { "网赌": "online gambling", "网贷": "online lending", "戒赌": "quit gambling" },
+    "corrections": {},
+    "expected": "他和网赌没关系",
+    "fixes": []
+  },
+  {
+    "name": "unchanged_plain",
+    "text": "我们一起去公园散步",
+    "terms": { "网赌": "online gambling", "网贷": "online lending", "戒赌": "quit gambling" },
+    "corrections": {},
+    "expected": "我们一起去公园散步",
+    "fixes": []
+  },
+  {
+    "name": "unchanged_anesthetic",
+    "text": "这就是麻醉剂",
+    "terms": { "网赌": "online gambling", "网贷": "online lending", "戒赌": "quit gambling" },
+    "corrections": {},
+    "expected": "这就是麻醉剂",
+    "fixes": []
+  },
+  {
+    "name": "freq_protect_jiejie",
+    "text": "我和姐姐一起去的",
+    "terms": { "格格": "Gege", "戒戒": "Jiejie" },
+    "corrections": {},
+    "expected": "我和姐姐一起去的",
+    "fixes": []
+  },
+  {
+    "name": "freq_protect_gege",
+    "text": "我和哥哥一起去的",
+    "terms": { "格格": "Gege", "戒戒": "Jiejie" },
+    "corrections": {},
+    "expected": "我和哥哥一起去的",
+    "fixes": []
+  },
+  {
+    "name": "freq_protect_mama",
+    "text": "妈妈说要回家",
+    "terms": { "格格": "Gege", "戒戒": "Jiejie" },
+    "corrections": {},
+    "expected": "妈妈说要回家",
+    "fixes": []
+  },
+  {
+    "name": "explicit_wins_over_freq",
+    "text": "我和姐姐一起去的",
+    "terms": {},
+    "corrections": { "姐姐": "戒戒" },
+    "expected": "我和戒戒一起去的",
+    "fixes": [ { "from": "姐姐", "to": "戒戒", "count": 1 } ]
+  },
+  {
+    "name": "empty_terms_identity",
+    "text": "碰到王独的人",
+    "terms": {},
+    "corrections": {},
+    "expected": "碰到王独的人",
+    "fixes": []
+  },
+  {
+    "name": "non_chinese_ignored",
+    "text": "2026 年 wangdu 王独",
+    "terms": { "网赌": "online gambling", "网贷": "online lending", "戒赌": "quit gambling" },
+    "corrections": {},
+    "expected": "2026 年 wangdu 网赌",
+    "fixes": [ { "from": "王独", "to": "网赌" } ]
+  }
+]
