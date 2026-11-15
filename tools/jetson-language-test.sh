@@ -38,9 +38,13 @@ EXCERPT=$SMOKE_DIR/speech.wav
 unset MOZART_ASR_STUB MOZART_ASR_STUB_TEXT MOZART_TTS_STUB
 export LD_LIBRARY_PATH="$ASSETS_DIR/lib:$ASSETS_DIR/llama${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
 export MOZART_LLAMA_BIN="$ASSETS_DIR/llama/llama-server"
+# 运行时状态与桥开关存档独立到本次产物目录：语言链路以 TOML 为基线
+# （speech_enabled=true），不继承设备上全局状态文件里的运行时改动。
+export MOZART_STATE_DIR="$SMOKE_DIR/state"
 
 mkdir -p "$SMOKE_DIR"
-rm -rf "$RUN" "$SUB" "$EXCERPT" "$SMOKE_DIR"/rec.raw "$SMOKE_DIR"/st-*.json
+rm -rf "$RUN" "$SUB" "$EXCERPT" "$SMOKE_DIR"/rec.raw "$SMOKE_DIR"/st-*.json \
+       "$SMOKE_DIR/state" "$SMOKE_DIR/bridge-state.json"
 
 ts() { printf "[%5ss]" "$SECONDS"; }
 ctl() { "$BIN_DIR/mozart-ctl" --config "$CFG" "$@"; }
@@ -151,6 +155,16 @@ if [ "$READY" != 1 ]; then
   fail_fast "六进程 ${i}s 内未全部 running：$STATES"
 fi
 echo "ready after ${i}s:$STATES"
+
+# 状态隔离校验：bridge 应从 TOML 基线恢复 speech_enabled=true（旧状态文件
+# 会把它改成 false 而关掉 TTS）。桥状态由 daemon 轮询上报，等字段出现即可。
+for _ in $(seq 1 10); do
+  SPEECH=$(jget "$SMOKE_DIR/st-ready.json" path bridge.speech_enabled 2>/dev/null || true)
+  [ -n "$SPEECH" ] && break
+  sleep 1
+  ctl status --json > "$SMOKE_DIR/st-ready.json" 2>/dev/null || true
+done
+assert_eq "bridge speech_enabled（状态隔离）" "${SPEECH:-}" "true"
 
 # ---- 喂语音并回录播放端 ----
 echo "=== play ${T_S}s speech ==="

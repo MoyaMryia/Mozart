@@ -560,14 +560,27 @@ else
 fi
 end_scenario "queue-f-before.json queue-f-down.json job-f-reloaded.json out-f.wav"
 
-# ---- g 入口拒绝：模型不存在、扩展名不在白名单 ----
+# ---- g 入口拒绝：模型不存在（入队后推理层报错）、扩展名不在白名单 ----
 scenario "g-reject-paths"
+# SPEC-10：模型存在性入队不预检，未知模型由推理层 LoadModel 运行时报错，
+# 任务标 failed 带可查原因，队列继续。
 ctl file submit "$SMOKE_DIR/short.wav" --model no-such-model --json \
   > "$SMOKE_DIR/reject-model.json" 2> "$SMOKE_DIR/reject-model.err"
 RC=$?
-assert_eq "不存在模型退出码（4＝被拒）" "$RC" "4"
-if grep -qi "model not found" "$SMOKE_DIR/reject-model.err"; then ok "拒绝原因含 model not found"
-else bad "拒绝原因缺失：$(cat "$SMOKE_DIR/reject-model.err")"; fi
+assert_eq "不存在模型入队退出码" "$RC" "0"
+JOB_G_MODEL=$(jget "$SMOKE_DIR/reject-model.json" path job_id)
+if [ -z "$JOB_G_MODEL" ]; then
+  bad "不存在模型未回 job_id：$(cat "$SMOKE_DIR/reject-model.err")"
+else
+  ok "job_id=$JOB_G_MODEL"
+  STATE=$(wait_job "$JOB_G_MODEL" g-model "$JOB_TIMEOUT" failed); RC=$?
+  assert_eq "终态" "$STATE" "failed"
+  if [ "$RC" -eq 0 ]; then
+    ERR=$(jget "$SMOKE_DIR/job-g-model.json" path error)
+    if printf '%s' "$ERR" | grep -qi "model not found"; then ok "失败原因含 model not found：$ERR"
+    else bad "失败原因不符：$ERR"; fi
+  fi
+fi
 ctl file submit "$SMOKE_DIR/bad.txt" --model "$MODEL_ID" --json \
   > "$SMOKE_DIR/reject-ext.json" 2> "$SMOKE_DIR/reject-ext.err"
 RC=$?
@@ -576,7 +589,7 @@ if grep -qi "unsupported file extension" "$SMOKE_DIR/reject-ext.err"; then ok "�
 else bad "拒绝原因缺失：$(cat "$SMOKE_DIR/reject-ext.err")"; fi
 LEFT=$(ls -1 "$FILES" | grep -c "input.txt" || true)
 assert_eq "坏扩展名未留副本" "$LEFT" "0"
-end_scenario "reject-model.err reject-ext.err"
+end_scenario "reject-model.json reject-model.err job-g-model.json reject-ext.err"
 
 # ---- h 时长上限：真实整段录音超 300 s，解码后拒绝 ----
 scenario "h-duration-cap"
