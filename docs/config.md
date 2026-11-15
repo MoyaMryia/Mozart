@@ -1,8 +1,10 @@
 # Mozart 配置规范（TOML schema）
 
-状态：定稿中。最后更新：2026-11-13。
+状态：定稿中。最后更新：2026-11-14。
 
 本文件是 TOML 配置的唯一 schema 依据：段、键、类型、默认、范围、运行时/重启分类。配置模型（TOML 基线 + 运行时状态文件、`config set`/`config save`、`restart_required` 契约）见 [SPEC-04](SPEC/SPEC-04-daemon.md)，本文件不复述。解析与校验实现于 `core/src/config.rs`，须与本文件一致。
+
+当前配置写回的实现范围见 [SPEC-04 的“已确认”](SPEC/SPEC-04-daemon.md#已确认)。下表 R/S 分类是既定要求，不表示对应控制路径已全部实现。
 
 ## 分类原则
 
@@ -143,6 +145,7 @@ path = "/home/user/mozart/assets/models/asr/zipformer-zh-14M"
 | --- | --- | --- | --- | --- |
 | socket | string | bridge.sock | 纯文件名 | S |
 | subtitles_path | path | ~/.local/state/mozart/subtitles.jsonl | — | S |
+| corrections_path | path | 空 | 可选显式纠错表；格式见下文 | S |
 | translate_enabled | bool | true | — | R |
 | speech_enabled | bool | true | — | R |
 | llama_socket | string | llama.sock | 纯文件名 | S |
@@ -150,6 +153,8 @@ path = "/home/user/mozart/assets/models/asr/zipformer-zh-14M"
 | translate_queue_capacity | int | 32 | ≥1 | S |
 | speech_queue_capacity | int | 16 | ≥1 | S |
 | retry_max | int | 2 | 0..=2 | S |
+
+`corrections_path` 指向 JSON 对象文件，格式为 `{"原文":"改为"}`，键和值均为非空中文字符串。文件条目覆盖同键内置词条；未配置或文件不存在时使用内置表。非法内容使桥启动失败。路径加载时展开开头的 `~`。
 
 ### [file]
 
