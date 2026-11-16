@@ -24,28 +24,67 @@ constexpr size_t kGeneratorFrames = 200;
 // 分窗/单窗几何的设计基准：流式契约生成器 T=398（窗 2 s、pad 1 s、hop 1 s）。
 // 其它定长引擎按 T/398 同比缩放窗与 pad；T=398 时因子为 1，文件分窗路径逐位不变。
 constexpr size_t kWindowReferenceFrames = 398;
+// 短交叉淡化：不再固定 50% 重叠，避免把两套噪声/相位混满整段。
+constexpr size_t kCrossfade16k = 3200;
+constexpr float kPi = 3.14159265358979323846f;
 // 文件按 320 样本契约帧攒段，解码向上取整最多补一帧，折算到 160 样本 hop 至多 2 帧。
 // 整段单次路径容忍这点补帧余量，避免“帧数严格相等”被解码补帧绊倒而误退分窗。
 constexpr size_t kFullLengthFrameSlack = MOZART_INPUT_SAMPLES / kHop16k;
 constexpr size_t kRealtimePitchCacheFrames = 1024;
 
+size_t reflect_position(int64_t position, size_t length) {
+    // 调用方保证 length >= 2。
+    const int64_t period = 2 * (static_cast<int64_t>(length) - 1);
+    position %= period;
+    if (position < 0) position += period;
+    if (position >= static_cast<int64_t>(length)) position = period - position;
+    return static_cast<size_t>(position);
+}
+
 std::vector<float> reflect_pad(const std::vector<float>& audio, size_t pad) {
     if (audio.empty() || pad == 0) return audio;
     if (audio.size() == 1) return std::vector<float>(1 + 2 * pad, audio.front());
-    const int64_t length = static_cast<int64_t>(audio.size());
-    const int64_t period = 2 * (length - 1);
-    const auto reflected = [&](int64_t position) {
-        position %= period;
-        if (position < 0) position += period;
-        if (position >= length) position = period - position;
-        return static_cast<size_t>(position);
-    };
     std::vector<float> out(audio.size() + 2 * pad);
     for (size_t i = 0; i < out.size(); ++i) {
         const int64_t position = static_cast<int64_t>(i) - static_cast<int64_t>(pad);
-        out[i] = audio[reflected(position)];
+        out[i] = audio[reflect_position(position, audio.size())];
     }
     return out;
+}
+
+// 按有符号起点切片；越出源首尾的位置用反射补齐。用于给分窗取整段里的
+// 真实相邻音频和对应音高，只有真正越过整段边界时才反射。
+template <typename T>
+std::vector<T> slice_with_edge_reflect(
+    const std::vector<T>& source, int64_t start, size_t count
+) {
+    // 调用方保证 source 至少 2 个样本。
+    std::vector<T> out(count);
+    for (size_t i = 0; i < count; ++i) {
+        out[i] = source[reflect_position(start + static_cast<int64_t>(i), source.size())];
+    }
+    return out;
+}
+
+uint64_t splitmix64(uint64_t value) {
+    value += 0x9e3779b97f4a7c15ULL;
+    value = (value ^ (value >> 30)) * 0xbf58476d1ce4e5b9ULL;
+    value = (value ^ (value >> 27)) * 0x94d049bb133111ebULL;
+    return value ^ (value >> 31);
+}
+
+uint64_t noise_key(uint64_t stream, uint64_t index, uint64_t channel) {
+    return splitmix64(stream ^ splitmix64(index + 0x9e3779b97f4a7c15ULL * (channel + 1)));
+}
+
+float normal_from_key(uint64_t key) {
+    const uint64_t first = splitmix64(key);
+    const uint64_t second = splitmix64(key ^ 0xa0761d6478bd642fULL);
+    const double u1 = static_cast<double>(first >> 11) * 0x1.0p-53;
+    const double u2 = static_cast<double>(second >> 11) * 0x1.0p-53;
+    const double radius = std::sqrt(-2.0 * std::log(std::max(u1, 1e-12)));
+    return static_cast<float>(
+        radius * std::cos(2.0 * 3.14159265358979323846 * u2));
 }
 
 void peak_normalize(std::vector<float>& audio, float ceiling) {
@@ -250,6 +289,7 @@ std::vector<float> RVCInferencer::infer(
     const size_t pad_out = kPad16k * model_sr / 16000;
 
     size_t generator_frames = kGeneratorFrames;
+    bool use_engine_max_window = false;
     const auto generator_shape = model_->generator_engine().input_shape("feats");
     const bool dynamic_generator = generator_shape.size() >= 2
         && generator_shape[1] <= 0;
@@ -272,8 +312,10 @@ std::vector<float> RVCInferencer::infer(
     const bool full_shape_supported = maximum_shape.size() < 2 || maximum_shape[1] <= 0
         || full_frames <= static_cast<size_t>(maximum_shape[1]);
     if (dynamic_generator && !full_shape_supported) {
-        // 超过整段 profile 时沿用固定窗口装配，避免截断输入或越界分配。
-        generator_frames = kWindowReferenceFrames;
+        // 超出整段 profile 时用引擎允许的最大 T，再由 T 反推主窗；
+        // 不再固定 398 或 10 s，避免浪费模型能力。
+        generator_frames = static_cast<size_t>(maximum_shape[1]);
+        use_engine_max_window = true;
     }
 
     // The correctness-first dynamic contract follows the original RVC path:
@@ -338,19 +380,25 @@ std::vector<float> RVCInferencer::infer(
         return finalize_output(std::move(converted));
     }
 
-    // 分窗/单窗内层几何随生成器 T 同比缩放（基准 T=398），并对齐到一个 HuBERT
-    // 帧（2*kHop16k 样本）避免分数帧。T=398 时各量与旧常量逐位相等。
+    // 分窗/单窗内层几何：动态超 max 时按引擎最大 T 反推主窗；
+    // 其它情况仍按 T/398 比例，并对齐到一个 HuBERT 帧（320 样本）。
     const auto scale_window_len = [&](size_t base) {
         return (base * generator_frames / kWindowReferenceFrames / (2 * kHop16k)) * (2 * kHop16k);
     };
-    const size_t win_16k = scale_window_len(kWindow16k);
     // 内层 pad 封顶到外层 kPad16k（F0 上下文边界），防更大 T 退分窗时单窗
     // 音高偏移 (kPad16k-pad_16k) 下溢；T=200/398 不触发封顶。
     const size_t pad_16k = std::min(scale_window_len(kPad16k), kPad16k);
+    const size_t raw_win_16k = use_engine_max_window
+        ? std::max<size_t>(2 * kHop16k, generator_frames * kHop16k - 2 * pad_16k)
+        : scale_window_len(kWindow16k);
+    const size_t win_16k = (raw_win_16k / (2 * kHop16k)) * (2 * kHop16k);
     const size_t pad_tgt = pad_16k * model_sr / 16000;
     const size_t window_out = win_16k * model_sr / 16000;
-    const size_t hop_in = win_16k / 2;
-    const size_t hop_out = hop_in * model_sr / 16000;
+    // 短淡化对齐到 2 个 HuBERT 帧，保证 hop 仍是 160 的整数倍。
+    const size_t crossfade_in =
+        (std::min(kCrossfade16k, win_16k / 4) / (2 * kHop16k)) * (2 * kHop16k);
+    const size_t crossfade_out = crossfade_in * model_sr / 16000;
+    const size_t hop_in = win_16k - crossfade_in;
 
     if (audio_16k.size() <= win_16k) {
         // Golden-aligned: feed the reflect-padded window to HuBERT (matching
@@ -386,24 +434,40 @@ std::vector<float> RVCInferencer::infer(
         return finalize_output(std::move(converted));
     }
 
+    // 分窗的 source_phase 需要从整段起点累计的 F0 周期，避免每窗从 0 重新起相。
+    std::vector<double> pitch_cycles(pitchf_full.size() + 1, 0.0);
+    for (size_t i = 0; i < pitchf_full.size(); ++i) {
+        pitch_cycles[i + 1] = pitch_cycles[i]
+            + static_cast<double>(pitchf_full[i]) * 0.01;
+    }
+
     std::vector<float> assembled;
     assembled.reserve((padded.size() * model_sr / 16000) + window_out);
     size_t windows = 0;
     for (size_t start = 0; start < padded.size(); start += hop_in) {
         check_cancelled(cancelled);
-        auto window = slice_or_pad(padded, start, win_16k);
-        // Golden-aligned per window: reflect-pad the window before HuBERT
-        // (matching RVC pipeline.vc) and run at the engine's native T.
-        auto hubert_input = reflect_pad(window, pad_16k);
-        const size_t f0_start = start / kHop16k;
-        std::vector<float> pitchf(generator_frames, 0.0f);
-        std::vector<int64_t> pitch(generator_frames, 1);
-        for (size_t t = 0; t < generator_frames; ++t) {
-            const size_t src = std::min(f0_start + t, pitchf_full.size() - 1);
-            pitchf[t] = pitchf_full[src];
-            pitch[t] = pitch_full[src];
-        }
-        auto converted = infer_window(hubert_input, pitchf, pitch, cancelled);
+        // 内窗用整段里的真实相邻音频当上下文；只有越过整段首尾时才
+        // 反射。RVC 的 Golden 路径也是对整段 pad 后按块切，而不是
+        // 对每个块单独做 reflect。最后一个窗为保证定长会越过整段
+        // pad 末尾，越界部分仍是反射；Golden 在最后一块会截断。
+        auto hubert_input = slice_with_edge_reflect(
+            padded,
+            static_cast<int64_t>(start) - static_cast<int64_t>(pad_16k),
+            win_16k + 2 * pad_16k);
+        // 音高从输入上下文起点开始切，而不是主窗起点；否则整个窗的
+        // pitch 会比音频晚 pad，表现为跑调、电音。
+        const int64_t pitch_start =
+            (static_cast<int64_t>(start) - static_cast<int64_t>(pad_16k))
+            / static_cast<int64_t>(kHop16k);
+        auto pitchf = slice_with_edge_reflect(pitchf_full, pitch_start, generator_frames);
+        auto pitch = slice_with_edge_reflect(pitch_full, pitch_start, generator_frames);
+        const int64_t input_frame_start = std::max<int64_t>(0, pitch_start);
+        const size_t cycles_index = static_cast<size_t>(std::min<int64_t>(
+            input_frame_start, static_cast<int64_t>(pitch_cycles.size() - 1)));
+        const double absolute_cycles = pitch_cycles[cycles_index];
+        auto converted = infer_window(
+            hubert_input, pitchf, pitch, cancelled,
+            true, input_frame_start, absolute_cycles);
         if (converted.size() > 2 * pad_tgt) {
             converted = std::vector<float>(
                 converted.begin() + static_cast<std::ptrdiff_t>(pad_tgt),
@@ -414,11 +478,14 @@ std::vector<float> RVCInferencer::infer(
             assembled.insert(assembled.end(), converted.begin(),
                              converted.begin() + static_cast<std::ptrdiff_t>(std::min(converted.size(), window_out)));
         } else {
-            const size_t overlap = std::min(hop_out, assembled.size());
+            const size_t overlap = std::min(crossfade_out, assembled.size());
             const size_t assembled_at = assembled.size() - overlap;
             for (size_t i = 0; i < overlap; ++i) {
-                const float w = static_cast<float>(i) / static_cast<float>(std::max(size_t{1}, overlap));
-                assembled[assembled_at + i] = assembled[assembled_at + i] * (1.0f - w) + converted[i] * w;
+                const float t = (static_cast<float>(i) + 0.5f)
+                    / static_cast<float>(std::max(size_t{1}, overlap));
+                const float w_in = std::sin(0.5f * kPi * t);
+                const float w_out = std::cos(0.5f * kPi * t);
+                assembled[assembled_at + i] = assembled[assembled_at + i] * w_out + converted[i] * w_in;
             }
             assembled.insert(assembled.end(),
                              converted.begin() + static_cast<std::ptrdiff_t>(overlap),
@@ -704,7 +771,10 @@ std::vector<float> RVCInferencer::infer_window(
     const std::vector<float>& audio_16k,
     const std::vector<float>& pitchf,
     const std::vector<int64_t>& pitch,
-    const std::atomic<bool>* cancelled
+    const std::atomic<bool>* cancelled,
+    bool absolute_noise,
+    int64_t absolute_frame_start,
+    double absolute_cycles
 ) {
     check_cancelled(cancelled);
     const auto profile_start = profile::Clock::now();
@@ -715,7 +785,9 @@ std::vector<float> RVCInferencer::infer_window(
     feats = apply_index(feats);
     check_cancelled(cancelled);
     const auto profile_index = profile::Clock::now();
-    auto output = synthesize_window(feats, pitchf, pitch, unindexed);
+    auto output = synthesize_window(
+        feats, pitchf, pitch, unindexed,
+        absolute_noise, absolute_frame_start, absolute_cycles);
     check_cancelled(cancelled);
     // 窗完成才计数：取消时未完成的窗不计入文件批处理进度。
     generator_windows_.fetch_add(1, std::memory_order_relaxed);
@@ -757,7 +829,10 @@ std::vector<float> RVCInferencer::synthesize_window(
     const std::vector<float>& feats,
     const std::vector<float>& pitchf,
     const std::vector<int64_t>& pitch,
-    const std::vector<float>& unindexed_feats
+    const std::vector<float>& unindexed_feats,
+    bool absolute_noise,
+    int64_t absolute_frame_start,
+    double absolute_cycles
 ) {
     if (!model_->generator_engine().loaded()) {
         throw std::runtime_error("Generator engine not loaded");
@@ -857,18 +932,46 @@ std::vector<float> RVCInferencer::synthesize_window(
             ? static_cast<size_t>(source_model_shape[2]) : 1;
         const size_t output_per_frame = model_->config().sample_rate / 100;
 
-        // Resetting per prefix preserves the Golden full-history contract:
-        // overlapping latent positions receive the same sampled values.
-        std::mt19937 random(114514);
-        std::normal_distribution<float> normal(0.0f, 1.0f);
-        std::uniform_real_distribution<float> uniform(0.0f, 1.0f);
         std::vector<float> latent_noise(channels * T);
-        for (float& value : latent_noise) value = normal(random);
         std::vector<float> source_phase(source_dim);
-        for (float& value : source_phase) value = uniform(random);
-        source_phase.front() = 0.0f;
         std::vector<float> source_noise(T * output_per_frame * source_dim);
-        for (float& value : source_noise) value = normal(random);
+        if (!absolute_noise) {
+            // 整段路径保持原来的固定种子序列。
+            std::mt19937 random(114514);
+            std::normal_distribution<float> normal(0.0f, 1.0f);
+            std::uniform_real_distribution<float> uniform(0.0f, 1.0f);
+            for (float& value : latent_noise) value = normal(random);
+            for (float& value : source_phase) value = uniform(random);
+            source_phase.front() = 0.0f;
+            for (float& value : source_noise) value = normal(random);
+        } else {
+            // 分窗路径按绝对帧/样本索引生成，重叠区拿到同一组噪声；
+            // source_phase 用累计 F0 周期补偿本地 cumsum 的相位起点。
+            const uint64_t frame_start =
+                static_cast<uint64_t>(std::max<int64_t>(0, absolute_frame_start));
+            for (size_t channel = 0; channel < channels; ++channel) {
+                for (size_t t = 0; t < T; ++t) {
+                    latent_noise[channel * T + t] = normal_from_key(
+                        noise_key(0x1ULL, frame_start + t, channel));
+                }
+            }
+            std::mt19937 phase_random(114514);
+            std::uniform_real_distribution<float> uniform(0.0f, 1.0f);
+            for (float& value : source_phase) value = uniform(phase_random);
+            source_phase.front() = 0.0f;
+            for (size_t harmonic = 0; harmonic < source_dim; ++harmonic) {
+                const double cycles = absolute_cycles * static_cast<double>(harmonic + 1);
+                source_phase[harmonic] = static_cast<float>(std::fmod(
+                    static_cast<double>(source_phase[harmonic]) + cycles, 1.0));
+            }
+            const uint64_t sample_start = frame_start * output_per_frame;
+            for (size_t sample = 0; sample < T * output_per_frame; ++sample) {
+                for (size_t channel = 0; channel < source_dim; ++channel) {
+                    source_noise[sample * source_dim + channel] = normal_from_key(
+                        noise_key(0x2ULL, sample_start + sample, channel));
+                }
+            }
+        }
 
         inputs.push_back(typed_input(
             "latent_noise",

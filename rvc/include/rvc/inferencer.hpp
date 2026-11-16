@@ -84,7 +84,10 @@ private:
         const std::vector<float>& feats,
         const std::vector<float>& pitchf,
         const std::vector<int64_t>& pitch,
-        const std::vector<float>& unindexed_feats
+        const std::vector<float>& unindexed_feats,
+        bool absolute_noise,
+        int64_t absolute_frame_start,
+        double absolute_cycles
     );
 
     std::vector<float> apply_rms_mix(
@@ -96,7 +99,10 @@ private:
         const std::vector<float>& audio_16k,
         const std::vector<float>& pitchf,
         const std::vector<int64_t>& pitch,
-        const std::atomic<bool>* cancelled = nullptr
+        const std::atomic<bool>* cancelled = nullptr,
+        bool absolute_noise = false,
+        int64_t absolute_frame_start = 0,
+        double absolute_cycles = 0.0
     );
 };
 
