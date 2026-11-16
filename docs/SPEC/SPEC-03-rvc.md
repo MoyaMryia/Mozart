@@ -36,7 +36,7 @@
 - [x] 粗粒度边界：数据面只有“输入帧进、输出帧出”，控制面只有加载、启动、停止、重置和状态查询；不暴露张量、引擎和 stream。
 - [x] 数据面沿用 core 的帧契约：16 kHz 输入、48 kHz 输出，一帧一条消息。
 - [x] 文件转换复用帧数据面：C++ 只收帧/发帧、不接触文件，对端是 pre（实时）还是 daemon（文件）无感知。文件帧发送必须不丢（阻塞/流控，区别于实时的非阻塞丢弃）；输出 socket 由数据面对端绑定（实时 pre、文件 daemon），实时/文件互斥故不冲突，切换时交接绑定。（`rvc/src/rvc/file_worker.cpp:67-127`、`rvc/transport/unix_dgram_stream.cpp:290-311`）
-- [x] 离线推理 v1 整段批处理：C++ 收齐 daemon 喂入的帧、攒成整段跑现有离线流程再回输出帧；质量参数沿用旧实现不动（峰值归一化 0.95、48 Hz 高通、整段 F0、按引擎形状整段一次过或滑窗 + 重叠淡化、RMS 混合、限幅 0.99）。滑窗窗长由 HuBERT 帧数反推：窗输入恰好产出 T 帧，主窗取生成器输出覆盖减两侧 pad；内层 pad 按 T/398 缩放并封顶 1 s，淡化 200 ms 等功率（T=398：主窗 1.98 s、hop 1.78 s；T=200：主窗 1 s、hop 0.8 s）。内存由 300 s 时长上限兜底。分块流式推迟，见 [FUTURE.md](../FUTURE.md)。（`rvc/src/rvc/inferencer.cpp:20-33,227-262,418-535`）
+- [x] 离线推理 v1 整段批处理：C++ 收齐 daemon 喂入的帧、攒成整段跑现有离线流程再回输出帧；质量参数沿用旧实现不动（峰值归一化 0.95、48 Hz 高通、整段 F0、按引擎形状整段一次过或滑窗 + 重叠淡化、RMS 混合、限幅 0.99）。滑窗窗长随生成器帧数 T 按 T/398 缩放（T=398 为 2 s 窗、1 s hop；T=200 为 1 s 窗、0.5 s hop）。内存由 300 s 时长上限兜底。分块流式推迟，见 [FUTURE.md](../FUTURE.md)。（`rvc/src/rvc/inferencer.cpp:24-26,85,234-235,284,330,374,430`）
 - [x] 错误用返回码或状态原因表达；不跨进程抛异常，不传 C++ 容器和指针。
 - [x] 内存所有权明确：消息自带长度，谁分配谁释放，进程间不共享裸指针。
 - [x] 线程模型：Rust 调度独占模式和队列；C++ 进程内单推理线程；控制命令不阻塞音频路径。（模型加载不占控制锁：`rvc/control/stream_session.cpp:152,159`）
@@ -88,13 +88,10 @@ TOML 顶层 `[[models]]` 数组声明可用模型，每项含 `id`、`type`（rv
 
 ## 改进点
 
-- [x] 文件链模型主导参数：采样率从 `config.json` 读取；emb/latent/source 维度从 ONNX 读取；生成器 T 从引擎 profile 读取；窗几何由 T/HuBERT 帧数反推。40k/48k 共 10 个模型已完成文件链路实测。（`tools/model/build_dynamic_engines.py`、`rvc/src/rvc/inferencer.cpp`）
-- [ ] 实时契约固定形状由模型能力推导：front 280 / decoder 30 / hubert 44800 / rmvpe 32；动态输出采样率方案见 [FUTURE](../FUTURE.md)。（`rvc/src/rvc/pipeline.cpp:202-213`）
+- [ ] 模型主导参数动态化（多模型适配，总方向）：凡由模型决定的参数（采样率、帧率、hop、特征维度、上采样比、合成帧数 T、音高量化）从模型动态读取，据此推导分窗几何、推理模式（整段/动态/分窗）与重采样，不写死常量。实时契约的固定形状（front 280 / decoder 30 / hubert 44800 / rmvpe 32）也应由模型能力推导。（`rvc/src/rvc/pipeline.cpp:202-213`）前置的跨模型实测已覆盖 40k/48k 共 10 个模型（文件链路）；实时固定形状仍待模型能力推导，动态输出采样率方案见 [FUTURE](../FUTURE.md)。
 - [x] 文件链路多模型：静态定长、静态整段与动态生成器（40k/48k）共 10 个模型板端完成，输出按输入时长统一收口，`frames_in == frames_out`；空闲模型切换先释放旧 inferencer 并腾出缓存槽位，避免旧模型显存未释放时触发 TensorRT OOM 回退 ONNX；活动流期间保持旧模型直到新模型换入。（`rvc/src/rvc/inferencer.cpp:243-442`、`rvc/src/rvc/pipeline.cpp:136-151`、`rvc/src/rvc/model_loader.cpp:307-342`、`reports/multi-model-file-20261115/RESULTS.md`）
-- [x] 文件分窗几何由 T/HuBERT 帧数反推：`offline_window_geometry` 统一计算窗输入、主窗、pad、hop 和淡化；`tests/test_rvc_window_geometry.cpp` 覆盖 T=398/200/2380/2400/40k 与 T=100..4200 偶数扫描，native 9/9 通过。（`rvc/src/rvc/inferencer.cpp:227-262`、`tests/test_rvc_window_geometry.cpp`）
-- [ ] 文件分窗几何验收：`[file].chunk_frames` 暴露几何消融；10/30/120 s 的 F0、log-mel、内存和延迟；22 s 内整段结果不变。pad 按 T/398 缩放封顶 1 s、淡化 200 ms 仍为常量。
-- [x] 文件链大窗资产与工具链：档位 compact/balanced/large/max 由 `tools/model/file_chain_tiers.json` 单一定义；共享 HuBERT 512000 / RMVPE 3232 已构建部署；30 s miku/gkw 实测 2 窗、峰值 4.47 GiB、8.27/6.74 s，无 ONNX 特征兜底。加载器继续区分实时/文件资产。（当前 miku 生成器仍为旧 opt=398；生成器 large 重建待完成。）
-- [ ] 文件链大窗模型覆盖与质量验收：当前模型集按 large 重建；同输入 F0/log-mel 对拍；`max` 档板端验证。档位语义见 [SPEC-12](SPEC-12-file-chain-params.md)。
+- [ ] 文件分窗几何动态化：398 只作默认参考；窗长、hop、pad 和超 profile 分块由引擎 min/opt/max、T、采样率与输入时长推导；拟增 `[file].chunk_frames`。验收：10/30/120 s 的 F0、log-mel、内存和延迟，22 s 内整段结果不变。（`rvc/src/rvc/inferencer.cpp:26,262-266,336-346`）
+- [ ] 文件链路优先大窗资产：编译时为文件链路提供覆盖目标时长的大窗或动态大 profile；加载器区分实时/文件资产，长文件不默认 T=200。验收：同输入的窗数、F0、log-mel、显存和延迟。
 - [ ] 文件小窗质量方向：必须小窗时，先做互相关/SOLA 对齐，再用等功率淡化；评估真实前后文、跨窗 F0 平滑、窗级增益匹配和噪声/相位连续性。验收看 F0 P90、log-mel、边界阶跃、显存与延迟。
 - [ ] 实时链路单独优化：实时模型可与文件不同，能力区分仅文件/仅实时/两者；按 240 ms 块、50 ms 淡化、SOLA、400 ms 启动单独调优；40 kHz 见 [FUTURE](../FUTURE.md)。验收：48 kHz 无回归，具备实时资产的新模型起流、延迟 P95 与连续性。
 - [x] 模型加载移出控制锁。（`rvc/control/stream_session.cpp:152,159`）

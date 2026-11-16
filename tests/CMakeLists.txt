@@ -52,9 +52,3 @@ add_executable(t_resample test_resample.cpp)
 target_link_libraries(t_resample PRIVATE mozart_rvc_runtime mozart_warnings)
 add_test(NAME resample COMMAND t_resample)
 set_tests_properties(resample PROPERTIES LABELS "unit" TIMEOUT 30)
-
-# 文件分窗几何：HuBERT 帧数反推窗长，T=398 不变性（无 GPU 依赖）。
-add_executable(t_rvc_window_geometry test_rvc_window_geometry.cpp)
-target_link_libraries(t_rvc_window_geometry PRIVATE mozart_rvc_runtime mozart_warnings)
-add_test(NAME rvc_window_geometry COMMAND t_rvc_window_geometry)
-set_tests_properties(rvc_window_geometry PROPERTIES LABELS "unit" TIMEOUT 30)
