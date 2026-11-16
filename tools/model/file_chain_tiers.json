@@ -13,12 +13,12 @@
       "rmvpe_frames": [32, 1632, 1632]
     },
     "large": {
-      "generator_frames": [100, 398, 2400],
+      "generator_frames": [100, 597, 2400],
       "hubert_samples": [32000, 384320, 512000],
       "rmvpe_frames": [32, 3232, 3232]
     },
     "max": {
-      "generator_frames": [100, 398, 4200],
+      "generator_frames": [100, 796, 4200],
       "hubert_samples": [32000, 672320, 672320],
       "rmvpe_frames": [32, 4224, 4224]
     }
