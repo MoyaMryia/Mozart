@@ -67,6 +67,8 @@
 - [x] 模式名与状态字段统一。
 - [x] 端口集中配置。（`core/src/config.rs`）
 - [ ] （文档）职责行 `HTTP/SSE` 为残留措辞，v1 daemon 不起 HTTP，待删。
+- [ ] 实时换模型命令与编排：落地 [docs/config.md](../config.md)「运行时换模型走控制命令」的设计意图。新增 daemon 控制命令与 CLI `model use <id>`（命令号待分配）；编排二选一：StopStream→LoadModel→StartStream（断流）或流中 LoadModel（不断流），取舍待决策；失败保留旧模型并回报原因。`model_id` 仍为 S 类基线键，`config set` 继续拒绝。推理侧状态语义见 SPEC-03。验收：板端切换延迟、接缝与帧守恒。
+- [ ] 实时原生多采样率：`StartStream` 播放采样率协商与重配播放链的断流代价评估；主条见 SPEC-03。
 
 ## 待讨论
 

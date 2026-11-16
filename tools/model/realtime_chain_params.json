@@ -1,0 +1,32 @@
+{
+  "version": 1,
+  "model_contract": {
+    "input_sample_rate": 16000,
+    "output_sample_rate": 48000,
+    "feature_hop": 160,
+    "feature_frame_rate": 100,
+    "hubert_frame_rate": 50,
+    "feature_duplication": 2,
+    "rmvpe_mel_bands": 128,
+    "rmvpe_n_fft": 1024,
+    "rmvpe_hop": 160,
+    "rmvpe_fmin_hz": 30,
+    "rmvpe_fmax_hz": 8000
+  },
+  "geometry": {
+    "window_samples": 3840,
+    "past_context_samples": 40000,
+    "crossfade_max_out": 2400,
+    "sola_search_max_out": 480,
+    "startup_delay_ms": 400,
+    "startup_buffer_blocks": 1,
+    "skip_silence": true
+  },
+  "compile": {
+    "fp16": false,
+    "no_tf32": true,
+    "workspace_mib": 1024,
+    "builder_optimization_level": 3,
+    "profiling_verbosity": "detailed"
+  }
+}

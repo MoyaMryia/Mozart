@@ -137,3 +137,5 @@
 - 2026-11-13：新增 `[process.env]` 段，daemon spawn 子进程时注入 TOML 定义的环境变量（SPEC-04、config.md）。
 - 2026-11-13：模型注册表定稿：TOML 顶层 `[[models]]` 数组（id/type/path），LoadModel 和 ListModels 优先从注册表解析路径，注册表为空时回退 models_dir 扫描；特征引擎四路径改为可选，缺省从 models_dir 按约定文件名自动发现（SPEC-03、config.md）。
 - 2026-11-16：新增 SPEC-11 模型预设与 SPEC-12 文件链参数索引。
+- 2026-11-16：FUTURE 模型相关三条（多模型适配、实时原生多采样率、采样率调研）迁入 SPEC-03 并解除推迟，跨模块链接项落 SPEC-01/02/04；新增实时流中换模型条目（SPEC-03 推理侧、SPEC-04 命令与编排）。
+- 2026-11-16：实时几何与资产参数契约入 SPEC-03 新节（单一来源 `realtime_chain_params.json`，非形状类旋钮归 `[rvc.realtime]`，实时独有、不进预设）；SPEC-12 实时形状归属改指 SPEC-03。

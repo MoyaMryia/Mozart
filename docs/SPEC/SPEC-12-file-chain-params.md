@@ -11,7 +11,7 @@
 
 - 本文 owns：文件链资产档位、生成器/HuBERT/RMVPE profile 的语义、文件链运行时几何公式、构建与部署规则。
 - 运行时会话参数（`pitch_shift`、`index_rate`、`rms_mix_rate`、`protect`、`f0_method`）归 [SPEC-11](SPEC-11-preset.md) 与 [config.md](../config.md)，本文不重复。
-- 实时链路的固定形状（front 280 / decoder 30 / HuBERT 44800 / RMVPE 32）归 [SPEC-03](SPEC-03-rvc.md)，本文不覆盖。
+- 实时链路的几何与固定形状（front 280 / decoder 30 / HuBERT 44800 / RMVPE 32）归 [SPEC-03](SPEC-03-rvc.md) 实时几何与资产参数节，本文不覆盖。
 - 文件时长和上传上限归 [config.md](../config.md) 的 `[file]`，本文不重复。
 
 ## 数值来源
