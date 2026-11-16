@@ -395,8 +395,8 @@ fn spawn_batch(
             for (i, slot) in upsampled.iter_mut().enumerate() {
                 *slot = pcm[i / 3];
             }
-            let frame = OutputFrame {
-                meta: FrameMeta {
+            let frame = OutputFrame::new_48k(
+                FrameMeta {
                     pts_ns: idx as u64 * u64::from(FRAME_MS) * 1_000_000,
                     frame_idx: idx as u32,
                     vad_flag: 1,
@@ -404,8 +404,8 @@ fn spawn_batch(
                     conf: 0,
                     segment_id: 0,
                 },
-                pcm: upsampled,
-            };
+                upsampled,
+            );
             if tx.send_blocking(&frame).is_err() {
                 return;
             }

@@ -27,8 +27,8 @@ fn null_device_config(dir: &std::path::Path) -> String {
 
 /// TTS 桩帧：48 kHz 单声道，meta 按 20 ms 步进。
 fn tts_frame(idx: u32) -> OutputFrame {
-    OutputFrame {
-        meta: FrameMeta {
+    OutputFrame::new_48k(
+        FrameMeta {
             pts_ns: idx as u64 * 20_000_000,
             frame_idx: idx,
             vad_flag: 1,
@@ -36,8 +36,8 @@ fn tts_frame(idx: u32) -> OutputFrame {
             conf: 0,
             segment_id: 0,
         },
-        pcm: [0.25; OUTPUT_SAMPLES],
-    }
+        [0.25; OUTPUT_SAMPLES],
+    )
 }
 
 #[test]

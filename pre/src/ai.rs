@@ -424,8 +424,8 @@ mod tests {
         };
         let tx = connect_output(&path, Duration::from_secs(2));
 
-        let frame = OutputFrame {
-            meta: FrameMeta {
+        let frame = OutputFrame::new_48k(
+            FrameMeta {
                 pts_ns: 42,
                 frame_idx: 7,
                 vad_flag: 1,
@@ -433,8 +433,8 @@ mod tests {
                 conf: 3,
                 segment_id: 4,
             },
-            pcm: [0.5; mozart_core::OUTPUT_SAMPLES],
-        };
+            [0.5; mozart_core::OUTPUT_SAMPLES],
+        );
         tx.send(&frame).unwrap();
         let got = ring.pop(Some(Duration::from_secs(1))).unwrap();
         let FrameMeta { frame_idx, .. } = got.meta;
@@ -462,12 +462,12 @@ mod tests {
             let path = path.clone();
             std::thread::spawn(move || recv_loop(path, ring, shared, stop))
         };
-        let frame = OutputFrame {
-            meta: FrameMeta {
+        let frame = OutputFrame::new_48k(
+            FrameMeta {
                 pts_ns: 1, frame_idx: 1, vad_flag: 1, energy_db: 0, conf: 0, segment_id: 0,
             },
-            pcm: [0.25; mozart_core::OUTPUT_SAMPLES],
-        };
+            [0.25; mozart_core::OUTPUT_SAMPLES],
+        );
 
         // 实时态：送达入环。
         let tx = connect_output(&path, Duration::from_secs(2));
@@ -544,12 +544,12 @@ mod tests {
         // daemon 断言实时态：绑定并恢复接收。
         shared.set_mode_asserted(true);
         let tx = connect_output(&path, Duration::from_secs(2));
-        let frame = OutputFrame {
-            meta: FrameMeta {
+        let frame = OutputFrame::new_48k(
+            FrameMeta {
                 pts_ns: 9, frame_idx: 9, vad_flag: 1, energy_db: 0, conf: 0, segment_id: 0,
             },
-            pcm: [0.5; mozart_core::OUTPUT_SAMPLES],
-        };
+            [0.5; mozart_core::OUTPUT_SAMPLES],
+        );
         tx.send(&frame).unwrap();
         let got = ring.pop(Some(Duration::from_secs(1))).unwrap();
         let FrameMeta { frame_idx, .. } = got.meta;
@@ -576,8 +576,8 @@ mod tests {
             std::thread::spawn(move || tts_recv_loop(rx, ring, shared, stop))
         };
 
-        let frame = OutputFrame {
-            meta: FrameMeta {
+        let frame = OutputFrame::new_48k(
+            FrameMeta {
                 pts_ns: 42,
                 frame_idx: 7,
                 vad_flag: 1,
@@ -585,8 +585,8 @@ mod tests {
                 conf: 0,
                 segment_id: 0,
             },
-            pcm: [0.5; mozart_core::OUTPUT_SAMPLES],
-        };
+            [0.5; mozart_core::OUTPUT_SAMPLES],
+        );
         tx.send(&frame).unwrap();
         let got = ring.pop(Some(Duration::from_secs(1))).unwrap();
         let FrameMeta { frame_idx, .. } = got.meta;

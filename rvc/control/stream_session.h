@@ -79,6 +79,15 @@ struct ModelListing {
     bool exists = false;
 };
 
+// kind=realtime 非形状旋钮（SPEC-03 [rvc.realtime]）：StartStream 可选携带，缺省取
+// realtime_geometry.hpp 规范默认值。
+struct RealtimeStreamOptions {
+    uint32_t crossfade_ms = 50;
+    uint32_t sola_search_ms = 10;
+    uint32_t startup_delay_ms = 400;
+    bool skip_silence = true;
+};
+
 // kind=file 批处理选项（计划 D1）；realtime 忽略。
 // 数据面复用配置默认 input_socket/output_socket（SPEC-03 状态门控交接：
 // 文件期间 pre 暂停发送并释放输出 socket，daemon 接管同一对 socket）。
@@ -111,7 +120,9 @@ public:
     // 失败时 reason 给出原因（数据面绑定失败等）。
     virtual std::unique_ptr<StreamWorker> start_worker(
         bool realtime, const RvcParameters& params,
-        const FileBatchOptions& file_options, std::string& reason) = 0;
+        const FileBatchOptions& file_options,
+        const RealtimeStreamOptions& realtime_options,
+        std::string& reason) = 0;
 };
 
 class StreamSession {
@@ -186,7 +197,9 @@ public:
     bool supports_file() const override;
     std::unique_ptr<StreamWorker> start_worker(
         bool realtime, const RvcParameters& params,
-        const FileBatchOptions& file_options, std::string& reason) override;
+        const FileBatchOptions& file_options,
+        const RealtimeStreamOptions& realtime_options,
+        std::string& reason) override;
 
 private:
     InferenceBackendConfig config_;

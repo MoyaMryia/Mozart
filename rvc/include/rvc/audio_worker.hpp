@@ -36,6 +36,8 @@ public:
         // 实时能力由入口（StreamSession）校验，此处不再复检。
         bool realtime_kind = true;
         bool skip_silence = true;
+        uint32_t crossfade_ms = 50;
+        uint32_t sola_search_ms = 10;
         uint32_t realtime_playout_delay_ms = 400;
     };
 

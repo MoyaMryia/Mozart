@@ -177,7 +177,7 @@ impl Services {
 }
 
 /// StartStream 会话参数（SPEC-03 参数边界表）：实时与文件共用 `[rvc]` 一份。
-/// kind 与文件批处理字段由调用方补齐。
+/// kind 与文件批处理字段由调用方补齐；实时流另带 `[rvc.realtime]` 旋钮。
 fn stream_body(rvc: &RvcConfig, model_handle: u64) -> Value {
     json!({
         "model_handle": model_handle,
@@ -186,6 +186,10 @@ fn stream_body(rvc: &RvcConfig, model_handle: u64) -> Value {
         "rms_mix_rate": rvc.rms_mix_rate,
         "protect": rvc.protect,
         "f0_method": rvc.f0_method,
+        "crossfade_ms": rvc.realtime.crossfade_ms,
+        "sola_search_ms": rvc.realtime.sola_search_ms,
+        "startup_delay_ms": rvc.realtime.startup_delay_ms,
+        "skip_silence": rvc.realtime.skip_silence,
     })
 }
 
@@ -846,6 +850,14 @@ pub(crate) fn merge_session_key(
         "rvc.f0_method" => merged.f0_method.clone_from(&fresh.f0_method),
         "rvc.rms_mix_rate" => merged.rms_mix_rate = fresh.rms_mix_rate,
         "rvc.protect" => merged.protect = fresh.protect,
+        "rvc.realtime.crossfade_ms" => merged.realtime.crossfade_ms = fresh.realtime.crossfade_ms,
+        "rvc.realtime.sola_search_ms" => {
+            merged.realtime.sola_search_ms = fresh.realtime.sola_search_ms
+        }
+        "rvc.realtime.startup_delay_ms" => {
+            merged.realtime.startup_delay_ms = fresh.realtime.startup_delay_ms
+        }
+        "rvc.realtime.skip_silence" => merged.realtime.skip_silence = fresh.realtime.skip_silence,
         other => {
             return Err((
                 ctl::CODE_INTERNAL.to_string(),
@@ -934,6 +946,69 @@ fn realtime_params_changed(old: &RvcConfig, new: &RvcConfig) -> bool {
     old.pitch_shift != new.pitch_shift
         || old.index_rate != new.index_rate
         || old.f0_method != new.f0_method
+        || old.realtime.crossfade_ms != new.realtime.crossfade_ms
+        || old.realtime.sola_search_ms != new.realtime.sola_search_ms
+        || old.realtime.startup_delay_ms != new.realtime.startup_delay_ms
+        || old.realtime.skip_silence != new.realtime.skip_silence
+}
+
+/// 实时/空闲换模型（SPEC-04 `model use <id>`）：采用断流切换
+/// （StopStream→LoadModel→StartStream），避免 8 GB 设备同时驻留双引擎 OOM，
+/// 并支持跨采样率（40k/48k）重建 `StreamingRvc`。失败尝试恢复原模型与流。
+pub(crate) fn switch_rvc_model_locked(
+    state: &Mutex<State>,
+    services: &Services,
+    rvc: &RvcConfig,
+    model_id: &str,
+) -> Result<(Option<String>, RvcConfig), (String, String)> {
+    if model_id.is_empty() {
+        return Err((
+            ctl::CODE_INVALID_ARGUMENT.to_string(),
+            "model_id must not be empty".to_string(),
+        ));
+    }
+    if lock_state(state).gpu_owner() == Some(Activity::File) {
+        return Err((
+            ctl::CODE_BUSY.to_string(),
+            "cannot switch realtime model while file job owns GPU".to_string(),
+        ));
+    }
+    let status = services.rvc_status()?;
+    let previous = status.model_id.clone();
+    let was_realtime_streaming =
+        status.state == "streaming" && status.stream_kind.as_deref() == Some("realtime");
+
+    if was_realtime_streaming {
+        stop_rvc_stream(services).map_err(|err| err.into_rejection())?;
+    }
+
+    let mut next_rvc = rvc.clone();
+    next_rvc.model_id = model_id.to_string();
+
+    let load_res = services.load_model_handle(model_id);
+    match load_res {
+        Ok(_) => {
+            if was_realtime_streaming {
+                if let Err(err) = start_rvc_stream(services, &next_rvc, model_id, false) {
+                    let (code, reason) = err.into_rejection();
+                    if let Some(prev) = previous.as_deref() {
+                        let _ = start_rvc_stream(services, rvc, prev, true);
+                    }
+                    return Err((code, format!("model use start stream: {reason}")));
+                }
+            }
+            Ok((previous, next_rvc))
+        }
+        Err(err) => {
+            let (code, reason) = err.into_rejection();
+            if was_realtime_streaming {
+                if let Some(prev) = previous.as_deref() {
+                    let _ = start_rvc_stream(services, rvc, prev, true);
+                }
+            }
+            Err((code, reason))
+        }
+    }
 }
 
 /// 恢复失败：组合原始错误与恢复错误，并留可查询的持久降级原因。

@@ -414,6 +414,37 @@ int main()
         CHECK(s.stats().resets.load() == 2, "large forward clock jump triggers reset");
     }
 
+    printf("test_native_40k_realtime_streaming\n");
+    {
+        struct Pipe40k : public RVCPipelineBase {
+            std::vector<float> process(const std::vector<float>& audio) override {
+                return std::vector<float>((audio.size() * 40000) / 16000, 0.25f);
+            }
+            std::vector<float> process_realtime(
+                const std::vector<float>&,
+                const RvcRealtimeRequest& request) override {
+                return std::vector<float>(request.output_samples, 0.25f);
+            }
+        } pipe40k;
+        StreamingRvc::Config cfg;
+        cfg.output_sample_rate = 40000;
+        cfg.upstream_realtime = true;
+        cfg.window_samples = 3840;
+        cfg.past_context_samples = 40000;
+        cfg.crossfade_out = 2000;
+        cfg.sola_search_out = 400;
+        cfg.startup_buffer_blocks = 1;
+        cfg.startup_delay_out = 400 * 40;
+        StreamingRvc s(cfg);
+        for (uint32_t i = 1; i <= 30; ++i) {
+            s.push(make_frame(i, 1, 0.1f, 1, i * 20000000ull));
+            while (s.try_process_one(pipe40k)) {}
+        }
+        CHECK(s.output_sample_rate() == 40000, "40k output_sample_rate");
+        CHECK(s.output_frame_samples() == 800, "40k output_frame_samples == 800");
+        CHECK(s.stats().blocks.load() >= 2, "40k stream produces blocks");
+    }
+
     if (g_fail) {
         printf("\n%d test(s) FAILED\n", g_fail);
         return 1;

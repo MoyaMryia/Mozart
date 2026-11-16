@@ -113,6 +113,8 @@ void FileWorker::batch_loop() {
             frame.meta.pts_ns =
                 static_cast<uint64_t>(i) * MOZART_OUTPUT_FRAME_MS * 1'000'000ull;
             frame.meta.vad_flag = 1;
+            frame.sample_rate = MOZART_OUTPUT_SAMPLE_RATE;
+            frame.valid_samples = MOZART_OUTPUT_SAMPLES;
             const size_t offset = i * MOZART_OUTPUT_SAMPLES;
             const size_t count =
                 std::min<size_t>(MOZART_OUTPUT_SAMPLES, output.size() - offset);

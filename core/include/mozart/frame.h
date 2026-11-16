@@ -71,14 +71,16 @@ typedef struct {
 MOZART_STATIC_ASSERT(sizeof(mozart_input_frame_t) == 16 + 320 * 4,
                      "mozart_input_frame_t size mismatch");
 
-// ---- 48 kHz 输出契约帧（推理进程 → 音频进程）----------------------------------
+// ---- 32/40/48 kHz 输出契约帧（推理进程 → 音频进程）---------------------------
 #pragma pack(push, 1)
 typedef struct {
     mozart_frame_meta_t meta;
+    uint32_t            sample_rate;    // 模型/输出采样率，如 32000 / 40000 / 48000
+    uint32_t            valid_samples;  // pcm 中有效样本数，1..=MOZART_OUTPUT_SAMPLES
     float               pcm[MOZART_OUTPUT_SAMPLES];
 } mozart_output_frame_t;
 #pragma pack(pop)
-MOZART_STATIC_ASSERT(sizeof(mozart_output_frame_t) == 16 + 960 * 4,
+MOZART_STATIC_ASSERT(sizeof(mozart_output_frame_t) == 24 + 960 * 4,
                      "mozart_output_frame_t size mismatch");
 
 // ---- 线包常量 ----------------------------------------------------------------
@@ -86,7 +88,7 @@ MOZART_STATIC_ASSERT(sizeof(mozart_output_frame_t) == 16 + 960 * 4,
 #define MOZART_OUTPUT_PACKET_MAGIC  0x54525A4Du   // 'TRZM'
 #define MOZART_PACKET_HEADER_SIZE   20            // 4B magic + 16B meta
 // 输入线包: 20 + 320*4 = 1300 字节
-// 输出线包: 20 + 960*4 = 3860 字节
+// 输出线包: 20 + 8 + 960*4 = 3868 字节
 
 #ifdef __cplusplus
 }

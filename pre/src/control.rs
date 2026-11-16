@@ -722,18 +722,18 @@ mod tests {
         assert_eq!(data(&reply.body)["route"], "rvc");
 
         // speech stop 清播报环：先塞两帧，停止后环空、应答计 frames_cleared。
-        tts.push(OutputFrame {
-            meta: mozart_core::FrameMeta {
+        tts.push(OutputFrame::new_48k(
+            mozart_core::FrameMeta {
                 pts_ns: 0, frame_idx: 0, vad_flag: 1, energy_db: 0, conf: 0, segment_id: 0,
             },
-            pcm: [0.0; mozart_core::OUTPUT_SAMPLES],
-        });
-        tts.push(OutputFrame {
-            meta: mozart_core::FrameMeta {
+            [0.0; mozart_core::OUTPUT_SAMPLES],
+        ));
+        tts.push(OutputFrame::new_48k(
+            mozart_core::FrameMeta {
                 pts_ns: 0, frame_idx: 1, vad_flag: 1, energy_db: 0, conf: 0, segment_id: 0,
             },
-            pcm: [0.0; mozart_core::OUTPUT_SAMPLES],
-        });
+            [0.0; mozart_core::OUTPUT_SAMPLES],
+        ));
         conn.send(ctl::PRE_SPEECH_STOP, 4, b"{}").unwrap();
         let reply = conn.recv(Some(Duration::from_secs(2))).unwrap();
         let stopped = data(&reply.body);

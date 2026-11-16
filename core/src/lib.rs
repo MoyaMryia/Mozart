@@ -43,7 +43,29 @@ pub struct InputFrame {
 #[derive(Clone, Copy)]
 pub struct OutputFrame {
     pub meta: FrameMeta,
+    pub sample_rate: u32,
+    pub valid_samples: u32,
     pub pcm: [f32; OUTPUT_SAMPLES],
+}
+
+impl OutputFrame {
+    pub fn new(
+        meta: FrameMeta,
+        sample_rate: u32,
+        valid_samples: u32,
+        pcm: [f32; OUTPUT_SAMPLES],
+    ) -> Self {
+        Self {
+            meta,
+            sample_rate,
+            valid_samples,
+            pcm,
+        }
+    }
+
+    pub fn new_48k(meta: FrameMeta, pcm: [f32; OUTPUT_SAMPLES]) -> Self {
+        Self::new(meta, OUTPUT_SAMPLE_RATE, OUTPUT_SAMPLES as u32, pcm)
+    }
 }
 
 /// 48 kHz 原始采集帧（进程内使用，不跨进程边界），对应 frame.h 的 `mozart_raw_frame_t`。
@@ -56,10 +78,10 @@ pub struct RawFrame {
 
 const _: () = assert!(std::mem::size_of::<FrameMeta>() == 16);
 const _: () = assert!(std::mem::size_of::<InputFrame>() == 16 + INPUT_SAMPLES * 4);
-const _: () = assert!(std::mem::size_of::<OutputFrame>() == 16 + OUTPUT_SAMPLES * 4);
+const _: () = assert!(std::mem::size_of::<OutputFrame>() == 24 + OUTPUT_SAMPLES * 4);
 const _: () = assert!(std::mem::size_of::<RawFrame>() == 16 + RAW_SAMPLES * 4);
 const _: () = assert!(std::mem::size_of::<InputFrame>() + 4 == 1300);
-const _: () = assert!(std::mem::size_of::<OutputFrame>() + 4 == 3860);
+const _: () = assert!(std::mem::size_of::<OutputFrame>() + 4 == 3868);
 
 const _: () = assert!(std::mem::offset_of!(FrameMeta, pts_ns) == 0);
 const _: () = assert!(std::mem::offset_of!(FrameMeta, frame_idx) == 8);
@@ -70,7 +92,9 @@ const _: () = assert!(std::mem::offset_of!(FrameMeta, segment_id) == 15);
 const _: () = assert!(std::mem::offset_of!(InputFrame, meta) == 0);
 const _: () = assert!(std::mem::offset_of!(InputFrame, pcm) == 16);
 const _: () = assert!(std::mem::offset_of!(OutputFrame, meta) == 0);
-const _: () = assert!(std::mem::offset_of!(OutputFrame, pcm) == 16);
+const _: () = assert!(std::mem::offset_of!(OutputFrame, sample_rate) == 16);
+const _: () = assert!(std::mem::offset_of!(OutputFrame, valid_samples) == 20);
+const _: () = assert!(std::mem::offset_of!(OutputFrame, pcm) == 24);
 const _: () = assert!(std::mem::offset_of!(RawFrame, meta) == 0);
 const _: () = assert!(std::mem::offset_of!(RawFrame, pcm) == 16);
 
@@ -82,7 +106,7 @@ mod tests {
     fn frame_sizes_match_c_header() {
         assert_eq!(std::mem::size_of::<FrameMeta>(), 16);
         assert_eq!(std::mem::size_of::<InputFrame>(), 1296);
-        assert_eq!(std::mem::size_of::<OutputFrame>(), 3856);
+        assert_eq!(std::mem::size_of::<OutputFrame>(), 3864);
         assert_eq!(std::mem::size_of::<RawFrame>(), 3856);
     }
 }

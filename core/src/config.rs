@@ -133,6 +133,27 @@ impl Default for PreConfig {
     }
 }
 
+/// `[rvc.realtime]` 非形状类实时旋钮（SPEC-03 实时几何与资产参数节）。
+#[derive(Debug, Clone, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct RvcRealtimeConfig {
+    pub crossfade_ms: u32,
+    pub sola_search_ms: u32,
+    pub startup_delay_ms: u32,
+    pub skip_silence: bool,
+}
+
+impl Default for RvcRealtimeConfig {
+    fn default() -> Self {
+        Self {
+            crossfade_ms: 50,
+            sola_search_ms: 10,
+            startup_delay_ms: 400,
+            skip_silence: true,
+        }
+    }
+}
+
 /// RVC 会话参数五键的值对象（SPEC-11 预设文件、config 校验与 status 共用）。
 /// 字段名与 `[rvc]` 同名，范围校验见 `validate_rvc_session_values`。
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -182,6 +203,8 @@ pub struct RvcConfig {
     pub rmvpe_path: String,
     pub realtime_hubert_path: String,
     pub realtime_rmvpe_path: String,
+    #[serde(default)]
+    pub realtime: RvcRealtimeConfig,
 }
 
 impl Default for RvcConfig {
@@ -211,6 +234,7 @@ impl RvcConfig {
             rmvpe_path: String::new(),
             realtime_hubert_path: String::new(),
             realtime_rmvpe_path: String::new(),
+            realtime: RvcRealtimeConfig::default(),
         }
     }
 
@@ -683,6 +707,26 @@ impl Config {
         validate_socket_name(&self.rvc.input_socket, "rvc.input_socket")?;
         validate_socket_name(&self.rvc.output_socket, "rvc.output_socket")?;
         validate_rvc_session_values(&self.rvc.session_values())?;
+        if self.rvc.realtime.crossfade_ms > 50 {
+            return Err(ConfigError::Invalid(
+                "rvc.realtime.crossfade_ms must be <= 50".to_string(),
+            ));
+        }
+        if self.rvc.realtime.sola_search_ms > 10 {
+            return Err(ConfigError::Invalid(
+                "rvc.realtime.sola_search_ms must be <= 10".to_string(),
+            ));
+        }
+        if self.rvc.realtime.crossfade_ms + self.rvc.realtime.sola_search_ms > 60 {
+            return Err(ConfigError::Invalid(
+                "rvc.realtime.crossfade_ms + sola_search_ms must be <= 60".to_string(),
+            ));
+        }
+        if self.rvc.realtime.startup_delay_ms > 15000 {
+            return Err(ConfigError::Invalid(
+                "rvc.realtime.startup_delay_ms must be <= 15000".to_string(),
+            ));
+        }
         validate_socket_name(&self.asr.socket, "asr.socket")?;
         validate_socket_name(&self.asr.input_socket, "asr.input_socket")?;
         validate_socket_name(&self.asr.events_socket, "asr.events_socket")?;
@@ -894,6 +938,15 @@ pub fn write_rvc_session_baseline(
     atomic_write(path, &doc.to_string())
 }
 
+/// 将 `model use` 切换后的模型 ID 原子写回 TOML `[rvc].model_id` 基线，
+/// 保留注释与其他键；供 daemon 重启后延续上次选用的模型。
+pub fn write_rvc_model_baseline(path: &Path, model_id: &str) -> Result<(), ConfigError> {
+    let mut doc = load_doc(path)?;
+    set_doc_key(&mut doc, "rvc.model_id", toml_edit::value(model_id))?;
+    validate_doc(path, &doc)?;
+    atomic_write(path, &doc.to_string())
+}
+
 /// 纯单段目录名（模型 id 回退拼路径用）：在 socket 名规则上再加 NUL 拦截。
 fn is_plain_component(name: &str) -> bool {
     is_plain_name(name) && !name.contains('\0')
@@ -979,7 +1032,11 @@ pub fn runtime_key_owner(key: &str) -> Option<&'static str> {
         | "rvc.pitch_shift"
         | "rvc.index_rate"
         | "rvc.rms_mix_rate"
-        | "rvc.protect" => Some("rvc"),
+        | "rvc.protect"
+        | "rvc.realtime.crossfade_ms"
+        | "rvc.realtime.sola_search_ms"
+        | "rvc.realtime.startup_delay_ms"
+        | "rvc.realtime.skip_silence" => Some("rvc"),
         "bridge.translate_enabled" | "bridge.speech_enabled" => Some("bridge"),
         _ => None,
     }
@@ -1052,7 +1109,7 @@ pub fn set_key(path: Option<&Path>, key: &str, value: &str) -> Result<KeyEffect,
 /// write_runtime_key 写入前的整体校验拒绝非法值，不落盘。
 fn parse_runtime_value(key: &str, value: &str) -> Result<toml_edit::Item, ConfigError> {
     match key {
-        "file.denoise" => match value {
+        "file.denoise" | "rvc.realtime.skip_silence" => match value {
             "true" => Ok(toml_edit::value(true)),
             "false" => Ok(toml_edit::value(false)),
             _ => Err(ConfigError::Invalid(format!("键 {key} 需要 true/false"))),
@@ -2182,6 +2239,34 @@ mod tests {
         };
         assert_eq!(default_loaded.file_storage_dir(), expected_default);
 
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn rvc_realtime_defaults_and_validation() {
+        let dir = temp_config_dir("rvc-realtime");
+        let path = dir.join("mozart.toml");
+        std::fs::write(&path, "[rvc]\npitch_shift = 0\n").unwrap();
+
+        let cfg = Config::load_from(Some(&path)).unwrap();
+        assert_eq!(cfg.rvc.realtime.crossfade_ms, 50);
+        assert_eq!(cfg.rvc.realtime.sola_search_ms, 10);
+        assert_eq!(cfg.rvc.realtime.startup_delay_ms, 400);
+        assert!(cfg.rvc.realtime.skip_silence);
+
+        set_key(Some(&path), "rvc.realtime.crossfade_ms", "40").unwrap();
+        set_key(Some(&path), "rvc.realtime.sola_search_ms", "5").unwrap();
+        set_key(Some(&path), "rvc.realtime.startup_delay_ms", "200").unwrap();
+        set_key(Some(&path), "rvc.realtime.skip_silence", "false").unwrap();
+
+        let updated = Config::load_from(Some(&path)).unwrap();
+        assert_eq!(updated.rvc.realtime.crossfade_ms, 40);
+        assert_eq!(updated.rvc.realtime.sola_search_ms, 5);
+        assert_eq!(updated.rvc.realtime.startup_delay_ms, 200);
+        assert!(!updated.rvc.realtime.skip_silence);
+
+        assert!(set_key(Some(&path), "rvc.realtime.crossfade_ms", "51").is_err());
+        assert!(set_key(Some(&path), "rvc.realtime.sola_search_ms", "11").is_err());
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

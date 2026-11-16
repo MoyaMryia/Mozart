@@ -6,13 +6,16 @@ from pathlib import Path
 
 import torch
 
+from realtime_chain_params import derive_geometry
+
 
 def main():
+    rt = derive_geometry()
     parser = argparse.ArgumentParser(description="Export RMVPE to ONNX")
     parser.add_argument("--rmvpe-path", required=True)
     parser.add_argument("--output", default="rmvpe.onnx")
     parser.add_argument("--opset", type=int, default=17)
-    parser.add_argument("--frames", type=int, default=128)
+    parser.add_argument("--frames", type=int, default=rt.rmvpe_frames)
     parser.add_argument(
         "--rvc-source",
         type=Path,

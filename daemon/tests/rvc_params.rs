@@ -592,3 +592,59 @@ fn write_wav(path: &Path, seconds: u32, sample_rate: u32) {
     }
     std::fs::write(path, wav).unwrap();
 }
+
+/// `[rvc.realtime]` 旋钮经 `config set` 修改时触发实时流 StopStream→StartStream，
+/// 并携带新值到 rvc；`model use <id>` 在实时流期间执行 StopStream→LoadModel→StartStream。
+#[test]
+fn realtime_knob_and_model_use_orchestrate_stop_start() {
+    let h = Harness::new("rt-knob-model-use", &[]);
+    h.set_route_rvc();
+
+    let stop_before = h.rvc_count(ctl::RVC_STOP_STREAM);
+    let reply = h.config_set("rvc.realtime.crossfade_ms", "40");
+    assert_eq!(reply.status, "ok", "reason: {}", reply.reason);
+    assert!(
+        h.rvc_count(ctl::RVC_STOP_STREAM) > stop_before,
+        "改 rvc.realtime.crossfade_ms 应触发 StopStream"
+    );
+    let last_start = h
+        .stream_starts("realtime")
+        .pop()
+        .expect("应重起实时流");
+    assert_eq!(last_start["crossfade_ms"], 40);
+
+    let stop_before_use = h.rvc_count(ctl::RVC_STOP_STREAM);
+    let load_before_use = h.rvc_count(ctl::RVC_LOAD_MODEL);
+    h.conn
+        .send(ctl::DAEMON_MODEL_USE, 200, br#"{"model_id":"demo"}"#)
+        .unwrap();
+    let use_reply: mozart_core::ctl::schema::Response = serde_json::from_slice(
+        &h.conn
+            .recv(Some(Duration::from_secs(5)))
+            .unwrap()
+            .body,
+    )
+    .unwrap();
+    assert_eq!(use_reply.status, "ok", "reason: {}", use_reply.reason);
+    assert_eq!(use_reply.data["model_id"], "demo");
+    assert!(h.rvc_count(ctl::RVC_STOP_STREAM) > stop_before_use);
+    assert!(h.rvc_count(ctl::RVC_LOAD_MODEL) > load_before_use);
+    let last_after_use = h
+        .stream_starts("realtime")
+        .pop()
+        .expect("换模型后应重起实时流");
+    assert_eq!(last_after_use["crossfade_ms"], 40);
+
+    // 不存在的模型：返回错误并恢复原模型流。
+    h.conn
+        .send(ctl::DAEMON_MODEL_USE, 201, br#"{"model_id":"missing-model"}"#)
+        .unwrap();
+    let bad_reply: mozart_core::ctl::schema::Response = serde_json::from_slice(
+        &h.conn
+            .recv(Some(Duration::from_secs(5)))
+            .unwrap()
+            .body,
+    )
+    .unwrap();
+    assert_eq!(bad_reply.status, "error");
+}

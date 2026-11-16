@@ -82,6 +82,7 @@ public:
     virtual bool set_parameters(const RvcParameters&) { return false; }
     virtual bool supports_quality_streaming() const { return false; }
     virtual bool supports_realtime_streaming() const { return false; }
+    virtual uint32_t realtime_sample_rate() const { return 48000; }
 };
 
 class MockRVCPipeline : public RVCPipelineBase {
@@ -142,6 +143,7 @@ public:
     bool set_parameters(const RvcParameters& parameters) override;
     bool supports_quality_streaming() const override;
     bool supports_realtime_streaming() const override;
+    uint32_t realtime_sample_rate() const override;
 
 private:
     std::shared_ptr<ModelManager> model_manager_;

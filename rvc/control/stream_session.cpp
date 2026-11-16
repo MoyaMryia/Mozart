@@ -15,6 +15,7 @@
 #include "mozart/ctl.h"
 #include "rvc/audio_worker.hpp"
 #include "rvc/file_worker.hpp"
+#include "rvc/realtime_geometry.hpp"
 #include "transport/unix_dgram_stream.h"
 
 namespace rvc {
@@ -279,9 +280,65 @@ std::vector<uint8_t> StreamSession::handle_start_stream(
                           "model has no offline generator; refusing file stream");
     }
 
+    RealtimeStreamOptions realtime_options{
+        kRealtimeDefaultCrossfadeMs,
+        kRealtimeDefaultSolaSearchMs,
+        kRealtimeDefaultStartupDelayMs,
+        kRealtimeDefaultSkipSilence,
+    };
+    if (realtime) {
+        if (body.contains("crossfade_ms")) {
+            if (!body.at("crossfade_ms").is_number_unsigned()) {
+                return error_body(MOZART_CTL_CODE_INVALID_ARGUMENT,
+                                  "crossfade_ms must be an unsigned integer");
+            }
+            const uint64_t val = body.at("crossfade_ms").get<uint64_t>();
+            if (val > 50) {
+                return error_body(MOZART_CTL_CODE_INVALID_ARGUMENT,
+                                  "crossfade_ms must be <= 50");
+            }
+            realtime_options.crossfade_ms = static_cast<uint32_t>(val);
+        }
+        if (body.contains("sola_search_ms")) {
+            if (!body.at("sola_search_ms").is_number_unsigned()) {
+                return error_body(MOZART_CTL_CODE_INVALID_ARGUMENT,
+                                  "sola_search_ms must be an unsigned integer");
+            }
+            const uint64_t val = body.at("sola_search_ms").get<uint64_t>();
+            if (val > 10) {
+                return error_body(MOZART_CTL_CODE_INVALID_ARGUMENT,
+                                  "sola_search_ms must be <= 10");
+            }
+            realtime_options.sola_search_ms = static_cast<uint32_t>(val);
+        }
+        if (realtime_options.crossfade_ms + realtime_options.sola_search_ms > 60) {
+            return error_body(MOZART_CTL_CODE_INVALID_ARGUMENT,
+                              "crossfade_ms + sola_search_ms must be <= 60");
+        }
+        if (body.contains("startup_delay_ms")) {
+            if (!body.at("startup_delay_ms").is_number_unsigned()) {
+                return error_body(MOZART_CTL_CODE_INVALID_ARGUMENT,
+                                  "startup_delay_ms must be an unsigned integer");
+            }
+            const uint64_t val = body.at("startup_delay_ms").get<uint64_t>();
+            if (val > 15000) {
+                return error_body(MOZART_CTL_CODE_INVALID_ARGUMENT,
+                                  "startup_delay_ms must be <= 15000");
+            }
+            realtime_options.startup_delay_ms = static_cast<uint32_t>(val);
+        }
+        if (body.contains("skip_silence")) {
+            if (!body.at("skip_silence").is_boolean()) {
+                return error_body(MOZART_CTL_CODE_INVALID_ARGUMENT,
+                                  "skip_silence must be a boolean");
+            }
+            realtime_options.skip_silence = body.at("skip_silence").get<bool>();
+        }
+    }
+
     std::string reason;
     auto worker = backend_->start_worker(realtime, parameters, file_options,
-                                         reason);
+                                         realtime_options, reason);
     if (!worker) {
         last_error_ = reason;
         return error_body(MOZART_CTL_CODE_INTERNAL, reason);
@@ -527,7 +584,9 @@ bool InferenceBackend::supports_file() const {
 
 std::unique_ptr<StreamWorker> InferenceBackend::start_worker(
     bool realtime, const RvcParameters& params,
-    const FileBatchOptions& file_options, std::string& reason) {
+    const FileBatchOptions& file_options,
+    const RealtimeStreamOptions& realtime_options,
+    std::string& reason) {
     // 会话参数在启动时固定（SPEC-03）；先落参数再造推理器。
     pipeline_->set_parameters(params);
     try {
@@ -548,8 +607,14 @@ std::unique_ptr<StreamWorker> InferenceBackend::start_worker(
             return std::make_unique<FileStreamWorker>(std::move(stream),
                                                       std::move(worker));
         }
+        AudioWorker::Config worker_config;
+        worker_config.realtime_kind = true;
+        worker_config.skip_silence = realtime_options.skip_silence;
+        worker_config.crossfade_ms = realtime_options.crossfade_ms;
+        worker_config.sola_search_ms = realtime_options.sola_search_ms;
+        worker_config.realtime_playout_delay_ms = realtime_options.startup_delay_ms;
         auto worker = std::make_unique<AudioWorker>(*stream, *pipeline_,
-                                                    AudioWorker::Config{});
+                                                    worker_config);
         worker->start();
         return std::make_unique<PumpStreamWorker>(std::move(stream),
                                                    std::move(worker));

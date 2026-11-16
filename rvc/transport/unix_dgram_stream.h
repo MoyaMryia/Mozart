@@ -37,7 +37,7 @@ namespace rvc {
 inline constexpr size_t kInputPacketBytes = 4 + sizeof(mozart_input_frame_t);
 inline constexpr size_t kOutputPacketBytes = 4 + sizeof(mozart_output_frame_t);
 static_assert(kInputPacketBytes == 1300, "输入线包必须 1300 B（frame.h 契约）");
-static_assert(kOutputPacketBytes == 3860, "输出线包必须 3860 B（frame.h 契约）");
+static_assert(kOutputPacketBytes == 3868, "输出线包必须 3868 B（frame.h 契约）");
 
 // ---- 线包编解码（魔数与长度校验在 decode 内完成，单一校验点）----
 

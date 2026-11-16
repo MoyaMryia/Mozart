@@ -134,6 +134,17 @@ path = "<资产根>/models/asr/<模型id>"
 
 五个会话参数在运行中是「当前模型 live 草稿」；持久来源是模型目录内的 `presets/default.toml`（SPEC-11）。模型切换时 daemon 把该模型的预设写入这五个键并应用；`config set` 改 live 值并用 `preset save` 写回预设。
 
+### [rvc.realtime]
+
+实时链路非形状旋钮（全局一套，不进模型预设，文件链不读不扫；ms 按模型输出采样率换算样本，最大参考上限见 `tools/model/realtime_chain_params.json`）：
+
+| 键 | 类型 | 默认 | 范围 | 类别 |
+| --- | --- | --- | --- | --- |
+| crossfade_ms | int | 50 | 0..=50，且与 sola_search_ms 之和 ≤ 60 | R |
+| sola_search_ms | int | 10 | 0..=10，且与 crossfade_ms 之和 ≤ 60 | R |
+| startup_delay_ms | int | 400 | 0..=15000 | R |
+| skip_silence | bool | true | — | R |
+
 ### [asr]
 
 | 键 | 类型 | 默认 | 范围 | 类别 |

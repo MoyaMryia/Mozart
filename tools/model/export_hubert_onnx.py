@@ -8,6 +8,8 @@ import numpy as np
 import torch
 from transformers import HubertModel
 
+from realtime_chain_params import derive_geometry
+
 
 class RvcV2Hubert(torch.nn.Module):
     def __init__(self, model):
@@ -24,11 +26,12 @@ class RvcV2Hubert(torch.nn.Module):
 
 
 def main():
+    rt = derive_geometry()
     parser = argparse.ArgumentParser(description="Export RVC v2 HuBERT to ONNX")
     parser.add_argument("--hubert-path", required=True)
     parser.add_argument("--output", default="hubert_base.onnx")
     parser.add_argument("--opset", type=int, default=17)
-    parser.add_argument("--samples", type=int, default=32000)
+    parser.add_argument("--samples", type=int, default=rt.hubert_samples)
     parser.add_argument(
         "--dynamic",
         action="store_true",

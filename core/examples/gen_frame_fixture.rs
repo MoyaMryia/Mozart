@@ -43,10 +43,7 @@ fn golden_output() -> OutputFrame {
     for (i, slot) in pcm.iter_mut().enumerate() {
         *slot = i as f32 * 0.25;
     }
-    OutputFrame {
-        meta: golden_meta(),
-        pcm,
-    }
+    OutputFrame::new_48k(golden_meta(), pcm)
 }
 
 fn main() {

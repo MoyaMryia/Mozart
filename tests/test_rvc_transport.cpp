@@ -101,6 +101,8 @@ mozart_input_frame_t sample_input(uint32_t idx) {
 mozart_output_frame_t sample_output(uint32_t idx) {
     mozart_output_frame_t frame{};
     frame.meta = sample_input(idx).meta;
+    frame.sample_rate = MOZART_OUTPUT_SAMPLE_RATE;
+    frame.valid_samples = MOZART_OUTPUT_SAMPLES;
     for (int i = 0; i < MOZART_OUTPUT_SAMPLES; ++i) {
         frame.pcm[i] = i * 0.25f + idx;
     }
@@ -165,14 +167,16 @@ int main() {
         // 输出线包金标（与 Rust 对拍用例同值）。
         mozart_output_frame_t out{};
         out.meta = frame.meta;
+        out.sample_rate = MOZART_OUTPUT_SAMPLE_RATE;
+        out.valid_samples = MOZART_OUTPUT_SAMPLES;
         out.pcm[0] = 1.0f;
         out.pcm[MOZART_OUTPUT_SAMPLES - 1] = -0.5f;
         uint8_t out_packet[kOutputPacketBytes];
-        CHECK(encode_output_packet(out, out_packet, sizeof(out_packet)) == 3860,
-              "output packet is 3860 bytes");
+        CHECK(encode_output_packet(out, out_packet, sizeof(out_packet)) == 3868,
+              "output packet is 3868 bytes");
         CHECK(std::memcmp(out_packet, "\x4D\x5A\x52\x54", 4) == 0,
               "output magic is little endian");
-        CHECK(std::memcmp(out_packet + 20, "\x00\x00\x80\x3F", 4) == 0,
+        CHECK(std::memcmp(out_packet + 28, "\x00\x00\x80\x3F", 4) == 0,
               "pcm[0] = 1.0f LE");
         CHECK(std::memcmp(out_packet + kOutputPacketBytes - 4, "\x00\x00\x00\xBF", 4) == 0,
               "pcm[959] = -0.5f LE");
@@ -383,11 +387,13 @@ int main() {
 
         mozart_output_frame_t out{};
         out.meta = frame.meta;
+        out.sample_rate = MOZART_OUTPUT_SAMPLE_RATE;
+        out.valid_samples = MOZART_OUTPUT_SAMPLES;
         for (int i = 0; i < MOZART_OUTPUT_SAMPLES; ++i) {
             out.pcm[i] = i * 0.25f;
         }
         const std::vector<uint8_t> output_bytes = read_fixture("output.bin");
-        CHECK(output_bytes.size() == kOutputPacketBytes, "output.bin is 3860 bytes");
+        CHECK(output_bytes.size() == kOutputPacketBytes, "output.bin is 3868 bytes");
         uint8_t out_packet[kOutputPacketBytes];
         CHECK(encode_output_packet(out, out_packet, sizeof(out_packet)) == kOutputPacketBytes,
               "output fixture frame encodes");

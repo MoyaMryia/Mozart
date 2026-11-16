@@ -111,6 +111,8 @@ private:
 class StreamingRvc {
 public:
     struct Config {
+        // 输出侧（32k/40k/48k 模型原生采样率，默认 48000）
+        uint32_t output_sample_rate = 48000;
         // 输入侧（16k）：窗口必须 = 32000（T=200 特征帧对应 2s 音频）
         size_t window_samples = 32000;
         // 输出侧（48k）块间交叉淡化长度。约束：crossfade_out/3 必须使
@@ -163,6 +165,8 @@ public:
     const Stats& stats() const noexcept { return stats_; }
     size_t output_pending() const;
     size_t startup_delay_out() const { return cfg_.startup_delay_out; }
+    uint32_t output_sample_rate() const noexcept { return cfg_.output_sample_rate; }
+    size_t output_frame_samples() const noexcept { return output_frame_samples_; }
 
     // 断续重置：等价于 push 侧检测到不连续（ResetStream 控制命令）。
     // 仅流式语义有效；推理线程在代数变化后自行作废淡化尾并重置实时缓存。
@@ -179,9 +183,11 @@ private:
     Config cfg_;
     Stats stats_;
 
-    const size_t hop_in_;        // 窗口推进步长（输入样本）
-    const size_t emit_out_;      // 每块固定输出的样本数（= hop_in * 3）
-    const size_t out_block_;     // 单块推理输出长度（= window * 3）
+    const size_t model_frame_out_;       // 模型单帧输出样本数（= output_sample_rate / 100）
+    const size_t output_frame_samples_;  // 20 ms 输出契约帧有效样本数（= output_sample_rate / 50）
+    const size_t hop_in_;                // 窗口推进步长（输入样本）
+    const size_t emit_out_;              // 每块固定输出的样本数
+    const size_t out_block_;             // 单块推理输出长度
     const size_t analysis_samples_;
 
     // 输入样本环（容量 = 4 窗，推理落后时丢最旧）

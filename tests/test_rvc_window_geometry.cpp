@@ -8,6 +8,7 @@
 //    T 帧、主窗覆盖无零尾、hop 对齐 160 样本、tgt 量纲换算
 // 奇数 T 的拒绝在 infer() 入口（需引擎），不在本单测范围。
 #include "rvc/inferencer.hpp"
+#include "rvc/realtime_geometry.hpp"
 
 #include <cstddef>
 #include <cstdint>
@@ -122,6 +123,38 @@ int main() {
             std::printf("  ok  偶数 T 扫描 200..4200 全部通过"
                         "（model_sr=%u，%zu 个 T）\n",
                         static_cast<unsigned>(model_sr), checked);
+    }
+
+    // 5. 实时几何单一来源镜像验证（48k / 40k / 32k，SPEC-03）。
+    {
+        const auto rt48 = derive_realtime_geometry(48000);
+        CHECK(rt48.overlap_out == 2880, "rt48 overlap_out == 2880");
+        CHECK(rt48.margin_16k == 960, "rt48 margin_16k == 960");
+        CHECK(rt48.front_frames == 280, "rt48 front_frames == 280");
+        CHECK(rt48.skip_head == 250, "rt48 skip_head == 250");
+        CHECK(rt48.return_frames == 30, "rt48 return_frames == 30");
+        CHECK(rt48.hubert_samples == 44800, "rt48 hubert_samples == 44800");
+        CHECK(rt48.hubert_frames == 139, "rt48 hubert_frames == 139");
+        CHECK(rt48.decoder_out_samples == 14400, "rt48 decoder_out_samples == 14400");
+        CHECK(rt48.output_hop == 11520, "rt48 output_hop == 11520");
+        CHECK(rt48.flow_head == 226, "rt48 flow_head == 226");
+        CHECK(rt48.latent_frames == 54, "rt48 latent_frames == 54");
+        CHECK(rt48.decoder_head == 24, "rt48 decoder_head == 24");
+        CHECK(rt48.rmvpe_frames == 32, "rt48 rmvpe_frames == 32");
+
+        const auto rt40 = derive_realtime_geometry(40000);
+        CHECK(rt40.front_frames == 280, "rt40 front_frames == 280");
+        CHECK(rt40.return_frames == 30, "rt40 return_frames == 30");
+        CHECK(rt40.output_frame_samples == 800, "rt40 output_frame_samples == 800");
+        CHECK(rt40.crossfade_max_out == 2000, "rt40 crossfade_max_out == 2000");
+        CHECK(rt40.sola_search_max_out == 400, "rt40 sola_search_max_out == 400");
+        CHECK(rt40.decoder_out_samples == 12000, "rt40 decoder_out_samples == 12000");
+        CHECK(rt40.output_hop == 9600, "rt40 output_hop == 9600");
+
+        const auto rt32 = derive_realtime_geometry(32000);
+        CHECK(rt32.output_frame_samples == 640, "rt32 output_frame_samples == 640");
+        CHECK(rt32.decoder_out_samples == 9600, "rt32 decoder_out_samples == 9600");
+        CHECK(rt32.output_hop == 7680, "rt32 output_hop == 7680");
     }
 
     if (g_fail == 0) std::printf("全部通过\n");

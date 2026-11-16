@@ -6,6 +6,7 @@
 //   - mock 管线直通分支保留（无 GPU 单测驱动全泵）。
 
 #include "rvc/audio_worker.hpp"
+#include "rvc/realtime_geometry.hpp"
 
 #include <algorithm>
 #include <chrono>
@@ -60,16 +61,16 @@ void AudioWorker::start() {
         scfg.upstream_realtime =
             config_.realtime_kind && pipeline_.supports_realtime_streaming();
         if (scfg.upstream_realtime) {
-            // 实时短块 preset（旧 AudioWorker.cpp:62-70）：240 ms 窗、
-            // 50 ms 交叉淡化、2.5 s 过去上下文、10 ms SOLA 搜索、
-            // 400 ms 启动缓冲。
-            scfg.window_samples = 3840;
-            scfg.crossfade_out = 2400;
-            scfg.past_context_samples = 40000;
-            scfg.sola_search_out = 480;
-            scfg.startup_buffer_blocks = 1;
+            const uint32_t out_sr = pipeline_.realtime_sample_rate();
+            const auto geom = derive_realtime_geometry(out_sr);
+            scfg.output_sample_rate = out_sr;
+            scfg.window_samples = geom.window_samples;
+            scfg.crossfade_out = static_cast<size_t>(config_.crossfade_ms) * (out_sr / 1000);
+            scfg.past_context_samples = geom.past_context_samples;
+            scfg.sola_search_out = static_cast<size_t>(config_.sola_search_ms) * (out_sr / 1000);
+            scfg.startup_buffer_blocks = kRealtimeStartupBufferBlocks;
             scfg.startup_delay_out =
-                config_.realtime_playout_delay_ms * (MOZART_OUTPUT_SAMPLE_RATE / 1000);
+                static_cast<size_t>(config_.realtime_playout_delay_ms) * (out_sr / 1000);
             pipeline_.reset_realtime();
         }
         scfg.full_history = !scfg.upstream_realtime
@@ -133,14 +134,17 @@ void AudioWorker::process_loop() {
         mozart_output_frame_t output{};
         if (stream_mode_) {
             output.meta = input.meta;
+            output.sample_rate = streaming_->output_sample_rate();
+            const size_t frame_samples = streaming_->output_frame_samples();
+            output.valid_samples = static_cast<uint32_t>(frame_samples);
             streaming_->push(input);
             const size_t got =
-                streaming_->pop_output(output.pcm, MOZART_OUTPUT_SAMPLES);
-            if (got < MOZART_OUTPUT_SAMPLES) {
-                std::fill(output.pcm + got, output.pcm + MOZART_OUTPUT_SAMPLES, 0.0f);
+                streaming_->pop_output(output.pcm, frame_samples);
+            if (got < frame_samples) {
+                std::fill(output.pcm + got, output.pcm + frame_samples, 0.0f);
             }
             std::lock_guard<std::mutex> lock(stats_mutex_);
-            if (got < MOZART_OUTPUT_SAMPLES) {
+            if (got < frame_samples) {
                 ++underrun_count_;
                 if (!stream_output_started_) ++startup_underrun_count_;
             }
@@ -165,6 +169,8 @@ void AudioWorker::process_loop() {
 void AudioWorker::process_frame(const mozart_input_frame_t& input,
                                 mozart_output_frame_t& output) {
     output.meta = input.meta;
+    output.sample_rate = MOZART_OUTPUT_SAMPLE_RATE;
+    output.valid_samples = MOZART_OUTPUT_SAMPLES;
 
     if (config_.skip_silence && input.meta.vad_flag == 0) {
         std::memset(output.pcm, 0, sizeof(output.pcm));
@@ -189,7 +195,7 @@ AudioWorker::StreamStats AudioWorker::get_stream_stats() const {
         s.inference_errors = src.inference_errors.load();
         s.history_resets = src.history_resets.load();
         s.queue_depth_frames =
-            streaming_->output_pending() / MOZART_OUTPUT_SAMPLES;
+            streaming_->output_pending() / streaming_->output_frame_samples();
         const auto& timing = streaming_->timing();
         if (timing.count() > 0) {   // 静音跳过的块不计时，保持 NaN
             s.inference_ms_last = timing.last();

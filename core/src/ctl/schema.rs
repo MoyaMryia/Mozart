@@ -520,6 +520,13 @@ pub struct ModelEntry {
     pub loaded: bool,
 }
 
+/// DAEMON_MODEL_USE 请求体。
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ModelUseRequest {
+    pub model_id: String,
+}
+
 /// 音频设备条目（DAEMON_DEVICE_LIST 的 data.devices 元素）。
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DeviceEntry {

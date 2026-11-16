@@ -136,7 +136,9 @@ size_t encode_output_packet(const mozart_output_frame_t& frame,
     if (cap < kOutputPacketBytes) return 0;
     write_u32_le(out, MOZART_OUTPUT_PACKET_MAGIC);
     encode_meta(frame.meta, out);
-    encode_pcm(frame.pcm, MOZART_OUTPUT_SAMPLES, out);
+    write_u32_le(out + 20, frame.sample_rate);
+    write_u32_le(out + 24, frame.valid_samples);
+    encode_pcm(frame.pcm, MOZART_OUTPUT_SAMPLES, out + 8);
     return kOutputPacketBytes;
 }
 
@@ -145,7 +147,9 @@ bool decode_output_packet(const uint8_t* bytes, size_t len,
     if (len != kOutputPacketBytes) return false;
     if (read_u32_le(bytes) != MOZART_OUTPUT_PACKET_MAGIC) return false;
     out.meta = decode_meta<mozart_frame_meta_t>(bytes);
-    decode_pcm(bytes, MOZART_OUTPUT_SAMPLES, out.pcm);
+    out.sample_rate = read_u32_le(bytes + 20);
+    out.valid_samples = read_u32_le(bytes + 24);
+    decode_pcm(bytes + 8, MOZART_OUTPUT_SAMPLES, out.pcm);
     return true;
 }
 

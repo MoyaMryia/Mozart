@@ -8,6 +8,7 @@ import numpy as np
 import torch
 
 from export_generator_onnx import decode_generator, load_generator
+from realtime_chain_params import derive_geometry
 
 
 class GeneratorFront(torch.nn.Module):
@@ -106,21 +107,29 @@ def export_and_validate(
 
 
 def main():
+    rt = derive_geometry()
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("model", type=Path)
     parser.add_argument("--front-output", type=Path, required=True)
     parser.add_argument("--decoder-output", type=Path, required=True)
-    parser.add_argument("--front-frames", type=int, default=1650)
-    parser.add_argument("--decoder-frames", type=int, default=226)
+    parser.add_argument("--front-frames", type=int, default=rt.front_frames)
+    parser.add_argument("--decoder-frames", type=int, default=rt.decoder_frames)
     parser.add_argument(
         "--skip-head",
         type=int,
+        default=rt.skip_head,
         help="fixed upstream-realtime history frames to remove before output",
     )
     parser.add_argument(
         "--return-frames",
         type=int,
+        default=rt.return_frames,
         help="fixed upstream-realtime block + overlap + SOLA-search frames",
+    )
+    parser.add_argument(
+        "--non-realtime",
+        action="store_true",
+        help="export non-realtime split front/decoder without skip-head crop",
     )
     parser.add_argument("--opset", type=int, default=18)
     parser.add_argument("--dynamo-front", action="store_true")
@@ -133,9 +142,7 @@ def main():
     args = parser.parse_args()
     if args.front_frames <= 0 or args.decoder_frames <= 0:
         raise ValueError("frame counts must be positive")
-    if (args.skip_head is None) != (args.return_frames is None):
-        raise ValueError("skip-head and return-frames must be specified together")
-    realtime = args.skip_head is not None
+    realtime = not args.non_realtime
     if realtime:
         if args.skip_head < 0 or args.return_frames <= 0:
             raise ValueError("invalid realtime skip/return frame counts")
@@ -151,9 +158,10 @@ def main():
 
     wrapper, _ = load_generator(args.model, args.rvc_source)
     generator = wrapper.generator
+    emb_dim = getattr(getattr(generator.enc_p, "emb_phone", None), "in_features", 768)
     torch.manual_seed(114514)
     front_inputs = (
-        torch.randn(1, args.front_frames, 768),
+        torch.randn(1, args.front_frames, emb_dim),
         torch.tensor([args.front_frames], dtype=torch.float32),
         torch.randint(1, 255, (1, args.front_frames), dtype=torch.float32),
         torch.tensor([0], dtype=torch.int64),

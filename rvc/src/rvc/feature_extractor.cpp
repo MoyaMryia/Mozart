@@ -1,6 +1,7 @@
 // 搬运自 Mozart-Old/rvc-backend/src/rvc/feature_extractor.cpp，改动：
 // 未用形参标注 [[maybe_unused]]（-Werror）；删去零调用方的 extract_mel。
 #include "rvc/feature_extractor.hpp"
+#include "rvc/realtime_geometry.hpp"
 #include "rvc/profile.hpp"
 #include "rvc/trt_engine.hpp"
 
@@ -48,16 +49,18 @@ FeatureExtractor::FeatureExtractor(
 {
     if (!defer_quality) ensure_quality_engines();
 
+    const auto rt_geom = derive_realtime_geometry();
     if (realtime_hubert_path_ && std::filesystem::exists(*realtime_hubert_path_)) {
         realtime_hubert_engine_ = make_engine(*realtime_hubert_path_);
         if (!realtime_hubert_engine_
             || dynamic_cast<TrtEngine*>(realtime_hubert_engine_.get()) == nullptr
             || !validate_realtime_engine(
-                *realtime_hubert_engine_, "audio", {1, 44800}, "features",
-                139 * 768)) {
+                *realtime_hubert_engine_, "audio",
+                {1, static_cast<int64_t>(rt_geom.hubert_samples)}, "features",
+                rt_geom.hubert_frames * 768)) {
             spdlog::warn(
-                "Realtime HuBERT requires a healthy TensorRT [1,44800] engine: {}",
-                realtime_hubert_path_->string());
+                "Realtime HuBERT requires a healthy TensorRT [1,{}] engine: {}",
+                rt_geom.hubert_samples, realtime_hubert_path_->string());
             realtime_hubert_engine_.reset();
         } else {
             spdlog::info("Realtime HuBERT engine loaded: {}",
@@ -73,10 +76,13 @@ FeatureExtractor::FeatureExtractor(
         if (!realtime_rmvpe_engine_
             || dynamic_cast<TrtEngine*>(realtime_rmvpe_engine_.get()) == nullptr
             || !validate_realtime_engine(
-                *realtime_rmvpe_engine_, "mel", {1, 128, 32}, "f0",
-                32 * 360)) {
+                *realtime_rmvpe_engine_, "mel",
+                {1, static_cast<int64_t>(kRealtimeRmvpeMelBands),
+                 static_cast<int64_t>(rt_geom.rmvpe_frames)},
+                "f0", rt_geom.rmvpe_frames * 360)) {
             spdlog::warn(
-                "Realtime RMVPE requires a healthy TensorRT [1,128,32] engine: {}",
+                "Realtime RMVPE requires a healthy TensorRT [1,{},{}] engine: {}",
+                kRealtimeRmvpeMelBands, rt_geom.rmvpe_frames,
                 realtime_rmvpe_path_->string());
             realtime_rmvpe_engine_.reset();
         } else {

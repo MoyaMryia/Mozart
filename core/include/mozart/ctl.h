@@ -69,6 +69,7 @@ enum {
     MOZART_CTL_DAEMON_PRESET_SAVE = 0x011D,  // data {"model_id","preset","values"}
     MOZART_CTL_DAEMON_PRESET_USE  = 0x011E,  // data {"model_id","preset","values"}；编排失败回 error
     MOZART_CTL_DAEMON_PRESET_LIST = 0x011F,  // data {"model_id","preset","preset_values","live_values","dirty"}
+    MOZART_CTL_DAEMON_MODEL_USE   = 0x0120,  // 体 {"model_id"}，data {"model_id","previous_model_id"}；实时/空闲切换模型
 
     MOZART_CTL_PRE_HELLO      = 0x0201,
     MOZART_CTL_PRE_SET_ROUTE  = 0x0202,

@@ -173,6 +173,11 @@ enum ModelAction {
         #[arg(long)]
         available: bool,
     },
+    /// 切换当前加载的 RVC 模型（实时流期间会短暂断流重启）
+    Use {
+        /// 目标模型 id
+        id: String,
+    },
 }
 
 #[derive(Clone, Copy, ValueEnum)]
@@ -269,6 +274,7 @@ fn run(cli: Cli) -> Result<(), CliError> {
         Action::File { action } => file_command(&config, action, cli.json),
         Action::Model { action } => match action {
             ModelAction::List { available } => model_list(&config, cli.json, available),
+            ModelAction::Use { id } => model_use(&config, cli.json, &id),
         },
         Action::Restart { service } => restart(&config, service, cli.json),
         Action::Device { action } => match action {
@@ -632,6 +638,22 @@ fn model_list(config: &Config, json_output: bool, available: bool) -> Result<(),
             yes_no(model.loaded)
         );
     }
+    Ok(())
+}
+
+fn model_use(config: &Config, json_output: bool, id: &str) -> Result<(), CliError> {
+    let body = serde_json::to_string(&json!({"model_id": id}))
+        .map_err(|err| CliError::new(EXIT_ERROR, format!("encode request: {err}")))?;
+    let data = call(config, ctl::DAEMON_MODEL_USE, body.as_bytes())?;
+    if json_output {
+        println!("{data}");
+        return Ok(());
+    }
+    let previous = data
+        .get("previous_model_id")
+        .and_then(|v| v.as_str())
+        .unwrap_or("-");
+    println!("model switched: {previous} -> {id}");
     Ok(())
 }
 

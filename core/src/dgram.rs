@@ -62,20 +62,24 @@ impl WirePacket for InputFrame {
 
 impl WirePacket for OutputFrame {
     const MAGIC: u32 = crate::OUTPUT_PACKET_MAGIC;
-    const PACKET_BYTES: usize = PACKET_HEADER_SIZE + crate::OUTPUT_SAMPLES * 4;
+    const PACKET_BYTES: usize = PACKET_HEADER_SIZE + 8 + crate::OUTPUT_SAMPLES * 4;
 
     fn encode(&self, out: &mut [u8]) {
         out[0..4].copy_from_slice(&Self::MAGIC.to_le_bytes());
         let meta = self.meta;
         encode_meta(&meta, out);
+        out[20..24].copy_from_slice(&self.sample_rate.to_le_bytes());
+        out[24..28].copy_from_slice(&self.valid_samples.to_le_bytes());
         let pcm = self.pcm;
-        encode_pcm(&pcm, out);
+        encode_pcm_at(&pcm, out, PACKET_HEADER_SIZE + 8);
     }
 
     fn decode(bytes: &[u8]) -> Self {
         Self {
             meta: decode_meta(bytes),
-            pcm: decode_pcm(bytes),
+            sample_rate: u32::from_le_bytes(bytes[20..24].try_into().unwrap()),
+            valid_samples: u32::from_le_bytes(bytes[24..28].try_into().unwrap()),
+            pcm: decode_pcm_at(bytes, PACKET_HEADER_SIZE + 8),
         }
     }
 }
@@ -104,15 +108,23 @@ fn decode_meta(bytes: &[u8]) -> FrameMeta {
 
 /// PCM 编码到线包偏移 20 之后，逐样本小端。
 fn encode_pcm<const N: usize>(pcm: &[f32; N], out: &mut [u8]) {
-    for (slot, sample) in out[PACKET_HEADER_SIZE..].chunks_exact_mut(4).zip(pcm) {
+    encode_pcm_at(pcm, out, PACKET_HEADER_SIZE);
+}
+
+fn encode_pcm_at<const N: usize>(pcm: &[f32; N], out: &mut [u8], offset: usize) {
+    for (slot, sample) in out[offset..].chunks_exact_mut(4).zip(pcm) {
         slot.copy_from_slice(&sample.to_le_bytes());
     }
 }
 
 /// 从线包偏移 20 之后解码 PCM，逐样本小端。
 fn decode_pcm<const N: usize>(bytes: &[u8]) -> [f32; N] {
+    decode_pcm_at(bytes, PACKET_HEADER_SIZE)
+}
+
+fn decode_pcm_at<const N: usize>(bytes: &[u8], offset: usize) -> [f32; N] {
     let mut pcm = [0f32; N];
-    for (slot, chunk) in pcm.iter_mut().zip(bytes[PACKET_HEADER_SIZE..].chunks_exact(4)) {
+    for (slot, chunk) in pcm.iter_mut().zip(bytes[offset..].chunks_exact(4)) {
         *slot = f32::from_le_bytes(chunk.try_into().unwrap());
     }
     pcm
@@ -517,8 +529,8 @@ mod tests {
         for (i, slot) in pcm.iter_mut().enumerate() {
             *slot = i as f32 * 0.25 + idx as f32;
         }
-        OutputFrame {
-            meta: FrameMeta {
+        OutputFrame::new_48k(
+            FrameMeta {
                 pts_ns: 0x0102_0304_0506_0708 + idx as u64,
                 frame_idx: idx,
                 vad_flag: 1,
@@ -527,7 +539,7 @@ mod tests {
                 segment_id: 4,
             },
             pcm,
-        }
+        )
     }
 
     /// meta 比较按值传参；packed 字段只能经解构按值读取，不能取引用。
@@ -601,8 +613,8 @@ mod tests {
         let mut pcm = [0f32; crate::OUTPUT_SAMPLES];
         pcm[0] = 1.0;
         pcm[crate::OUTPUT_SAMPLES - 1] = -0.5;
-        let frame = OutputFrame {
-            meta: FrameMeta {
+        let frame = OutputFrame::new_48k(
+            FrameMeta {
                 pts_ns: 0x8877_6655_4433_2211,
                 frame_idx: 0xD4D3_D2D1,
                 vad_flag: 1,
@@ -611,19 +623,21 @@ mod tests {
                 segment_id: 4,
             },
             pcm,
-        };
+        );
         let mut packet = [0u8; <OutputFrame as WirePacket>::PACKET_BYTES];
         frame.encode(&mut packet);
-        assert_eq!(packet.len(), 3860);
+        assert_eq!(packet.len(), 3868);
         // 魔数 0x54525A4D 小端。
         assert_eq!(&packet[0..4], &[0x4D, 0x5A, 0x52, 0x54]);
         assert_eq!(&packet[4..12], &0x8877_6655_4433_2211u64.to_le_bytes());
         assert_eq!(&packet[12..16], &0xD4D3_D2D1u32.to_le_bytes());
         assert_eq!(&packet[16..20], &[1, 2, 3, 4]);
+        assert_eq!(&packet[20..24], &48000u32.to_le_bytes());
+        assert_eq!(&packet[24..28], &960u32.to_le_bytes());
         // pcm[0] = 1.0f32 小端。
-        assert_eq!(&packet[20..24], &[0x00, 0x00, 0x80, 0x3F]);
+        assert_eq!(&packet[28..32], &[0x00, 0x00, 0x80, 0x3F]);
         // 末样本 pcm[959] = -0.5f32 小端。
-        assert_eq!(&packet[3856..3860], &[0x00, 0x00, 0x00, 0xBF]);
+        assert_eq!(&packet[3864..3868], &[0x00, 0x00, 0x00, 0xBF]);
     }
 
     #[test]

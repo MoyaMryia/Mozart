@@ -1,4 +1,5 @@
 #include "rvc/pipeline.hpp"
+#include "rvc/realtime_geometry.hpp"
 // 搬运自 Mozart-Old/rvc-backend/src/rvc/pipeline.cpp，改动：裁掉 filter_radius
 // 校验与 RVCPipelineFactory（新进程由 LoadModel 命令显式加载模型）。
 #include <spdlog/spdlog.h>
@@ -202,6 +203,11 @@ bool RealRVCPipeline::supports_quality_streaming() const {
         && model->generator_engine().input_type("latent_noise").has_value();
 }
 
+uint32_t RealRVCPipeline::realtime_sample_rate() const {
+    const auto model = model_manager_->current_model();
+    return model ? model->config().sample_rate : output_sample_rate_;
+}
+
 bool RealRVCPipeline::supports_realtime_streaming() const {
     RvcParameters parameters;
     {
@@ -209,21 +215,29 @@ bool RealRVCPipeline::supports_realtime_streaming() const {
         parameters = parameters_;
     }
     const auto model = model_manager_->current_model();
-    if (!model || !model->loaded() || !model->has_realtime_generator()
-        || model->config().sample_rate != output_sample_rate_
-        || input_sample_rate_ != 16000
-        || !feature_extractor_->supports_realtime_hubert_samples(44800)) {
+    if (!model || !model->loaded() || !model->has_realtime_generator()) {
+        return false;
+    }
+    const uint32_t model_sr = model->config().sample_rate;
+    if (!is_supported_realtime_sample_rate(model_sr)
+        || input_sample_rate_ != kRealtimeInputSampleRate) {
+        return false;
+    }
+    const auto geom = derive_realtime_geometry(model_sr);
+    if (!feature_extractor_->supports_realtime_hubert_samples(geom.hubert_samples)) {
         return false;
     }
     if (parameters.f0_method == "rmvpe"
-        && !feature_extractor_->supports_realtime_rmvpe_frames(32)) {
+        && !feature_extractor_->supports_realtime_rmvpe_frames(geom.rmvpe_frames)) {
         return false;
     }
     const auto front_shape = model->realtime_front_engine().input_shape("feats");
     const auto decoder_shape = model->realtime_decoder_engine().input_shape("z");
-    return front_shape.size() == 3 && front_shape[1] == 280
+    return front_shape.size() == 3
+        && front_shape[1] == static_cast<int64_t>(geom.front_frames)
         && front_shape[2] == static_cast<int64_t>(model->config().emb_channels)
-        && decoder_shape.size() == 3 && decoder_shape[2] == 30;
+        && decoder_shape.size() == 3
+        && decoder_shape[2] == static_cast<int64_t>(geom.return_frames);
 }
 
 std::vector<float> RealRVCPipeline::process(const std::vector<float>& audio) {

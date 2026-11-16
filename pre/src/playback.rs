@@ -11,7 +11,7 @@ use crate::route::{Mute, Router};
 use crate::state::{Shared, Speaker};
 use mozart_core::ctl::schema::Route;
 use mozart_core::ring::Ring;
-use mozart_core::{OutputFrame, RawFrame, RAW_SAMPLES};
+use mozart_core::{OutputFrame, RawFrame, OUTPUT_SAMPLES, RAW_SAMPLES, RAW_SAMPLE_RATE};
 use std::sync::atomic::AtomicBool;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -79,6 +79,63 @@ fn drain_rvc_skipped(rvc: &Ring<OutputFrame>, shared: &Shared) {
     }
 }
 
+/// 播放边界无分配状态化重采样器：当 RVC 模型原生采样率（如 40 kHz）与 ALSA
+/// 播放采样率（48 kHz）不同时，在播放线程入口做一次 1 样本延迟线性插值重采样；
+/// 采样率一致时零拷贝直通。
+struct BoundaryResampler {
+    last_sample: f32,
+    last_rate: u32,
+}
+
+impl BoundaryResampler {
+    fn new() -> Self {
+        Self {
+            last_sample: 0.0,
+            last_rate: 0,
+        }
+    }
+
+    fn reset(&mut self) {
+        self.last_sample = 0.0;
+        self.last_rate = 0;
+    }
+
+    fn resample_to_48k(&mut self, frame: &OutputFrame) -> [f32; RAW_SAMPLES] {
+        let rate = frame.sample_rate;
+        let valid = (frame.valid_samples as usize).min(OUTPUT_SAMPLES);
+        let pcm = frame.pcm;
+        if rate == RAW_SAMPLE_RATE && valid == RAW_SAMPLES {
+            self.last_sample = pcm[RAW_SAMPLES - 1];
+            self.last_rate = rate;
+            return pcm;
+        }
+        if valid == 0 || rate == 0 {
+            self.reset();
+            return [0f32; RAW_SAMPLES];
+        }
+        if self.last_rate != rate {
+            self.last_sample = pcm[0];
+            self.last_rate = rate;
+        }
+        let mut out = [0f32; RAW_SAMPLES];
+        let step = valid as f64 / RAW_SAMPLES as f64;
+        for (j, slot) in out.iter_mut().enumerate() {
+            let pos = (j as f64) * step - 1.0;
+            if pos < 0.0 {
+                let frac = (pos + 1.0) as f32;
+                *slot = self.last_sample + (pcm[0] - self.last_sample) * frac;
+            } else {
+                let idx0 = (pos as usize).min(valid - 1);
+                let idx1 = (idx0 + 1).min(valid - 1);
+                let frac = (pos - idx0 as f64) as f32;
+                *slot = pcm[idx0] + (pcm[idx1] - pcm[idx0]) * frac;
+            }
+        }
+        self.last_sample = pcm[valid - 1];
+        out
+    }
+}
+
 /// 播放线程主体。返回 Err 表示致命流错误；主线程据此退出进程。
 pub fn run(
     pcm: alsa::pcm::PCM,
@@ -95,6 +152,7 @@ pub fn run(
     let mut router = Router::new(Route::Direct);
     let mut mute = Mute::new();
     let mut speaker = SpeakerScheduler::new();
+    let mut rvc_resampler = BoundaryResampler::new();
     let mut underruns = 0u64;
     let mut reported = 0u64;
     loop {
@@ -134,6 +192,7 @@ pub fn run(
                     };
                     // direct 期间后端输出帧不播、排空并计数（旧 skipped_replies）。
                     drain_rvc_skipped(&rvc, &shared);
+                    rvc_resampler.reset();
                     pcm
                 }
                 Route::Rvc => {
@@ -141,8 +200,11 @@ pub fn run(
                     let _ = trunk.pop(Some(Duration::ZERO));
                     // AI 接收环缺帧补零续流（大缓冲与欠载补零归 C++ 侧，SPEC-03）。
                     match rvc.pop(Some(FRAME_WAIT)) {
-                        Some(frame) => frame.pcm,
-                        None => [0f32; RAW_SAMPLES],
+                        Some(frame) => rvc_resampler.resample_to_48k(&frame),
+                        None => {
+                            rvc_resampler.reset();
+                            [0f32; RAW_SAMPLES]
+                        }
                     }
                 }
             },
@@ -230,8 +292,8 @@ mod tests {
         let shared = crate::state::test_shared("cap", "play", "test");
         let rvc = Ring::<OutputFrame>::new(4);
         for idx in 0..3u32 {
-            rvc.push(OutputFrame {
-                meta: FrameMeta {
+            rvc.push(OutputFrame::new_48k(
+                FrameMeta {
                     pts_ns: 0,
                     frame_idx: idx,
                     vad_flag: 0,
@@ -239,8 +301,8 @@ mod tests {
                     conf: 0,
                     segment_id: 0,
                 },
-                pcm: [0.0; mozart_core::OUTPUT_SAMPLES],
-            });
+                [0.0; mozart_core::OUTPUT_SAMPLES],
+            ));
         }
         drain_rvc_skipped(&rvc, &shared);
         assert_eq!(rvc.depth(), 0, "排空后 AI 环不得有陈货");
@@ -332,5 +394,34 @@ mod tests {
     #[test]
     fn broadcast_holdoff_matches_200ms() {
         assert_eq!(BROADCAST_HOLDOFF, Duration::from_millis(200));
+    }
+
+    #[test]
+    fn boundary_resampler_handles_40k_and_48k_passthrough() {
+        let mut resampler = BoundaryResampler::new();
+        let meta = FrameMeta {
+            pts_ns: 0,
+            frame_idx: 0,
+            vad_flag: 1,
+            energy_db: 0,
+            conf: 0,
+            segment_id: 0,
+        };
+        let mut pcm48 = [0.0f32; OUTPUT_SAMPLES];
+        pcm48[0] = 0.25;
+        pcm48[959] = -0.5;
+        let out48 = resampler.resample_to_48k(&OutputFrame::new_48k(meta, pcm48));
+        assert_eq!(out48[0], 0.25);
+        assert_eq!(out48[959], -0.5);
+
+        let mut pcm40 = [0.0f32; OUTPUT_SAMPLES];
+        for i in 0..800 {
+            pcm40[i] = i as f32 / 800.0;
+        }
+        let out40 = resampler.resample_to_48k(&OutputFrame::new(meta, 40000, 800, pcm40));
+        assert_eq!(out40.len(), RAW_SAMPLES);
+        assert!(out40.iter().all(|v| v.is_finite()));
+        assert!((out40[0] - 0.0).abs() < 1e-6);
+        assert!(out40[959] > 0.99);
     }
 }

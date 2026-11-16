@@ -45,7 +45,7 @@ fn main() {
         for (i, slot) in pcm.iter_mut().enumerate() {
             *slot = pcm_in[i / 3];
         }
-        if let Err(err) = tx.send(&OutputFrame { meta, pcm }) {
+        if let Err(err) = tx.send(&OutputFrame::new_48k(meta, pcm)) {
             eprintln!("mozart-rvc-echo: send: {err}");
         }
     }

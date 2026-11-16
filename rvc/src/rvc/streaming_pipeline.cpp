@@ -4,6 +4,7 @@
 //   - 推理失败原因存入 last_inference_error_（降级可查询）。
 #include "rvc/streaming_pipeline.hpp"
 #include "rvc/profile.hpp"
+#include "rvc/realtime_geometry.hpp"
 
 #include <algorithm>
 #include <cmath>
@@ -23,34 +24,37 @@ constexpr uint32_t kFrameIdxResetGap = 4;        // frame_idx 缺口 >4 帧视�
 constexpr size_t kOutRingCapacity = 96000 * 8;   // 16s @48k（推理可领先消费端数块）
 constexpr float kPi = 3.14159265358979323846f;
 constexpr size_t kModelFrame16k = 160;
-constexpr size_t kModelFrame48k = 480;
 } // namespace
 
 StreamingRvc::StreamingRvc(Config config)
     : cfg_(std::move(config)),
+      model_frame_out_(cfg_.output_sample_rate / 100),
+      output_frame_samples_(cfg_.output_sample_rate / 50),
       hop_in_(cfg_.upstream_realtime
           ? cfg_.window_samples
-          : cfg_.window_samples - cfg_.crossfade_out / 3),
-      emit_out_(hop_in_ * 3),
+          : cfg_.window_samples - (cfg_.crossfade_out * kRealtimeInputSampleRate) / cfg_.output_sample_rate),
+      emit_out_((hop_in_ * cfg_.output_sample_rate) / kRealtimeInputSampleRate),
       out_block_(cfg_.upstream_realtime
           ? emit_out_ + cfg_.crossfade_out + cfg_.sola_search_out
-          : cfg_.window_samples * 3),
+          : (cfg_.window_samples * cfg_.output_sample_rate) / kRealtimeInputSampleRate),
       analysis_samples_(cfg_.upstream_realtime
           ? cfg_.past_context_samples + cfg_.window_samples
-              + (cfg_.crossfade_out + cfg_.sola_search_out) / 3
+              + ((cfg_.crossfade_out + cfg_.sola_search_out) * kRealtimeInputSampleRate) / cfg_.output_sample_rate
           : cfg_.window_samples)
 {
-    if (cfg_.window_samples < 200 || cfg_.crossfade_out % 3 != 0
-        || cfg_.sola_search_out % 3 != 0
-        || cfg_.crossfade_out >= cfg_.window_samples * 3
+    if (!is_supported_realtime_sample_rate(cfg_.output_sample_rate)
+        || cfg_.window_samples < 200
+        || (cfg_.crossfade_out * kRealtimeInputSampleRate) % cfg_.output_sample_rate != 0
+        || (cfg_.sola_search_out * kRealtimeInputSampleRate) % cfg_.output_sample_rate != 0
+        || cfg_.crossfade_out >= (cfg_.window_samples * cfg_.output_sample_rate) / kRealtimeInputSampleRate
         || (cfg_.upstream_realtime && cfg_.full_history)
         || (cfg_.upstream_realtime
             && (cfg_.past_context_samples % kModelFrame16k != 0
                 || analysis_samples_ % kModelFrame16k != 0
-                || out_block_ % kModelFrame48k != 0))
+                || out_block_ % model_frame_out_ != 0))
         || cfg_.startup_buffer_blocks == 0
         || cfg_.startup_buffer_blocks > kOutRingCapacity / emit_out_
-        || cfg_.startup_delay_out % MOZART_OUTPUT_SAMPLES != 0
+        || cfg_.startup_delay_out % output_frame_samples_ != 0
         || cfg_.startup_delay_out > kOutRingCapacity - cfg_.startup_buffer_blocks * emit_out_) {
         throw std::invalid_argument("StreamingRvc: invalid window/crossfade config");
     }
@@ -268,7 +272,7 @@ bool StreamingRvc::try_process_one(RVCPipelineBase& pipeline)
             const RvcRealtimeRequest request{
                 cfg_.window_samples,
                 cfg_.past_context_samples / kModelFrame16k,
-                out_block_ / kModelFrame48k,
+                out_block_ / model_frame_out_,
                 out_block_
             };
             converted = pipeline.process_realtime(window, request);
@@ -292,7 +296,8 @@ bool StreamingRvc::try_process_one(RVCPipelineBase& pipeline)
     const auto t_pipeline_done = profile::Clock::now();
 
     if (cfg_.full_history) {
-        const size_t output_start = static_cast<size_t>(window_start) * 3;
+        const size_t output_start =
+            (static_cast<size_t>(window_start) * cfg_.output_sample_rate) / kRealtimeInputSampleRate;
         if (converted.size() < output_start + out_block_) {
             record_inference_error(
                 "quality streaming: prefix returned " + std::to_string(converted.size())

@@ -91,7 +91,9 @@ struct FakeBackend : SessionBackend {
     bool supports_file() const override { return allow_file; }
     std::unique_ptr<StreamWorker> start_worker(
         bool realtime, const RvcParameters& params,
-        const FileBatchOptions& file_options, std::string& reason) override {
+        const FileBatchOptions& file_options,
+        const RealtimeStreamOptions& realtime_options,
+        std::string& reason) override {
         if (fail_start) {
             reason = "bind failed";
             return nullptr;
@@ -99,11 +101,13 @@ struct FakeBackend : SessionBackend {
         last_params = params;
         last_realtime = realtime;
         last_file_options = file_options;
+        last_realtime_options = realtime_options;
         return std::make_unique<FakeWorker>(*this);
     }
     RvcParameters last_params{};
     bool last_realtime = false;
     FileBatchOptions last_file_options{};
+    RealtimeStreamOptions last_realtime_options{};
 };
 
 void FakeWorker::stop() { owner_.stop_calls.fetch_add(1); }

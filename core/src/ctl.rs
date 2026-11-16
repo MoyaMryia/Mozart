@@ -67,6 +67,8 @@ pub const DAEMON_PRESET_SAVE: u16 = 0x011D;
 pub const DAEMON_PRESET_USE: u16 = 0x011E;
 /// 体：{}（空）；data {"model_id","preset","preset_values","live_values","dirty"}。
 pub const DAEMON_PRESET_LIST: u16 = 0x011F;
+/// 体：schema::ModelUseRequest {"model_id"}；data {"model_id","previous_model_id"}。
+pub const DAEMON_MODEL_USE: u16 = 0x0120;
 
 pub const PRE_HELLO: u16 = 0x0201;
 pub const PRE_SET_ROUTE: u16 = 0x0202;
@@ -641,6 +643,7 @@ mod tests {
         assert_eq!(DAEMON_PRESET_SAVE, 0x011D);
         assert_eq!(DAEMON_PRESET_USE, 0x011E);
         assert_eq!(DAEMON_PRESET_LIST, 0x011F);
+        assert_eq!(DAEMON_MODEL_USE, 0x0120);
         assert_eq!(RVC_LIST_MODELS, 0x0307);
         assert_eq!(PRE_SET_FILE_MODE, 0x0206);
         assert_eq!(PRE_SET_DSP, 0x0207);
@@ -672,6 +675,7 @@ mod tests {
         ("DAEMON_PRESET_SAVE", DAEMON_PRESET_SAVE),
         ("DAEMON_PRESET_USE", DAEMON_PRESET_USE),
         ("DAEMON_PRESET_LIST", DAEMON_PRESET_LIST),
+        ("DAEMON_MODEL_USE", DAEMON_MODEL_USE),
         ("PRE_HELLO", PRE_HELLO),
         ("PRE_SET_ROUTE", PRE_SET_ROUTE),
         ("PRE_SET_MUTE", PRE_SET_MUTE),

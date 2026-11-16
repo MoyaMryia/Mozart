@@ -531,6 +531,58 @@ fn realtime_switch_after_file_job_uses_target_model_preset() {
     assert_eq!(h.rvc_params().pitch_shift, 4);
 }
 
+#[test]
+fn model_use_loads_target_preset_and_rejects_corrupt_preset() {
+    let h = Harness::new("model-use", &["model-a", "model-b", "model-c"], "model-a");
+    let mut b_vals = mozart_core::config::RvcSessionValues::default();
+    b_vals.pitch_shift = 7;
+    mozart_core::preset::write_default(&h.models.join("model-b"), &b_vals).unwrap();
+    let bad_dir = h.models.join("model-c").join("presets");
+    std::fs::create_dir_all(&bad_dir).unwrap();
+    std::fs::write(bad_dir.join("default.toml"), "not valid toml = [").unwrap();
+
+    h.set_route_rvc();
+    h.clear_log();
+
+    let reply = h.call(
+        ctl::DAEMON_MODEL_USE,
+        &serde_json::to_vec(&mozart_core::ctl::schema::ModelUseRequest {
+            model_id: "model-b".to_string(),
+        })
+        .unwrap(),
+    );
+    expect_ok(reply);
+    let starts = h.stream_starts("realtime");
+    assert_eq!(starts.len(), 1, "model use 应只起一次流：{starts:?}");
+    assert_eq!(starts[0]["pitch_shift"], 7);
+    assert_eq!(h.rvc_params().pitch_shift, 7);
+    let listed: mozart_core::ctl::schema::PresetListData =
+        serde_json::from_value(expect_ok(h.preset_list())).unwrap();
+    assert_eq!(listed.model_id, "model-b");
+    assert!(!listed.dirty);
+    let get_b = expect_ok(h.call(
+        ctl::DAEMON_CONFIG_GET,
+        br#"{"key":"rvc.model_id"}"#,
+    ));
+    assert_eq!(get_b["value"], "model-b");
+
+    // 损坏预设在切流前拦截，不打断当前 model-b。
+    let bad_reply = h.call(
+        ctl::DAEMON_MODEL_USE,
+        &serde_json::to_vec(&mozart_core::ctl::schema::ModelUseRequest {
+            model_id: "model-c".to_string(),
+        })
+        .unwrap(),
+    );
+    expect_error(bad_reply, ctl::CODE_INTERNAL);
+    assert_eq!(h.rvc_params().pitch_shift, 7);
+    let get_after_bad = expect_ok(h.call(
+        ctl::DAEMON_CONFIG_GET,
+        br#"{"key":"rvc.model_id"}"#,
+    ));
+    assert_eq!(get_after_bad["value"], "model-b");
+}
+
 /// 生成 PCM16 单声道正弦 WAV（同 file_worker 用例）。
 fn write_wav(path: &Path, seconds: u32, sample_rate: u32) {
     let count = (seconds * sample_rate) as usize;

@@ -1,4 +1,5 @@
 #include "rvc/inferencer.hpp"
+#include "rvc/realtime_geometry.hpp"
 // 搬运自 Mozart-Old/rvc-backend/src/rvc/inferencer.cpp，改动：裁掉 filter_radius
 //（只保存未参与计算的死参数，SPEC-03 v1 不暴露）。
 #include "rvc/profile.hpp"
@@ -562,8 +563,8 @@ std::vector<float> RVCInferencer::infer_realtime(
     if (!model_->loaded() || !model_->has_realtime_generator()) {
         throw std::runtime_error("Realtime Generator engines not loaded");
     }
-    if (input_sample_rate_ != 16000
-        || output_sample_rate_ != model_->config().sample_rate
+    if (input_sample_rate_ != kRealtimeInputSampleRate
+        || !is_supported_realtime_sample_rate(model_->config().sample_rate)
         || request.block_samples_16k == 0
         || request.block_samples_16k % kHop16k != 0
         || request.return_frames == 0

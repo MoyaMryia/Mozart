@@ -228,6 +228,7 @@ impl PresetManager {
             .map_err(|err| (ctl::CODE_INTERNAL.to_string(), err.to_string()))?;
         let mut fresh = Config::load_from(Some(path))
             .map_err(|err| (ctl::CODE_INTERNAL.to_string(), err.to_string()))?;
+        fresh.rvc.model_id = old.rvc.model_id.clone();
         let overrides = self
             .state_file
             .lock()

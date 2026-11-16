@@ -84,13 +84,10 @@ fn output_fixture_matches_rust_serialization() {
     for (i, slot) in pcm.iter_mut().enumerate() {
         *slot = i as f32 * 0.25;
     }
-    let expect = OutputFrame {
-        meta: golden_meta(),
-        pcm,
-    };
+    let expect = OutputFrame::new_48k(golden_meta(), pcm);
     let mut packet = [0u8; <OutputFrame as WirePacket>::PACKET_BYTES];
     expect.encode(&mut packet);
-    assert_eq!(bytes.len(), 3860, "output.bin 必须是 3860 B 输出线包");
+    assert_eq!(bytes.len(), 3868, "output.bin 必须是 3868 B 输出线包");
     assert_eq!(&bytes[..], &packet[..], "output.bin 与 Rust 序列化不一致");
 
     let decoded = <OutputFrame as WirePacket>::decode(&bytes);

@@ -23,8 +23,8 @@ fn make_frame(chunk: &[f32], idx: u32) -> OutputFrame {
     // packed 字段不能取引用：先在本地数组填充，再按值赋入。
     let mut pcm = [0f32; OUTPUT_SAMPLES];
     pcm[..chunk.len()].copy_from_slice(chunk);
-    OutputFrame {
-        meta: FrameMeta {
+    OutputFrame::new_48k(
+        FrameMeta {
             pts_ns: idx as u64 * FRAME_MS as u64 * 1_000_000,
             frame_idx: idx,
             vad_flag: 1,
@@ -33,7 +33,7 @@ fn make_frame(chunk: &[f32], idx: u32) -> OutputFrame {
             segment_id: 0,
         },
         pcm,
-    }
+    )
 }
 
 /// 把整句 48 kHz PCM 打包为契约帧：每帧 960 samples，末帧不足补零。
