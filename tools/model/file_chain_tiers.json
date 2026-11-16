@@ -8,9 +8,9 @@
       "rmvpe_frames": [32, 1600, 1600]
     },
     "balanced": {
-      "generator_frames": [100, 2200, 2200],
-      "hubert_samples": [32000, 352320, 352320],
-      "rmvpe_frames": [32, 2304, 2304]
+      "generator_frames": [100, 1600, 1600],
+      "hubert_samples": [32000, 256320, 256320],
+      "rmvpe_frames": [32, 1632, 1632]
     },
     "large": {
       "generator_frames": [100, 1600, 2400],
