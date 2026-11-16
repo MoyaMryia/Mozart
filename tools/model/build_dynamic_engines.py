@@ -22,7 +22,24 @@ from pathlib import Path
 from trtexec import resolve as resolve_trtexec, resolve_or_name
 
 HUBERT_SAMPLES_PER_FRAME = 160
+# HuBERT 卷积栈几何，镜像 inferencer.cpp 的 kHubertHop16k/kHubertReceptive16k
+#（offline_window_geometry 的窗输入反推）；两侧改动须同步，C++ 侧有单测钉住。
+HUBERT_HOP_SAMPLES = 320
+HUBERT_RECEPTIVE_SAMPLES = 400
 DEFAULT_SAMPLE_RATE = 48000
+
+
+def window_input_samples(generator_frames: int) -> int:
+    """HuBERT 恰好产出 generator_frames 帧的最小窗输入（向上对齐 320）。"""
+    min_input = (
+        generator_frames * HUBERT_SAMPLES_PER_FRAME
+        + (HUBERT_RECEPTIVE_SAMPLES - HUBERT_HOP_SAMPLES)
+    )
+    return (
+        (min_input + HUBERT_HOP_SAMPLES - 1)
+        // HUBERT_HOP_SAMPLES
+        * HUBERT_HOP_SAMPLES
+    )
 
 
 @dataclass(frozen=True)
@@ -217,10 +234,11 @@ def validate_tier(tier: Tier) -> None:
         if values[0] > values[1]:
             raise SystemExit(f"{name} min must be <= opt")
     generator_max = tier.generator_frames[2]
-    if tier.hubert_samples[2] < generator_max * HUBERT_SAMPLES_PER_FRAME:
+    hubert_required = window_input_samples(generator_max)
+    if tier.hubert_samples[2] < hubert_required:
         raise SystemExit(
-            "hubert max must cover the generator window "
-            f"({generator_max} * {HUBERT_SAMPLES_PER_FRAME} samples)"
+            "hubert max must cover the generator window input "
+            f"({generator_max} frames -> {hubert_required} samples)"
         )
     if any(value % 32 for value in tier.rmvpe_frames):
         raise SystemExit("rmvpe frame counts must be multiples of 32")

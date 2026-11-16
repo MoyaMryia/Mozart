@@ -235,7 +235,7 @@ RVC_SOURCE=~/mozart-assets/RVC python3 tools/model/run_streaming_reference.py \
 档位数值的单一来源是 [`tools/model/file_chain_tiers.json`](../tools/model/file_chain_tiers.json)；当前值用 `--list-tiers` 查看。字段语义、公式和边界见 [SPEC-12](SPEC/SPEC-12-file-chain-params.md)。
 
 - 文件链 HuBERT/RMVPE 是共享引擎，所有模型共用一套。提高全局档位时，先用 `--feature-only` 重建共享特征引擎，再重建各模型生成器。
-- 模型生成器的 max 不应超过共享 HuBERT 的 max；超过时运行时会回退 ONNX 特征。
+- 模型生成器的 max 不应超过共享 HuBERT 的 max；超过时运行时会回退 ONNX 特征。HuBERT max 须覆盖分窗窗输入 `align_up(160T+80, 320)`（T 为生成器 max 帧数，公式镜像 `inferencer.cpp` `offline_window_geometry`），否则逐窗回退 ONNX。
 - `max` 档未在板端验证。阻塞原因：40 s 窗的构建耗时和峰值显存未测。解除条件：在 8 GB 设备上按 `max` 档构建并跑 30/60 s 文件，确认峰值低于 5.8 GB。
 - 静态 ONNX 输入不套用档位，按固定形状编译。
 - 有生成器时，`build-manifest.json` 写在生成器 engine 同目录；仅 `--feature-only` 时写在特征 engine 目录。记录档位、profile、采样率来源、命令和哈希。
