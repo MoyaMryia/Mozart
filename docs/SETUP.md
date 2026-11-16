@@ -168,7 +168,7 @@ Python 脚本，居仓库 `tools/model/`，直接调用，不做 CLI 封装。
 | `export_generator_split_onnx.py` | 生成器 pth → front/decoder onnx（实时拆分） |
 | `export_hubert_onnx.py` | HuBERT base → onnx |
 | `export_rmvpe_onnx.py` | RMVPE → onnx |
-| `build_dynamic_engines.py` | 文件路径动态 onnx → engine（trtexec 包装，须在设备上） |
+| `build_dynamic_engines.py` | 文件链 onnx → engine（档位预设、trtexec 包装，须在设备上） |
 | `build_realtime_engines.py` | 实时定长 onnx → engine（front/decoder/hubert/rmvpe，设备上） |
 | `run_reference.py` | PyTorch 参考推理，保存各模型输入张量 |
 | `run_streaming_reference.py` | 流式 PyTorch 参考（golden 流式对拍，24 帧窗） |
@@ -187,7 +187,7 @@ Python 脚本，居仓库 `tools/model/`，直接调用，不做 CLI 封装。
 | 目标权重 | export_generator、run_reference | 位置参数 / `--model` | `~/rvc-pth/<id>.pth` |
 | golden 参考 | run_reference、verify_golden | `--input` / `--manifest` 等必填 | 仓外 |
 
-导出依赖 PyTorch，在开发机运行；编译依赖 trtexec，在设备运行。RVC 源码树是上游实现，不是旧仓库代码。`build_dynamic_engines.py` 从生成器 ONNX 读取 emb/latent/source 维度；`trtexec` 可用 `TRTEXEC` 或 `--trtexec` 指定，两个构建脚本相同。
+导出依赖 PyTorch，在开发机运行；编译依赖 trtexec，在设备运行。RVC 源码树是上游实现，不是旧仓库代码。`build_dynamic_engines.py` 从生成器 ONNX 读取 emb/latent/source 维度，按 `--tier` 选择 profile，`--model-config` 提供采样率并校验 emb。`trtexec` 可用 `TRTEXEC` 或 `--trtexec` 指定，两个构建脚本相同。
 
 ### 调用示例
 
@@ -202,10 +202,17 @@ python3 tools/model/export_generator_split_onnx.py ~/rvc-pth/qiqi-zh.pth \
     --front-output qiqi-zh-front.onnx --decoder-output qiqi-zh-decoder.onnx \
     --front-frames 280 --decoder-frames 30 --skip-head 250 --return-frames 30
 
-# 编译引擎（设备；--sample-rate 决定每帧输出样本数：48000→480，40000→400）
+# 编译引擎（设备；默认 large 档，采样率从模型 config.json 读取）
 python3 tools/model/build_dynamic_engines.py \
     --generator qiqi-zh-dynamic.onnx --generator-engine qiqi-zh.engine \
-    --feature-assets <特征onnx目录> --sample-rate 48000
+    --feature-assets <特征onnx目录> --model-config <模型目录>/config.json
+
+# 查看档位
+python3 tools/model/build_dynamic_engines.py --list-tiers
+
+# 只重建共享特征引擎（所有文件链模型共用）
+python3 tools/model/build_dynamic_engines.py --feature-only \
+    --feature-assets <特征onnx目录> --tier large
 
 # golden 参考与对拍
 RVC_SOURCE=~/mozart-assets/RVC python3 tools/model/run_reference.py \
@@ -220,6 +227,28 @@ RVC_SOURCE=~/mozart-assets/RVC python3 tools/model/run_streaming_reference.py \
     --hubert-path <hubert_base目录> --rmvpe-path <rmvpe.pt> \
     --output stream.wav --tensor-dir tensors
 ```
+
+### 文件链档位
+
+`--tier` 选择一组默认 profile，默认 `large`。档位是默认值，不是显存硬限制；脚本仍会校验形状上下限和 RMVPE 的 32 倍数。
+
+| 档位 | 主窗 | 生成器 min/opt/max | HuBERT min/opt/max | RMVPE min/opt/max |
+| --- | --- | --- | --- | --- |
+| `compact` | 10 s | 100/1200/1200 | 32000/192000/192000 | 32/1600/1600 |
+| `balanced` | 20 s | 100/2200/2200 | 32000/352000/352000 | 32/2304/2304 |
+| `large`（默认） | 22 s | 100/2400/2400 | 32000/384000/512000 | 32/3232/3232 |
+| `max` | 40 s | 100/4200/4200 | 32000/672000/672000 | 32/4224/4224 |
+
+档位表以 `--list-tiers` 输出为准，改档位时同步本表。
+
+- 主窗 = 生成器输入时长减 2 s，前后各 1 s 上下文。
+- `opt` 取该档的忙时形状，`max` 是能力上限。HuBERT 的 `max` 可高于当前窗输入，作为更大窗的余量。
+- `opt` 与 `max` 拆开，避免用目标大窗形状做全量 tactic 搜索导致构建过慢。
+- 文件链 HuBERT/RMVPE 是共享引擎，所有模型共用一套。提高全局档位时，先用 `--feature-only` 重建共享特征引擎，再重建各模型生成器。
+- 模型生成器的 max 不应超过共享 HuBERT 的 max；超过时运行时会回退 ONNX 特征。
+- `max` 档未在板端验证。阻塞原因：40 s 窗的构建耗时和峰值显存未测。解除条件：在 8 GB 设备上按 `max` 档构建并跑 30/60 s 文件，确认峰值低于 5.8 GB。
+- 静态 ONNX 输入不套用档位，按固定形状编译。
+- 有生成器时，`build-manifest.json` 写在生成器 engine 同目录；仅 `--feature-only` 时写在特征 engine 目录。记录档位、profile、采样率来源、命令和哈希。
 
 ### 实时链路资产生成
 
@@ -252,8 +281,8 @@ python3 tools/model/build_realtime_engines.py \
 ## 加新模型流程
 
 1. 权重落入 `~/rvc-pth/<id>.pth`。
-2. 开发机运行导出脚本，产出 onnx。
-3. 设备上运行编译脚本，产出生成器 engine。特征引擎共享，不用重编。
+2. 开发机运行导出脚本，产出动态 onnx（`--dynamic-time`）。
+3. 设备上用 `--tier large --model-config <模型目录>/config.json --generator-only` 编译生成器；共享特征引擎只在校准全局档位时重建。
 4. 成品层建 `<id>/` 目录，放 config 与生成器，登记 `[[models]]`。
 5. 测试：`file submit --model <id>`，按需 golden 对拍。
 
