@@ -46,6 +46,16 @@ struct Harness {
 impl Harness {
     /// 每个用例独立模型目录（不写仓库资产）；配置模型 id 为空表示不预载。
     fn new(tag: &str, models: &[&str], config_model: &str) -> Self {
+        Self::build(tag, models, config_model, None)
+    }
+
+    /// rvc 启动即已加载 `preload` 模型（不起流）：daemon 未经历预设载入，
+    /// 参数来源记录为空。
+    fn new_preloaded(tag: &str, models: &[&str], config_model: &str, preload: &str) -> Self {
+        Self::build(tag, models, config_model, Some(preload))
+    }
+
+    fn build(tag: &str, models: &[&str], config_model: &str, preload: Option<&str>) -> Self {
         static SEQ: AtomicU64 = AtomicU64::new(0);
         let dir = std::env::temp_dir().join(format!(
             "mozart-preset-it-{}-{tag}-{}",
@@ -65,6 +75,9 @@ impl Harness {
             "export MOZART_RVC_STUB_MODELS='{}'\n",
             models.join(",")
         ));
+        if let Some(preload) = preload {
+            text.push_str(&format!("export MOZART_RVC_STUB_PRELOAD='{preload}'\n"));
+        }
         text.push_str(&format!("exec '{}' \"$@\"\n", example("rvc_stub").display()));
         std::fs::write(&script, text).unwrap();
         let mut perms = std::fs::metadata(&script).unwrap().permissions();
@@ -349,6 +362,11 @@ fn corrupt_preset_fails_file_job_and_preset_use_without_baseline_write() {
 
     let reason = h.run_file_failed("a.wav", "model-a");
     assert!(reason.contains("preset"), "失败原因应指明预设：{reason}");
+    // 坏的是服务端资产文件，不是 submit 参数：错误码为 Internal。
+    assert!(
+        reason.contains(&format!("preset load: {}:", ctl::CODE_INTERNAL)),
+        "文件任务错误码应为 Internal：{reason}"
+    );
 
     // 队列继续：另一模型的任务正常完成。
     h.run_file("b.wav", "model-b");
@@ -358,7 +376,7 @@ fn corrupt_preset_fails_file_job_and_preset_use_without_baseline_write() {
     assert_eq!(loaded, "model-b");
     expect_ok(h.config_set("rvc.pitch_shift", "3"));
     std::fs::write(h.preset_path("model-b"), "not toml").unwrap();
-    let reason = expect_error(h.preset_use(), ctl::CODE_INVALID_ARGUMENT);
+    let reason = expect_error(h.preset_use(), ctl::CODE_INTERNAL);
     assert!(reason.contains("preset"), "{reason}");
     assert_eq!(h.rvc_params().pitch_shift, 3, "损坏预设不得覆盖 live 基线");
 }
@@ -370,25 +388,109 @@ fn failed_model_load_does_not_overwrite_loaded_model_preset() {
     std::fs::create_dir_all(h.models.join("model-b")).unwrap();
     h.run_file("a1.wav", "model-a");
     expect_ok(h.config_set("rvc.pitch_shift", "3"));
-    apply_data(h.preset_save());
+    let saved = apply_data(h.preset_save());
+    let before = std::fs::read_to_string(h.preset_path("model-a")).unwrap();
 
     let reason = h.run_file_failed("b.wav", "model-b");
     assert!(reason.contains("model not found"), "{reason}");
 
-    // rvc 仍加载 model-a，live 却是 model-b 的预设：拒绝保存，A 预设不被覆盖。
-    let before = std::fs::read_to_string(h.preset_path("model-a")).unwrap();
-    let reason = expect_error(h.preset_save(), ctl::CODE_NOT_READY);
-    assert!(reason.contains("live params belong to model 'model-b'"), "{reason}");
+    // 写基线在 LoadModel 之后：B 加载失败不写基线，live 仍是 A 的预设值，
+    // rvc 也仍加载 A，两者不错位。
+    let list = list_data(h.preset_list());
+    assert_eq!(list.model_id, "model-a");
+    assert_eq!(list.live_values, saved.values, "加载失败不得改 live 参数");
+    assert!(!list.dirty, "live 应仍等于 A 的预设：{list:?}");
     assert_eq!(
         before,
-        std::fs::read_to_string(h.preset_path("model-a")).unwrap()
+        std::fs::read_to_string(h.preset_path("model-a")).unwrap(),
+        "A 的预设文件不得被改动"
     );
 
-    // 下一次 A 任务重新载入 A 的预设，不会沿用 B 的参数。
+    // 参数来源仍是 A：save 正常成功，不被错位拒绝。
+    let again = apply_data(h.preset_save());
+    assert_eq!(again.model_id, "model-a");
+    assert_eq!(again.values, saved.values);
+
+    // 下一次 A 任务沿用 A 的参数，不会读到 B 的预设。
     h.clear_log();
     h.run_file("a2.wav", "model-a");
     let starts = h.stream_starts("file");
     assert_eq!(starts[0]["pitch_shift"], 3, "{starts:?}");
+}
+
+#[test]
+fn failed_realtime_model_load_keeps_live_params() {
+    // 实时目标固定 model-b（桩不加载它）：切换失败不得写基线或改 live 参数。
+    let h = Harness::new("failed-realtime", &["model-a"], "model-b");
+    std::fs::create_dir_all(h.models.join("model-b")).unwrap();
+    h.run_file("a.wav", "model-a");
+    expect_ok(h.config_set("rvc.pitch_shift", "3"));
+    let saved = apply_data(h.preset_save());
+    let live_before = h.rvc_params();
+    let baseline_before = std::fs::read_to_string(h.daemon.dir.join("config.toml")).unwrap();
+
+    let reply = h.call(ctl::DAEMON_ROUTE_SET, br#"{"route":"rvc"}"#);
+    let reason = expect_error(reply, ctl::CODE_INVALID_ARGUMENT);
+    assert!(reason.contains("model not found"), "{reason}");
+
+    assert_eq!(h.rvc_params(), live_before, "LoadModel 失败不得改 live 参数");
+    assert_eq!(
+        baseline_before,
+        std::fs::read_to_string(h.daemon.dir.join("config.toml")).unwrap(),
+        "LoadModel 失败不得写 TOML 基线"
+    );
+    assert!(
+        h.stream_starts("realtime").is_empty(),
+        "加载失败不得起实时流：{:?}",
+        h.entries()
+    );
+    // 来源仍是 A：save 正常成功，A 预设不被 B 的默认值覆盖。
+    assert_eq!(apply_data(h.preset_save()).values, saved.values);
+}
+
+#[test]
+fn missing_model_dir_reports_load_model_error_not_preset_error() {
+    let h = Harness::new("missing-dir", &["model-a"], "model-a");
+    h.run_file("a.wav", "model-a");
+    expect_ok(h.config_set("rvc.pitch_shift", "3"));
+    let live_before = h.rvc_params();
+    let baseline_before = std::fs::read_to_string(h.daemon.dir.join("config.toml")).unwrap();
+
+    // 目录不存在：预设层不预检模型存在性，报错归 LoadModel（SPEC-10）。
+    let reason = h.run_file_failed("ghost.wav", "ghost-model");
+    assert!(reason.contains("model not found"), "报错须归推理层：{reason}");
+    assert!(
+        reason.contains(ctl::CODE_INVALID_ARGUMENT),
+        "缺失模型应回 InvalidArgument：{reason}"
+    );
+    assert!(!reason.contains("preset"), "预设层不得抢报错权：{reason}");
+    assert!(!h.models.join("ghost-model").exists(), "不得创建模型目录");
+    assert_eq!(h.rvc_params(), live_before, "live 参数不得变");
+    assert_eq!(
+        baseline_before,
+        std::fs::read_to_string(h.daemon.dir.join("config.toml")).unwrap(),
+        "TOML 基线不得变"
+    );
+}
+
+#[test]
+fn save_rejects_when_param_source_unknown() {
+    // rvc 启动即加载 model-a，daemon 未经历载入；路由保持 direct，实时链
+    // 不触发载入，来源记录一直为空。此时 live 参数可能属于别的模型。
+    let h = Harness::new_preloaded("unknown-source", &["model-a"], "", "model-a");
+    assert_eq!(
+        h.status().rvc.unwrap().model_id.as_deref(),
+        Some("model-a"),
+        "桩应预加载模型"
+    );
+
+    let reason = expect_error(h.preset_save(), ctl::CODE_NOT_READY);
+    assert!(reason.contains("source is unknown"), "{reason}");
+    assert!(!h.preset_path("model-a").exists(), "拒绝时不得写预设");
+
+    // preset use 载入一次后来源明确，save 放行。
+    apply_data(h.preset_use());
+    expect_ok(h.preset_save());
 }
 
 #[test]

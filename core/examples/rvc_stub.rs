@@ -21,6 +21,8 @@
 //! 回 NotReady，模拟 rvc 不可达。
 //! 测试旋钮 `MOZART_RVC_STUB_MODELS=<a,b>`：可加载模型清单（缺省 demo），
 //! 供多模型切换用例使用。
+//! 测试旋钮 `MOZART_RVC_STUB_PRELOAD=<id>`：启动即视为已加载该模型（不起流），
+//! 模拟 daemon 连上已有模型的 rvc。
 
 mod stub_common;
 
@@ -122,9 +124,12 @@ fn main() {
         .ok()
         .filter(|models| !models.is_empty())
         .unwrap_or_else(|| vec![STUB_MODEL.to_string()]);
+    let preload = std::env::var("MOZART_RVC_STUB_PRELOAD")
+        .ok()
+        .filter(|id| models.iter().any(|known| known == id));
     let mut state = State {
         models,
-        model: None,
+        model: preload,
         streaming: false,
         kind: None,
         batch: None,

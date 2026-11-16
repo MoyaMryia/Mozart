@@ -138,3 +138,4 @@
 - 2026-11-13：模型注册表定稿：TOML 顶层 `[[models]]` 数组（id/type/path），LoadModel 和 ListModels 优先从注册表解析路径，注册表为空时回退 models_dir 扫描；特征引擎四路径改为可选，缺省从 models_dir 按约定文件名自动发现（SPEC-03、config.md）。
 - 2026-11-16：新增 SPEC-11 模型预设与 SPEC-12 文件链参数索引。
 - 2026-11-16：SPEC-11 模型预设实现：`preset save/use/list`、模型切换载入 `default.toml`、文件链 RVC 参数快照后移到交接后、板端 preset 套件。
+- 2026-11-16：SPEC-11 修订：载入拆为读校验与写基线两步、`LoadModel` 夹在中间，加载失败不留参数错位；损坏预设回 Internal；`preset save` 校验参数来源；CLI 三个 preset 命令统一长超时（SPEC-04、SPEC-11）。

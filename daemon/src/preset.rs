@@ -1,8 +1,9 @@
 //! 模型预设编排（SPEC-11）：把会话参数按模型持久化，并在模型切换时载入。
-//! 载入动作复用 `config set rvc.<会话参数>` 的单一编排：一次原子写五键到
-//! TOML 基线 → 重建生效配置 → `apply_rvc_session_params_locked`。
+//! 载入分两步：resolve 读并校验预设，commit 一次原子写五键到 TOML 基线 →
+//! 重建生效配置 → `apply_rvc_session_params_locked`。LoadModel 夹在两步之间，
+//! 预设损坏与模型加载失败都发生在写入前，不留参数错位。
 //! 锁顺序：transition → 预设串行锁 → toml 锁 → state 文件；调用方若已持
-//! transition（路由/对账路径），必须用 `prepare_for_model_locked`。
+//! transition（路由/对账路径），必须用 `_locked` 变体。
 
 use crate::runtime::SharedConfig;
 use crate::services::{self, Services};
@@ -27,6 +28,13 @@ pub struct PresetManager {
     applied: Mutex<Option<String>>,
 }
 
+/// resolve 步的结果：`Skip` 不写基线，`Ready` 的值等 LoadModel 成功后提交。
+pub(crate) enum PresetResolution {
+    /// 同模型已载入（保留运行时调参），或模型目录不可解析已降级用 live 参数。
+    Skip,
+    Ready(RvcSessionValues),
+}
+
 impl PresetManager {
     pub fn new(
         config: SharedConfig,
@@ -47,32 +55,67 @@ impl PresetManager {
         }
     }
 
-    /// 模型切换载入点：目标模型与已载入预设不同才读并应用；同模型跳过，
-    /// 保留运行时调参。调用方不得持 transition 锁。
-    pub fn prepare_for_model(&self, model_id: &str) -> Result<Arc<Config>, (String, String)> {
+    /// 模型切换载入第一步：目标模型与已载入预设不同才读并校验，不写基线、
+    /// 不改生效配置与 applied。调用方不得持 transition 锁；LoadModel 成功后
+    /// 用 `commit_for_model` 提交，两步之间不攥锁做 RPC。
+    pub fn resolve_for_model(&self, model_id: &str) -> Result<PresetResolution, (String, String)> {
         let _transition = self.services.transition();
-        self.prepare_for_model_locked(model_id)
+        self.resolve_for_model_locked(model_id)
     }
 
     /// 已持 transition 锁的路径（路由切换、对账）使用；避免重复加锁。
-    pub(crate) fn prepare_for_model_locked(
+    pub(crate) fn resolve_for_model_locked(
         &self,
         model_id: &str,
+    ) -> Result<PresetResolution, (String, String)> {
+        let applied = self.lock_applied();
+        if applied.as_deref() == Some(model_id) {
+            return Ok(PresetResolution::Skip);
+        }
+        let config = self.config.snapshot();
+        let Some(model_dir) = config.rvc_model_dir(model_id) else {
+            // 旧配置可能只给 model_id、没有注册表或 models_dir：无法定位预设，
+            // 用 live 参数继续，并留可查询降级原因；显式 preset 命令仍报错。
+            lock_state(&self.state)
+                .push_degraded(format!("{}; using live params", unresolvable_reason(model_id)));
+            return Ok(PresetResolution::Skip);
+        };
+        // 模型存在性归推理层（SPEC-10）：目录不存在时跳过载入，让 LoadModel 回
+        // InvalidArgument「model not found」，预设层不预检、不抢报错权。
+        if !model_dir.is_dir() {
+            return Ok(PresetResolution::Skip);
+        }
+        let values = preset::ensure_default(&model_dir).map_err(reject)?;
+        Ok(PresetResolution::Ready(values))
+    }
+
+    /// 模型切换载入第二步：写基线并应用，返回新的生效配置快照。
+    /// 调用方不得持 transition 锁。
+    pub fn commit_for_model(
+        &self,
+        model_id: &str,
+        resolution: PresetResolution,
     ) -> Result<Arc<Config>, (String, String)> {
+        let _transition = self.services.transition();
+        self.commit_for_model_locked(model_id, resolution)
+    }
+
+    /// 已持 transition 锁的路径使用。两步之间放开过锁：重新判定 applied 并
+    /// 取当前生效配置，不套用 resolve 时的旧快照。
+    pub(crate) fn commit_for_model_locked(
+        &self,
+        model_id: &str,
+        resolution: PresetResolution,
+    ) -> Result<Arc<Config>, (String, String)> {
+        let PresetResolution::Ready(values) = resolution else {
+            return Ok(self.config.snapshot());
+        };
         let mut applied = self.lock_applied();
+        // 别的入口可能已载入同一模型：此时保留其 live 参数，不重复写基线。
         if applied.as_deref() == Some(model_id) {
             return Ok(self.config.snapshot());
         }
         let old = self.config.snapshot();
-        let Some(model_dir) = old.rvc_model_dir(model_id) else {
-            // 旧配置可能只给 model_id、没有注册表或 models_dir：无法定位预设，
-            // 用 live 参数继续，并留可查询降级原因；显式 preset 命令仍报错。
-            lock_state(&self.state).push_degraded(format!(
-                "preset: cannot resolve model directory for '{model_id}'; using live params"
-            ));
-            return Ok(old);
-        };
-        let values = preset::ensure_default(&model_dir).map_err(reject)?;
         self.write_and_apply(&mut applied, model_id, &values, &old)
     }
 
@@ -97,10 +140,16 @@ impl PresetManager {
         let _transition = self.services.transition();
         let applied = self.lock_applied();
         let model_id = self.current_model()?;
-        // 模型加载失败时 [rvc] 已是目标模型的预设参数，但 rvc 还停在上一个
-        // 模型；此时保存会把前者的参数写进后者的预设，拒绝并提示先载入。
-        if let Some(applied_model) = applied.as_deref() {
-            if applied_model != model_id {
+        let config = self.config.snapshot();
+        // 先解析目录：不可解析时给出配置指引，而不是让来源校验先回一条
+        // 「先 preset use」的死路建议（use 同样会因目录不可解析失败）。
+        let model_dir = self.model_dir(&config, &model_id)?;
+        // 参数来源必须已知且与 rvc 已加载模型一致：来源为空（daemon 启动时
+        // rvc 已有模型在跑，未经历载入）或属于别的模型时，live 参数可能来自
+        // 其他模型，保存会覆盖错预设。
+        match applied.as_deref() {
+            Some(applied_model) if applied_model == model_id => {}
+            Some(applied_model) => {
                 return Err((
                     ctl::CODE_NOT_READY.to_string(),
                     format!(
@@ -108,9 +157,15 @@ impl PresetManager {
                     ),
                 ));
             }
+            None => {
+                return Err((
+                    ctl::CODE_NOT_READY.to_string(),
+                    format!(
+                        "live param source is unknown for model '{model_id}'; run preset use to load its preset before saving"
+                    ),
+                ));
+            }
         }
-        let config = self.config.snapshot();
-        let model_dir = self.model_dir(&config, &model_id)?;
         let values = config.rvc.session_values();
         preset::write_default(&model_dir, &values).map_err(reject)?;
         Ok(PresetApplyData {
@@ -183,9 +238,7 @@ impl PresetManager {
         services::apply_rvc_session_params_locked(&self.state, &self.services, &old.rvc, &fresh.rvc)?;
         self.config.replace(fresh);
         *applied = Some(model_id.to_string());
-        lock_state(&self.state).clear_degraded_prefix(&format!(
-            "preset: cannot resolve model directory for '{model_id}'"
-        ));
+        lock_state(&self.state).clear_degraded_prefix(&unresolvable_reason(model_id));
         Ok(self.config.snapshot())
     }
 
@@ -216,14 +269,13 @@ impl PresetManager {
     }
 }
 
+/// 模型目录不可解析的降级原因前缀：记录与清除共用，改一处即两边同步。
+fn unresolvable_reason(model_id: &str) -> String {
+    format!("preset: cannot resolve model directory for '{model_id}'")
+}
+
 fn reject(err: PresetError) -> (String, String) {
-    let code = match &err {
-        PresetError::Io { .. }
-        | PresetError::Serialize(_)
-        | PresetError::Config(_) => ctl::CODE_INTERNAL,
-        PresetError::Missing(_)
-        | PresetError::Parse { .. }
-        | PresetError::Invalid(_) => ctl::CODE_INVALID_ARGUMENT,
-    };
-    (code.to_string(), err.to_string())
+    // 客户端体为空，坏的是服务端资产文件或 IO：一律 Internal，不是请求参数错。
+    // Missing 不会到这里：ensure_default 吸收它，list 单独回 NotReady。
+    (ctl::CODE_INTERNAL.to_string(), err.to_string())
 }

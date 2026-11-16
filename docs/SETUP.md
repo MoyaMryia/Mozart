@@ -115,7 +115,7 @@ MOZART_JETSON=<SSH目标> tools/jetson-e2e.sh
 | `--smoke` | `tools/jetson-smoke.sh` | daemon + pre + rvc 三进程冒烟 |
 | `--file` | `tools/jetson-file-test.sh` | 文件转换、取消、队列与入口校验 |
 | `--file-models` | `tools/jetson-file-multimodel.sh` | `models/rvc` 下全部模型的文件转换与帧守恒 |
-| `--preset` | `tools/jetson-preset-test.sh` | 模型预设首次自动建、save/use/list、实时载入与资产隔离 |
+| `--preset` | `tools/jetson-preset-test.sh` | 模型预设首次自动建、save/use/list、实时载入、A→B→A 切换、加载失败与损坏预设保护、资产隔离（需两个模型，`MODEL_B` 可指定） |
 | `--language` | `tools/jetson-language-test.sh` | ASR → 翻译 → TTS 播报 |
 | `--measure` | `tools/jetson-measure.sh` | 延迟、淡变、长跑、自愈测量 |
 

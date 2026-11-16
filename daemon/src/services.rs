@@ -456,9 +456,13 @@ fn switch_rvc(
     let status = services.rvc_status()?;
     let model_id = resolve_model_id(&config.rvc, &status)?;
     if !realtime_stream_matches(&status, &model_id) {
-        // 模型切换：预设载入先于 LoadModel；同模型已载入时直接复用 live 参数。
-        let fresh = presets.prepare_for_model_locked(&model_id)?;
-        start_rvc_stream(services, &fresh.rvc, &model_id, true)
+        // 模型切换：先读校验预设，LoadModel 成功后再写基线；同模型复用 live 参数。
+        let resolution = presets.resolve_for_model_locked(&model_id)?;
+        let handle = services
+            .load_model_handle(&model_id)
+            .map_err(CallError::into_rejection)?;
+        let fresh = presets.commit_for_model_locked(&model_id, resolution)?;
+        start_rvc_stream_with_handle(services, &fresh.rvc, handle, true)
             .map_err(CallError::into_rejection)?;
     }
 
@@ -512,6 +516,17 @@ fn start_rvc_stream(
     busy_ok: bool,
 ) -> Result<StartOutcome, CallError> {
     let handle = services.load_model_handle(model_id)?;
+    start_rvc_stream_with_handle(services, rvc, handle, busy_ok)
+}
+
+/// 已知 model_handle 的起流：预设载入把 LoadModel 夹在读校验与写基线之间，
+/// 调用方先取 handle、提交预设后再起流。
+fn start_rvc_stream_with_handle(
+    services: &Services,
+    rvc: &RvcConfig,
+    handle: u64,
+    busy_ok: bool,
+) -> Result<StartOutcome, CallError> {
     let mut body = stream_body(rvc, handle);
     body["kind"] = json!("realtime");
     let text = body.to_string();
@@ -783,14 +798,29 @@ fn ensure_realtime_stream(
     if realtime_stream_matches(status, &model_id) {
         return true;
     }
-    let fresh = match presets.prepare_for_model_locked(&model_id) {
+    let resolution = match presets.resolve_for_model_locked(&model_id) {
+        Ok(resolution) => resolution,
+        Err((code, reason)) => {
+            degraded.push(format!("rvc preset load: {code}: {reason}"));
+            return false;
+        }
+    };
+    // LoadModel 成功后才写基线：加载失败时 live 参数仍属已加载模型。
+    let handle = match services.load_model_handle(&model_id) {
+        Ok(handle) => handle,
+        Err(err) => {
+            degraded.push(format!("rvc stream apply: {}", err.describe()));
+            return false;
+        }
+    };
+    let fresh = match presets.commit_for_model_locked(&model_id, resolution) {
         Ok(config) => config,
         Err((code, reason)) => {
             degraded.push(format!("rvc preset load: {code}: {reason}"));
             return false;
         }
     };
-    match start_rvc_stream(services, &fresh.rvc, &model_id, true) {
+    match start_rvc_stream_with_handle(services, &fresh.rvc, handle, true) {
         Ok(_) => true,
         Err(err) => {
             degraded.push(format!("rvc stream apply: {}", err.describe()));

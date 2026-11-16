@@ -201,7 +201,8 @@ enum ConfigAction {
     Set {
         /// 配置键，如 pre.capture_device
         key: String,
-        /// 新值
+        /// 新值；允许负数（如 pitch_shift -6），不被当作选项
+        #[arg(allow_hyphen_values = true)]
         value: String,
     },
     /// 读配置基线；缺省键读整份，待重启键在值后提示
@@ -639,8 +640,8 @@ fn call(config: &Config, type_: u16, body: &[u8]) -> Result<Value, CliError> {
     call_with_timeout(config, type_, body, config.daemon.rpc_timeout_ms)
 }
 
-/// 同 `call`，客户端超时由调用方指定：config set 覆盖 daemon 的多次串行 RPC，
-/// 其他命令沿用 rpc_timeout_ms。
+/// 同 `call`，客户端超时由调用方指定：config set 与 preset 命令覆盖 daemon 的
+/// 多次串行 RPC，其他命令沿用 rpc_timeout_ms。
 fn call_with_timeout(
     config: &Config,
     type_: u16,
@@ -800,23 +801,20 @@ fn preset_command(
     action: PresetAction,
     json_output: bool,
 ) -> Result<(), CliError> {
+    // 三个命令都在 daemon 侧抢 transition 锁并查一次 rvc 状态，poller 持锁
+    // 对账会拖长应答：短超时会在服务端已完成写入时报超时。预算同 config set。
+    let timeout_ms = config_set_timeout_ms(config);
     match action {
         PresetAction::Save => {
-            let data = call(config, ctl::DAEMON_PRESET_SAVE, b"{}")?;
+            let data = call_with_timeout(config, ctl::DAEMON_PRESET_SAVE, b"{}", timeout_ms)?;
             print_preset_apply(&data, "saved", json_output)
         }
         PresetAction::Use => {
-            // 载入可能 Stop/Start 实时流：客户端预算与 config set 相同。
-            let data = call_with_timeout(
-                config,
-                ctl::DAEMON_PRESET_USE,
-                b"{}",
-                config_set_timeout_ms(config),
-            )?;
+            let data = call_with_timeout(config, ctl::DAEMON_PRESET_USE, b"{}", timeout_ms)?;
             print_preset_apply(&data, "loaded", json_output)
         }
         PresetAction::List => {
-            let data = call(config, ctl::DAEMON_PRESET_LIST, b"{}")?;
+            let data = call_with_timeout(config, ctl::DAEMON_PRESET_LIST, b"{}", timeout_ms)?;
             if json_output {
                 println!("{data}");
                 return Ok(());
@@ -1532,6 +1530,29 @@ mod tests {
         ));
         assert!(parse(&["config"]).is_err());
         assert!(parse(&["config", "set", "onlykey"]).is_err());
+    }
+
+    #[test]
+    fn config_set_accepts_negative_value_without_separator() {
+        // pitch_shift 范围 -12..=12，负值是正常用法，不该要求用户加 `--`。
+        for raw in ["-6", "-12", "-0.5"] {
+            let cli = parse(&["config", "set", "rvc.pitch_shift", raw]).unwrap();
+            match cli.command {
+                Action::Config {
+                    action: ConfigAction::Set { key, value },
+                } => {
+                    assert_eq!(key, "rvc.pitch_shift");
+                    assert_eq!(value, raw, "负值须原样传入");
+                }
+                _ => panic!("expected config set"),
+            }
+        }
+        // `--` 分隔仍然可用。
+        let cli = parse(&["config", "set", "rvc.pitch_shift", "--", "-6"]).unwrap();
+        assert!(matches!(
+            cli.command,
+            Action::Config { action: ConfigAction::Set { value, .. } } if value == "-6"
+        ));
     }
 
     #[test]

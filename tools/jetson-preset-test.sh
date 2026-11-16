@@ -6,12 +6,14 @@
 # 模型文件经符号链接放入 SMOKE_DIR 下的临时模型目录：预设写临时目录，
 #   不污染只读资产树。
 # 场景：无模型 NotReady / 首次加载自动建 default / save-use-list 与 dirty /
-#   preset save 不改配置 TOML / 实时载入 / 资产目录无 presets 残留。
+#   preset save 不改配置 TOML / 实时载入 / A→B→A 切换与同模型保留调参 /
+#   模型加载失败不改 live 参数 / 损坏预设 / 资产目录无 presets 残留。
 set -u
 
 BIN_DIR=${BIN_DIR:-$HOME/mozart-runtime/bin}
 MODELS_DIR=${MODELS_DIR:-$HOME/mozart-assets/models/rvc}
 MODEL_ID=${MODEL_ID:-qiqi-zh}
+MODEL_B=${MODEL_B:-liuying}
 SMOKE_DIR=${SMOKE_DIR:-/tmp/mozart-preset-test}
 CAP_SUB=${CAP_SUB:-2}
 PB_SUB=${PB_SUB:-3}
@@ -19,13 +21,16 @@ DURATION_S=${DURATION_S:-3}
 JOB_TIMEOUT=${JOB_TIMEOUT:-420}
 RESTORE_RUNTIME=${RESTORE_RUNTIME:-0}
 SRC_MODEL=$MODELS_DIR/$MODEL_ID
+SRC_MODEL_B=$MODELS_DIR/$MODEL_B
 FEATURE_DIR=${FEATURE_DIR:-$SRC_MODEL}
 RUN=$SMOKE_DIR/run
 CFG=$SMOKE_DIR/preset.toml
 FILES=$SMOKE_DIR/files
 WORK_MODELS=$SMOKE_DIR/models
 WORK_MODEL=$WORK_MODELS/$MODEL_ID
+WORK_MODEL_B=$WORK_MODELS/$MODEL_B
 PRESET=$WORK_MODEL/presets/default.toml
+PRESET_B=$WORK_MODEL_B/presets/default.toml
 RUNTIME_CFG=$HOME/mozart-runtime/mozart.toml
 
 ctl() { "$BIN_DIR/mozart-ctl" --config "$CFG" "$@"; }
@@ -74,6 +79,11 @@ for bin in mozart-ctl mozart-daemon mozart-pre mozart-rvc; do
   [ -x "$BIN_DIR/$bin" ] || { echo "PRESET FAILED: 缺 $BIN_DIR/$bin" >&2; exit 1; }
 done
 [ -d "$SRC_MODEL" ] || { echo "PRESET FAILED: 缺模型目录 $SRC_MODEL" >&2; exit 1; }
+[ -d "$SRC_MODEL_B" ] || { echo "PRESET FAILED: 缺模型目录 $SRC_MODEL_B（切换用例需第二个模型，MODEL_B 可指定）" >&2; exit 1; }
+[ -f "$SRC_MODEL_B/config.json" ] || { echo "PRESET FAILED: 缺 $SRC_MODEL_B/config.json" >&2; exit 1; }
+if [ ! -e "$SRC_MODEL_B/$MODEL_B.engine" ] && [ ! -e "$SRC_MODEL_B/$MODEL_B.onnx" ]; then
+  echo "PRESET FAILED: 缺 $MODEL_B 生成器（.engine/.onnx）" >&2; exit 1
+fi
 for asset in hubert_base_dynamic.onnx rmvpe_dynamic.onnx hubert-realtime.onnx \
              rmvpe-realtime.onnx; do
   [ -e "$FEATURE_DIR/$asset" ] || { echo "PRESET FAILED: 缺特征引擎 $FEATURE_DIR/$asset" >&2; exit 1; }
@@ -82,9 +92,11 @@ done
 
 cleanup
 rm -rf "$RUN" "$FILES" "$WORK_MODELS"
-mkdir -p "$SMOKE_DIR" "$FILES" "$WORK_MODEL"
+mkdir -p "$SMOKE_DIR" "$FILES" "$WORK_MODEL" "$WORK_MODEL_B"
 find "$SRC_MODEL" -mindepth 1 -maxdepth 1 ! -name presets -exec ln -s {} "$WORK_MODEL/" \;
+find "$SRC_MODEL_B" -mindepth 1 -maxdepth 1 ! -name presets -exec ln -s {} "$WORK_MODEL_B/" \;
 ASSET_PRESETS_BEFORE=$(find "$SRC_MODEL" -maxdepth 1 -name presets -print)
+ASSET_PRESETS_BEFORE_B=$(find "$SRC_MODEL_B" -maxdepth 1 -name presets -print)
 
 cat > "$CFG" <<EOF
 [daemon]
@@ -177,9 +189,17 @@ with wave.open(path, "wb") as w:
 PY
 }
 
-submit_job() { # <wav>：回 job_id；失败回空
-  ctl file submit "$1" --model "$MODEL_ID" --json 2>"$SMOKE_DIR/submit.err" \
+submit_job_model() { # <wav> <model>：回 job_id；失败回空
+  ctl file submit "$1" --model "$2" --json 2>"$SMOKE_DIR/submit.err" \
     | python3 -c 'import json,sys;print(json.load(sys.stdin)["job_id"])' 2>/dev/null
+}
+submit_job() { submit_job_model "$1" "$MODEL_ID"; }
+live_pitch() { ctl status --json 2>/dev/null | jget rvc_params.pitch_shift 2>/dev/null || true; }
+job_error() { ctl file status "$1" --json 2>/dev/null | jget error 2>/dev/null || true; }
+file_has() { if grep -qF "$1" "$2" 2>/dev/null; then echo yes; else echo no; fi; }
+cfg_hash() { sha256sum "$CFG" | cut -d' ' -f1; }
+run_job() { # <job_id>：回终态；submit 失败回 submit_failed
+  if [ -n "$1" ]; then wait_job "$1"; else echo submit_failed; fi
 }
 
 wait_job() { # <job_id>：回终态
@@ -269,9 +289,88 @@ if wait_streaming; then ok "实时流仍在跑"; else bad "实时流中断未恢
 ctl route set direct >/dev/null 2>&1
 end_scenario
 
+scenario "模型切换 A→B→A 与同模型保留调参"
+# A 预设存成 pitch 3，作为切回 A 时载入的是 A 预设而非 B 参数的判据。
+ctl config set rvc.pitch_shift 3 >/dev/null 2>&1
+ctl preset save --json >/dev/null 2>&1 || bad "A 预设保存失败"
+assert_eq "A 预设含 pitch 3" "$(file_has 'pitch_shift = 3' "$PRESET")" "yes"
+
+JOB=$(submit_job_model "$INPUT" "$MODEL_B")
+STATE=$(run_job "$JOB")
+assert_eq "B job state" "$STATE" "completed"
+[ -f "$PRESET_B" ] && ok "B 首次加载自动建预设" || bad "未创建 $PRESET_B"
+assert_eq "切 B 后 live pitch" "$(live_pitch)" "0"
+assert_eq "B 默认值写入基线" "$(file_has 'pitch_shift = 0' "$CFG")" "yes"
+
+JOB=$(submit_job "$INPUT")
+assert_eq "切回 A job state" "$(run_job "$JOB")" "completed"
+assert_eq "切回 A 载入 A 预设" "$(live_pitch)" "3"
+
+ctl config set rvc.pitch_shift 5 >/dev/null 2>&1
+JOB=$(submit_job "$INPUT")
+assert_eq "同模型 job state" "$(run_job "$JOB")" "completed"
+assert_eq "同模型连续任务保留调参" "$(live_pitch)" "5"
+end_scenario
+
+scenario "模型加载失败不改 live 参数与基线"
+# 目录存在但模型文件残缺：预设能解析并建 default，LoadModel 才失败。
+# 这正是「先读校验、LoadModel 成功后再写基线」要挡住的路径。
+BROKEN=$WORK_MODELS/broken-model
+mkdir -p "$BROKEN"
+printf 'not a model\n' > "$BROKEN/placeholder.txt"
+LIVE_BEFORE=$(live_pitch)
+CFG_BEFORE=$(cfg_hash)
+PRESET_BEFORE=$(sha256sum "$PRESET" | cut -d' ' -f1)
+JOB=$(submit_job_model "$INPUT" "broken-model")
+assert_eq "残缺模型 job state" "$(run_job "$JOB")" "failed"
+ERR=$(job_error "$JOB")
+case "$ERR" in *preset*) bad "失败应在 LoadModel 而非预设解析：$ERR";; *) ok "失败原因不是预设：$ERR";; esac
+[ -f "$BROKEN/presets/default.toml" ] && ok "残缺模型目录也建了 default（resolve 先于 LoadModel）" \
+  || bad "未在残缺模型目录建 default"
+assert_eq "加载失败后 live pitch 不变" "$(live_pitch)" "$LIVE_BEFORE"
+assert_eq "加载失败后 TOML 基线不变" "$(cfg_hash)" "$CFG_BEFORE"
+assert_eq "加载失败后 A 预设不变" "$(sha256sum "$PRESET" | cut -d' ' -f1)" "$PRESET_BEFORE"
+# 真 rvc 加载新模型前会驱逐空闲模型，失败后可能无模型在载：此时 save 回
+# NotReady「no model loaded」属预期。要拦的是来源守卫误拒（错位/来源未知）。
+if ctl preset save --json >/dev/null 2>"$SMOKE_DIR/save-after-fail.err"; then
+  ok "来源仍是 A，save 放行"
+elif grep -q 'no model loaded' "$SMOKE_DIR/save-after-fail.err"; then
+  ok "rvc 已驱逐空闲模型，save 回 NotReady（无模型在载）属预期"
+else
+  bad "save 被来源守卫误拒：$(cat "$SMOKE_DIR/save-after-fail.err")"
+fi
+end_scenario
+
+scenario "损坏预设：任务 failed、队列继续、use 报错不写基线"
+printf 'version = 1\npitch_shift = 99\n' > "$PRESET_B"
+JOB=$(submit_job_model "$INPUT" "$MODEL_B")
+assert_eq "损坏预设 B job state" "$(run_job "$JOB")" "failed"
+ERR=$(job_error "$JOB")
+case "$ERR" in *preset*) ok "失败原因指明预设";; *) bad "失败原因未指明预设：$ERR";; esac
+case "$ERR" in *Internal*) ok "错误码为 Internal";; *) bad "错误码不是 Internal：$ERR";; esac
+
+JOB=$(submit_job "$INPUT")
+assert_eq "队列继续：A job state" "$(run_job "$JOB")" "completed"
+
+LIVE_BEFORE=$(live_pitch)
+CFG_BEFORE=$(cfg_hash)
+printf 'not toml\n' > "$PRESET"
+if ctl preset use --json >/dev/null 2>"$SMOKE_DIR/use-corrupt.err"; then
+  bad "损坏预设 preset use 应失败"
+elif grep -q 'Internal' "$SMOKE_DIR/use-corrupt.err"; then
+  ok "use 回 Internal"
+else
+  bad "use 错误码不是 Internal：$(cat "$SMOKE_DIR/use-corrupt.err")"
+fi
+assert_eq "损坏 use 后 live 不变" "$(live_pitch)" "$LIVE_BEFORE"
+assert_eq "损坏 use 后基线不变" "$(cfg_hash)" "$CFG_BEFORE"
+end_scenario
+
 scenario "资产目录无 presets 残留"
-ASSET_PRESETS_AFTER=$(find "$SRC_MODEL" -maxdepth 1 -name presets -print)
-assert_eq "资产 presets 前后一致" "$ASSET_PRESETS_AFTER" "$ASSET_PRESETS_BEFORE"
+assert_eq "A 资产 presets 前后一致" \
+  "$(find "$SRC_MODEL" -maxdepth 1 -name presets -print)" "$ASSET_PRESETS_BEFORE"
+assert_eq "B 资产 presets 前后一致" \
+  "$(find "$SRC_MODEL_B" -maxdepth 1 -name presets -print)" "$ASSET_PRESETS_BEFORE_B"
 end_scenario
 
 echo "=== summary ==="
