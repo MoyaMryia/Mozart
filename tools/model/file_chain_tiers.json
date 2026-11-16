@@ -3,22 +3,22 @@
   "default": "large",
   "tiers": {
     "compact": {
-      "generator_frames": [100, 1000, 1000],
+      "generator_frames": [100, 398, 1000],
       "hubert_samples": [32000, 160320, 160320],
       "rmvpe_frames": [32, 1024, 1024]
     },
     "balanced": {
-      "generator_frames": [100, 1600, 1600],
+      "generator_frames": [100, 398, 1600],
       "hubert_samples": [32000, 256320, 256320],
       "rmvpe_frames": [32, 1632, 1632]
     },
     "large": {
-      "generator_frames": [100, 1600, 2400],
+      "generator_frames": [100, 398, 2400],
       "hubert_samples": [32000, 384320, 512000],
       "rmvpe_frames": [32, 3232, 3232]
     },
     "max": {
-      "generator_frames": [100, 4200, 4200],
+      "generator_frames": [100, 398, 4200],
       "hubert_samples": [32000, 672320, 672320],
       "rmvpe_frames": [32, 4224, 4224]
     }
