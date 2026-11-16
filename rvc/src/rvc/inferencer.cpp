@@ -18,12 +18,16 @@ namespace rvc {
 namespace {
 
 constexpr size_t kHop16k = 160;
-constexpr size_t kWindow16k = 32000;
 constexpr size_t kPad16k = 16000;
 constexpr size_t kGeneratorFrames = 200;
-// 分窗/单窗几何的设计基准：流式契约生成器 T=398（窗 2 s、pad 1 s、hop 1 s）。
-// 其它定长引擎按 T/398 同比缩放窗与 pad；T=398 时因子为 1，文件分窗路径逐位不变。
+// 内层 pad 的缩放基准：流式契约生成器 T=398（pad 1 s）。
+// 主窗不按比例缩放，由 HuBERT 帧数反推，见 offline_window_geometry。
 constexpr size_t kWindowReferenceFrames = 398;
+// HuBERT 卷积栈：hop 320 样本、感受野 400 样本，对 L 样本输出
+// floor((L-400)/320)+1 帧。feature_extractor.cpp 实时引擎校验常量
+// 44800→139 帧可验证此公式。
+constexpr size_t kHubertHop16k = 320;
+constexpr size_t kHubertReceptive16k = 400;
 // 短交叉淡化：不再固定 50% 重叠，避免把两套噪声/相位混满整段。
 constexpr size_t kCrossfade16k = 3200;
 constexpr float kPi = 3.14159265358979323846f;
@@ -220,6 +224,39 @@ void limit_peak(std::vector<float>& audio, float ceiling) {
 
 } // namespace
 
+OfflineWindowGeometry offline_window_geometry(
+    size_t generator_frames, uint32_t model_sr
+) {
+    // 内层 pad 按 T/398 缩放，封顶到外层 kPad16k（F0 上下文边界），防单窗
+    // 音高偏移 (kPad16k-pad_16k) 下溢；T=200/398 不触发封顶。
+    const size_t pad_16k = std::min(
+        (kPad16k * generator_frames / kWindowReferenceFrames / kHubertHop16k)
+            * kHubertHop16k,
+        kPad16k);
+    // 窗输入由"HuBERT 恰好产出 T 帧"反推：L ∈ [160T+80, 160T+400)，
+    // 取下界向上对齐 320。主窗取生成器输出覆盖 T*160 减两侧 pad：输出时间轴
+    // 比窗输入短（卷积边缘损耗），按窗输入对称裁剪会越过输出末端补零。
+    // L 超出 win+2pad 的余量落在右上下文里。T=398 的 pad/淡化与旧常量一致。
+    const size_t min_input =
+        generator_frames * kHop16k + (kHubertReceptive16k - kHubertHop16k);
+    const size_t window_input =
+        ((min_input + kHubertHop16k - 1) / kHubertHop16k) * kHubertHop16k;
+    const size_t win_16k = generator_frames * kHop16k - 2 * pad_16k;
+    // 短淡化对齐到 2 个 HuBERT 帧，保证 hop 仍是 160 的整数倍。
+    const size_t crossfade_in =
+        (std::min(kCrossfade16k, win_16k / 4) / kHubertHop16k) * kHubertHop16k;
+    OfflineWindowGeometry geometry;
+    geometry.pad_16k = pad_16k;
+    geometry.win_16k = win_16k;
+    geometry.window_input = window_input;
+    geometry.crossfade_in = crossfade_in;
+    geometry.hop_in = win_16k - crossfade_in;
+    geometry.pad_tgt = pad_16k * model_sr / 16000;
+    geometry.window_out = win_16k * model_sr / 16000;
+    geometry.crossfade_out = crossfade_in * model_sr / 16000;
+    return geometry;
+}
+
 RVCInferencer::RVCInferencer(
     std::shared_ptr<RVCModel> model,
     std::shared_ptr<FeatureExtractor> feature_extractor,
@@ -289,7 +326,6 @@ std::vector<float> RVCInferencer::infer(
     const size_t pad_out = kPad16k * model_sr / 16000;
 
     size_t generator_frames = kGeneratorFrames;
-    bool use_engine_max_window = false;
     const auto generator_shape = model_->generator_engine().input_shape("feats");
     const bool dynamic_generator = generator_shape.size() >= 2
         && generator_shape[1] <= 0;
@@ -312,10 +348,15 @@ std::vector<float> RVCInferencer::infer(
     const bool full_shape_supported = maximum_shape.size() < 2 || maximum_shape[1] <= 0
         || full_frames <= static_cast<size_t>(maximum_shape[1]);
     if (dynamic_generator && !full_shape_supported) {
-        // 超出整段 profile 时用引擎允许的最大 T，再由 T 反推主窗；
-        // 不再固定 398 或 10 s，避免浪费模型能力。
+        // 超出整段 profile 时用引擎允许的最大 T，窗长由 T 反推
+        //（offline_window_geometry），不再固定 398 或 10 s。
         generator_frames = static_cast<size_t>(maximum_shape[1]);
-        use_engine_max_window = true;
+    }
+
+    // 生成器帧数 = 2×HuBERT 帧数，奇数 T 会使窗输入少产一帧，特征以末帧重复
+    // 顶替造成帧数失配。入口拒绝，避免静默降级。
+    if (generator_frames % 2 != 0) {
+        throw std::invalid_argument("Generator frame count must be even");
     }
 
     // The correctness-first dynamic contract follows the original RVC path:
@@ -380,25 +421,15 @@ std::vector<float> RVCInferencer::infer(
         return finalize_output(std::move(converted));
     }
 
-    // 分窗/单窗内层几何：动态超 max 时按引擎最大 T 反推主窗；
-    // 其它情况仍按 T/398 比例，并对齐到一个 HuBERT 帧（320 样本）。
-    const auto scale_window_len = [&](size_t base) {
-        return (base * generator_frames / kWindowReferenceFrames / (2 * kHop16k)) * (2 * kHop16k);
-    };
-    // 内层 pad 封顶到外层 kPad16k（F0 上下文边界），防更大 T 退分窗时单窗
-    // 音高偏移 (kPad16k-pad_16k) 下溢；T=200/398 不触发封顶。
-    const size_t pad_16k = std::min(scale_window_len(kPad16k), kPad16k);
-    const size_t raw_win_16k = use_engine_max_window
-        ? std::max<size_t>(2 * kHop16k, generator_frames * kHop16k - 2 * pad_16k)
-        : scale_window_len(kWindow16k);
-    const size_t win_16k = (raw_win_16k / (2 * kHop16k)) * (2 * kHop16k);
-    const size_t pad_tgt = pad_16k * model_sr / 16000;
-    const size_t window_out = win_16k * model_sr / 16000;
-    // 短淡化对齐到 2 个 HuBERT 帧，保证 hop 仍是 160 的整数倍。
-    const size_t crossfade_in =
-        (std::min(kCrossfade16k, win_16k / 4) / (2 * kHop16k)) * (2 * kHop16k);
-    const size_t crossfade_out = crossfade_in * model_sr / 16000;
-    const size_t hop_in = win_16k - crossfade_in;
+    // 分窗/单窗内层几何：窗长由 HuBERT 帧数反推，pad 按 T/398 缩放并封顶。
+    const auto geometry = offline_window_geometry(generator_frames, model_sr);
+    const size_t pad_16k = geometry.pad_16k;
+    const size_t win_16k = geometry.win_16k;
+    const size_t window_input = geometry.window_input;
+    const size_t pad_tgt = geometry.pad_tgt;
+    const size_t window_out = geometry.window_out;
+    const size_t crossfade_out = geometry.crossfade_out;
+    const size_t hop_in = geometry.hop_in;
 
     if (audio_16k.size() <= win_16k) {
         // Golden-aligned: feed the reflect-padded window to HuBERT (matching
@@ -453,7 +484,7 @@ std::vector<float> RVCInferencer::infer(
         auto hubert_input = slice_with_edge_reflect(
             padded,
             static_cast<int64_t>(start) - static_cast<int64_t>(pad_16k),
-            win_16k + 2 * pad_16k);
+            window_input);
         // 音高从输入上下文起点开始切，而不是主窗起点；否则整个窗的
         // pitch 会比音频晚 pad，表现为跑调、电音。
         const int64_t pitch_start =
