@@ -26,8 +26,8 @@
 
 生成器帧率 100 Hz（10 ms/帧）。对档位生成器上限 `T`：
 
-- 档位 T 均大于 398，pad 封顶 1 s；主窗 = `T / 100 - 2` 秒，2 秒为前后各 1 秒上下文。
-- HuBERT 输入 = `T × 160` 样本；HuBERT 的 `max` 必须覆盖。
+- 档位 T 均大于 398，pad 封顶 1 s；主窗 = `T × 160 − 2 × pad` 样本（生成器输出覆盖），档位主窗 = `T / 100 - 2` 秒，2 秒为前后各 1 秒上下文。
+- HuBERT 窗输入 = `align_up(160T + 80, 320)` 样本：卷积栈 hop 320、感受野 400，产 `floor((L−400)/320)+1` 帧，生成器 T = 2×帧数（`offline_window_geometry`）。HuBERT 的 `max` 必须覆盖窗输入，否则逐窗回退 ONNX。
 - RMVPE 整段 mel：整段补 1 秒上下文后按 100 Hz 取帧；STFT 边缘多 1 帧，向上补到 32 的倍数。RMVPE 的 `max` 应覆盖目标文件长度。
 - `min` 是最小输入；`opt` 是忙时形状；`max` 是能力上限。`opt` 不决定上限，只影响 TensorRT 调优和构建耗时。
 - 生成器 profile 的 `min/opt/max` 同时约束 `pitch`、`pitchf`、`latent_noise`、`source_noise`；`source_noise` 长度 = `T × 采样率 / 100`。
@@ -43,8 +43,16 @@
 ## 运行时
 
 - 运行时读引擎 profile 的 `max`，不读档位 JSON；档位只影响资产构建。
-- 文件链几何常量（参考 T=398、1 秒 pad、100 Hz、HuBERT 160 样本/帧）是实现参考；改动必须先更新本文和 `inferencer.cpp` 的常量与注释。
+- 文件链几何常量（参考 T=398、1 秒 pad、100 Hz、HuBERT 160 样本/帧、hop 320/感受野 400 样本）是实现参考；改动必须先更新本文和 `inferencer.cpp` 的常量与注释。
 - 单文件链路峰值目标 5.8 GB（8 GB 设备）；实测记录见 `reports/`。
+
+## 实施状态
+
+- [x] 档位数值单一来源：`tools/model/file_chain_tiers.json`；脚本读取，`--list-tiers` 打印；SETUP 只链接。
+- [x] 共享特征引擎：HuBERT 512000、RMVPE 3232 已构建并部署；30 s miku/gkw 实测 2 窗、峰值 4.47 GiB、8.27/6.74 s，无 ONNX 特征兜底。
+- [x] 窗几何：`offline_window_geometry` + `tests/test_rvc_window_geometry.cpp`，native 9/9 通过。
+- [ ] `max` 档板端验证：40 s 窗的构建耗时和峰值显存；阻塞与解除条件见 SETUP。
+- [ ] 当前模型集按 `large` 重建；qiqi-zh large 生成器重建中。miku 生成器仍为旧 opt=398。
 
 ## 适用范围
 
