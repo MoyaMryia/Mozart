@@ -1,6 +1,6 @@
 # Jetson 开发环境与部署
 
-最后更新：2026-11-15。本文是 Jetson 目录、资产、部署与测试的唯一权威。
+最后更新：2026-11-16。本文是 Jetson 目录、资产、部署与测试的唯一权威。
 连接方式不在仓库记录；部署时用参数或 `MOZART_JETSON` 提供 SSH 目标。
 资产分层与工具链的设计规范见 [SPEC/SPEC-10-env.md](SPEC/SPEC-10-env.md)，TOML 字段见 [config.md](config.md)。
 
@@ -88,23 +88,22 @@ MOZART_JETSON=<SSH目标> tools/jetson-e2e.sh
 
 ### 部署行为
 
-`tools/deploy-jetson.sh` 按以下顺序执行，任一步失败自动恢复：
+`tools/deploy-jetson.sh` 默认增量执行，`--full` 强制全量。任一步失败自动恢复：
 
 1. 快照 `~/Mozart` 源码到 `~/.mozart-prev`。
-2. rsync 本机仓库到 `~/Mozart`，排除 `target/`、`build/`、`.git/`。
-3. 前拨源码 mtime 并删除 workspace 成员的 cargo 指纹，强制全量重编。
-4. 构建 Rust 全部二进制与示例；构建 `jetson-release` C++ 产物；rvc 对齐到 `target/debug`。
-5. 停止运行时并确认无残留进程。
-6. 备份 `~/mozart-runtime/bin` 到 `bin.prev`；安装 7 个程序与 `examples/rvc_stub`。
-7. 用 `~/mozart-runtime/mozart.toml` 重启，等待 `pre` 与 rvc 健康。
-8. 写 `~/mozart-runtime/deploy.json`。
+2. rsync 本机仓库到 `~/Mozart`，排除 `target/`、`build/`、`.git/`。默认按内容同步（`--checksum --no-times`）：变更文件落传输时刻的 mtime，未变更文件保持原 mtime，构建缓存保留。`--full` 时前拨全部源码 mtime 并删除 workspace 成员的 cargo 指纹，强制全量重编。
+3. 构建 Rust 全部二进制与示例；构建 `jetson-release` C++ 产物；rvc 对齐到 `target/debug`。增量时 cargo/ninja 只重编受影响部分。
+4. 安装前比对构建产物与运行位，按字节差异决定重启范围。
+5. 备份 `~/mozart-runtime/bin` 到 `bin.prev`；安装 7 个程序与 `examples/rvc_stub`。安装用临时文件加原子替换，不打断运行中的进程。
+6. 默认：不停机，`mozart-ctl restart` 只重启二进制变化的服务；健康检查只等待原本 running 的服务恢复，`pre` 另需控制面就绪。daemon 变化、运行时未运行或 `--full`：停止运行时并确认无残留进程，安装后用 `mozart.toml` 整栈启动，等待 `pre` 与 rvc 健康。
+7. 写 `~/mozart-runtime/deploy.json`。
 
 失败恢复分两段：
 
 - 构建失败：恢复源码快照，清理 `target/debug` 部署产物，不打断正在运行的运行时。
 - 安装或重启失败：从 `bin.prev` 恢复上一代二进制，重启旧栈。
 
-`deploy.json` 记录提交号、是否有未提交改动、时间、构建预设和安装清单。
+`deploy.json` 记录提交号、是否有未提交改动、时间、构建预设、部署模式和实际重启的服务。
 
 ### 部署后测试
 
