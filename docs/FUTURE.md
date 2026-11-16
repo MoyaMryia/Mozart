@@ -9,6 +9,7 @@
 | 项 | 场景与动机 | 影响模块 | 前置条件 |
 | --- | --- | --- | --- |
 | 在线参数调整（SetParams） | 调 `pitch_shift`、`index_rate` 时希望不中断音频。v1 已用 `config set` + `StopStream`→`StartStream` 覆盖常规调参（短暂打断）；仍缺无中断调整。 | rvc、daemon | C++ 在块边界读参数快照；`SetParams` 控制命令；防抖与状态回报。 |
+| 多预设与 last-used | v1 每模型只有 `default.toml`，切回模型固定载入 default，不记忆上次选择。多预设按名 save/use/delete、切回恢复上次预设、把任意预设设为 default 推迟。 | daemon、ctl、core | 预设命名与字符集校验；命令体扩 `name`；per-model 持久状态。 |
 | 回声抑制 / 回声消除（AEC） | 扬声器播出的变声或播报被麦克风再次拾取，形成回声甚至啸叫。 | pre、core | DSP 阶段接口预留参考帧；播放侧提供带时间戳的最终混音参考环；板端测 ERLE（回声抑制量）和双讲（双方同时说话）。 |
 | 降噪器切换 | 默认继续用 WOLA；保留切换能力，便于以后对比 DTLN、RNNoise。 | pre | 统一降噪器接口；固定输入逐阶段对拍；板端 CPU 与延迟预算。 |
 | 共享内存环形缓冲 | 已评估：当前 20 ms 帧率下 Unix 数据报足够，暂不采用；只有实测抖动或 CPU 压力不够时才做。 | core、pre、rvc | 跨进程 SPSC（单生产者单消费者）、丢最旧、生命周期管理。 |

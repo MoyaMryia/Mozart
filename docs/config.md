@@ -11,7 +11,7 @@
 按机制 + 切换成本，**能即时生效就归运行时**：
 
 - **运行时（R）**：键值每次操作才读（阈值/上限/开关/超时），或 owning 服务有运行中应用的控制命令。`config set` 写 TOML 基线 + 清该键状态覆盖 + 立即下发生效。
-- **重启（S）**：键值启动时固化进长活结构（打开的设备、绑定的 socket、预分配的环、加载的模型、spawn 的二进制、存储目录）。`config set` 只写 TOML、不动运行进程，返回 `restart_required` + `affected`。
+- **重启（S）**：键值启动时固化进长活结构（打开的设备、绑定的 socket、预分配的环、加载的模型、spawn 的二进制、存储目录）。`config set` 只写 TOML、不动运行进程，返回 `restart_required` + `affected`。`config get` 应答带 `pending_restart_keys`（尚未重启生效的键名，无则空数组），人读输出在值后追加一行待重启提示。
 
 ## 配置来源与优先级
 
@@ -132,6 +132,8 @@ path = "<资产根>/models/asr/<模型id>"
 
 特征引擎自动发现：四个路径为空时，从 `models_dir` 按约定文件名查找（`hubert_base_dynamic.onnx`、`rmvpe_dynamic.onnx`、`hubert-realtime.onnx`、`rmvpe-realtime.onnx`）。找到即用，找不到报错。
 
+五个会话参数在运行中是「当前模型 live 草稿」；持久来源是模型目录内的 `presets/default.toml`（SPEC-11）。模型切换时 daemon 把该模型的预设写入这五个键并应用；`config set` 改 live 值并用 `preset save` 写回预设。
+
 ### [asr]
 
 | 键 | 类型 | 默认 | 范围 | 类别 |
@@ -189,6 +191,7 @@ path = "<资产根>/models/asr/<模型id>"
 ## 特殊机制说明
 
 - **RVC 会话参数**（f0_method / pitch_shift / index_rate / rms_mix_rate / protect）：`config set rvc.<会话参数>` 写 TOML 持久基线。实时流在跑且本次写入的 `pitch_shift`、`index_rate` 或 `f0_method` 值变化时，daemon 以 `StopStream`→`StartStream` 应用新参，短暂打断。仅改 `protect` / `rms_mix_rate` 更新基线与生效配置，不打断实时流。direct/空闲只更新生效配置。文件任务不中断：当前任务用旧参、下一任务用新参。触发细则与失败恢复见 [SPEC-04](SPEC/SPEC-04-daemon.md)。`protect` / `rms_mix_rate` 在实时链路不应用，仍只对文件链路生效；实时补应用与干净块边界 `SetParams` 见 [FUTURE.md](FUTURE.md)。
+- **模型预设**（SPEC-11）：每个 RVC 模型目录 `presets/default.toml` 保存五个会话参数。模型切换时 daemon 载入该文件到 `[rvc]` 并应用；`preset save` 把当前 live 五参数写回当前模型，`preset use` 重新载入，`preset list` 显示预设值、live 值与 dirty。`presets/` 是资产树唯一可写目录；daemon 是唯一写者，原子写。命令细节见 [SPEC-11](SPEC/SPEC-11-preset.md)。
 - **pre DSP 开关**经 `SetDsp`（0x0207，体含 denoise/gate/agc/limiter 四键）运行时生效：denoise 重新启用时重置 WOLA 流式状态、重新攒初始化帧，gate/agc/limiter 直接切换。
 - **逻辑上限 vs 预分配环**：`[file].queue_capacity` 是入队时查的逻辑上限（未预分配）→ R；`[pre].capture_queue_frames` 与 asr/tts/bridge 的 `*_capacity` 是预分配环/队列 → S。
 - **位置键**（storage_dir、subtitles_path）归 S：运行中改位置会使已有文件/队列分裂，需重启统一。

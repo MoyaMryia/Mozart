@@ -56,10 +56,17 @@ pub const DAEMON_DEVICE_LIST: u16 = 0x0119;
 /// 体：schema::ConfigSetRequest {"key","value"}；
 /// data {"key","value","restart_required","affected"}（SPEC-04 重启提示契约）。
 pub const DAEMON_CONFIG_SET: u16 = 0x011A;
-/// 体：schema::ConfigGetRequest {"key"?}；data {"value"}（缺省 key 回整份基线）。
+/// 体：schema::ConfigGetRequest {"key"?}；data {"value","pending_restart_keys"}
+/// （缺省 key 回整份基线；pending_restart_keys 为尚未重启生效的键名，无则空数组）。
 pub const DAEMON_CONFIG_GET: u16 = 0x011B;
 /// 体：{}（空）；data {"saved":u64}。状态文件覆盖批量写回 TOML 基线后清空（SPEC-04）。
 pub const DAEMON_CONFIG_SAVE: u16 = 0x011C;
+/// 体：{}（空）；data {"model_id","preset","values"}。当前模型五参数写入 default.toml（SPEC-11）。
+pub const DAEMON_PRESET_SAVE: u16 = 0x011D;
+/// 体：{}（空）；data {"model_id","preset","values"}。载入 default.toml 到 live 生效配置。
+pub const DAEMON_PRESET_USE: u16 = 0x011E;
+/// 体：{}（空）；data {"model_id","preset","preset_values","live_values","dirty"}。
+pub const DAEMON_PRESET_LIST: u16 = 0x011F;
 
 pub const PRE_HELLO: u16 = 0x0201;
 pub const PRE_SET_ROUTE: u16 = 0x0202;
@@ -631,6 +638,9 @@ mod tests {
         assert_eq!(DAEMON_CONFIG_SET, 0x011A);
         assert_eq!(DAEMON_CONFIG_GET, 0x011B);
         assert_eq!(DAEMON_CONFIG_SAVE, 0x011C);
+        assert_eq!(DAEMON_PRESET_SAVE, 0x011D);
+        assert_eq!(DAEMON_PRESET_USE, 0x011E);
+        assert_eq!(DAEMON_PRESET_LIST, 0x011F);
         assert_eq!(RVC_LIST_MODELS, 0x0307);
         assert_eq!(PRE_SET_FILE_MODE, 0x0206);
         assert_eq!(PRE_SET_DSP, 0x0207);
@@ -659,6 +669,9 @@ mod tests {
         ("DAEMON_CONFIG_SET", DAEMON_CONFIG_SET),
         ("DAEMON_CONFIG_GET", DAEMON_CONFIG_GET),
         ("DAEMON_CONFIG_SAVE", DAEMON_CONFIG_SAVE),
+        ("DAEMON_PRESET_SAVE", DAEMON_PRESET_SAVE),
+        ("DAEMON_PRESET_USE", DAEMON_PRESET_USE),
+        ("DAEMON_PRESET_LIST", DAEMON_PRESET_LIST),
         ("PRE_HELLO", PRE_HELLO),
         ("PRE_SET_ROUTE", PRE_SET_ROUTE),
         ("PRE_SET_MUTE", PRE_SET_MUTE),

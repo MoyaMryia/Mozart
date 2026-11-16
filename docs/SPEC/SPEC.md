@@ -31,7 +31,7 @@
 | 8 | [SPEC-08-verification.md](SPEC-08-verification.md) | rvc-golden、reports | 讨论中 |
 | 9 | [SPEC-09-pipeline.md](SPEC-09-pipeline.md) | 开发与部署流水线 | 讨论中 |
 | 10 | [SPEC-10-env.md](SPEC-10-env.md) | 模型资产与工具链（环境管理） | 讨论中 |
-| 11 | [SPEC-11-preset.md](SPEC-11-preset.md) | 模型预设（按模型持久化会话参数） | 讨论中 |
+| 11 | [SPEC-11-preset.md](SPEC-11-preset.md) | 模型预设（按模型持久化会话参数） | 已实现 |
 | 12 | [SPEC-12-file-chain-params.md](SPEC-12-file-chain-params.md) | 文件链参数与档位单一来源 | 讨论中 |
 
 阅读顺序按数据流：core → pre → rvc → daemon。语言、前端、设备、验证按需插入。
@@ -143,3 +143,6 @@
 - 2026-11-16：FUTURE 模型相关三条（多模型适配、实时原生多采样率、采样率调研）迁入 SPEC-03 并解除推迟，跨模块链接项落 SPEC-01/02/04；新增实时流中换模型条目（SPEC-03 推理侧、SPEC-04 命令与编排）。
 - 2026-11-16：实时几何与资产参数契约入 SPEC-03 新节（单一来源 `realtime_chain_params.json`，非形状类旋钮归 `[rvc.realtime]`，实时独有、不进预设）；SPEC-12 实时形状归属改指 SPEC-03。
 - 2026-11-16：待办流程定稿：SPEC 待办清单为事实源，完成后勾选；FUTURE 仅作暂存区，取出条目先讨论再登记。AGENTS.md 增加此约束并移除“待定事项”：已定项删除，文档检查缺口迁入 SPEC-09。
+- 2026-11-16：SPEC-11 模型预设实现：`preset save/use/list`、模型切换载入 `default.toml`、文件链 RVC 参数快照后移到交接后、板端 preset 套件。
+- 2026-11-16：SPEC-11 修订：载入拆为读校验与写基线两步、`LoadModel` 夹在中间，加载失败不留参数错位；模型存在性归推理层；损坏预设回 Internal；`preset save` 校验参数来源；CLI 三个 preset 命令统一长超时、`config set` 接受负值（SPEC-04、SPEC-11）。
+- 2026-11-16：待重启显示扩到键级：`GetStatus` 与 `config get` 应答带 `pending_restart_keys`，CLI 在值后提示尚未生效的键；键按受影响服务集合清除（SPEC-04、config.md）。

@@ -1,6 +1,6 @@
 //! daemon 与 ctl 共用的运行配置：TOML 文件 + 环境变量覆盖 + 入口校验。
 
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::fmt;
 use std::io;
@@ -133,6 +133,30 @@ impl Default for PreConfig {
     }
 }
 
+/// RVC 会话参数五键的值对象（SPEC-11 预设文件、config 校验与 status 共用）。
+/// 字段名与 `[rvc]` 同名，范围校验见 `validate_rvc_session_values`。
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RvcSessionValues {
+    pub pitch_shift: i32,
+    pub index_rate: f64,
+    pub rms_mix_rate: f64,
+    pub protect: f64,
+    pub f0_method: String,
+}
+
+impl Default for RvcSessionValues {
+    fn default() -> Self {
+        Self {
+            pitch_shift: 0,
+            index_rate: 0.0,
+            rms_mix_rate: 1.0,
+            protect: 0.33,
+            f0_method: "rmvpe".to_string(),
+        }
+    }
+}
+
 #[derive(Debug, Clone, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct RvcConfig {
@@ -162,16 +186,23 @@ pub struct RvcConfig {
 
 impl Default for RvcConfig {
     fn default() -> Self {
+        Self::from_session_values(RvcSessionValues::default())
+    }
+}
+
+impl RvcConfig {
+    /// 用会话参数覆盖五个键，其余键取默认；供默认值构造与预设载入共用。
+    fn from_session_values(values: RvcSessionValues) -> Self {
         Self {
             socket: "rvc.sock".to_string(),
             input_socket: "rvc-in.sock".to_string(),
             output_socket: "rvc-out.sock".to_string(),
             model_id: String::new(),
-            f0_method: "rmvpe".to_string(),
-            pitch_shift: 0,
-            index_rate: 0.0,
-            rms_mix_rate: 1.0,
-            protect: 0.33,
+            f0_method: values.f0_method,
+            pitch_shift: values.pitch_shift,
+            index_rate: values.index_rate,
+            rms_mix_rate: values.rms_mix_rate,
+            protect: values.protect,
             models_dir: String::new(),
             device: "cuda".to_string(),
             half: false,
@@ -180,6 +211,16 @@ impl Default for RvcConfig {
             rmvpe_path: String::new(),
             realtime_hubert_path: String::new(),
             realtime_rmvpe_path: String::new(),
+        }
+    }
+
+    pub fn session_values(&self) -> RvcSessionValues {
+        RvcSessionValues {
+            pitch_shift: self.pitch_shift,
+            index_rate: self.index_rate,
+            rms_mix_rate: self.rms_mix_rate,
+            protect: self.protect,
+            f0_method: self.f0_method.clone(),
         }
     }
 }
@@ -641,31 +682,7 @@ impl Config {
         validate_socket_name(&self.rvc.socket, "rvc.socket")?;
         validate_socket_name(&self.rvc.input_socket, "rvc.input_socket")?;
         validate_socket_name(&self.rvc.output_socket, "rvc.output_socket")?;
-        if self.rvc.f0_method != "rmvpe" {
-            return Err(ConfigError::Invalid(
-                "rvc.f0_method must be \"rmvpe\"".to_string(),
-            ));
-        }
-        if !(-12..=12).contains(&self.rvc.pitch_shift) {
-            return Err(ConfigError::Invalid(
-                "rvc.pitch_shift must be within -12..=12".to_string(),
-            ));
-        }
-        if !self.rvc.index_rate.is_finite() || !(0.0..=1.0).contains(&self.rvc.index_rate) {
-            return Err(ConfigError::Invalid(
-                "rvc.index_rate must be within 0.0..=1.0".to_string(),
-            ));
-        }
-        if !self.rvc.rms_mix_rate.is_finite() || !(0.0..=1.0).contains(&self.rvc.rms_mix_rate) {
-            return Err(ConfigError::Invalid(
-                "rvc.rms_mix_rate must be within 0.0..=1.0".to_string(),
-            ));
-        }
-        if !self.rvc.protect.is_finite() || !(0.0..=0.5).contains(&self.rvc.protect) {
-            return Err(ConfigError::Invalid(
-                "rvc.protect must be within 0.0..=0.5".to_string(),
-            ));
-        }
+        validate_rvc_session_values(&self.rvc.session_values())?;
         validate_socket_name(&self.asr.socket, "asr.socket")?;
         validate_socket_name(&self.asr.input_socket, "asr.input_socket")?;
         validate_socket_name(&self.asr.events_socket, "asr.events_socket")?;
@@ -811,10 +828,83 @@ impl Config {
             .find(|m| m.id == id && m.model_type == model_type)
             .map(|m| m.path.as_path())
     }
+
+    /// RVC 模型目录（预设文件定位）：注册表 path 优先，空时回退
+    /// models_dir/<id>；回退只接受纯目录名，拒绝路径穿越。
+    pub fn rvc_model_dir(&self, id: &str) -> Option<PathBuf> {
+        if let Some(path) = self.model_path(id, "rvc") {
+            return Some(path.to_path_buf());
+        }
+        if self.rvc.models_dir.is_empty() || !is_plain_component(id) {
+            return None;
+        }
+        Some(Path::new(&self.rvc.models_dir).join(id))
+    }
+}
+
+/// 会话参数五键的范围校验（单一来源）：Config::validate 与预设解析共用。
+pub fn validate_rvc_session_values(values: &RvcSessionValues) -> Result<(), ConfigError> {
+    if values.f0_method != "rmvpe" {
+        return Err(ConfigError::Invalid(
+            "rvc.f0_method must be \"rmvpe\"".to_string(),
+        ));
+    }
+    if !(-12..=12).contains(&values.pitch_shift) {
+        return Err(ConfigError::Invalid(
+            "rvc.pitch_shift must be within -12..=12".to_string(),
+        ));
+    }
+    if !values.index_rate.is_finite() || !(0.0..=1.0).contains(&values.index_rate) {
+        return Err(ConfigError::Invalid(
+            "rvc.index_rate must be within 0.0..=1.0".to_string(),
+        ));
+    }
+    if !values.rms_mix_rate.is_finite() || !(0.0..=1.0).contains(&values.rms_mix_rate) {
+        return Err(ConfigError::Invalid(
+            "rvc.rms_mix_rate must be within 0.0..=1.0".to_string(),
+        ));
+    }
+    if !values.protect.is_finite() || !(0.0..=0.5).contains(&values.protect) {
+        return Err(ConfigError::Invalid(
+            "rvc.protect must be within 0.0..=0.5".to_string(),
+        ));
+    }
+    Ok(())
+}
+
+/// 预设载入：一次原子写五个会话参数键到 TOML 基线，保留其余键与注释。
+pub fn write_rvc_session_baseline(
+    path: &Path,
+    values: &RvcSessionValues,
+) -> Result<(), ConfigError> {
+    let mut doc = load_doc(path)?;
+    for (key, item) in [
+        (
+            "rvc.pitch_shift",
+            toml_edit::value(i64::from(values.pitch_shift)),
+        ),
+        ("rvc.index_rate", toml_edit::value(values.index_rate)),
+        ("rvc.rms_mix_rate", toml_edit::value(values.rms_mix_rate)),
+        ("rvc.protect", toml_edit::value(values.protect)),
+        ("rvc.f0_method", toml_edit::value(values.f0_method.clone())),
+    ] {
+        set_doc_key(&mut doc, key, item)?;
+    }
+    validate_doc(path, &doc)?;
+    atomic_write(path, &doc.to_string())
+}
+
+/// 纯单段目录名（模型 id 回退拼路径用）：在 socket 名规则上再加 NUL 拦截。
+fn is_plain_component(name: &str) -> bool {
+    is_plain_name(name) && !name.contains('\0')
+}
+
+fn is_plain_name(name: &str) -> bool {
+    !name.is_empty() && name != "." && name != ".." && !name.contains('/')
 }
 
 fn validate_socket_name(name: &str, field: &str) -> Result<(), ConfigError> {
-    if name.is_empty() || name.contains('/') || name == "." || name == ".." {
+    if !is_plain_name(name) {
         return Err(ConfigError::Invalid(format!(
             "{field} must be a plain file name"
         )));
@@ -1332,6 +1422,58 @@ mod tests {
         assert_eq!(config.rvc.rms_mix_rate, 0.0);
         assert_eq!(config.rvc.protect, 0.0);
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn write_rvc_session_baseline_only_touches_five_keys() {
+        let dir = temp_config_dir("preset-baseline");
+        let path = dir.join("mozart.toml");
+        std::fs::write(
+            &path,
+            "# 顶部注释\n[rvc]\nmodel_id = \"model-a\"\nmodels_dir = \"/models\"\ndevice = \"cpu\"\npitch_shift = 0\n",
+        )
+        .unwrap();
+        let values = RvcSessionValues {
+            pitch_shift: 3,
+            index_rate: 0.5,
+            rms_mix_rate: 0.25,
+            protect: 0.4,
+            f0_method: "rmvpe".to_string(),
+        };
+        write_rvc_session_baseline(&path, &values).unwrap();
+
+        let text = std::fs::read_to_string(&path).unwrap();
+        assert!(text.contains("# 顶部注释"), "应保留注释：{text}");
+        assert!(text.contains("model_id = \"model-a\""), "{text}");
+        assert!(text.contains("models_dir = \"/models\""), "{text}");
+        assert!(text.contains("device = \"cpu\""), "{text}");
+        let config = Config::load_from(Some(&path)).unwrap();
+        assert_eq!(config.rvc.session_values(), values);
+        assert_eq!(config.rvc.model_id, "model-a");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn rvc_model_dir_prefers_registry_and_guards_fallback_id() {
+        let config: Config = toml::from_str(
+            "[rvc]\nmodels_dir = \"/models\"\n\n[[models]]\nid = \"model-a\"\ntype = \"rvc\"\npath = \"/registry/a\"\n",
+        )
+        .unwrap();
+        assert_eq!(
+            config.rvc_model_dir("model-a"),
+            Some(PathBuf::from("/registry/a"))
+        );
+        assert_eq!(
+            config.rvc_model_dir("model-b"),
+            Some(PathBuf::from("/models/model-b"))
+        );
+        assert_eq!(config.rvc_model_dir("../escape"), None);
+        assert_eq!(config.rvc_model_dir("a/b"), None);
+        assert_eq!(config.rvc_model_dir("."), None);
+        assert_eq!(config.rvc_model_dir(""), None);
+
+        let no_dir: Config = toml::from_str("[rvc]\n").unwrap();
+        assert_eq!(no_dir.rvc_model_dir("model-a"), None);
     }
 
     #[test]

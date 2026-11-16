@@ -17,6 +17,8 @@ MODELS_DIR=${MODELS_DIR:-$HOME/mozart-assets/models/rvc/qiqi-zh}
 REPO_DIR=${REPO_DIR:-$HOME/Mozart}
 BIN_DIR=${BIN_DIR:-$REPO_DIR/target/debug}
 SMOKE_DIR=${SMOKE_DIR:-/tmp/mozart-smoke}
+WORK_MODELS=$SMOKE_DIR/models
+WORK_MODEL=$WORK_MODELS/qiqi-zh
 CAP_SUB=${CAP_SUB:-2}
 PB_SUB=${PB_SUB:-3}
 RUN=$SMOKE_DIR/run
@@ -27,7 +29,9 @@ pkill -f "mozart-pre --socket" 2>/dev/null
 pkill -f "mozart-rvc --socket" 2>/dev/null
 sleep 0.3
 mkdir -p "$SMOKE_DIR"
-rm -rf "$RUN" "$SMOKE_DIR"/rec.raw "$SMOKE_DIR"/signal.raw "$SMOKE_DIR"/st-*.json "$SMOKE_DIR"/st-*.txt
+rm -rf "$RUN" "$WORK_MODELS" "$SMOKE_DIR"/rec.raw "$SMOKE_DIR"/signal.raw "$SMOKE_DIR"/st-*.json "$SMOKE_DIR"/st-*.txt
+mkdir -p "$WORK_MODEL"
+find "$MODELS_DIR" -mindepth 1 -maxdepth 1 ! -name presets -exec ln -s {} "$WORK_MODEL/" \;
 
 ts() { printf "[%4ss]" "$SECONDS"; }
 ctl() { "$BIN_DIR/mozart-ctl" --config "$CFG" "$@"; }
@@ -69,7 +73,7 @@ input_socket = "rvc-in.sock"
 output_socket = "rvc-out.sock"
 model_id = "qiqi-zh"
 f0_method = "rmvpe"
-models_dir = "$MODELS_DIR"
+models_dir = "$WORK_MODELS"
 device = "cuda"
 half = false
 cache_limit = 2

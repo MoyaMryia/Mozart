@@ -36,7 +36,7 @@
 ├── llama/                    # llama-server 与 .so
 ├── RVC/                      # 上游 RVC 源码树（导出/golden 的 --rvc-source）
 └── models/
-    ├── rvc/<id>/
+    ├── rvc/<id>/             # 含 presets/default.toml（唯一可写例外）
     ├── asr/<id>/
     ├── asr-review/<id>/
     ├── tts/<id>/
@@ -54,7 +54,7 @@
 
 - `~/Mozart` 由部署脚本管理，不在设备上手改源码。
 - `~/mozart-runtime` 是唯一运行实例；配置只改 `mozart.toml`。
-- `~/mozart-assets` 只读；测试只写 `/tmp/mozart-*` 与 `~/mozart-runtime/{run,state,out}`。
+- `~/mozart-assets` 只读；例外是各 RVC 模型目录内的 `presets/`，由 daemon 写入模型预设（SPEC-11）。其余测试只写 `/tmp/mozart-*` 与 `~/mozart-runtime/{run,state,out}`。
 - 历史实验目录只放 `~/mozart-archive/legacy/`；旧报告中的路径视为历史记录。
 
 ## 工作流
@@ -115,6 +115,7 @@ MOZART_JETSON=<SSH目标> tools/jetson-e2e.sh
 | `--smoke` | `tools/jetson-smoke.sh` | daemon + pre + rvc 三进程冒烟 |
 | `--file` | `tools/jetson-file-test.sh` | 文件转换、取消、队列与入口校验 |
 | `--file-models` | `tools/jetson-file-multimodel.sh` | `models/rvc` 下全部模型的文件转换与帧守恒 |
+| `--preset` | `tools/jetson-preset-test.sh` | 模型预设首次自动建、save/use/list、实时载入、A→B→A 切换、加载失败与损坏预设保护、资产隔离（需两个模型，`MODEL_B` 可指定） |
 | `--language` | `tools/jetson-language-test.sh` | ASR → 翻译 → TTS 播报 |
 | `--measure` | `tools/jetson-measure.sh` | 延迟、淡变、长跑、自愈测量 |
 
@@ -139,6 +140,7 @@ tools/jetson-e2e.sh <SSH目标> --measure latency
 | 成品 | `~/mozart-assets/models/rvc/<id>/` | config + 生成器 + 特征引擎引用 + index |
 
 成品目录名 = 模型 id = 文件前缀。加载器按 `<id>` 前缀找文件，同名 `.engine` 优先于 `.onnx`。
+每个 RVC 模型目录内的 `presets/default.toml` 保存该模型的五个会话参数；首次加载自动创建，之后由 `preset save` 更新。`presets/` 是资产树内唯一可写目录。
 设备上现有模型以 `mozart-ctl model list --available` 为准，不在文档中维护清单。
 
 ### 共享特征引擎

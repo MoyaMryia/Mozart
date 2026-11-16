@@ -2,6 +2,7 @@
 //! 对账以 daemon 的期望状态为准，切路由与轮询共用同一把 transition 锁。
 //! llama-server 无控制协议，不建 ServiceLink，只由 supervisor 监管进程。
 
+use crate::preset::PresetManager;
 use crate::runtime::SharedConfig;
 use crate::state::{lock_state, State};
 use crate::state_file::BridgeRestore;
@@ -311,10 +312,11 @@ pub fn route_set(
     state: &Mutex<State>,
     services: &Services,
     config: &Config,
+    presets: &PresetManager,
     target: Route,
 ) -> Result<Route, (String, String)> {
     let _transition = services.transition();
-    route_set_locked(state, services, config, target)
+    route_set_locked(state, services, config, presets, target)
 }
 
 /// 调用方已持 transition 锁（poller 仲裁应用等待槽路由时用）。
@@ -322,6 +324,7 @@ pub(crate) fn route_set_locked(
     state: &Mutex<State>,
     services: &Services,
     config: &Config,
+    presets: &PresetManager,
     target: Route,
 ) -> Result<Route, (String, String)> {
     // 快查也必须在 transition 锁内：锁外读取会在切换进行中给出假成功应答。
@@ -340,7 +343,7 @@ pub(crate) fn route_set_locked(
     }
     match target {
         Route::Direct => switch_direct(state, services),
-        Route::Rvc => switch_rvc(state, services, config),
+        Route::Rvc => switch_rvc(state, services, config, presets),
     }
 }
 
@@ -448,11 +451,18 @@ fn switch_rvc(
     state: &Mutex<State>,
     services: &Services,
     config: &Config,
+    presets: &PresetManager,
 ) -> Result<Route, (String, String)> {
     let status = services.rvc_status()?;
     let model_id = resolve_model_id(&config.rvc, &status)?;
     if !realtime_stream_matches(&status, &model_id) {
-        start_rvc_stream(services, &config.rvc, &model_id, true)
+        // 模型切换：先读校验预设，LoadModel 成功后再写基线；同模型复用 live 参数。
+        let resolution = presets.resolve_for_model_locked(&model_id)?;
+        let handle = services
+            .load_model_handle(&model_id)
+            .map_err(CallError::into_rejection)?;
+        let fresh = presets.commit_for_model_locked(&model_id, resolution)?;
+        start_rvc_stream_with_handle(services, &fresh.rvc, handle, true)
             .map_err(CallError::into_rejection)?;
     }
 
@@ -506,6 +516,17 @@ fn start_rvc_stream(
     busy_ok: bool,
 ) -> Result<StartOutcome, CallError> {
     let handle = services.load_model_handle(model_id)?;
+    start_rvc_stream_with_handle(services, rvc, handle, busy_ok)
+}
+
+/// 已知 model_handle 的起流：预设载入把 LoadModel 夹在读校验与写基线之间，
+/// 调用方先取 handle、提交预设后再起流。
+fn start_rvc_stream_with_handle(
+    services: &Services,
+    rvc: &RvcConfig,
+    handle: u64,
+    busy_ok: bool,
+) -> Result<StartOutcome, CallError> {
     let mut body = stream_body(rvc, handle);
     body["kind"] = json!("realtime");
     let text = body.to_string();
@@ -543,7 +564,13 @@ fn set_pre_mute(services: &Services, mute: bool) -> Result<(), CallError> {
         .map(|_| ())
 }
 
-pub fn poll(state: &Mutex<State>, services: &Services, config: &Config, pre_handoff_active: bool) {
+pub fn poll(
+    state: &Mutex<State>,
+    services: &Services,
+    config: &Config,
+    presets: &PresetManager,
+    pre_handoff_active: bool,
+) {
     let mut degraded = Vec::new();
     let pre_status = poll_pre(services, &mut degraded);
     let rvc_status = poll_rvc(services, &mut degraded);
@@ -565,6 +592,7 @@ pub fn poll(state: &Mutex<State>, services: &Services, config: &Config, pre_hand
             state,
             services,
             config,
+            presets,
             pre_status.as_ref(),
             rvc_status.as_ref(),
             &mut degraded,
@@ -701,6 +729,7 @@ fn reconcile(
     state: &Mutex<State>,
     services: &Services,
     config: &Config,
+    presets: &PresetManager,
     pre_status: Option<&PreStatus>,
     rvc_status: Option<&RvcStatus>,
     degraded: &mut Vec<String>,
@@ -720,7 +749,7 @@ fn reconcile(
     let rvc_route_ready = if file_gpu || active != Route::Rvc {
         true
     } else {
-        ensure_realtime_stream(services, &config.rvc, rvc_status, degraded)
+        ensure_realtime_stream(services, &config.rvc, rvc_status, presets, degraded)
     };
 
     if let Some(status) = pre_status {
@@ -753,6 +782,7 @@ fn ensure_realtime_stream(
     services: &Services,
     rvc: &RvcConfig,
     status: Option<&RvcStatus>,
+    presets: &PresetManager,
     degraded: &mut Vec<String>,
 ) -> bool {
     let Some(status) = status else {
@@ -768,7 +798,29 @@ fn ensure_realtime_stream(
     if realtime_stream_matches(status, &model_id) {
         return true;
     }
-    match start_rvc_stream(services, rvc, &model_id, true) {
+    let resolution = match presets.resolve_for_model_locked(&model_id) {
+        Ok(resolution) => resolution,
+        Err((code, reason)) => {
+            degraded.push(format!("rvc preset load: {code}: {reason}"));
+            return false;
+        }
+    };
+    // LoadModel 成功后才写基线：加载失败时 live 参数仍属已加载模型。
+    let handle = match services.load_model_handle(&model_id) {
+        Ok(handle) => handle,
+        Err(err) => {
+            degraded.push(format!("rvc stream apply: {}", err.describe()));
+            return false;
+        }
+    };
+    let fresh = match presets.commit_for_model_locked(&model_id, resolution) {
+        Ok(config) => config,
+        Err((code, reason)) => {
+            degraded.push(format!("rvc preset load: {code}: {reason}"));
+            return false;
+        }
+    };
+    match start_rvc_stream_with_handle(services, &fresh.rvc, handle, true) {
         Ok(_) => true,
         Err(err) => {
             degraded.push(format!("rvc stream apply: {}", err.describe()));

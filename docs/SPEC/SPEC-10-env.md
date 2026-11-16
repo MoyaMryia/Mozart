@@ -23,7 +23,8 @@
 
 - [x] 原料层 `~/rvc-pth/`：原始权重与下载后待本地处理的内容，按 `<id>.pth` 命名，可选配 `<id>.index`。
 - [x] 成品层 `~/mozart-assets/models/rvc/<id>/`：目录名 = 模型 id = 文件前缀，不带 `-run` 后缀。
-- [x] 成品目录契约：`config.json` + `<id>.onnx`/`.engine`（离线生成器）+ `<id>-front.*`/`<id>-decoder.*`（实时，可选）+ `<id>.index`（可选）。加载器按 `<id>` 前缀找文件（`rvc/src/rvc/model_loader.cpp:103-120`）。
+- [x] 成品目录契约：`config.json` + `<id>.onnx`/`.engine`（离线生成器）+ `<id>-front.*`/`<id>-decoder.*`（实时，可选）+ `<id>.index`（可选）+ `presets/default.toml`（daemon 写入，可选）。加载器按 `<id>` 前缀找文件（`rvc/src/rvc/model_loader.cpp:103-120`）。
+- [x] 资产树默认只读；`presets/` 是唯一可写例外，由 daemon 原子写模型预设（SPEC-11）。首次加载模型时自动创建 `presets/default.toml`。
 - [x] 引擎优先：同名 `.engine` 存在则优先于 `.onnx`（`rvc/src/rvc/model_loader.cpp:167-178`）。
 - [x] 共享特征引擎（HuBERT/RMVPE）放一处，各模型引用，不每份复制；`[rvc]` 全局路径显式指向共享目录（`rvc/config/rvc_config.cpp:112-116`）。
 - [x] 成品层资产自包含，不依赖旧仓库符号链接。
@@ -52,6 +53,7 @@ Python 脚本，居 `tools/model/`，直接调用。导出依赖 PyTorch，不�
 - [ ] 编译：设备上运行编译脚本，产出生成器 engine。
 - [ ] 登记：编辑 `[[models]]` 注册表（id、type=rvc、path），复用现有加载路径解析（`rvc/src/rvc/model_loader.cpp:262-292`）。
 - [ ] 测试：`file submit --model <id>`，按需 golden 对拍（SPEC-08 验收）。
+- [x] 预设：首次加载自动创建 `presets/default.toml`；运行时调参用 `preset save` 写回该模型（SPEC-11）。
 
 ## 配置
 

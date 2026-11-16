@@ -996,6 +996,118 @@ fn config_get_builds_request() {
     let output = env.run(&["config", "get", "pre.capture_device", "--json"]);
     assert_eq!(stdout_json(&output)["value"], json!("default"));
     assert_eq!(stub.requests()[0].1, json!({"key": "pre.capture_device"}));
+
+    // 旧 daemon 无 pending_restart_keys：人读输出只有值，不追加提示。
+    let human = env.run(&["config", "get", "pre.capture_device"]);
+    assert_success(&human);
+    assert_eq!(String::from_utf8_lossy(&human.stdout), "\"default\"\n");
+}
+
+/// 键级待重启标记：值原样打印，提示追加在值后；单键查询只提示该键。
+#[test]
+fn config_get_appends_pending_restart_keys() {
+    let env = CtlEnv::new("config-get-pending");
+    let _stub = StubDaemon::start(
+        &env.socket(),
+        vec![(
+            ctl::DAEMON_CONFIG_GET,
+            ok_body(json!({
+                "value": "plughw:CARD=X,DEV=0",
+                "pending_restart_keys": ["pre.capture_device", "pre.playback_device"],
+            })),
+        )],
+    );
+
+    let json = env.run(&["config", "get", "pre.capture_device", "--json"]);
+    assert_success(&json);
+    assert_eq!(
+        stdout_json(&json)["pending_restart_keys"],
+        json!(["pre.capture_device", "pre.playback_device"])
+    );
+
+    let hit = env.run(&["config", "get", "pre.capture_device"]);
+    assert_success(&hit);
+    let text = String::from_utf8_lossy(&hit.stdout);
+    assert!(
+        text.starts_with("\"plughw:CARD=X,DEV=0\"\n"),
+        "值须原样在前：{text}"
+    );
+    assert!(
+        text.contains("pending  pre.capture_device（待重启：mozart-ctl restart 生效）"),
+        "stdout: {text}"
+    );
+    assert!(
+        !text.contains("pre.playback_device"),
+        "单键查询只提示该键：{text}"
+    );
+
+    let miss = env.run(&["config", "get", "rvc.pitch_shift"]);
+    assert_success(&miss);
+    assert!(
+        !String::from_utf8_lossy(&miss.stdout).contains("pending"),
+        "该键不待重启时不追加提示"
+    );
+
+    let all = env.run(&["config", "get"]);
+    assert_success(&all);
+    let text = String::from_utf8_lossy(&all.stdout);
+    assert!(
+        text.contains(
+            "pending  pre.capture_device pre.playback_device（待重启：mozart-ctl restart 生效）"
+        ),
+        "整份基线列出全部待重启键：{text}"
+    );
+}
+
+/// 按段查询（`config get pre`）须提示该段下的待重启键，别的段不提示。
+#[test]
+fn config_get_section_read_marks_child_keys() {
+    let env = CtlEnv::new("config-get-section");
+    let _stub = StubDaemon::start(
+        &env.socket(),
+        vec![(
+            ctl::DAEMON_CONFIG_GET,
+            ok_body(json!({
+                "value": {"capture_device": "plughw:CARD=X,DEV=0"},
+                "pending_restart_keys": ["pre.capture_device"],
+            })),
+        )],
+    );
+
+    let section = env.run(&["config", "get", "pre"]);
+    assert_success(&section);
+    let text = String::from_utf8_lossy(&section.stdout);
+    assert!(
+        text.contains("pending  pre.capture_device（待重启：mozart-ctl restart 生效）"),
+        "按段查询须提示段下待重启键：{text}"
+    );
+
+    let other = env.run(&["config", "get", "rvc"]);
+    assert_success(&other);
+    assert!(
+        !String::from_utf8_lossy(&other.stdout).contains("pending"),
+        "别的段不提示"
+    );
+}
+
+/// 字段类型错属契约破坏：报错，不静默当「无待重启」。
+#[test]
+fn config_get_rejects_malformed_pending_field() {
+    let env = CtlEnv::new("config-get-bad-pending");
+    let _stub = StubDaemon::start(
+        &env.socket(),
+        vec![(
+            ctl::DAEMON_CONFIG_GET,
+            ok_body(json!({"value": "x", "pending_restart_keys": "pre.capture_device"})),
+        )],
+    );
+    let out = env.run(&["config", "get", "pre.capture_device"]);
+    assert_eq!(out.status.code(), Some(1), "字段类型错须报错");
+    assert!(
+        String::from_utf8_lossy(&out.stderr).contains("pending_restart_keys"),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
 }
 
 #[test]

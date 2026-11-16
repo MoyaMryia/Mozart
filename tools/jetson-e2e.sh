@@ -9,14 +9,15 @@
 #   --smoke      三进程冒烟
 #   --file       文件转换链路
 #   --file-models 多模型文件转换（MODELS_DIR 下全部模型）
+#   --preset     模型预设（首次自动建、save/use/list、实时载入）
 #   --language   字幕/翻译/播报链路
 #   --measure <场景> [参数...]  性能测量（需要 release 构建）
-#   --all        全部功能套件（unit + smoke + file + file-models + language）
+#   --all        全部功能套件（unit + smoke + file + file-models + preset + language）
 #
 # 前置：已运行 tools/deploy-jetson.sh；REPO_DIR 构建树（默认 ~/Mozart）、
 # ~/mozart-runtime/bin 与 mozart.toml 存在。证据目录：/tmp/mozart-smoke、
-# /tmp/mozart-file-test、/tmp/mozart-multimodel、/tmp/mozart-language-test；
-# measure 证据在 ~/mozart-t7。
+# /tmp/mozart-file-test、/tmp/mozart-multimodel、/tmp/mozart-preset-test、
+# /tmp/mozart-language-test；measure 证据在 ~/mozart-t7。
 set -euo pipefail
 
 TARGET=${MOZART_JETSON:-}
@@ -25,13 +26,14 @@ RUN_UNIT=0
 RUN_SMOKE=0
 RUN_FILE=0
 RUN_FILE_MODELS=0
+RUN_PRESET=0
 RUN_LANGUAGE=0
 RUN_MEASURE=0
 SELECTED=0
 MEASURE_ARGS=()
 
 usage() {
-  echo "用法：tools/jetson-e2e.sh <SSH目标> [--unit] [--smoke] [--file] [--file-models] [--language] [--all] [--measure <场景> [参数...]]" >&2
+  echo "用法：tools/jetson-e2e.sh <SSH目标> [--unit] [--smoke] [--file] [--file-models] [--preset] [--language] [--all] [--measure <场景> [参数...]]" >&2
   echo "      MOZART_JETSON=<SSH目标> tools/jetson-e2e.sh" >&2
   echo "  不指定套件时默认 unit + smoke + file + language；--measure 需要 release 构建。" >&2
 }
@@ -41,7 +43,7 @@ while [ $# -gt 0 ]; do
   case "$1" in
     -h|--help) usage; exit 0 ;;
     --all)
-      RUN_UNIT=1; RUN_SMOKE=1; RUN_FILE=1; RUN_FILE_MODELS=1; RUN_LANGUAGE=1; SELECTED=1; shift ;;
+      RUN_UNIT=1; RUN_SMOKE=1; RUN_FILE=1; RUN_FILE_MODELS=1; RUN_PRESET=1; RUN_LANGUAGE=1; SELECTED=1; shift ;;
     --unit)
       RUN_UNIT=1; SELECTED=1; shift ;;
     --smoke)
@@ -50,6 +52,8 @@ while [ $# -gt 0 ]; do
       RUN_FILE=1; SELECTED=1; shift ;;
     --file-models)
       RUN_FILE_MODELS=1; SELECTED=1; shift ;;
+    --preset)
+      RUN_PRESET=1; SELECTED=1; shift ;;
     --language)
       RUN_LANGUAGE=1; SELECTED=1; shift ;;
     --measure)
@@ -90,7 +94,7 @@ if [ "$SELECTED" -eq 0 ]; then
 fi
 
 remote_env="MOZART_RUNTIME_DIR=$(printf '%q' "${MOZART_RUNTIME_DIR:-}")"
-remote_env+=" RUN_UNIT=$RUN_UNIT RUN_SMOKE=$RUN_SMOKE RUN_FILE=$RUN_FILE RUN_FILE_MODELS=$RUN_FILE_MODELS RUN_LANGUAGE=$RUN_LANGUAGE RUN_MEASURE=$RUN_MEASURE"
+remote_env+=" RUN_UNIT=$RUN_UNIT RUN_SMOKE=$RUN_SMOKE RUN_FILE=$RUN_FILE RUN_FILE_MODELS=$RUN_FILE_MODELS RUN_PRESET=$RUN_PRESET RUN_LANGUAGE=$RUN_LANGUAGE RUN_MEASURE=$RUN_MEASURE"
 for v in REPO_DIR MODELS_DIR CAP_SUB PB_SUB ASSETS_DIR SAMPLE_M4A M_ROOT; do
   if [ -n "${!v:-}" ]; then
     remote_env+=" $v=$(printf '%q' "${!v}")"
@@ -110,6 +114,7 @@ if [ "$RUN_UNIT" -eq 1 ]; then suites+=" unit"; fi
 if [ "$RUN_SMOKE" -eq 1 ]; then suites+=" smoke"; fi
 if [ "$RUN_FILE" -eq 1 ]; then suites+=" file"; fi
 if [ "$RUN_FILE_MODELS" -eq 1 ]; then suites+=" file-models"; fi
+if [ "$RUN_PRESET" -eq 1 ]; then suites+=" preset"; fi
 if [ "$RUN_LANGUAGE" -eq 1 ]; then suites+=" language"; fi
 if [ "$RUN_MEASURE" -eq 1 ]; then suites+=" measure"; fi
 echo "== Jetson 部署后测试：$TARGET（${suites# }）=="
@@ -126,8 +131,8 @@ ASSETS_DIR=${ASSETS_DIR:-${MOZART_ASSETS_DIR:-$HOME/mozart-assets}}
 STOPPED=0
 NEED_STOP=0
 if [ "$RUN_SMOKE" = "1" ] || [ "$RUN_FILE" = "1" ] || \
-   [ "$RUN_FILE_MODELS" = "1" ] || [ "$RUN_LANGUAGE" = "1" ] || \
-   [ "$RUN_MEASURE" = "1" ]; then
+   [ "$RUN_FILE_MODELS" = "1" ] || [ "$RUN_PRESET" = "1" ] || \
+   [ "$RUN_LANGUAGE" = "1" ] || [ "$RUN_MEASURE" = "1" ]; then
   NEED_STOP=1
 fi
 
@@ -225,6 +230,11 @@ if [ "$RUN_FILE_MODELS" = "1" ]; then
   RESTORE_RUNTIME=0 MODELS_DIR="${MODELS_DIR:-$ASSETS_DIR/models/rvc}" \
     tools/jetson-file-multimodel.sh || fail 'jetson-file-multimodel.sh'
 fi
+if [ "$RUN_PRESET" = "1" ]; then
+  echo '== 套件：模型预设 =='
+  RESTORE_RUNTIME=0 MODELS_DIR="${MODELS_DIR:-$ASSETS_DIR/models/rvc}" \
+    tools/jetson-preset-test.sh || fail 'jetson-preset-test.sh'
+fi
 if [ "$RUN_LANGUAGE" = "1" ]; then
   echo '== 套件：字幕/翻译/播报链路 =='
   tools/jetson-language-test.sh || fail 'jetson-language-test.sh'
@@ -237,5 +247,5 @@ if [ "$RUN_MEASURE" = "1" ]; then
 fi
 
 echo '== 全部选中套件通过 =='
-echo '证据：/tmp/mozart-smoke /tmp/mozart-file-test /tmp/mozart-multimodel /tmp/mozart-language-test ~/mozart-t7'
+echo '证据：/tmp/mozart-smoke /tmp/mozart-file-test /tmp/mozart-multimodel /tmp/mozart-preset-test /tmp/mozart-language-test ~/mozart-t7'
 REMOTE

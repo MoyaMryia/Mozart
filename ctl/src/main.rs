@@ -1,9 +1,10 @@
 use clap::{Parser, Subcommand, ValueEnum};
-use mozart_core::config::{ensure_run_dir, Config};
+use mozart_core::config::{ensure_run_dir, Config, RvcSessionValues};
 use mozart_core::ctl::schema::{
     Activity, ConfigGetRequest, ConfigSetRequest, DeviceEntry, DeviceListRequest, FileCancelRequest,
     FileFetchRequest, FileJob, FileJobState, FileProgress, FileStatusRequest, FileSubmitRequest,
-    ModelEntry, ProcessState, Response, RestartRequest, Route, Status,
+    ModelEntry, PresetApplyData, PresetListData, ProcessState, Response, RestartRequest, Route,
+    Status,
 };
 use mozart_core::ctl::{self, Seqpacket};
 use serde_json::{json, Value};
@@ -90,6 +91,11 @@ enum Action {
     Config {
         #[command(subcommand)]
         action: ConfigAction,
+    },
+    /// 当前已加载模型的预设（SPEC-11）
+    Preset {
+        #[command(subcommand)]
+        action: PresetAction,
     },
 }
 
@@ -195,16 +201,27 @@ enum ConfigAction {
     Set {
         /// 配置键，如 pre.capture_device
         key: String,
-        /// 新值
+        /// 新值；允许负数（如 pitch_shift -6），不被当作选项
+        #[arg(allow_hyphen_values = true)]
         value: String,
     },
-    /// 读配置基线；缺省键读整份
+    /// 读配置基线；缺省键读整份，待重启键在值后提示
     Get {
         /// 配置键；缺省读整份
         key: Option<String>,
     },
     /// 把运行时状态覆盖批量写回基线并清空状态文件（无需重启）
     Save,
+}
+
+#[derive(Subcommand)]
+enum PresetAction {
+    /// 把当前 live 五参数保存到当前模型的 default 预设
+    Save,
+    /// 载入当前模型的 default 预设，丢弃未保存调参
+    Use,
+    /// 查看当前模型预设值与 live 值及差异
+    List,
 }
 
 struct CliError {
@@ -262,6 +279,7 @@ fn run(cli: Cli) -> Result<(), CliError> {
             ConfigAction::Get { key } => config_get(&config, key.as_deref(), cli.json),
             ConfigAction::Save => config_save(&config, cli.json),
         },
+        Action::Preset { action } => preset_command(&config, action, cli.json),
     }
 }
 
@@ -622,8 +640,8 @@ fn call(config: &Config, type_: u16, body: &[u8]) -> Result<Value, CliError> {
     call_with_timeout(config, type_, body, config.daemon.rpc_timeout_ms)
 }
 
-/// 同 `call`，客户端超时由调用方指定：config set 覆盖 daemon 的多次串行 RPC，
-/// 其他命令沿用 rpc_timeout_ms。
+/// 同 `call`，客户端超时由调用方指定：config set 与 preset 命令覆盖 daemon 的
+/// 多次串行 RPC，其他命令沿用 rpc_timeout_ms。
 fn call_with_timeout(
     config: &Config,
     type_: u16,
@@ -731,6 +749,36 @@ fn config_get(config: &Config, key: Option<&str>, json_output: bool) -> Result<(
     let text = serde_json::to_string_pretty(value)
         .map_err(|err| CliError::new(EXIT_ERROR, err.to_string()))?;
     println!("{text}");
+    // 基线值可能尚未生效：值后追加待重启键，标记不进值里（--json 契约与人读值都不变形）。
+    // 缺字段按空还原（旧 daemon）；字段在但类型错属契约破坏，报错不静默当无待重启。
+    let pending: Vec<String> = match data.get("pending_restart_keys") {
+        None => Vec::new(),
+        Some(Value::Array(keys)) => keys
+            .iter()
+            .map(|item| {
+                item.as_str().map(str::to_string).ok_or_else(|| {
+                    CliError::new(EXIT_ERROR, "invalid config get payload: pending_restart_keys 元素须为字符串")
+                })
+            })
+            .collect::<Result<_, _>>()?,
+        Some(_) => {
+            return Err(CliError::new(
+                EXIT_ERROR,
+                "invalid config get payload: pending_restart_keys 须为数组",
+            ))
+        }
+    };
+    // 按段读（如 `config get pre`）时，该段下的待重启键同样要提示。
+    let marked: Vec<String> = match key {
+        Some(key) => pending
+            .into_iter()
+            .filter(|name| name == key || name.starts_with(&format!("{key}.")))
+            .collect(),
+        None => pending,
+    };
+    if !marked.is_empty() {
+        println!("{}", pending_hint(&marked));
+    }
     Ok(())
 }
 
@@ -746,6 +794,72 @@ fn config_save(config: &Config, json_output: bool) -> Result<(), CliError> {
         .ok_or_else(|| CliError::new(EXIT_ERROR, "invalid config save payload: missing saved"))?;
     println!("config saved: {saved} keys");
     Ok(())
+}
+
+fn preset_command(
+    config: &Config,
+    action: PresetAction,
+    json_output: bool,
+) -> Result<(), CliError> {
+    // 三个命令都在 daemon 侧抢 transition 锁并查一次 rvc 状态，poller 持锁
+    // 对账会拖长应答：短超时会在服务端已完成写入时报超时。预算同 config set。
+    let timeout_ms = config_set_timeout_ms(config);
+    match action {
+        PresetAction::Save => {
+            let data = call_with_timeout(config, ctl::DAEMON_PRESET_SAVE, b"{}", timeout_ms)?;
+            print_preset_apply(&data, "saved", json_output)
+        }
+        PresetAction::Use => {
+            let data = call_with_timeout(config, ctl::DAEMON_PRESET_USE, b"{}", timeout_ms)?;
+            print_preset_apply(&data, "loaded", json_output)
+        }
+        PresetAction::List => {
+            let data = call_with_timeout(config, ctl::DAEMON_PRESET_LIST, b"{}", timeout_ms)?;
+            if json_output {
+                println!("{data}");
+                return Ok(());
+            }
+            let list: PresetListData = serde_json::from_value(data).map_err(|err| {
+                CliError::new(EXIT_ERROR, format!("invalid preset list payload: {err}"))
+            })?;
+            println!(
+                "preset {} model={} dirty={}",
+                list.preset,
+                list.model_id,
+                yes_no(list.dirty)
+            );
+            print_preset_values("preset", &list.preset_values);
+            print_preset_values("live  ", &list.live_values);
+            Ok(())
+        }
+    }
+}
+
+fn print_preset_apply(data: &Value, action: &str, json_output: bool) -> Result<(), CliError> {
+    if json_output {
+        println!("{data}");
+        return Ok(());
+    }
+    let apply: PresetApplyData = serde_json::from_value(data.clone()).map_err(|err| {
+        CliError::new(EXIT_ERROR, format!("invalid preset payload: {err}"))
+    })?;
+    println!(
+        "preset {}: {} (model {})",
+        action, apply.preset, apply.model_id
+    );
+    print_preset_values("values", &apply.values);
+    Ok(())
+}
+
+fn print_preset_values(prefix: &str, values: &RvcSessionValues) {
+    println!(
+        "{prefix} pitch={} index={} rms={} protect={} f0={}",
+        values.pitch_shift,
+        values.index_rate,
+        values.rms_mix_rate,
+        values.protect,
+        values.f0_method
+    );
 }
 
 fn body_json<T: serde::Serialize>(value: &T) -> Result<Vec<u8>, CliError> {
@@ -1144,11 +1258,16 @@ fn print_status(status: &Status) {
         println!("degraded {}", status.degraded.join("; "));
     }
     if !status.pending_restart.is_empty() {
-        println!(
-            "pending  {}（待重启：mozart-ctl restart 生效）",
-            status.pending_restart.join(" ")
-        );
+        println!("{}", pending_hint(&status.pending_restart));
     }
+}
+
+/// 待重启提示行：status 列服务名，config get 列键名，措辞同一来源。
+fn pending_hint(names: &[String]) -> String {
+    format!(
+        "pending  {}（待重启：mozart-ctl restart 生效）",
+        names.join(" ")
+    )
 }
 
 fn route_name(route: Route) -> &'static str {
@@ -1411,5 +1530,55 @@ mod tests {
         ));
         assert!(parse(&["config"]).is_err());
         assert!(parse(&["config", "set", "onlykey"]).is_err());
+    }
+
+    #[test]
+    fn config_set_accepts_negative_value_without_separator() {
+        // pitch_shift 范围 -12..=12，负值是正常用法，不该要求用户加 `--`。
+        for raw in ["-6", "-12", "-0.5"] {
+            let cli = parse(&["config", "set", "rvc.pitch_shift", raw]).unwrap();
+            match cli.command {
+                Action::Config {
+                    action: ConfigAction::Set { key, value },
+                } => {
+                    assert_eq!(key, "rvc.pitch_shift");
+                    assert_eq!(value, raw, "负值须原样传入");
+                }
+                _ => panic!("expected config set"),
+            }
+        }
+        // `--` 分隔仍然可用。
+        let cli = parse(&["config", "set", "rvc.pitch_shift", "--", "-6"]).unwrap();
+        assert!(matches!(
+            cli.command,
+            Action::Config { action: ConfigAction::Set { value, .. } } if value == "-6"
+        ));
+    }
+
+    #[test]
+    fn preset_parses_save_use_list_and_json() {
+        assert!(matches!(
+            parse(&["preset", "save"]).unwrap().command,
+            Action::Preset {
+                action: PresetAction::Save
+            }
+        ));
+        assert!(matches!(
+            parse(&["preset", "use"]).unwrap().command,
+            Action::Preset {
+                action: PresetAction::Use
+            }
+        ));
+        let cli = parse(&["--json", "preset", "list"]).unwrap();
+        assert!(cli.json);
+        assert!(matches!(
+            cli.command,
+            Action::Preset {
+                action: PresetAction::List
+            }
+        ));
+        assert!(parse(&["preset"]).is_err());
+        assert!(parse(&["preset", "bogus"]).is_err());
+        assert!(parse(&["preset", "use", "default"]).is_err());
     }
 }

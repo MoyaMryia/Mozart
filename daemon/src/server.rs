@@ -1,6 +1,7 @@
 use crate::device;
 use crate::file::{worker::FileWorker, FileCoordinator};
 use crate::poller::Poller;
+use crate::preset::PresetManager;
 use crate::runtime::SharedConfig;
 use crate::services::{self, Services};
 use crate::state::{lock_state, Role, State};
@@ -34,6 +35,7 @@ struct Ctx {
     state: Arc<Mutex<State>>,
     services: Arc<Services>,
     file: Arc<FileCoordinator>,
+    presets: Arc<PresetManager>,
     config: SharedConfig,
     state_file: Arc<Mutex<StateFile>>,
     config_path: Option<PathBuf>,
@@ -68,6 +70,16 @@ pub fn serve(config: &Config, config_path: Option<&Path>) -> io::Result<()> {
     let state = Arc::new(Mutex::new(State::new()));
     let services = Arc::new(Services::new(&shared));
     let running = Arc::new(AtomicBool::new(true));
+    // 预设载入与 config set/save 共用 TOML 串行锁与 transition 锁。
+    let toml_lock = Arc::new(Mutex::new(()));
+    let presets = Arc::new(PresetManager::new(
+        shared.clone(),
+        state.clone(),
+        services.clone(),
+        state_file.clone(),
+        config_path.clone(),
+        toml_lock.clone(),
+    ));
     // SIGTERM/SIGINT 与 Shutdown 同一优雅关停（SPEC-04），幂等。
     // signal-hook 经自管道递送：handler 只写管道（异步信号安全），状态改动
     // 在下面的迭代线程做。线程与 handler 常驻到进程退出：重复信号只是再次
@@ -113,6 +125,7 @@ pub fn serve(config: &Config, config_path: Option<&Path>) -> io::Result<()> {
         shared.clone(),
         state.clone(),
         services.clone(),
+        presets.clone(),
         running.clone(),
         Arc::new(FileWorker),
     )?);
@@ -120,6 +133,7 @@ pub fn serve(config: &Config, config_path: Option<&Path>) -> io::Result<()> {
         shared.clone(),
         state.clone(),
         services.clone(),
+        presets.clone(),
         file.clone(),
         bridge_restore,
         running.clone(),
@@ -129,11 +143,12 @@ pub fn serve(config: &Config, config_path: Option<&Path>) -> io::Result<()> {
         state,
         services,
         file,
+        presets,
         config: shared,
         state_file,
         config_path,
         restarts,
-        toml_lock: Arc::new(Mutex::new(())),
+        toml_lock,
         running,
     };
     let outcome = accept_loop(&listener, &ctx);
@@ -252,7 +267,13 @@ fn handle_request(ctx: &Ctx, msg: &Message) -> (Vec<u8>, bool) {
         ctl::DAEMON_ROUTE_SET => match parse_body::<RouteSetRequest>(&msg.body) {
             Ok(request) => {
                 let config = ctx.config.snapshot();
-                match services::route_set(&ctx.state, &ctx.services, &config, request.route) {
+                match services::route_set(
+                    &ctx.state,
+                    &ctx.services,
+                    &config,
+                    &ctx.presets,
+                    request.route,
+                ) {
                     Ok(route) => (schema::ok_body(json!({"route": route})), false),
                     Err((code, reason)) => (schema::error_body(&code, &reason), false),
                 }
@@ -330,12 +351,20 @@ fn handle_request(ctx: &Ctx, msg: &Message) -> (Vec<u8>, bool) {
         },
         ctl::DAEMON_CONFIG_GET => match parse_body::<ConfigGetRequest>(&msg.body) {
             Ok(request) => match get_key(ctx.config_path.as_deref(), request.key.as_deref()) {
-                Ok(value) => (schema::ok_body(json!({"value": value})), false),
+                // 读到的基线值可能尚未生效：待重启键恒随应答给出，无则空数组。
+                Ok(value) => {
+                    let pending = lock_state(&ctx.state).pending_restart_keys();
+                    let data = json!({"value": value, "pending_restart_keys": pending});
+                    (schema::ok_body(data), false)
+                }
                 Err(err) => (schema::error_body(ctl::CODE_INVALID_ARGUMENT, &err.to_string()), false),
             },
             Err(reply) => (reply, false),
         },
         ctl::DAEMON_CONFIG_SAVE => (config_save_reply(ctx), false),
+        ctl::DAEMON_PRESET_SAVE => preset_reply(ctx.presets.save_current()),
+        ctl::DAEMON_PRESET_USE => preset_reply(ctx.presets.use_default()),
+        ctl::DAEMON_PRESET_LIST => preset_reply(ctx.presets.list()),
         _ => (
             schema::error_body(ctl::CODE_UNKNOWN_COMMAND, "unknown command"),
             false,
@@ -392,6 +421,19 @@ fn file_reply(result: Result<serde_json::Value, (String, String)>) -> (Vec<u8>, 
     }
 }
 
+fn preset_reply<T: serde::Serialize>(result: Result<T, (String, String)>) -> (Vec<u8>, bool) {
+    match result {
+        Ok(data) => match serde_json::to_value(data) {
+            Ok(data) => (schema::ok_body(data), false),
+            Err(err) => (
+                schema::error_body(ctl::CODE_INTERNAL, &err.to_string()),
+                false,
+            ),
+        },
+        Err((code, reason)) => (schema::error_body(&code, &reason), false),
+    }
+}
+
 /// config set（SPEC-04）：设备键先对照当前清单校验存在（防呆），再原子写基线，
 /// 回重启提示契约 restart_required + affected，并登记待重启。daemon 运行时键与
 /// rvc 会话参数键写基线后即时应用：daemon/file 键清覆盖并重建生效配置；rvc 会话
@@ -413,13 +455,16 @@ fn config_set_reply(ctx: &Ctx, request: &ConfigSetRequest) -> Vec<u8> {
             Err((code, reason)) => return schema::error_body(&code, &reason),
         }
     }
+    // 锁顺序 transition → toml：预设载入在持 transition 时也要写 TOML 基线，
+    // 反向加锁会与预设路径互等。非 rvc 键也持 transition，代价是短暂延后轮询。
+    let _transition = ctx.services.transition();
     let _toml = ctx.toml_lock.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
     // 写键前的生效配置：rvc 会话参数判断变化与失败回退都以它为旧值。
     let old = ctx.config.snapshot();
     match set_key(ctx.config_path.as_deref(), &request.key, &request.value) {
         Ok(effect) => {
             if effect.restart_required {
-                lock_state(&ctx.state).mark_pending_restart(&effect.affected);
+                lock_state(&ctx.state).mark_pending_restart(&request.key, &effect.affected);
             } else if let Err((code, reason)) = apply_runtime_key(ctx, &request.key, &old) {
                 return schema::error_body(&code, &reason);
             }
@@ -439,6 +484,7 @@ fn config_set_reply(ctx: &Ctx, request: &ConfigSetRequest) -> Vec<u8> {
 /// rvc 会话键的生效配置只吸收本次写入的键（见 services::merge_session_key），
 /// 再按需重启实时流；编排与替换同处 transition 临界区，失败不替换生效配置
 /// （TOML 新基线保留，下一次对应键写入或 daemon 重启再尝试）。
+/// 调用方须已持 transition 锁。
 fn apply_runtime_key(ctx: &Ctx, key: &str, old: &Config) -> Result<(), (String, String)> {
     lock_state_file(&ctx.state_file)
         .remove_key(key)
@@ -451,9 +497,8 @@ fn apply_runtime_key(ctx: &Ctx, key: &str, old: &Config) -> Result<(), (String, 
         // 未生效的 rvc 基线（如失败恢复留下的 pitch）不得混入生效配置，
         // 否则 status 与在跑流不一致。
         fresh.rvc = services::merge_session_key(key, &old.rvc, &fresh.rvc)?;
-        // 替换与 Stop/Start 同处临界区：释放锁后再替换会给轮询留下用旧快照
-        // 起流的窄窗口。失败路径不替换，TOML 新基线保留。
-        let _transition = ctx.services.transition();
+        // 替换与 Stop/Start 同处调用方持有的 transition 临界区：释放后再替换
+        // 会给轮询留下用旧快照起流的窄窗口。失败路径不替换，TOML 新基线保留。
         services::apply_rvc_session_params_locked(&ctx.state, &ctx.services, &old.rvc, &fresh.rvc)
             .map_err(|(code, reason)| {
                 (

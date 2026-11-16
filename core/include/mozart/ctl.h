@@ -60,8 +60,15 @@ enum {
     MOZART_CTL_DAEMON_RESTART     = 0x0118,  // 体 {"service"}
     MOZART_CTL_DAEMON_DEVICE_LIST = 0x0119,  // 体 {"all"?}，data {"devices":[{"id","label","kind"}]}
     MOZART_CTL_DAEMON_CONFIG_SET  = 0x011A,  // 体 {"key","value"}，data {"key","value","restart_required","affected"}
-    MOZART_CTL_DAEMON_CONFIG_GET  = 0x011B,  // 体 {"key"?}，data {"value"}（缺省 key 回整份基线）
+    // 体 {"key"?}，data {"value","pending_restart_keys"}（缺省 key 回整份基线；
+    // pending_restart_keys 为尚未重启生效的键名，无则空数组）
+    MOZART_CTL_DAEMON_CONFIG_GET  = 0x011B,
     MOZART_CTL_DAEMON_CONFIG_SAVE = 0x011C,  // 体 {}（空），data {"saved"}；状态覆盖批量写回基线后清空
+    // 模型预设（SPEC-11）：体 {}（空，v1 固定 default、当前已加载模型）；
+    // data 见各模块规格。无模型加载回 NotReady。
+    MOZART_CTL_DAEMON_PRESET_SAVE = 0x011D,  // data {"model_id","preset","values"}
+    MOZART_CTL_DAEMON_PRESET_USE  = 0x011E,  // data {"model_id","preset","values"}；编排失败回 error
+    MOZART_CTL_DAEMON_PRESET_LIST = 0x011F,  // data {"model_id","preset","preset_values","live_values","dirty"}
 
     MOZART_CTL_PRE_HELLO      = 0x0201,
     MOZART_CTL_PRE_SET_ROUTE  = 0x0202,
