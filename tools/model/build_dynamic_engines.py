@@ -38,23 +38,38 @@ class Tier:
         return self.generator_frames[2] // 100 - 2
 
 
-# Main window + 2 s context = generator frames / 100.
-# HuBERT sees the whole generator window (frames * 160 samples).
-# RMVPE runs on the whole padded file; its max covers the same main window.
-TIERS = {
-    "compact": Tier(
-        "compact", (100, 1200, 1200), (32000, 192000, 192000), (32, 1600, 1600)
-    ),
-    "balanced": Tier(
-        "balanced", (100, 2200, 2200), (32000, 352000, 352000), (32, 2304, 2304)
-    ),
-    "large": Tier(
-        "large", (100, 2400, 2400), (32000, 384000, 512000), (32, 3232, 3232)
-    ),
-    "max": Tier(
-        "max", (100, 4200, 4200), (32000, 672000, 672000), (32, 4224, 4224)
-    ),
-}
+TIERS_PATH = Path(__file__).with_name("file_chain_tiers.json")
+
+
+def load_tiers(path: Path) -> tuple[dict[str, Tier], str]:
+    try:
+        data = json.loads(path.read_text())
+    except (OSError, json.JSONDecodeError) as error:
+        raise SystemExit(f"{path}: cannot read tiers: {error}")
+    if data.get("version") != 1:
+        raise SystemExit(f"{path}: unsupported tiers version")
+    tiers: dict[str, Tier] = {}
+    for name, values in data.get("tiers", {}).items():
+        try:
+            generator = tuple(int(v) for v in values["generator_frames"])
+            hubert = tuple(int(v) for v in values["hubert_samples"])
+            rmvpe = tuple(int(v) for v in values["rmvpe_frames"])
+        except (KeyError, TypeError, ValueError) as error:
+            raise SystemExit(f"{path}: tier {name} is invalid: {error}")
+        if len(generator) != 3 or len(hubert) != 3 or len(rmvpe) != 3:
+            raise SystemExit(
+                f"{path}: tier {name} needs three values per profile"
+            )
+        tiers[name] = Tier(name, generator, hubert, rmvpe)
+    if not tiers:
+        raise SystemExit(f"{path}: no tiers defined")
+    default = data.get("default")
+    if default not in tiers:
+        raise SystemExit(f"{path}: default tier is missing or unknown")
+    return tiers, default
+
+
+TIERS, DEFAULT_TIER = load_tiers(TIERS_PATH)
 
 
 @dataclass(frozen=True)
@@ -304,8 +319,8 @@ def main() -> None:
     parser.add_argument("--model-id", help="model id recorded in the manifest")
     parser.add_argument("--sample-rate", type=int,
                         help="model sample rate (default: config.json or 48000)")
-    parser.add_argument("--tier", choices=sorted(TIERS), default="large",
-                        help="window profile tier (default: large)")
+    parser.add_argument("--tier", choices=sorted(TIERS), default=DEFAULT_TIER,
+                        help="window profile tier (default: %(default)s)")
     parser.add_argument("--max-generator-frames", type=int,
                         help="override the tier generator max")
     parser.add_argument("--max-hubert-samples", type=int,

@@ -1,0 +1,26 @@
+{
+  "version": 1,
+  "default": "large",
+  "tiers": {
+    "compact": {
+      "generator_frames": [100, 1200, 1200],
+      "hubert_samples": [32000, 192000, 192000],
+      "rmvpe_frames": [32, 1600, 1600]
+    },
+    "balanced": {
+      "generator_frames": [100, 2200, 2200],
+      "hubert_samples": [32000, 352000, 352000],
+      "rmvpe_frames": [32, 2304, 2304]
+    },
+    "large": {
+      "generator_frames": [100, 2400, 2400],
+      "hubert_samples": [32000, 384000, 512000],
+      "rmvpe_frames": [32, 3232, 3232]
+    },
+    "max": {
+      "generator_frames": [100, 4200, 4200],
+      "hubert_samples": [32000, 672000, 672000],
+      "rmvpe_frames": [32, 4224, 4224]
+    }
+  }
+}

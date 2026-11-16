@@ -1,6 +1,6 @@
 # SPEC 索引
 
-状态：讨论中。最后更新：2026-11-15。
+状态：讨论中。最后更新：2026-11-16。
 
 ## 总体
 
@@ -31,6 +31,8 @@
 | 8 | [SPEC-08-verification.md](SPEC-08-verification.md) | rvc-golden、reports | 讨论中 |
 | 9 | [SPEC-09-pipeline.md](SPEC-09-pipeline.md) | 开发与部署流水线 | 讨论中 |
 | 10 | [SPEC-10-env.md](SPEC-10-env.md) | 模型资产与工具链（环境管理） | 讨论中 |
+| 11 | [SPEC-11-preset.md](SPEC-11-preset.md) | 模型预设（按模型持久化会话参数） | 讨论中 |
+| 12 | [SPEC-12-file-chain-params.md](SPEC-12-file-chain-params.md) | 文件链参数与档位单一来源 | 讨论中 |
 
 阅读顺序按数据流：core → pre → rvc → daemon。语言、前端、设备、验证按需插入。
 
@@ -134,3 +136,4 @@
 - 2026-11-13：音频设备识别定稿：枚举归 daemon（ALSA API、按需不缓存、id+标签、配置校验），CLI `device list`；pre 只用设备不枚举；设备热切换入 FUTURE（SPEC-02、SPEC-04）。
 - 2026-11-13：新增 `[process.env]` 段，daemon spawn 子进程时注入 TOML 定义的环境变量（SPEC-04、config.md）。
 - 2026-11-13：模型注册表定稿：TOML 顶层 `[[models]]` 数组（id/type/path），LoadModel 和 ListModels 优先从注册表解析路径，注册表为空时回退 models_dir 扫描；特征引擎四路径改为可选，缺省从 models_dir 按约定文件名自动发现（SPEC-03、config.md）。
+- 2026-11-16：新增 SPEC-11 模型预设与 SPEC-12 文件链参数索引。

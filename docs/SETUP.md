@@ -230,20 +230,10 @@ RVC_SOURCE=~/mozart-assets/RVC python3 tools/model/run_streaming_reference.py \
 
 ### 文件链档位
 
-`--tier` 选择一组默认 profile，默认 `large`。档位是默认值，不是显存硬限制；脚本仍会校验形状上下限和 RMVPE 的 32 倍数。
+`--tier` 选择一组默认 profile，默认值由 JSON 的 `default` 字段给出。档位是默认值，不是显存硬限制；脚本仍会校验形状上下限和 RMVPE 的 32 倍数。
 
-| 档位 | 主窗 | 生成器 min/opt/max | HuBERT min/opt/max | RMVPE min/opt/max |
-| --- | --- | --- | --- | --- |
-| `compact` | 10 s | 100/1200/1200 | 32000/192000/192000 | 32/1600/1600 |
-| `balanced` | 20 s | 100/2200/2200 | 32000/352000/352000 | 32/2304/2304 |
-| `large`（默认） | 22 s | 100/2400/2400 | 32000/384000/512000 | 32/3232/3232 |
-| `max` | 40 s | 100/4200/4200 | 32000/672000/672000 | 32/4224/4224 |
+档位数值的单一来源是 [`tools/model/file_chain_tiers.json`](../tools/model/file_chain_tiers.json)；当前值用 `--list-tiers` 查看。字段语义、公式和边界见 [SPEC-12](SPEC/SPEC-12-file-chain-params.md)。
 
-档位表以 `--list-tiers` 输出为准，改档位时同步本表。
-
-- 主窗 = 生成器输入时长减 2 s，前后各 1 s 上下文。
-- `opt` 取该档的忙时形状，`max` 是能力上限。HuBERT 的 `max` 可高于当前窗输入，作为更大窗的余量。
-- `opt` 与 `max` 拆开，避免用目标大窗形状做全量 tactic 搜索导致构建过慢。
 - 文件链 HuBERT/RMVPE 是共享引擎，所有模型共用一套。提高全局档位时，先用 `--feature-only` 重建共享特征引擎，再重建各模型生成器。
 - 模型生成器的 max 不应超过共享 HuBERT 的 max；超过时运行时会回退 ONNX 特征。
 - `max` 档未在板端验证。阻塞原因：40 s 窗的构建耗时和峰值显存未测。解除条件：在 8 GB 设备上按 `max` 档构建并跑 30/60 s 文件，确认峰值低于 5.8 GB。
