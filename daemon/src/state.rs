@@ -72,6 +72,10 @@ pub struct State {
     /// 写了重启键但尚未重启的服务（SPEC-04 待重启显示）：config set 重启键加入，
     /// restart 该服务后清除。崩溃重启复用旧配置快照，不清（分歧仍在）。
     pending_restart: std::collections::BTreeSet<String>,
+    /// 键级待重启：键 → 尚未重启的受影响服务集合。config get 读到的是基线新值，
+    /// 靠这份映射标出该值尚未生效（服务级集合看不出是哪个键）。
+    /// 一个键影响多个服务时，全部服务都重启后才算生效。
+    pending_restart_keys: std::collections::BTreeMap<String, std::collections::BTreeSet<String>>,
     shutting_down: bool,
 }
 
@@ -102,6 +106,7 @@ impl State {
             degraded: Vec::new(),
             degraded_persistent: Vec::new(),
             pending_restart: std::collections::BTreeSet::new(),
+            pending_restart_keys: std::collections::BTreeMap::new(),
             shutting_down: false,
         }
     }
@@ -145,7 +150,13 @@ impl State {
                 .cloned()
                 .collect(),
             pending_restart: self.pending_restart.iter().cloned().collect(),
+            pending_restart_keys: self.pending_restart_keys(),
         }
+    }
+
+    /// 待重启的键名，按键排序（BTreeMap 键序）。
+    pub fn pending_restart_keys(&self) -> Vec<String> {
+        self.pending_restart_keys.keys().cloned().collect()
     }
 
     pub fn route_desired(&self) -> Route {
@@ -277,16 +288,26 @@ impl State {
             .retain(|reason| !reason.starts_with(prefix));
     }
 
-    /// 写重启键后登记受影响服务待重启（SPEC-04）。
-    pub fn mark_pending_restart(&mut self, affected: &[String]) {
+    /// 写重启键后登记受影响服务与该键待重启（SPEC-04）。
+    /// affected 由 core::config::set_key 给出，这里不重新推导键的分类。
+    pub fn mark_pending_restart(&mut self, key: &str, affected: &[String]) {
         for service in affected {
             self.pending_restart.insert(service.clone());
         }
+        self.pending_restart_keys
+            .entry(key.to_string())
+            .or_default()
+            .extend(affected.iter().cloned());
     }
 
     /// 单服务重启受理后清除其待重启标记（重读 TOML，分歧消除）。
+    /// 键级标记只去掉该服务；键影响多个服务时，全部重启后才删键。
     pub fn clear_pending_restart(&mut self, service: &str) {
         self.pending_restart.remove(service);
+        self.pending_restart_keys.retain(|_, owners| {
+            owners.remove(service);
+            !owners.is_empty()
+        });
     }
 
     pub fn process_starting(&mut self, role: Role) {
@@ -419,13 +440,48 @@ mod tests {
     fn pending_restart_marks_and_clears_per_service() {
         let mut state = State::new();
         assert!(state.status().pending_restart.is_empty());
-        state.mark_pending_restart(&["pre".to_string()]);
-        state.mark_pending_restart(&["pre".to_string(), "rvc".to_string()]);
-        assert_eq!(state.status().pending_restart, vec!["pre", "rvc"]);
+        assert!(state.status().pending_restart_keys.is_empty());
+        state.mark_pending_restart("pre.capture_device", &["pre".to_string()]);
+        // 状态机不分类键：多服务键用合成名，只验服务集合与键映射的清除口径。
+        state.mark_pending_restart("multi.service", &["pre".to_string(), "rvc".to_string()]);
+        let status = state.status();
+        assert_eq!(status.pending_restart, vec!["pre", "rvc"]);
+        assert_eq!(
+            status.pending_restart_keys,
+            vec!["multi.service", "pre.capture_device"],
+            "键级标记按键排序"
+        );
+        // 清 pre 只清 pre 独占的键；rvc 仍待重启的键保留。
         state.clear_pending_restart("pre");
-        assert_eq!(state.status().pending_restart, vec!["rvc"]);
+        let status = state.status();
+        assert_eq!(status.pending_restart, vec!["rvc"]);
+        assert_eq!(status.pending_restart_keys, vec!["multi.service"]);
         state.clear_pending_restart("rvc");
-        assert!(state.status().pending_restart.is_empty());
+        let status = state.status();
+        assert!(status.pending_restart.is_empty());
+        assert!(status.pending_restart_keys.is_empty());
+
+        // 反序清除：先重启 rvc，多服务键仍待 pre 重启，不得提前删。
+        state.mark_pending_restart("multi.service", &["pre".to_string(), "rvc".to_string()]);
+        state.clear_pending_restart("rvc");
+        assert_eq!(state.status().pending_restart_keys, vec!["multi.service"]);
+        state.clear_pending_restart("pre");
+        assert!(state.status().pending_restart_keys.is_empty());
+    }
+
+    #[test]
+    fn pending_restart_keys_clear_only_for_restarted_service() {
+        let mut state = State::new();
+        state.mark_pending_restart("pre.capture_device", &["pre".to_string()]);
+        state.mark_pending_restart("pre.playback_device", &["pre".to_string()]);
+        // 重启别的服务不影响本服务的键。
+        state.clear_pending_restart("rvc");
+        assert_eq!(
+            state.status().pending_restart_keys,
+            vec!["pre.capture_device", "pre.playback_device"]
+        );
+        state.clear_pending_restart("pre");
+        assert!(state.status().pending_restart_keys.is_empty());
     }
 
     #[test]

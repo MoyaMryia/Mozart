@@ -56,7 +56,8 @@ pub const DAEMON_DEVICE_LIST: u16 = 0x0119;
 /// 体：schema::ConfigSetRequest {"key","value"}；
 /// data {"key","value","restart_required","affected"}（SPEC-04 重启提示契约）。
 pub const DAEMON_CONFIG_SET: u16 = 0x011A;
-/// 体：schema::ConfigGetRequest {"key"?}；data {"value"}（缺省 key 回整份基线）。
+/// 体：schema::ConfigGetRequest {"key"?}；data {"value","pending_restart_keys"}
+/// （缺省 key 回整份基线；pending_restart_keys 为尚未重启生效的键名，无则空数组）。
 pub const DAEMON_CONFIG_GET: u16 = 0x011B;
 /// 体：{}（空）；data {"saved":u64}。状态文件覆盖批量写回 TOML 基线后清空（SPEC-04）。
 pub const DAEMON_CONFIG_SAVE: u16 = 0x011C;

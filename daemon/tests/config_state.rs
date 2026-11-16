@@ -1,9 +1,10 @@
 //! 配置写回后半段（SPEC-04）：运行时状态文件、config save、启动恢复、
-//! 运行时键即时下发、写重启键后 status 待重启显示。
+//! 运行时键即时下发、写重启键后 status 与 config get 的待重启显示。
 
 mod common;
 
 use common::{call, example, status, submit_file, wait_ready, wait_until, DaemonProcess};
+use mozart_core::ctl::schema::Response;
 use mozart_core::ctl::{self, Seqpacket};
 use serde_json::json;
 use std::path::Path;
@@ -21,6 +22,31 @@ fn wait_bridge_ready(conn: &Seqpacket) {
         wait_until(Duration::from_secs(5), || status(conn).bridge.is_some()),
         "bridge was not polled"
     );
+}
+
+/// 取一个真实存在的采集设备；无声卡主机返回 None（设备校验依赖 ALSA 枚举）。
+fn capture_device(conn: &Seqpacket) -> Option<String> {
+    let devices = call(conn, ctl::DAEMON_DEVICE_LIST, br#"{"all":true}"#);
+    assert_eq!(devices.status, "ok");
+    let found = devices.data["devices"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|d| d["kind"] == "capture")
+        .and_then(|d| d["id"].as_str())
+        .map(str::to_string);
+    if found.is_none() {
+        eprintln!("跳过：本机无采集设备，待重启键用例未跑断言");
+    }
+    found
+}
+
+/// config get 应答：key 为 None 读整份基线。
+fn config_get(conn: &Seqpacket, key: Option<&str>) -> Response {
+    let body = json!({ "key": key }).to_string();
+    let reply = call(conn, ctl::DAEMON_CONFIG_GET, body.as_bytes());
+    assert_eq!(reply.status, "ok", "reason: {}", reply.reason);
+    reply
 }
 
 #[test]
@@ -152,16 +178,7 @@ fn restart_key_marks_pending_until_restart() {
     wait_ready(&conn);
 
     // 取一个真实存在的采集设备；无声卡主机跳过（设备校验依赖 ALSA 枚举）。
-    let devices = call(&conn, ctl::DAEMON_DEVICE_LIST, br#"{"all":true}"#);
-    assert_eq!(devices.status, "ok");
-    let capture = devices.data["devices"]
-        .as_array()
-        .unwrap()
-        .iter()
-        .find(|d| d["kind"] == "capture")
-        .and_then(|d| d["id"].as_str())
-        .map(str::to_string);
-    let Some(capture) = capture else {
+    let Some(capture) = capture_device(&conn) else {
         return;
     };
 
@@ -185,4 +202,78 @@ fn restart_key_marks_pending_until_restart() {
         }),
         "pending restart should clear after restart"
     );
+}
+
+/// 键级待重启标记：config get 读到的是基线新值，应答须指出该键尚未生效；
+/// restart 受影响服务后标记清空。
+#[test]
+fn config_get_marks_pending_key_until_restart() {
+    let daemon = DaemonProcess::start_with_config(
+        "cfg-pending-key",
+        &example("pre_stub"),
+        &example("rvc_stub"),
+        BASELINE,
+    );
+    let conn = daemon.connect();
+    wait_ready(&conn);
+
+    let Some(capture) = capture_device(&conn) else {
+        return;
+    };
+    let body = json!({"key": "pre.capture_device", "value": capture}).to_string();
+    let reply = call(&conn, ctl::DAEMON_CONFIG_SET, body.as_bytes());
+    assert_eq!(reply.status, "ok", "reason: {}", reply.reason);
+
+    let got = config_get(&conn, Some("pre.capture_device"));
+    assert_eq!(got.data["value"], json!(capture));
+    assert_eq!(
+        got.data["pending_restart_keys"],
+        json!(["pre.capture_device"]),
+        "基线新值尚未生效，应答须带该键"
+    );
+    // 整份基线带同一份列表；单键查询也回全量，过滤归 CLI。
+    assert_eq!(
+        config_get(&conn, None).data["pending_restart_keys"],
+        json!(["pre.capture_device"])
+    );
+    assert_eq!(
+        config_get(&conn, Some("rvc.model_id")).data["pending_restart_keys"],
+        json!(["pre.capture_device"])
+    );
+
+    let restart = call(&conn, ctl::DAEMON_RESTART, br#"{"service":"pre"}"#);
+    assert_eq!(restart.status, "ok", "reason: {}", restart.reason);
+    assert_eq!(
+        config_get(&conn, Some("pre.capture_device")).data["pending_restart_keys"],
+        json!([]),
+        "重启受理后键级标记应清空"
+    );
+    assert_eq!(config_get(&conn, None).data["pending_restart_keys"], json!([]));
+}
+
+/// 运行时键即时生效，不进待重启集合；无待重启键时应答仍带空数组（契约稳定）。
+#[test]
+fn runtime_key_not_marked_pending() {
+    let daemon = DaemonProcess::start_with_config(
+        "cfg-runtime-pending",
+        &example("pre_stub"),
+        &example("rvc_stub"),
+        BASELINE,
+    );
+    let conn = daemon.connect();
+    wait_ready(&conn);
+
+    let reply = call(
+        &conn,
+        ctl::DAEMON_CONFIG_SET,
+        br#"{"key":"rvc.pitch_shift","value":"3"}"#,
+    );
+    assert_eq!(reply.status, "ok", "reason: {}", reply.reason);
+    assert_eq!(reply.data["restart_required"], false);
+
+    let got = config_get(&conn, Some("rvc.pitch_shift"));
+    assert_eq!(got.data["value"], 3);
+    assert_eq!(got.data["pending_restart_keys"], json!([]));
+    assert_eq!(config_get(&conn, None).data["pending_restart_keys"], json!([]));
+    assert!(status(&conn).pending_restart_keys.is_empty());
 }

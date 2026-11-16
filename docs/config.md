@@ -11,7 +11,7 @@
 按机制 + 切换成本，**能即时生效就归运行时**：
 
 - **运行时（R）**：键值每次操作才读（阈值/上限/开关/超时），或 owning 服务有运行中应用的控制命令。`config set` 写 TOML 基线 + 清该键状态覆盖 + 立即下发生效。
-- **重启（S）**：键值启动时固化进长活结构（打开的设备、绑定的 socket、预分配的环、加载的模型、spawn 的二进制、存储目录）。`config set` 只写 TOML、不动运行进程，返回 `restart_required` + `affected`。
+- **重启（S）**：键值启动时固化进长活结构（打开的设备、绑定的 socket、预分配的环、加载的模型、spawn 的二进制、存储目录）。`config set` 只写 TOML、不动运行进程，返回 `restart_required` + `affected`。`config get` 应答带 `pending_restart_keys`（尚未重启生效的键名，无则空数组），人读输出在值后追加一行待重启提示。
 
 ## 配置来源与优先级
 

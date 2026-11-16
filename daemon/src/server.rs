@@ -351,7 +351,12 @@ fn handle_request(ctx: &Ctx, msg: &Message) -> (Vec<u8>, bool) {
         },
         ctl::DAEMON_CONFIG_GET => match parse_body::<ConfigGetRequest>(&msg.body) {
             Ok(request) => match get_key(ctx.config_path.as_deref(), request.key.as_deref()) {
-                Ok(value) => (schema::ok_body(json!({"value": value})), false),
+                // 读到的基线值可能尚未生效：待重启键恒随应答给出，无则空数组。
+                Ok(value) => {
+                    let pending = lock_state(&ctx.state).pending_restart_keys();
+                    let data = json!({"value": value, "pending_restart_keys": pending});
+                    (schema::ok_body(data), false)
+                }
                 Err(err) => (schema::error_body(ctl::CODE_INVALID_ARGUMENT, &err.to_string()), false),
             },
             Err(reply) => (reply, false),
@@ -459,7 +464,7 @@ fn config_set_reply(ctx: &Ctx, request: &ConfigSetRequest) -> Vec<u8> {
     match set_key(ctx.config_path.as_deref(), &request.key, &request.value) {
         Ok(effect) => {
             if effect.restart_required {
-                lock_state(&ctx.state).mark_pending_restart(&effect.affected);
+                lock_state(&ctx.state).mark_pending_restart(&request.key, &effect.affected);
             } else if let Err((code, reason)) = apply_runtime_key(ctx, &request.key, &old) {
                 return schema::error_body(&code, &reason);
             }

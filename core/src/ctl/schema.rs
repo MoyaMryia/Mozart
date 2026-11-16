@@ -240,6 +240,9 @@ pub struct Status {
     /// 写了重启键但尚未重启的服务名（SPEC-04 待重启显示）。旧快照缺此字段按空还原。
     #[serde(default)]
     pub pending_restart: Vec<String>,
+    /// 尚未重启生效的键名（SPEC-04 键级待重启标记）。旧快照缺此字段按空还原。
+    #[serde(default)]
+    pub pending_restart_keys: Vec<String>,
 }
 
 /// ASR 进程状态快照（ASR_GET_STATUS 的 data）。

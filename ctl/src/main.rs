@@ -204,7 +204,7 @@ enum ConfigAction {
         /// 新值
         value: String,
     },
-    /// 读配置基线；缺省键读整份
+    /// 读配置基线；缺省键读整份，待重启键在值后提示
     Get {
         /// 配置键；缺省读整份
         key: Option<String>,
@@ -748,6 +748,36 @@ fn config_get(config: &Config, key: Option<&str>, json_output: bool) -> Result<(
     let text = serde_json::to_string_pretty(value)
         .map_err(|err| CliError::new(EXIT_ERROR, err.to_string()))?;
     println!("{text}");
+    // 基线值可能尚未生效：值后追加待重启键，标记不进值里（--json 契约与人读值都不变形）。
+    // 缺字段按空还原（旧 daemon）；字段在但类型错属契约破坏，报错不静默当无待重启。
+    let pending: Vec<String> = match data.get("pending_restart_keys") {
+        None => Vec::new(),
+        Some(Value::Array(keys)) => keys
+            .iter()
+            .map(|item| {
+                item.as_str().map(str::to_string).ok_or_else(|| {
+                    CliError::new(EXIT_ERROR, "invalid config get payload: pending_restart_keys 元素须为字符串")
+                })
+            })
+            .collect::<Result<_, _>>()?,
+        Some(_) => {
+            return Err(CliError::new(
+                EXIT_ERROR,
+                "invalid config get payload: pending_restart_keys 须为数组",
+            ))
+        }
+    };
+    // 按段读（如 `config get pre`）时，该段下的待重启键同样要提示。
+    let marked: Vec<String> = match key {
+        Some(key) => pending
+            .into_iter()
+            .filter(|name| name == key || name.starts_with(&format!("{key}.")))
+            .collect(),
+        None => pending,
+    };
+    if !marked.is_empty() {
+        println!("{}", pending_hint(&marked));
+    }
     Ok(())
 }
 
@@ -1230,11 +1260,16 @@ fn print_status(status: &Status) {
         println!("degraded {}", status.degraded.join("; "));
     }
     if !status.pending_restart.is_empty() {
-        println!(
-            "pending  {}（待重启：mozart-ctl restart 生效）",
-            status.pending_restart.join(" ")
-        );
+        println!("{}", pending_hint(&status.pending_restart));
     }
+}
+
+/// 待重启提示行：status 列服务名，config get 列键名，措辞同一来源。
+fn pending_hint(names: &[String]) -> String {
+    format!(
+        "pending  {}（待重启：mozart-ctl restart 生效）",
+        names.join(" ")
+    )
 }
 
 fn route_name(route: Route) -> &'static str {
