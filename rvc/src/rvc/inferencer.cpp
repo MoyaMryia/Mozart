@@ -18,6 +18,8 @@ namespace rvc {
 namespace {
 
 constexpr size_t kHop16k = 160;
+// F0 帧率 100 Hz，每帧 0.01 s；F0(Hz)×此值 = 每帧周期数。
+constexpr double kF0FrameSeconds = 0.01;
 constexpr size_t kPad16k = 16000;
 constexpr size_t kGeneratorFrames = 200;
 // 内层 pad 的缩放基准：流式契约生成器 T=398（pad 1 s）。
@@ -469,7 +471,7 @@ std::vector<float> RVCInferencer::infer(
     std::vector<double> pitch_cycles(pitchf_full.size() + 1, 0.0);
     for (size_t i = 0; i < pitchf_full.size(); ++i) {
         pitch_cycles[i + 1] = pitch_cycles[i]
-            + static_cast<double>(pitchf_full[i]) * 0.01;
+            + static_cast<double>(pitchf_full[i]) * kF0FrameSeconds;
     }
 
     std::vector<float> assembled;
@@ -492,13 +494,26 @@ std::vector<float> RVCInferencer::infer(
             / static_cast<int64_t>(kHop16k);
         auto pitchf = slice_with_edge_reflect(pitchf_full, pitch_start, generator_frames);
         auto pitch = slice_with_edge_reflect(pitch_full, pitch_start, generator_frames);
-        const int64_t input_frame_start = std::max<int64_t>(0, pitch_start);
-        const size_t cycles_index = static_cast<size_t>(std::min<int64_t>(
-            input_frame_start, static_cast<int64_t>(pitch_cycles.size() - 1)));
-        const double absolute_cycles = pitch_cycles[cycles_index];
+        // 噪声/相位按绝对帧索引对齐：第 0 窗 pitch_start<0（上下文起点在整段
+        // 起点之前），不夹到 0，否则首缝与下一窗噪声/相位错网格（金属感）。
+        // absolute_cycles 为整段起点到上下文起点的累计周期；pitch_start<0 时
+        // 取左 pad 周期的负值，与反射音频的音高一致。
+        double absolute_cycles;
+        if (pitch_start >= 0) {
+            absolute_cycles = pitch_cycles[static_cast<size_t>(pitch_start)];
+        } else {
+            // 第 0 窗上下文起点在整段起点之前；左 pad 周期取负抵消本地 cumsum。
+            // left_frames = pad_16k/160 ≤ 100 < T = pitchf.size()，无需边界守卫。
+            const size_t left_frames = static_cast<size_t>(-pitch_start);
+            double left_cycles = 0.0;
+            for (size_t i = 0; i < left_frames; ++i) {
+                left_cycles += static_cast<double>(pitchf[i]) * kF0FrameSeconds;
+            }
+            absolute_cycles = -left_cycles;
+        }
         auto converted = infer_window(
             hubert_input, pitchf, pitch, cancelled,
-            true, input_frame_start, absolute_cycles);
+            true, pitch_start, absolute_cycles);
         if (converted.size() > 2 * pad_tgt) {
             converted = std::vector<float>(
                 converted.begin() + static_cast<std::ptrdiff_t>(pad_tgt),
@@ -976,14 +991,16 @@ std::vector<float> RVCInferencer::synthesize_window(
             source_phase.front() = 0.0f;
             for (float& value : source_noise) value = normal(random);
         } else {
-            // 分窗路径按绝对帧/样本索引生成，重叠区拿到同一组噪声；
+            // 分窗路径按绝对帧/样本索引键噪声：重叠区绝对索引≥0，跨窗同键。
+            // 第 0 窗左 pad 绝对索引<0，wrap 成 uint64 仍确定（该区被裁剪）。
             // source_phase 用累计 F0 周期补偿本地 cumsum 的相位起点。
-            const uint64_t frame_start =
-                static_cast<uint64_t>(std::max<int64_t>(0, absolute_frame_start));
+            const int64_t frame_start = absolute_frame_start;
             for (size_t channel = 0; channel < channels; ++channel) {
                 for (size_t t = 0; t < T; ++t) {
                     latent_noise[channel * T + t] = normal_from_key(
-                        noise_key(0x1ULL, frame_start + t, channel));
+                        noise_key(0x1ULL,
+                            static_cast<uint64_t>(frame_start + static_cast<int64_t>(t)),
+                            channel));
                 }
             }
             std::mt19937 phase_random(114514);
@@ -992,14 +1009,19 @@ std::vector<float> RVCInferencer::synthesize_window(
             source_phase.front() = 0.0f;
             for (size_t harmonic = 0; harmonic < source_dim; ++harmonic) {
                 const double cycles = absolute_cycles * static_cast<double>(harmonic + 1);
-                source_phase[harmonic] = static_cast<float>(std::fmod(
-                    static_cast<double>(source_phase[harmonic]) + cycles, 1.0));
+                double phase = std::fmod(
+                    static_cast<double>(source_phase[harmonic]) + cycles, 1.0);
+                if (phase < 0.0) phase += 1.0;
+                source_phase[harmonic] = static_cast<float>(phase);
             }
-            const uint64_t sample_start = frame_start * output_per_frame;
+            const int64_t sample_start =
+                frame_start * static_cast<int64_t>(output_per_frame);
             for (size_t sample = 0; sample < T * output_per_frame; ++sample) {
                 for (size_t channel = 0; channel < source_dim; ++channel) {
                     source_noise[sample * source_dim + channel] = normal_from_key(
-                        noise_key(0x2ULL, sample_start + sample, channel));
+                        noise_key(0x2ULL,
+                            static_cast<uint64_t>(sample_start + static_cast<int64_t>(sample)),
+                            channel));
                 }
             }
         }
