@@ -39,6 +39,7 @@ Mozart 是面向 NVIDIA Jetson Orin Nano Super 8 GB 的本地语音处理系统�
 本机全量检查用 `tools/ci-local.sh all`。部署用 `tools/deploy-jetson.sh <SSH目标>`，部署不跑测试。
 部署后测试用 `tools/jetson-e2e.sh <SSH目标> [套件]`。SSH 目标由参数或 `MOZART_JETSON` 提供，仓库不保存设备地址。
 每次要进行新测试时，必定监测机子上有没有正在运行或者测试的，应该先等完然后再重启（如果又不要）防止多实例出现还有孤儿进程。如果要执行构建任务，请先停止服务防止OOM。
+具体开发时，如果有多人在调试记得使用多目录进行开发，避免发生冲突。
 
 ## 文件系统组织
 
