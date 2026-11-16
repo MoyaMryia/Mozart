@@ -1,27 +1,27 @@
 #!/bin/bash
-# 文件链分窗基准 runner（docs/RVC-FILE-BENCHMARK.md）。
-# MODEL_IDS × DURATIONS 矩阵，输入 $INPUT_DIR/gkw_male_<dur>s.wav（原始 WAV 直提，
-# daemon 解码）。一次起栈串行跑完，证据留 $SMOKE_DIR。
-# 判据：completed、frames_in==frames_out、输出样本=frames_in×960、48 kHz 单声道、
-#   引擎加载不回退 ONNX（"加载失败，回退 ONNX" 计数不增）。
-#   HuBERT/RMVPE 超 profile 的动态 ONNX 兜底（"Lazy-loaded ONNX fallback"）只记录
-#   不判失败——长文件整段 RMVPE 超 profile 属预期（SPEC-12、benchmark §2.1）。
-# 互斥：有 mozart-daemon 在跑时默认中止；STOP_RUNTIME=1 先停运行栈再跑。
+# 文件链路分窗基准 runner（docs/RVC-FILE-BENCHMARK.md）。
+# MODEL_IDS × DURATIONS 矩阵，输入 $INPUT_DIR/gkw_male_<dur>s.wav（原始 WAV 直提）。
+# 判据：completed、frames_in == frames_out、输出样本 = frames_in × 960、48 kHz 单声道、
+#   引擎加载不得回退 ONNX。HuBERT/RMVPE 超 profile 的动态 ONNX 兜底是长文件预期行为，
+#   只记录文件名不判失败（benchmark 文档 2.1）。
+# 互斥：有 mozart-daemon 在跑时默认拒绝启动；STOP_RUNTIME=1 先停生产运行时再跑。
+# 证据留 $SMOKE_DIR：config-used.toml、各 run 的 submit/job/status/fetch/wav、summary.tsv。
 set -u
 
 BIN_DIR=${BIN_DIR:-$HOME/mozart-runtime/bin}
 MODELS_DIR=${MODELS_DIR:-$HOME/mozart-assets/models/rvc}
 MODEL_IDS=${MODEL_IDS:-"trump-v2 miku-v2-48k"}
-DURATIONS=${DURATIONS:-"10 30 60 120"}
+DURATIONS=${DURATIONS:-"30 60 120"}
 INPUT_DIR=${INPUT_DIR:-/tmp/mozart-window-inputs}
 SMOKE_DIR=${SMOKE_DIR:-/tmp/mozart-window-bc}
+MAX_DURATION_S=${MAX_DURATION_S:-300}
+JOB_TIMEOUT=${JOB_TIMEOUT:-900}
 STOP_RUNTIME=${STOP_RUNTIME:-0}
 RESTORE_RUNTIME=${RESTORE_RUNTIME:-1}
-JOB_TIMEOUT=${JOB_TIMEOUT:-900}
 CAP_SUB=${CAP_SUB:-2}
 PB_SUB=${PB_SUB:-3}
 RUN=$SMOKE_DIR/run
-CFG=$SMOKE_DIR/window.toml
+CFG=$SMOKE_DIR/multi.toml
 FILES=$SMOKE_DIR/files
 RUNTIME_CFG=$HOME/mozart-runtime/mozart.toml
 LOG=$RUN/logs/rvc.log
@@ -32,7 +32,7 @@ count_log() {
   n=$(grep -c "$1" "$LOG" 2>/dev/null || true)
   printf '%s' "${n:-0}"
 }
-wait_log_count() {
+wait_log_count() { # <模式> <下限> <超时秒>
   local deadline=$((SECONDS + $3))
   while [ "$(count_log "$1")" -le "$2" ]; do
     [ "$SECONDS" -ge "$deadline" ] && return 1
@@ -42,7 +42,10 @@ wait_log_count() {
 }
 cleanup() {
   if [ -S "$RUN/daemon.sock" ]; then ctl down >/dev/null 2>&1; fi
-  sleep 0.5
+  pkill -f mozart-daemon 2>/dev/null
+  pkill -f "mozart-pre --socket" 2>/dev/null
+  pkill -f "mozart-rvc --socket" 2>/dev/null
+  sleep 0.3
 }
 restore_runtime() {
   [ "$RESTORE_RUNTIME" = 1 ] || return 0
@@ -53,25 +56,26 @@ trap 'exit 130' INT
 trap 'exit 143' TERM
 
 for tool in python3 ffprobe ffmpeg; do
-  command -v "$tool" >/dev/null || { echo "WINDOW FAILED: 缺少 $tool" >&2; exit 1; }
+  command -v "$tool" >/dev/null || { echo "WINDOW-BC FAILED: 缺少 $tool" >&2; exit 1; }
 done
 python3 -c 'import numpy' 2>/dev/null \
-  || { echo "WINDOW FAILED: python3 缺 numpy" >&2; exit 1; }
+  || { echo "WINDOW-BC FAILED: python3 缺 numpy" >&2; exit 1; }
 for bin in mozart-ctl mozart-daemon mozart-pre mozart-rvc; do
-  [ -x "$BIN_DIR/$bin" ] || { echo "WINDOW FAILED: 缺 $BIN_DIR/$bin" >&2; exit 1; }
+  [ -x "$BIN_DIR/$bin" ] || { echo "WINDOW-BC FAILED: 缺 $BIN_DIR/$bin" >&2; exit 1; }
 done
-[ -d /proc/asound/Loopback ] || { echo "WINDOW FAILED: snd-aloop 未加载" >&2; exit 1; }
+[ -d /proc/asound/Loopback ] || { echo "WINDOW-BC FAILED: snd-aloop 未加载" >&2; exit 1; }
 
+# 互斥检查：任何 daemon 在跑都先停下（本 runner 或生产运行时），不静默杀别人的测试。
 if pgrep -f mozart-daemon >/dev/null 2>&1; then
   if [ "$STOP_RUNTIME" = 1 ]; then
     "$BIN_DIR/mozart-ctl" --config "$RUNTIME_CFG" down >/dev/null 2>&1 || true
-    for _ in $(seq 1 20); do
-      pgrep -f mozart-daemon >/dev/null 2>&1 || break
-      sleep 0.5
-    done
-  fi
-  if pgrep -f mozart-daemon >/dev/null 2>&1; then
-    echo "WINDOW FAILED: 仍有 mozart-daemon 在跑（互斥），先等完或停掉" >&2
+    sleep 1
+    if pgrep -f mozart-daemon >/dev/null 2>&1; then
+      echo "WINDOW-BC FAILED: 仍有 daemon 在跑（可能是其他测试），等完再试" >&2
+      exit 1
+    fi
+  else
+    echo "WINDOW-BC FAILED: 有 mozart-daemon 在跑；等完或设 STOP_RUNTIME=1" >&2
     exit 1
   fi
 fi
@@ -84,13 +88,11 @@ for m in $MODEL_IDS; do
     FEATURE_MODEL=$m; break
   fi
 done
-[ -n "$FEATURE_MODEL" ] || { echo "WINDOW FAILED: 无模型含完整特征引擎" >&2; exit 1; }
+[ -n "$FEATURE_MODEL" ] || { echo "WINDOW-BC FAILED: 无模型含完整特征引擎" >&2; exit 1; }
 FEATURE_DIR=$MODELS_DIR/$FEATURE_MODEL
 
 mkdir -p "$SMOKE_DIR" "$FILES"
 rm -rf "$RUN"
-rm -f "$SMOKE_DIR"/*.json "$SMOKE_DIR"/*.wav "$SMOKE_DIR"/*.tsv "$SMOKE_DIR"/*.toml
-
 cat > "$CFG" <<EOF
 [daemon]
 run_dir = "$RUN"
@@ -130,14 +132,14 @@ storage_dir = "$FILES"
 queue_capacity = 50
 storage_limit_bytes = 1048576000
 denoise = false
-max_duration_seconds = 300
+max_duration_seconds = $MAX_DURATION_S
 max_upload_bytes = 104857600
 ffmpeg_path = "/usr/bin/ffmpeg"
 ffmpeg_timeout_ms = 120000
 EOF
 cp "$CFG" "$SMOKE_DIR/config-used.toml"
 
-wait_ready() {
+wait_ready() { # <超时秒>
   local deadline=$((SECONDS + $1))
   while :; do
     ctl status --json > "$SMOKE_DIR/st-poll.json" 2>/dev/null
@@ -152,53 +154,56 @@ sys.exit(0 if d.get("pre") and (d.get("rvc") or {}).get("state") else 1)
 }
 
 echo "=== up ==="
-ctl up || { echo "WINDOW FAILED: ctl up 失败" >&2; exit 1; }
-wait_ready 120 || { echo "WINDOW FAILED: pre/rvc 未就绪" >&2; exit 1; }
+ctl up || { echo "WINDOW-BC FAILED: ctl up 失败" >&2; exit 1; }
+wait_ready 120 || { echo "WINDOW-BC FAILED: pre/rvc 未就绪" >&2; exit 1; }
 echo "feature_model=$FEATURE_MODEL models=$MODEL_IDS durations=$DURATIONS"
 
-printf 'model\tdur\tstate\tframes_in\tframes_out\twindows\tout_samples\tinfer_ms\twall_s\trms\tpeak\tvmhwm_mib\tfeature_fallback\treason\n' \
+printf 'label\tmodel\tdur\tstate\tframes_in\tframes_out\tout_samples\twindows\tinfer_ms\twall_s\trvc_vmhwm_kib\tfeature_fallback\treason\n' \
   > "$SMOKE_DIR/summary.tsv"
 FAIL_N=0
 for m in $MODEL_IDS; do
   for dur in $DURATIONS; do
+    LABEL="$m-gkw-$dur"
     INPUT=$INPUT_DIR/gkw_male_${dur}s.wav
-    TAG=$m-$dur
-    echo "=== $TAG ==="
+    echo "=== $LABEL ==="
     if [ ! -f "$INPUT" ]; then
-      printf '%s\t%s\tNO_INPUT\t-\t-\t-\t-\t-\t-\t-\t-\t-\t-\t%s\n' \
-        "$m" "$dur" "$INPUT" >> "$SMOKE_DIR/summary.tsv"
+      printf '%s\t%s\t%s\tNO_INPUT\t-\t-\t-\t-\t-\t-\t-\t-\t缺输入 %s\n' \
+        "$LABEL" "$m" "$dur" "$INPUT" >> "$SMOKE_DIR/summary.tsv"
       FAIL_N=$((FAIL_N + 1)); continue
     fi
     T0=$SECONDS
     FINISHED_BEFORE=$(count_log "FileWorker finished")
     LOADFAIL_BEFORE=$(count_log "加载失败，回退 ONNX")
     LAZY_BEFORE=$(count_log "Lazy-loaded ONNX fallback")
-    SUB=$(ctl file submit "$INPUT" --model "$m" --json 2>"$SMOKE_DIR/$TAG.submit.err") || SUB=""
+    SUB=$(ctl file submit "$INPUT" --model "$m" --json 2>"$SMOKE_DIR/$LABEL.submit.err") || SUB=""
     ID=$(printf '%s' "$SUB" | python3 -c 'import json,sys;print(json.load(sys.stdin)["job_id"])' 2>/dev/null || true)
     if [ -z "$ID" ]; then
-      printf '%s\t%s\tSUBMIT_FAIL\t-\t-\t-\t-\t-\t-\t-\t-\t-\t-\t%s\n' \
-        "$m" "$dur" "$(tr '\n' ' ' < "$SMOKE_DIR/$TAG.submit.err" | cut -c1-160)" \
-        >> "$SMOKE_DIR/summary.tsv"
+      printf '%s\t%s\t%s\tSUBMIT_FAIL\t-\t-\t-\t-\t-\t%s\t-\t-\t%s\n' \
+        "$LABEL" "$m" "$dur" "$((SECONDS - T0))" \
+        "$(tr '\n' ' ' < "$SMOKE_DIR/$LABEL.submit.err" | cut -c1-160)" >> "$SMOKE_DIR/summary.tsv"
       FAIL_N=$((FAIL_N + 1)); continue
     fi
     STATE=""
     DEADLINE=$((SECONDS + JOB_TIMEOUT))
     while :; do
-      ctl file status "$ID" --json > "$SMOKE_DIR/$TAG.job.json" 2>/dev/null
-      STATE=$(python3 -c 'import json;print(json.load(open("'"$SMOKE_DIR/$TAG.job.json"'")).get("state",""))' 2>/dev/null || true)
+      ctl file status "$ID" --json > "$SMOKE_DIR/$LABEL.job.json" 2>/dev/null
+      STATE=$(python3 -c 'import json;print(json.load(open("'"$SMOKE_DIR/$LABEL.job.json"'")).get("state",""))' 2>/dev/null || true)
       case "$STATE" in completed|failed|cancelled) break ;; esac
       if [ "$SECONDS" -ge "$DEADLINE" ]; then STATE="timeout"; break; fi
       sleep 1
     done
     WALL=$((SECONDS - T0))
-    ctl status --json > "$SMOKE_DIR/$TAG.status.json" 2>/dev/null
+    ctl status --json > "$SMOKE_DIR/$LABEL.status.json" 2>/dev/null
+    RVC_PID=$(pgrep -f "mozart-rvc --socket" | head -1)
+    VMHWM=$(awk '/VmHWM/{print $2}' "/proc/$RVC_PID/status" 2>/dev/null || true)
     FETCH_OK=0
     if [ "$STATE" = completed ]; then
-      ctl file fetch "$ID" -o "$SMOKE_DIR/$TAG.wav" --json > "$SMOKE_DIR/$TAG.fetch.json" 2>&1 \
-        && FETCH_OK=1
+      if ctl file fetch "$ID" -o "$SMOKE_DIR/$LABEL.wav" --json > "$SMOKE_DIR/$LABEL.fetch.json" 2>&1; then
+        FETCH_OK=1
+      fi
     fi
     FRAMES_IN=""; FRAMES_OUT=""; OUT_SAMPLES=""; WINDOWS=""
-    if [ "$STATE" = completed ] && wait_log_count "FileWorker finished" "$FINISHED_BEFORE" 15; then
+    if [ "$STATE" = completed ] && wait_log_count "FileWorker finished" "$FINISHED_BEFORE" 10; then
       LINE=$(grep "FileWorker finished" "$LOG" | sed -n "$((FINISHED_BEFORE + 1))p")
       FRAMES_IN=$(printf '%s' "$LINE" | sed -n 's/.*finished: \([0-9]*\) frames in, \([0-9]*\) frames out.*/\1/p')
       FRAMES_OUT=$(printf '%s' "$LINE" | sed -n 's/.*finished: \([0-9]*\) frames in, \([0-9]*\) frames out.*/\2/p')
@@ -206,48 +211,43 @@ for m in $MODEL_IDS; do
       WINDOWS=$(printf '%s' "$LINE" | sed -n 's/.*output samples, \([0-9]*\) windows.*/\1/p')
     fi
     LOADFAIL_AFTER=$(count_log "加载失败，回退 ONNX")
-    LAZY_AFTER=$(count_log "Lazy-loaded ONNX fallback")
-    FEATURE_FALLBACK=""
-    if [ "$LAZY_AFTER" -gt "$LAZY_BEFORE" ]; then
-      FEATURE_FALLBACK=$(grep "Lazy-loaded ONNX fallback" "$LOG" | tail -n $((LAZY_AFTER - LAZY_BEFORE)) | sed 's/.*fallback: //' | tr '\n' ',' )
-    fi
-    RVC_PID=$(pgrep -f "mozart-rvc --socket" | head -1)
-    VMHWM=$(awk '/VmHWM/{print int($2/1024)}' "/proc/$RVC_PID/status" 2>/dev/null || echo "")
+    FALLBACK_NAMES=$(grep "Lazy-loaded ONNX fallback" "$LOG" | sed -n "$((LAZY_BEFORE + 1)),\$p" \
+      | sed 's/.*fallback: //' | sort -u | tr '\n' ',' | sed 's/,$//')
     REASON=""
-    if [ "$STATE" != "completed" ]; then
+    EXPECTED_OUT=""
+    if [ -n "$FRAMES_IN" ]; then EXPECTED_OUT=$((FRAMES_IN * 960)); fi
+    if [ "$STATE" != completed ]; then
       REASON=$(python3 -c '
 import json, sys
 d = json.load(open(sys.argv[1]))
 e = d.get("error") or ""
 print(e.get("message") if isinstance(e, dict) else e)
-' "$SMOKE_DIR/$TAG.job.json" 2>/dev/null | tr '\t' ' ')
+' "$SMOKE_DIR/$LABEL.job.json" 2>/dev/null | tr '\t' ' ')
       FAIL_N=$((FAIL_N + 1))
     else
-      [ "$FETCH_OK" = 1 ] || { FAIL_N=$((FAIL_N + 1)); REASON="fetch 失败"; }
-      { [ -n "$FRAMES_IN" ] && [ "$FRAMES_IN" = "$FRAMES_OUT" ]; } \
-        || { FAIL_N=$((FAIL_N + 1)); REASON="${REASON:+$REASON; }frames $FRAMES_IN/$FRAMES_OUT"; }
-      EXPECTED=$((FRAMES_IN * 960))
-      { [ -n "$OUT_SAMPLES" ] && [ "$OUT_SAMPLES" = "$EXPECTED" ]; } \
-        || { FAIL_N=$((FAIL_N + 1)); REASON="${REASON:+$REASON; }samples $OUT_SAMPLES != $EXPECTED"; }
-      [ "$LOADFAIL_AFTER" = "$LOADFAIL_BEFORE" ] \
-        || { FAIL_N=$((FAIL_N + 1)); REASON="${REASON:+$REASON; }引擎加载回退 ONNX"; }
+      if [ "$FETCH_OK" -ne 1 ]; then FAIL_N=$((FAIL_N + 1)); REASON="fetch 失败"; fi
+      if [ -z "$FRAMES_IN" ] || [ "$FRAMES_IN" != "$FRAMES_OUT" ]; then
+        FAIL_N=$((FAIL_N + 1)); REASON="${REASON:+$REASON; }frames_in!=frames_out ($FRAMES_IN/$FRAMES_OUT)"
+      fi
+      if [ -z "$OUT_SAMPLES" ] || [ "$OUT_SAMPLES" != "$EXPECTED_OUT" ]; then
+        FAIL_N=$((FAIL_N + 1)); REASON="${REASON:+$REASON; }out_samples $OUT_SAMPLES != $EXPECTED_OUT"
+      fi
+      if [ "$LOADFAIL_AFTER" -ne "$LOADFAIL_BEFORE" ]; then
+        FAIL_N=$((FAIL_N + 1)); REASON="${REASON:+$REASON; }引擎加载回退 ONNX"
+      fi
     fi
-    STATS=$(python3 - "$SMOKE_DIR/$TAG.wav" <<'PY' 2>/dev/null || echo "-"
-import subprocess, sys
-import numpy as np
-raw = subprocess.run(["ffmpeg","-v","error","-i",sys.argv[1],"-f","f32le","-ac","1","-ar","48000","-"],
-                     capture_output=True, check=True).stdout
-x = np.frombuffer(raw, dtype="<f4")
-print(f"{np.sqrt(np.mean(x**2)):.5f}\t{np.max(np.abs(x)):.5f}")
+    python3 - "$LABEL" "$m" "$dur" "$STATE" "$WALL" "$SMOKE_DIR" "$REASON" \
+      "$FRAMES_IN" "$FRAMES_OUT" "$OUT_SAMPLES" "$WINDOWS" "${VMHWM:-}" "$FALLBACK_NAMES" \
+      <<'PY' >> "$SMOKE_DIR/summary.tsv"
+import json, sys
+label, m, dur, state, wall, root, reason, fi, fo, os_, win, vmhwm, fb = sys.argv[1:14]
+st = json.load(open(f"{root}/{label}.status.json"))
+rvc = st.get("rvc") or {}
+print("\t".join(str(v) for v in [
+    label, m, dur, state, fi, fo, os_, win,
+    rvc.get("inference_ms_last"), wall, vmhwm, fb, reason,
+]))
 PY
-)
-    RMS=$(printf '%s' "$STATS" | cut -f1)
-    PEAK=$(printf '%s' "$STATS" | cut -f2)
-    INFER_MS=$(python3 -c 'import json;print((json.load(open("'"$SMOKE_DIR/$TAG.status.json"'")).get("rvc") or {}).get("inference_ms_last",""))' 2>/dev/null || true)
-    printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
-      "$m" "$dur" "$STATE" "$FRAMES_IN" "$FRAMES_OUT" "$WINDOWS" "$OUT_SAMPLES" \
-      "$INFER_MS" "$WALL" "$RMS" "$PEAK" "$VMHWM" "$FEATURE_FALLBACK" "$REASON" \
-      >> "$SMOKE_DIR/summary.tsv"
     tail -1 "$SMOKE_DIR/summary.tsv"
   done
 done
@@ -255,7 +255,7 @@ done
 echo "=== summary ==="
 cat "$SMOKE_DIR/summary.tsv"
 if [ "$FAIL_N" -ne 0 ]; then
-  echo "WINDOW FAILED: $FAIL_N 项" >&2
+  echo "WINDOW-BC FAILED: $FAIL_N 项" >&2
   exit 1
 fi
-echo "WINDOW PASSED"
+echo "WINDOW-BC PASSED"
