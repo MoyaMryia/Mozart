@@ -1,0 +1,506 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>RVC 实时推理模块 · mozart-rvc</title>
+<style>
+:root {
+  --ink: #1b1f24;
+  --muted: #64707d;
+  --line: #d9dee4;
+  --soft: #f6f8fa;
+  --model: #1f5d8f;
+  --fixed: #5b6570;
+  --gen: #7a4b1e;
+  --build: #6b4f8a;
+  --run: #2f6b45;
+}
+* { box-sizing: border-box; }
+body {
+  margin: 0 auto;
+  max-width: 880px;
+  padding: 40px 28px 72px;
+  color: var(--ink);
+  background: #fff;
+  font: 16px/1.9 "Noto Sans CJK SC", "PingFang SC", "Microsoft YaHei", system-ui, sans-serif;
+}
+h1 {
+  font-size: 24px;
+  line-height: 1.3;
+  margin: 0 0 12px;
+  padding-bottom: 12px;
+  border-bottom: 2px solid var(--ink);
+}
+h2 {
+  font-size: 18px;
+  line-height: 1.4;
+  margin: 44px 0 12px;
+  padding-top: 16px;
+  border-top: 1px solid var(--line);
+}
+h3 {
+  font-size: 16px;
+  line-height: 1.5;
+  margin: 22px 0 8px;
+}
+p { margin: 0 0 12px; }
+a { color: var(--model); }
+code {
+  font-family: "JetBrains Mono", "Noto Sans Mono CJK SC", Consolas, monospace;
+  font-size: .9em;
+  background: var(--soft);
+  border: 1px solid var(--line);
+  border-radius: 3px;
+  padding: 0 4px;
+}
+.readme {
+  color: var(--muted);
+  font-size: 13px;
+  margin-bottom: 20px;
+}
+.flow {
+  margin: 14px 0;
+  padding: 12px 14px;
+  border-left: 3px solid var(--ink);
+  background: var(--soft);
+  font-size: 14px;
+}
+.src {
+  font-family: "JetBrains Mono", Consolas, monospace;
+  font-size: .85em;
+  white-space: nowrap;
+}
+.src-model { color: var(--model); }
+.src-fixed { color: var(--fixed); }
+.src-gen { color: var(--gen); }
+.src-build { color: var(--build); }
+.src-run { color: var(--run); }
+.why {
+  margin: 14px 0 20px;
+  padding: 12px 16px 12px 18px;
+  background: var(--soft);
+  border-left: 3px solid #a6b2bd;
+  font-size: 14px;
+  line-height: 1.85;
+}
+.why-label {
+  margin: 0 0 6px;
+  font-size: 12px;
+  letter-spacing: .08em;
+  color: var(--muted);
+}
+.why ul { margin: 0; padding-left: 20px; }
+.why li { margin: 4px 0; }
+.why p:last-child, .why ul:last-child { margin-bottom: 0; }
+.why strong { font-weight: 600; }
+.terms {
+  display: grid;
+  grid-template-columns: 130px minmax(0, 1fr);
+  gap: 8px 18px;
+  margin: 0 0 16px;
+}
+.terms dt { font-weight: 600; }
+.terms dd { margin: 0; }
+.io {
+  margin: 8px 0 18px;
+  padding-left: 20px;
+}
+.io li { margin: 4px 0; }
+@media (max-width: 640px) {
+  body { padding: 24px 16px 56px; font-size: 15px; }
+  .terms { grid-template-columns: 1fr; gap: 2px; }
+  .terms dd { margin-bottom: 10px; }
+}
+@media print {
+  body { max-width: none; padding: 0; font-size: 12px; }
+  h2 { break-after: avoid; }
+  .why { break-inside: avoid; }
+}
+</style>
+</head>
+<body>
+
+<h1>RVC 实时推理模块声明</h1>
+
+<p class="readme">范围：只讲 mozart-rvc 进程内部的实时推理。麦克风、pre 的 DSP、播放路由只作为输入输出边界，不展开。每站先列模块事实和参数，再用“补充解释”说明参数在链路里改什么。文件链见 <a href="rvc-module.html">rvc-module.html</a>；系统运行时全貌见 <a href="rvc-realtime-module.html">rvc-realtime-module.html</a>。</p>
+
+<p>下文先用全称定义，之后一律复用同一名称。</p>
+
+<p>契约帧：音频进程和推理进程之间传输的固定长度帧。输入 16 kHz、320 个采样点、20 ms；输出 48 kHz、960 个采样点、20 ms。</p>
+
+<p>块：推理进程内部一次处理的新音频长度。实时链是 240 ms，等于 3840 个 16 kHz 采样点。</p>
+
+<p>分析窗：推理进程每次实际喂给内容特征网络的音频长度。实时链是 2.8 秒，等于 44800 个 16 kHz 采样点。</p>
+
+<p>生成器前段：代码名 front。它把内容特征、音高、说话人编号和潜噪声变成潜变量 z。</p>
+
+<p>生成器解码段：代码名 decoder。它把潜变量 z 变成波形。</p>
+
+<p>共享引擎：所有模型共用的一份引擎。本文里指内容特征网络 HuBERT 和音高提取网络 RMVPE。</p>
+
+<p>音高编号：生成器认识的离散音高，记作 pitch，取值 1 到 255。连续音高记作 pitchf，单位 Hz。</p>
+
+<p>可选索引：代码名 index。它是训练集音色向量的库，按模型独立，不导出成引擎。</p>
+
+<p>参数来源分五种，每个参数后注明：<span class="src src-gen">〔生成时固定〕</span>在导出 ONNX 时填，之后不改；<span class="src src-build">〔编译时固定〕</span>在 ONNX 编译成 engine 时定；<span class="src src-run">〔推理时可调〕</span>在启动流或写配置时能改；<span class="src src-model">〔模型决定〕</span>来自 pth 或模型配置；<span class="src src-fixed">〔代码写死〕</span>是代码常量，改它等于改实时契约。</p>
+
+<aside class="why">
+<p class="why-label">补充解释：参数标记怎么读</p>
+<ul>
+<li><strong>〔生成时固定〕</strong>：这个值在导出 ONNX 时写进计算图。改了要重新导出，还要重新编译引擎。实时链的帧数大多属于这一类。</li>
+<li><strong>〔编译时固定〕</strong>：这个值在 TensorRT 编译时写进 engine。改了只需要重新编译，但编译必须在目标设备上做。</li>
+<li><strong>〔推理时可调〕</strong>：这个值在启动流或写配置时注入，不需要重新导出或编译。实时链能调的会话参数很少，只有五个。</li>
+<li><strong>〔模型决定〕</strong>：这个值来自 pth 或模型目录里的 config.json。换模型可能变，但用户不直接填。</li>
+<li><strong>〔代码写死〕</strong>：这个值是 C++ 常量。配置改不了，换模型也不变。少数值由引擎导出固定，换引擎仍可能变。</li>
+</ul>
+</aside>
+
+<h2>先认识几个词</h2>
+
+<dl class="terms">
+<dt>张量形状</dt>
+<dd>用一串数字描述一次输入或输出有多少维、每维多长。比如 [1, 280, 768] 表示 1 条样本、280 帧、每帧 768 个数。</dd>
+
+<dt>帧与帧移</dt>
+<dd>处理声音时不会一次看完整段，而是切成很短的片段，每一段叫一帧。帧移是相邻两帧起点相距多少个采样点，决定“隔多久看一次”。</dd>
+
+<dt>潜变量</dt>
+<dd>生成器中间的一层数字，记作 z。它已经把内容、音高和音色揉在一起，但还不是波形。front 输出它，decoder 吃它。</dd>
+
+<dt>TensorRT</dt>
+<dd>NVIDIA 的推理编译器。它把 ONNX 计算图针对具体显卡编译成 engine，换来更低的推理延迟。engine 绑定设备和 TensorRT 版本。</dd>
+
+<dt>定长与动态</dt>
+<dd>定长表示每次输入的形状固定，编译时就能完全优化；动态表示某些维度可以变，运行时才确定。实时链用定长。</dd>
+
+<dt>采样率</dt>
+<dd>每秒钟给声音“拍照”的次数，单位 Hz。实时链输入固定 16000 Hz，输出固定 48000 Hz。</dd>
+
+<dt>音高</dt>
+<dd>声音听起来的高低，单位 Hz。生成器不直接吃连续频率，而是吃量化后的音高编号。</dd>
+</dl>
+
+<h2>输入输出边界</h2>
+
+<p>上游是 pre 音频进程。它把麦克风采集、降噪、整形和降采样处理成 16 kHz 契约帧，再通过 Unix 数据报发给 mozart-rvc。</p>
+
+<p>下游仍是 pre。mozart-rvc 把 48 kHz 输出帧发回去，pre 按路由决定播放直出声音还是变声后的声音。</p>
+
+<p class="flow">pre 的 16 kHz 帧 → mozart-rvc 实时推理 → 48 kHz 帧 → pre 播放</p>
+
+<p>pre 的 DSP 细节不在本文范围。本文从“16 kHz 契约帧进入 mozart-rvc”开始，到“48 kHz 契约帧离开 mozart-rvc”结束。</p>
+
+<aside class="why">
+<p class="why-label">补充解释</p>
+<ul>
+<li><strong>为什么把边界放在 pre：</strong>RVC 推理只关心 16 kHz 音频帧和元数据。麦克风、降噪和播放属于音频进程，混进来会把问题拆散。</li>
+<li><strong>输入帧里有什么：</strong>16 字节元数据加 320 个 float32 样本。元数据包含时间戳、帧号、VAD 标记、能量、置信度和分段号。</li>
+<li><strong>输出帧里有什么：</strong>同样的元数据加 960 个 float32 样本。推理进程每收到一帧输入就回一帧输出，输出不足补零。</li>
+</ul>
+</aside>
+
+<h2>总流程</h2>
+
+<p class="flow">16 kHz 契约帧 → 帧调度 → HuBERT 与 RMVPE → 音高映射 → 索引检索（可选）→ front → decoder → SOLA → 48 kHz 契约帧</p>
+
+<p>真实推理不是一帧一帧独立做，而是先攒成 240 ms 的块，再带上 2.5 秒过去上下文，凑成 2.8 秒分析窗。分析窗里只有最新一块会被回放，历史只用来提供上下文。</p>
+
+<p>HuBERT 和 RMVPE 可以并行跑。前者回答“说了什么”，后者回答“音高是多少”。两者结果在 front 汇合，再交给 decoder 合成波形。</p>
+
+<aside class="why">
+<p class="why-label">补充解释：整条推理在做什么</p>
+<ul>
+<li><strong>一句话概括：</strong>把新来的一小段声音放进 2.8 秒上下文里，提取内容和音高，换成目标音色的潜变量，再合成 240 ms 新声音。</li>
+<li><strong>为什么不能只喂 240 ms：</strong>RVC 的生成器需要看到足够长的历史，才能保持音色、相位和韵律连续。2.5 秒过去上下文是实时链的折中。</li>
+<li><strong>为什么输出只有 240 ms：</strong>decoder 实际生成 300 ms，其中 60 ms 用来和上一块做对齐和淡化，真正推进的是 240 ms。</li>
+</ul>
+</aside>
+
+<h2>第 1 站 帧调度与窗口</h2>
+
+<p>这一站决定什么时候推理、拿多长的音频推理、结果怎么排回 20 ms 帧节拍。它不产出引擎。</p>
+
+<p>块长，3840 个 16 kHz 采样点<span class="src src-fixed">〔代码写死〕</span>。它等于 240 ms。每攒够一块新音频，才触发一次推理。</p>
+
+<p>过去上下文，40000 个 16 kHz 采样点<span class="src src-fixed">〔代码写死〕</span>。它等于 2.5 秒。每块重读这段历史，给生成器提供上下文。</p>
+
+<p>分析窗，44800 个 16 kHz 采样点<span class="src src-fixed">〔代码写死〕</span>。它等于 2.8 秒，由过去上下文、当前块和 960 个采样点的对齐余量组成。HuBERT 和 RMVPE 都吃这个窗。</p>
+
+<p>启动缓冲，400 ms<span class="src src-fixed">〔代码写死〕</span>。首次出声前先等这么久，再等输出环攒满一个完整块。它用来吸收推理耗时和送达抖动。</p>
+
+<p>输出环，16 秒<span class="src src-fixed">〔代码写死〕</span>。推理可以领先消费端数块。环满丢最旧并计数。</p>
+
+<h3>帧调度接口</h3>
+
+<ul class="io">
+<li><strong>输入参数：</strong>没有用户参数。块长、过去上下文、启动缓冲、输出环都由代码固定。</li>
+<li><strong>输入信号：</strong>16 kHz 输入帧，每帧 320 个 float32 样本；元数据包含 <code>pts_ns</code>、<code>frame_idx</code>、<code>vad_flag</code>、<code>energy_db</code>、<code>conf</code>、<code>segment_id</code>。</li>
+<li><strong>输出：</strong>48 kHz 输出帧，每帧 960 个 float32 样本。每收到一帧输入就回一帧输出，输出环不足时补零。</li>
+<li><strong>内部中间量：</strong>分析窗 [44800]；单块 decoder 输出 [14400]；实际推进 [11520]；淡化尾 [2400]。</li>
+</ul>
+
+<aside class="why">
+<p class="why-label">补充解释</p>
+<ul>
+<li><strong>为什么块长是 240 ms：</strong>块越长，上下文越足、推理次数越少，但延迟越高。240 ms 是实时链在延迟和连续性之间的折中。</li>
+<li><strong>为什么过去上下文是 2.5 秒：</strong>生成器需要历史来维持音色和韵律。2.5 秒是当前实测可用值，不是理论下限。</li>
+<li><strong>为什么分析窗是 2.8 秒：</strong>2.5 秒历史加 240 ms 当前块，再加 60 ms 对齐余量，正好 2.8 秒。</li>
+<li><strong>为什么 1:1 回帧：</strong>输入和输出都是 20 ms 一帧。推理快慢由输出环吸收，接口始终保持一帧进、一帧出。</li>
+<li><strong>静音和断流怎么处理：</strong>整窗没有 VAD 标记就跳过推理，输出等长静音；帧号缺口过大或时间戳跳变就清环、丢淡化尾、恢复启动缓冲。</li>
+</ul>
+</aside>
+
+<h2>第 2 站 内容特征 HuBERT</h2>
+
+<p>HuBERT 从 16 kHz 声音里提取“说了什么”的内容特征。它不负责音色，也不负责音高。</p>
+
+<h3>HuBERT 接口</h3>
+
+<ul class="io">
+<li><strong>生成时参数：</strong><code>--hubert-path</code> 指共享 HuBERT 模型目录；<code>--output</code> 指定 ONNX 文件名；<code>--samples</code> 固定 44800；<code>--opset</code> 默认 17；<code>--dynamic</code> 在实时链必须关闭。</li>
+<li><strong>编译时参数：</strong><code>--hubert</code> 指定 ONNX；<code>--fp16</code> 可选；<code>--trtexec</code> 可指定编译器路径。</li>
+<li><strong>推理时参数：</strong><code>realtime_hubert_path</code> 指向共享引擎，留空时按约定文件名自动发现。没有用户可调的会话参数。</li>
+<li><strong>输入信号：</strong><code>audio</code> float32 [1, 44800]，16 kHz 下的 2.8 秒 PCM。</li>
+<li><strong>输出：</strong><code>features</code> float32 [1, 139, 768]。运行时把每帧复制一份，凑成 [280, 768] 再送 front。</li>
+</ul>
+
+<aside class="why">
+<p class="why-label">补充解释</p>
+<ul>
+<li><strong>为什么输入固定 44800：</strong>实时链每个分析窗正好 2.8 秒，16 kHz 下就是 44800 个点。固定输入让 TensorRT 可以完全优化。</li>
+<li><strong>为什么输出 139 帧：</strong>HuBERT 的卷积栈每 320 个采样点出一帧，44800 个点出 139 帧。</li>
+<li><strong>为什么要变成 280 帧：</strong>生成器每秒要 100 帧，HuBERT 每秒只有约 50 帧。把每帧复制一份，正好补齐到 280 帧。</li>
+<li><strong>为什么所有模型共用一份：</strong>HuBERT 学的是通用语音内容，不包含某个音色的特征。换音色不需要换它。</li>
+<li><strong>为什么实时链必须是 TensorRT：</strong>启动时会校验引擎必须是健康的 TensorRT、输入正好 [1, 44800]、输出有限。ONNX 兜底不满足实时延迟。</li>
+</ul>
+</aside>
+
+<h2>第 3 站 音高提取 RMVPE</h2>
+
+<p>RMVPE 从声音的频谱里提取音高曲线。它不负责内容，也不负责音色。</p>
+
+<h3>mel 前端接口</h3>
+
+<ul class="io">
+<li><strong>输入参数：</strong>没有用户参数。128 个 mel 频带、1024 点 FFT、160 点帧移、30 到 8000 Hz 都写死。</li>
+<li><strong>输入信号：</strong><code>audio</code> float32 [4960]，从 44800 分析窗末尾截取。</li>
+<li><strong>输出：</strong><code>mel</code> float32 [1, 128, 32]。</li>
+</ul>
+
+<h3>RMVPE 接口</h3>
+
+<ul class="io">
+<li><strong>生成时参数：</strong><code>--rmvpe-path</code> 指 RMVPE 权重文件；<code>--rvc-source</code> 指上游 RVC 源码；<code>--output</code> 指定 ONNX 文件名；<code>--frames</code> 固定 32；<code>--opset</code> 默认 17；<code>--device</code> 默认 CPU。</li>
+<li><strong>编译时参数：</strong><code>--rmvpe</code> 指定 ONNX；<code>--fp16</code> 可选；<code>--trtexec</code> 可指定编译器路径。</li>
+<li><strong>推理时参数：</strong><code>f0_method</code> 只接受 <code>rmvpe</code>；<code>realtime_rmvpe_path</code> 指向共享引擎。mel 前端参数不开放。</li>
+<li><strong>输入信号：</strong><code>mel</code> float32 [1, 128, 32]。</li>
+<li><strong>输出：</strong><code>f0</code> float32 [1, 32, 360]，是显著性谱，不是 Hz。运行时解码成 32 个 F0 值，更新 1024 帧音高缓存。</li>
+</ul>
+
+<aside class="why">
+<p class="why-label">补充解释</p>
+<ul>
+<li><strong>为什么只看 4960 个采样点：</strong>音高只需要当前块附近。4960 个点刚好凑出 32 帧 mel，覆盖当前块和少量重叠上下文。</li>
+<li><strong>为什么每块重算 4 帧重叠：</strong>固定形状的 RMVPE 在窗边缘不可靠。每块丢掉 3 个左缘帧和 1 个右缘帧，把 28 个新帧写入缓存。</li>
+<li><strong>为什么音高缓存是 1024 帧：</strong>front 需要 280 帧音高，其中 250 帧来自历史。1024 帧足够覆盖历史，又不会占太多内存。</li>
+<li><strong>为什么只支持 rmvpe：</strong>代码里只实现了 rmvpe。其他方法名会直接报错，不会静默返回全零音高。</li>
+<li><strong>为什么所有模型共用一份：</strong>RMVPE 学的是通用音高提取，不包含音色。换音色不需要换它。</li>
+</ul>
+</aside>
+
+<h2>第 4 站 音高映射</h2>
+
+<p>这一站把连续音高曲线换成生成器认识的离散编号，同时应用变调。</p>
+
+<h3>音高映射接口</h3>
+
+<ul class="io">
+<li><strong>输入参数：</strong><code>pitch_shift</code> 推理时可调，范围 -12 到 12，单位是半音；<code>f0_method</code> 只接受 <code>rmvpe</code>。</li>
+<li><strong>输入信号：</strong>RMVPE 缓存里的 F0 值。当前块更新 28 帧，接口按 280 帧读取。</li>
+<li><strong>输出：</strong><code>pitch</code> [1, 280]，1 到 255 的离散编号；<code>pitchf</code> [1, 280]，变调后的连续频率。front 用完整的 <code>pitch</code>，decoder 用最后 30 帧 <code>pitchf</code>。</li>
+</ul>
+
+<aside class="why">
+<p class="why-label">补充解释</p>
+<ul>
+<li><strong>变调半音数怎么改声音：</strong>每加 1 个半音，频率乘以 2 的 1/12 次方。加 12 个半音升高一个八度，减 12 个半音降低一个八度。</li>
+<li><strong>为什么要量化成 1 到 255：</strong>生成器不吃连续频率，只认离散编号。按 mel 刻度分档，低音区更密、高音区更疏，更符合人耳感觉。</li>
+<li><strong>为什么 front 和 decoder 拿的音高不一样：</strong>front 需要 280 帧离散编号来对齐内容特征；decoder 只需要最后 30 帧连续频率来合成新块波形。</li>
+</ul>
+</aside>
+
+<h2>第 5 站 索引检索</h2>
+
+<p>这一站是可选的。它用训练集特征库修正内容特征，让音色更接近训练数据。没有 index 文件时不执行。</p>
+
+<h3>索引接口</h3>
+
+<ul class="io">
+<li><strong>输入参数：</strong><code>index_rate</code> 推理时可调，范围 0 到 1；候选表数 1 和近邻数 8 写死；index 文件按模型独立。</li>
+<li><strong>输入信号：</strong>HuBERT 特征的尾部。当前 280/250 几何下是 [14, 768]，前面 125 帧属于过去上下文，不参与检索。</li>
+<li><strong>输出：</strong>同形状的混合特征 [14, 768]。没有 index 文件或 <code>index_rate=0</code> 时原样返回。</li>
+</ul>
+
+<aside class="why">
+<p class="why-label">补充解释</p>
+<ul>
+<li><strong>检索在做什么：</strong>在训练集特征库里找最相似的 8 个样本，按距离平方反比加权，再把它们的音色特征混进当前特征。</li>
+<li><strong>index_rate 改什么：</strong>0 表示完全不用检索，1 表示完全用检索特征。中间值在模型自己的音色和训练集音色之间过渡。</li>
+<li><strong>为什么只查尾部：</strong>过去上下文只用来提供历史，不需要检索训练集音色。只查新音频对应的特征，既省时间，也避免把历史音色反复混进来。</li>
+<li><strong>为什么不能跨模型共用：</strong>index 的向量和音色、训练集绑定。换模型通常要同时换 index。</li>
+</ul>
+</aside>
+
+<h2>第 6 站 生成器 front</h2>
+
+<p>front 把内容特征、音高、说话人编号和潜噪声变成潜变量 z。它包含目标音色的权重，必须和 decoder 成对使用。</p>
+
+<h3>front 接口</h3>
+
+<ul class="io">
+<li><strong>生成时参数：</strong><code>--front-output</code> 指定 ONNX 输出；<code>--front-frames</code> 固定 280；<code>--skip-head</code> 固定 250；<code>--return-frames</code> 固定 30；<code>--decoder-frames</code> 固定 30；<code>--opset</code> 默认 18；<code>--dynamo-front</code> 可选；<code>--test-data-dir</code> 可选；<code>--rvc-source</code> 必填。</li>
+<li><strong>编译时参数：</strong><code>--front</code> 指定 ONNX；<code>--fp16</code> 可选；<code>--trtexec</code> 可指定编译器路径。</li>
+<li><strong>输入信号：</strong><code>feats</code> float32 [1, 280, 768]；<code>p_len</code> [1]，值 280；<code>pitch</code> [1, 280]，值 1 到 255；<code>sid</code> [1]，说话人编号；<code>latent_noise</code> float32 [1, 192, 54]。</li>
+<li><strong>输出：</strong><code>z</code> float32 [1, 192, 30]，取 280 帧潜变量中的最后 30 帧。</li>
+</ul>
+
+<p>192 是潜变量通道数，由 pth 决定，常见值是 192。54 由 280、250 和 24 推出。</p>
+
+<aside class="why">
+<p class="why-label">补充解释</p>
+<ul>
+<li><strong>为什么 front 看 280 帧、只返回 30 帧：</strong>front 需要 250 帧历史才能把新音频的特征放到正确上下文里，但输出只需要覆盖新块。</li>
+<li><strong>为什么 latent_noise 是 54 帧：</strong>front 先算了 280 帧，前 226 帧属于丢弃的历史部分，剩下 54 帧里再取最后 30 帧返回。</li>
+<li><strong>潜噪声改什么：</strong>它给合成过程提供细微纹理和气息。运行时用固定种子 114514 生成，跨块连续，不是用户参数。</li>
+<li><strong>为什么不能跨模型共用：</strong>front 里带的是目标音色权重。不同 pth 必须各自导出，而且不能拿 A 的 front 配 B 的 decoder。</li>
+</ul>
+</aside>
+
+<h2>第 7 站 生成器 decoder</h2>
+
+<p>decoder 把 z、连续音高、说话人编号、源相位和源噪声合成波形。</p>
+
+<h3>decoder 接口</h3>
+
+<ul class="io">
+<li><strong>生成时参数：</strong><code>--decoder-output</code> 指定 ONNX 输出；<code>--decoder-frames</code> 固定 30；<code>--return-frames</code> 固定 30；<code>--skip-head</code> 固定 250；<code>--opset</code> 默认 18；<code>--rvc-source</code> 必填。</li>
+<li><strong>编译时参数：</strong><code>--decoder</code> 指定 ONNX；<code>--fp16</code> 可选；<code>--trtexec</code> 可指定编译器路径。</li>
+<li><strong>输入信号：</strong><code>z</code> float32 [1, 192, 30]；<code>pitchf</code> float32 [1, 30]；<code>sid</code> [1]；<code>source_phase</code> float32 [1, 1, 1]；<code>source_noise</code> float32 [1, 14400, 1]。</li>
+<li><strong>输出：</strong><code>audio</code> float32 [1, 1, 14400]，48 kHz 下的 300 毫秒。40 kHz 模型输出 [1, 1, 12000]。</li>
+</ul>
+
+<p><code>source_phase</code> 和 <code>source_noise</code> 的最后一维是源维度，由 pth 决定。40 kHz 模型的 <code>source_noise</code> 是 [1, 12000, 1]。</p>
+
+<aside class="why">
+<p class="why-label">补充解释</p>
+<ul>
+<li><strong>为什么输出 300 ms、实际只推进 240 ms：</strong>多出来的 60 ms 用来和上一块做 SOLA 对齐和淡化，避免接缝咔哒声。</li>
+<li><strong>源噪声和源相位改什么：</strong>它们决定合成波形的相位和气息细节。运行时内部随机生成，不是用户参数。</li>
+<li><strong>为什么 decoder 帧数必须等于返回帧数：</strong>front 返回多少帧 z，decoder 就必须吃多少帧。脚本在导出时强制检查。</li>
+<li><strong>为什么 40 kHz 模型不能直接用：</strong>decoder 输出长度按采样率算。48 kHz 下 30 帧是 14400 样本，40 kHz 下是 12000 样本，运行时也会拒绝实时流。</li>
+</ul>
+</aside>
+
+<h2>第 8 站 SOLA 与输出</h2>
+
+<p>这一站把 decoder 每块独立生成的波形对齐并拼成连续音频。</p>
+
+<h3>SOLA 接口</h3>
+
+<ul class="io">
+<li><strong>输入参数：</strong>没有用户参数。SOLA 搜索 480 个采样点、淡化 2400 个采样点、每块推进 11520 个采样点都写死。</li>
+<li><strong>输入信号：</strong>decoder 输出的单块音频 [14400]，48 kHz。</li>
+<li><strong>输出：</strong>每块 11520 个输出样本，等于 240 毫秒。前 2400 个样本与上一块淡化尾对齐，再取紧随其后的 2400 个样本作为下一块的淡化尾。</li>
+<li><strong>内部输出环：</strong>16 秒容量。播放侧每 20 ms 取 960 个样本，不够时补零。</li>
+</ul>
+
+<aside class="why">
+<p class="why-label">补充解释</p>
+<ul>
+<li><strong>为什么要 SOLA：</strong>decoder 每块独立生成，块边界可能有相位差。先在 480 个样本内找最对齐的位置，再淡化，接缝才不容易听到咔哒声。</li>
+<li><strong>为什么淡化是 2400 个样本：</strong>2400 个样本等于 50 ms，足够盖住块边界，又不会把两块的声音混得太久。</li>
+<li><strong>为什么输出环要 16 秒：</strong>推理偶尔会比播放快。输出环让推理领先几块，播放侧仍然按 20 ms 节拍稳定取帧。</li>
+</ul>
+</aside>
+
+<h2>参数在推理里改什么</h2>
+
+<dl class="terms">
+<dt>pitch_shift</dt>
+<dd>改音高，单位半音，-12 到 12。它进入音高映射，改变 front 的离散音高和 decoder 的连续音高。正数升调，负数降调。</dd>
+
+<dt>index_rate</dt>
+<dd>改音色检索强度，0 到 1。0 完全不用训练集特征，1 完全用检索特征。没有 index 文件时不起作用。</dd>
+
+<dt>protect</dt>
+<dd>辅音保护比，0 到 0.5。实时链接受这个参数，但当前不执行保护混合，所以传了也不改变输出。</dd>
+
+<dt>rms_mix_rate</dt>
+<dd>音量包络混合比，0 到 1。实时链接受这个参数，但当前不做音量包络校正，所以传了也不改变输出。</dd>
+
+<dt>f0_method</dt>
+<dd>音高提取方法。当前只接受 rmvpe，换别的值直接报错。</dd>
+
+<dt>block / past / startup</dt>
+<dd>块长、过去上下文和启动缓冲。它们决定延迟和连续性，写死在代码里。改它们等于改实时契约，不能只改一个值。</dd>
+
+<dt>fp16</dt>
+<dd>编译时精度开关。开启后 engine 更小更快，可能有轻微数值差异。它不改变接口，只改变 engine 的数值和性能。</dd>
+
+<dt>sample_rate</dt>
+<dd>模型原生采样率。实时链要求它等于输出采样率 48000 Hz。40 kHz 模型会被能力门控拒绝。</dd>
+
+<dt>index / nprobe / neighbours</dt>
+<dd>检索库、候选表数和近邻数。index 按模型独立；候选表数 1 和近邻数 8 写死，改它们会改变检索范围和音色混合结果。</dd>
+</dl>
+
+<aside class="why">
+<p class="why-label">补充解释：为什么只有这几个真正可调</p>
+<ul>
+<li><strong>会话参数只有五个：</strong>pitch_shift、index_rate、rms_mix_rate、protect、f0_method。它们在 StartStream 时固定，避免运行中改参数造成块边界状态不一致。</li>
+<li><strong>为什么 protect 和 rms_mix_rate 不生效：</strong>实时路径优先低延迟，没有做辅音保护和音量包络校正。参数仍然接受并校验范围，是为了保持控制面统一，将来补实现时不用改接口。</li>
+<li><strong>为什么块长这些不开放：</strong>改块长会牵动窗口、淡化、SOLA、启动缓冲和帧契约。单改一个值无法保持连续，所以它们被设计成代码常量。</li>
+<li><strong>为什么 fp16 是编译时开关：</strong>TensorRT 在编译时决定数值精度。运行时改配置不会改变已经编好的 engine。</li>
+</ul>
+</aside>
+
+<h2>引擎从哪来</h2>
+
+<p>实时推理用四个引擎：每个模型的 front、decoder，以及所有模型共享的 HuBERT、RMVPE。</p>
+
+<p>front 和 decoder 从目标音色的 pth 导出，包含音色权重，不能跨模型共用；同一 pth 的 front 和 decoder 必须成对使用。</p>
+
+<p>HuBERT 和 RMVPE 从共享模型导出，不包含音色权重，可以跨所有 v2 模型共用。换音色只换 front 和 decoder。</p>
+
+<p>index 是可选的训练产物，按模型独立。没有它也能推理，只是不能用 <code>index_rate</code> 做检索混合。</p>
+
+<p>引擎在目标设备上编译，绑定设备和 TensorRT 版本。同名 <code>.engine</code> 优先于 <code>.onnx</code>；实时 HuBERT 和 RMVPE 必须使用健康的 TensorRT 引擎。</p>
+
+<h2>和文件链的差异</h2>
+
+<p>文件链从 pth 导出一个动态生成器；实时链导出 front 和 decoder 两个定长引擎。</p>
+
+<p>文件链的形状可以用档位调；实时链的形状由音频代码锁死，不能通过编译参数改。</p>
+
+<p>文件链有辅音保护、音量包络和后处理；实时链目前不应用 <code>protect</code> 和 <code>rms_mix_rate</code>。</p>
+
+<p>文件链可以处理 40 kHz 模型；实时链只接受与输出采样率一致的 48 kHz 模型。</p>
+
+<h2>适用范围</h2>
+
+<p>本文依据当前代码和文档说明 RVC 实时推理的模块接口，不是实测报告。性能、延迟和音质数据见 <code>reports/</code> 下的对应报告。</p>
+
+<p>未验证项：</p>
+
+<ul>
+<li><code>--fp16</code> 对实时音质和延迟的影响，未在本文范围实测。启用前应按目标模型做对比。</li>
+<li>40 kHz 模型的实时链路未实现。阻塞原因：帧契约与输出缓冲按 48 kHz 设计。解除条件：完成实时原生多采样率改造并板端验证。</li>
+<li>front 和 decoder 回退 ONNX 的实时延迟未测量。阻塞原因：实时链通常使用 TensorRT 引擎。解除条件：在目标设备上对比 ONNX 与 engine 的推理耗时。</li>
+<li>实时流中换模型的块边界状态语义未完全验证。阻塞原因：过去上下文、SOLA 状态和音高缓存在换模型时的归属规则尚未定稿。</li>
+</ul>
+
+<p class="readme">相关文档：<a href="rvc-module.html">RVC 模块（文件链）</a> · <a href="rvc-realtime-module.html">RVC 实时模块（系统运行时）</a></p>
+
+</body>
+</html>
