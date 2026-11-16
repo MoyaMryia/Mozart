@@ -3,9 +3,9 @@
   "default": "large",
   "tiers": {
     "compact": {
-      "generator_frames": [100, 1200, 1200],
-      "hubert_samples": [32000, 192320, 192320],
-      "rmvpe_frames": [32, 1600, 1600]
+      "generator_frames": [100, 1000, 1000],
+      "hubert_samples": [32000, 160320, 160320],
+      "rmvpe_frames": [32, 1024, 1024]
     },
     "balanced": {
       "generator_frames": [100, 1600, 1600],
