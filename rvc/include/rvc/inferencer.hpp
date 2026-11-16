@@ -24,6 +24,24 @@ struct RvcRealtimeRequest {
     size_t output_samples = 0;
 };
 
+// 文件分窗/单窗几何（纯算术，无引擎依赖，可单测）。
+// 16k 量以样本计，tgt 量以模型采样率计。
+// window_input 是 HuBERT 输入长度；win_16k 是主窗（生成器输出覆盖减两侧 pad），
+// 两者之差含卷积边缘损耗余量，作为额外右上下文。
+struct OfflineWindowGeometry {
+    size_t pad_16k;
+    size_t win_16k;
+    size_t window_input;
+    size_t crossfade_in;
+    size_t hop_in;
+    size_t pad_tgt;
+    size_t window_out;
+    size_t crossfade_out;
+};
+
+OfflineWindowGeometry offline_window_geometry(
+    size_t generator_frames, uint32_t model_sr);
+
 class RVCInferencer {
 public:
     RVCInferencer(
