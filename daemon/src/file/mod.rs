@@ -11,6 +11,7 @@ mod queue;
 mod storage;
 pub mod worker;
 
+use crate::preset::PresetManager;
 use crate::runtime::SharedConfig;
 use crate::services::{self, Services};
 use crate::state::{lock_state, State};
@@ -75,6 +76,7 @@ pub struct JobContext {
     pub services: Arc<Services>,
     pub state: Arc<Mutex<State>>,
     pub config: Arc<Config>,
+    pub presets: Arc<PresetManager>,
     pub running: Arc<AtomicBool>,
     /// 文件交接已建立（PRE_SET_FILE_MODE{active:true} 已应答）：FileHandoff
     /// begin 成功后置位、finish 起手清除。协调器据此门控失接管检测：
@@ -113,6 +115,7 @@ pub struct FileCoordinator {
     state: Arc<Mutex<State>>,
     services: Arc<Services>,
     config: SharedConfig,
+    presets: Arc<PresetManager>,
     running: Arc<AtomicBool>,
     /// 串行化 submit 与 finish 驱逐：submit 全程（reserve_job_id → 复制 → 入队）
     /// 持此锁，finish 快照保护集合并驱逐时也持此锁。两者互斥，新排队任务的
@@ -131,6 +134,7 @@ impl FileCoordinator {
         config: SharedConfig,
         state: Arc<Mutex<State>>,
         services: Arc<Services>,
+        presets: Arc<PresetManager>,
         running: Arc<AtomicBool>,
         worker: Arc<dyn Worker>,
     ) -> io::Result<Self> {
@@ -144,6 +148,7 @@ impl FileCoordinator {
             state,
             services,
             config,
+            presets,
             running,
             submit_lock: Mutex::new(()),
             job_thread: Mutex::new(None),
@@ -191,6 +196,7 @@ impl FileCoordinator {
                     &self.state,
                     &self.services,
                     &self.config.snapshot(),
+                    &self.presets,
                     route,
                 ) {
                     lock_state(&self.state)
@@ -420,6 +426,7 @@ impl FileCoordinator {
             services: self.services.clone(),
             state: self.state.clone(),
             config: self.config.snapshot(),
+            presets: self.presets.clone(),
             running: self.running.clone(),
             handoff_active: self.handoff_active.clone(),
         };
@@ -561,6 +568,8 @@ pub(crate) mod testutil {
 mod tests {
     use super::*;
     use crate::file::testutil::temp_dir;
+    use crate::preset::PresetManager;
+    use crate::state_file::StateFile;
     use mozart_core::ctl::schema::{Activity, PreStatus, Route, RvcStatus};
     use std::sync::mpsc;
     use std::time::{Duration, Instant};
@@ -626,6 +635,25 @@ mod tests {
         .unwrap()
     }
 
+    fn test_presets(
+        config: &SharedConfig,
+        state: &Arc<Mutex<State>>,
+        services: &Arc<Services>,
+        dir: &Path,
+    ) -> Arc<PresetManager> {
+        let state_file = Arc::new(Mutex::new(
+            StateFile::load(dir.join("state.json")).unwrap(),
+        ));
+        Arc::new(PresetManager::new(
+            config.clone(),
+            state.clone(),
+            services.clone(),
+            state_file,
+            None,
+            Arc::new(Mutex::new(())),
+        ))
+    }
+
     /// rvc socket 不存在：任何误发的 RPC 都会以 NotReady 失败，
     /// 以此证明 File 占用期间的路由分流不碰实时链路。
     fn setup(tag: &str) -> (Arc<FileCoordinator>, mpsc::Receiver<String>, mpsc::Sender<Outcome>, PathBuf) {
@@ -636,6 +664,7 @@ mod tests {
         let state = Arc::new(Mutex::new(State::new()));
         lock_state(&state).set_rvc_status(Some(fake_rvc_status()));
         let services = Arc::new(Services::new(&config));
+        let presets = test_presets(&config, &state, &services, &dir);
         let running = Arc::new(AtomicBool::new(true));
         let (started_tx, started_rx) = mpsc::channel();
         let (release_tx, release_rx) = mpsc::channel();
@@ -643,8 +672,9 @@ mod tests {
             started: started_tx,
             release: Mutex::new(release_rx),
         });
-        let coordinator =
-            Arc::new(FileCoordinator::new(config, state, services, running, worker).unwrap());
+        let coordinator = Arc::new(
+            FileCoordinator::new(config, state, services, presets, running, worker).unwrap(),
+        );
         (coordinator, started_rx, release_tx, dir)
     }
 
@@ -695,6 +725,7 @@ mod tests {
             &coordinator.state,
             &coordinator.services,
             &coordinator.config.snapshot(),
+            &coordinator.presets,
             Route::Rvc,
         )
         .unwrap();
@@ -711,6 +742,7 @@ mod tests {
             &coordinator.state,
             &coordinator.services,
             &coordinator.config.snapshot(),
+            &coordinator.presets,
             Route::Direct,
         )
         .unwrap();
@@ -722,6 +754,7 @@ mod tests {
             &coordinator.state,
             &coordinator.services,
             &coordinator.config.snapshot(),
+            &coordinator.presets,
             Route::Rvc,
         )
         .unwrap();
@@ -910,10 +943,18 @@ mod tests {
         let state = Arc::new(Mutex::new(State::new()));
         lock_state(&state).set_rvc_status(Some(fake_rvc_status()));
         let services = Arc::new(Services::new(&config));
+        let presets = test_presets(&config, &state, &services, &dir);
         let running = Arc::new(AtomicBool::new(true));
         let coordinator = Arc::new(
-            FileCoordinator::new(config, state, services, running, Arc::new(PanickingWorker))
-                .unwrap(),
+            FileCoordinator::new(
+                config,
+                state,
+                services,
+                presets,
+                running,
+                Arc::new(PanickingWorker),
+            )
+            .unwrap(),
         );
         let job_id = enqueue(&coordinator, "a.wav");
         // 临时文件残留：panic 收尾也要清掉。
@@ -1044,6 +1085,7 @@ mod tests {
         let state = Arc::new(Mutex::new(State::new()));
         lock_state(&state).set_rvc_status(Some(fake_rvc_status()));
         let services = Arc::new(Services::new(&config));
+        let presets = test_presets(&config, &state, &services, &dir);
         let running = Arc::new(AtomicBool::new(true));
         let (started_tx, started_rx) = mpsc::channel();
         let (release_tx, release_rx) = mpsc::channel();
@@ -1051,8 +1093,9 @@ mod tests {
             started: started_tx,
             release: Mutex::new(release_rx),
         });
-        let coordinator =
-            Arc::new(FileCoordinator::new(config, state, services, running, worker).unwrap());
+        let coordinator = Arc::new(
+            FileCoordinator::new(config, state, services, presets, running, worker).unwrap(),
+        );
 
         // 预置一个已完成任务的旧文件，确保驱逐必然触发并删到它。
         let old = dir.join("job_0000000000000.output.wav");

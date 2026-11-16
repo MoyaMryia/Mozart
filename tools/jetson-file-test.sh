@@ -11,6 +11,8 @@
 # 证据留在 $SMOKE_DIR：配置、样本、各阶段 status 与逐秒 progress-*.jsonl、
 #   取回 WAV、audio stats、measure.json、summary.tsv。
 #   MODELS_DIR   模型资产目录（默认 $HOME/mozart-assets/models/rvc/qiqi-zh）
+# 模型文件经符号链接放入 SMOKE_DIR 下的临时模型目录：预设写临时目录，
+#   不污染只读资产树。
 #   BIN_DIR      部署二进制目录（默认 $REPO_DIR/target/debug）
 #   REPO_DIR     仓库目录（默认 $HOME/Mozart）
 #   SMOKE_DIR    产物目录（默认 /tmp/mozart-file-test）
@@ -28,6 +30,8 @@ SMOKE_DIR=${SMOKE_DIR:-/tmp/mozart-file-test}
 CAP_SUB=${CAP_SUB:-2}
 PB_SUB=${PB_SUB:-3}
 MODEL_ID=${MODEL_ID:-qiqi-zh}
+WORK_MODELS=$SMOKE_DIR/models
+WORK_MODEL=$WORK_MODELS/$MODEL_ID
 SAMPLE_M4A=${SAMPLE_M4A:-$HOME/mozart-samples/jieshe.m4a}
 JOB_TIMEOUT=${JOB_TIMEOUT:-600}
 SHORT_S=${SHORT_S:-3}
@@ -98,8 +102,9 @@ done
 [ -d /proc/asound/Loopback ] || { echo "FILE TEST FAILED: snd-aloop 未加载（/proc/asound/Loopback 不存在）" >&2; exit 1; }
 
 cleanup
-mkdir -p "$SMOKE_DIR"
-rm -rf "$RUN" "$FILES"
+rm -rf "$RUN" "$FILES" "$WORK_MODELS"
+mkdir -p "$SMOKE_DIR" "$WORK_MODEL"
+find "$MODELS_DIR" -mindepth 1 -maxdepth 1 ! -name presets -exec ln -s {} "$WORK_MODEL/" \;
 rm -f "$SMOKE_DIR"/*.json "$SMOKE_DIR"/*.jsonl "$SMOKE_DIR"/*.wav "$SMOKE_DIR"/*.m4a \
       "$SMOKE_DIR"/*.txt "$SMOKE_DIR"/*.tsv "$SMOKE_DIR"/*.toml "$SMOKE_DIR"/*.log
 
@@ -319,7 +324,7 @@ input_socket = "rvc-in.sock"
 output_socket = "rvc-out.sock"
 model_id = "$MODEL_ID"
 f0_method = "rmvpe"
-models_dir = "$MODELS_DIR"
+models_dir = "$WORK_MODELS"
 device = "cuda"
 half = false
 cache_limit = 2
@@ -344,6 +349,7 @@ cp "$CFG" "$SMOKE_DIR/config-used.toml"
   echo "host: $(uname -srm)"
   echo "bin_dir: $BIN_DIR"
   echo "models_dir: $MODELS_DIR"
+  echo "work_models: $WORK_MODELS"
   echo "model_id: $MODEL_ID"
   echo "sample_m4a: $SAMPLE_M4A"
   echo "durations_s: short=$SHORT_S mid=$MID_S long=$LONG_S excerpt=$EXCERPT_S"

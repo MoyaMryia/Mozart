@@ -23,6 +23,7 @@ PB_SUB=${PB_SUB:-3}
 RUN=$SMOKE_DIR/run
 CFG=$SMOKE_DIR/multi.toml
 FILES=$SMOKE_DIR/files
+WORK_MODELS=$SMOKE_DIR/models
 RUNTIME_CFG=$HOME/mozart-runtime/mozart.toml
 LOG=$RUN/logs/rvc.log
 
@@ -92,7 +93,12 @@ done
 FEATURE_DIR=$MODELS_DIR/$FEATURE_MODEL
 
 mkdir -p "$SMOKE_DIR" "$FILES"
-rm -rf "$RUN"
+rm -rf "$RUN" "$WORK_MODELS"
+for m in $MODEL_IDS; do
+  mkdir -p "$WORK_MODELS/$m"
+  find "$MODELS_DIR/$m" -mindepth 1 -maxdepth 1 ! -name presets \
+    -exec ln -s {} "$WORK_MODELS/$m/" \;
+done
 cat > "$CFG" <<EOF
 [daemon]
 run_dir = "$RUN"
@@ -118,7 +124,7 @@ output_socket = "rvc-out.sock"
 model_id = "$FEATURE_MODEL"
 f0_method = "rmvpe"
 index_rate = 0.0
-models_dir = "$MODELS_DIR"
+models_dir = "$WORK_MODELS"
 device = "cuda"
 half = false
 cache_limit = 2

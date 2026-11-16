@@ -27,6 +27,8 @@ MODELS_DIR=${MODELS_DIR:-$HOME/mozart-assets/models/rvc/qiqi-zh}
 REPO_DIR=${REPO_DIR:-$HOME/Mozart}
 BIN_DIR=${BIN_DIR:-$REPO_DIR/target/release}
 M_ROOT=${M_ROOT:-$HOME/mozart-t7}
+WORK_MODELS=$M_ROOT/models
+WORK_MODEL=$WORK_MODELS/qiqi-zh
 CAP_SUB=${CAP_SUB:-2}
 PB_SUB=${PB_SUB:-3}
 SR=48000
@@ -72,7 +74,7 @@ input_socket = "rvc-in.sock"
 output_socket = "rvc-out.sock"
 model_id = "qiqi-zh"
 f0_method = "rmvpe"
-models_dir = "$MODELS_DIR"
+models_dir = "$WORK_MODELS"
 device = "cuda"
 half = false
 cache_limit = 2
@@ -134,6 +136,9 @@ SCENARIO=${1:-}
 [ -n "$SCENARIO" ] || die "usage: jetson-measure.sh <floor|latency|fade|longrun|voice|heal> [args]"
 M_DIR="$M_ROOT/$SCENARIO-$(now_ms)"
 mkdir -p "$M_DIR"
+rm -rf "$WORK_MODELS"
+mkdir -p "$WORK_MODEL"
+find "$MODELS_DIR" -mindepth 1 -maxdepth 1 ! -name presets -exec ln -s {} "$WORK_MODEL/" \;
 echo "evidence dir: $M_DIR"
 
 case "$SCENARIO" in

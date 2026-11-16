@@ -3,6 +3,7 @@
 
 use crate::file::FileCoordinator;
 use crate::hwmon::Monitor;
+use crate::preset::PresetManager;
 use crate::runtime::SharedConfig;
 use crate::services::{self, Services};
 use crate::state::{lock_state, State};
@@ -23,6 +24,7 @@ impl Poller {
         config: SharedConfig,
         state: Arc<Mutex<State>>,
         services: Arc<Services>,
+        presets: Arc<PresetManager>,
         file: Arc<FileCoordinator>,
         bridge_restore: Arc<Mutex<BridgeRestore>>,
         running: Arc<AtomicBool>,
@@ -34,7 +36,7 @@ impl Poller {
                 while running.load(Ordering::Acquire) {
                     // 每轮读最新生效配置：poll_interval_ms 等运行时键即时生效。
                     let config = config.snapshot();
-                    services::poll(&state, &services, &config, file.handoff_active());
+                    services::poll(&state, &services, &config, &presets, file.handoff_active());
                     services::restore_bridge_switches(&services, &bridge_restore);
                     file.tick();
                     let hw = monitor.sample();

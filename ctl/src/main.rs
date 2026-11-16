@@ -1,9 +1,10 @@
 use clap::{Parser, Subcommand, ValueEnum};
-use mozart_core::config::{ensure_run_dir, Config};
+use mozart_core::config::{ensure_run_dir, Config, RvcSessionValues};
 use mozart_core::ctl::schema::{
     Activity, ConfigGetRequest, ConfigSetRequest, DeviceEntry, DeviceListRequest, FileCancelRequest,
     FileFetchRequest, FileJob, FileJobState, FileProgress, FileStatusRequest, FileSubmitRequest,
-    ModelEntry, ProcessState, Response, RestartRequest, Route, Status,
+    ModelEntry, PresetApplyData, PresetListData, ProcessState, Response, RestartRequest, Route,
+    Status,
 };
 use mozart_core::ctl::{self, Seqpacket};
 use serde_json::{json, Value};
@@ -90,6 +91,11 @@ enum Action {
     Config {
         #[command(subcommand)]
         action: ConfigAction,
+    },
+    /// 当前已加载模型的预设（SPEC-11）
+    Preset {
+        #[command(subcommand)]
+        action: PresetAction,
     },
 }
 
@@ -207,6 +213,16 @@ enum ConfigAction {
     Save,
 }
 
+#[derive(Subcommand)]
+enum PresetAction {
+    /// 把当前 live 五参数保存到当前模型的 default 预设
+    Save,
+    /// 载入当前模型的 default 预设，丢弃未保存调参
+    Use,
+    /// 查看当前模型预设值与 live 值及差异
+    List,
+}
+
 struct CliError {
     code: u8,
     message: String,
@@ -262,6 +278,7 @@ fn run(cli: Cli) -> Result<(), CliError> {
             ConfigAction::Get { key } => config_get(&config, key.as_deref(), cli.json),
             ConfigAction::Save => config_save(&config, cli.json),
         },
+        Action::Preset { action } => preset_command(&config, action, cli.json),
     }
 }
 
@@ -746,6 +763,75 @@ fn config_save(config: &Config, json_output: bool) -> Result<(), CliError> {
         .ok_or_else(|| CliError::new(EXIT_ERROR, "invalid config save payload: missing saved"))?;
     println!("config saved: {saved} keys");
     Ok(())
+}
+
+fn preset_command(
+    config: &Config,
+    action: PresetAction,
+    json_output: bool,
+) -> Result<(), CliError> {
+    match action {
+        PresetAction::Save => {
+            let data = call(config, ctl::DAEMON_PRESET_SAVE, b"{}")?;
+            print_preset_apply(&data, "saved", json_output)
+        }
+        PresetAction::Use => {
+            // 载入可能 Stop/Start 实时流：客户端预算与 config set 相同。
+            let data = call_with_timeout(
+                config,
+                ctl::DAEMON_PRESET_USE,
+                b"{}",
+                config_set_timeout_ms(config),
+            )?;
+            print_preset_apply(&data, "loaded", json_output)
+        }
+        PresetAction::List => {
+            let data = call(config, ctl::DAEMON_PRESET_LIST, b"{}")?;
+            if json_output {
+                println!("{data}");
+                return Ok(());
+            }
+            let list: PresetListData = serde_json::from_value(data).map_err(|err| {
+                CliError::new(EXIT_ERROR, format!("invalid preset list payload: {err}"))
+            })?;
+            println!(
+                "preset {} model={} dirty={}",
+                list.preset,
+                list.model_id,
+                yes_no(list.dirty)
+            );
+            print_preset_values("preset", &list.preset_values);
+            print_preset_values("live  ", &list.live_values);
+            Ok(())
+        }
+    }
+}
+
+fn print_preset_apply(data: &Value, action: &str, json_output: bool) -> Result<(), CliError> {
+    if json_output {
+        println!("{data}");
+        return Ok(());
+    }
+    let apply: PresetApplyData = serde_json::from_value(data.clone()).map_err(|err| {
+        CliError::new(EXIT_ERROR, format!("invalid preset payload: {err}"))
+    })?;
+    println!(
+        "preset {}: {} (model {})",
+        action, apply.preset, apply.model_id
+    );
+    print_preset_values("values", &apply.values);
+    Ok(())
+}
+
+fn print_preset_values(prefix: &str, values: &RvcSessionValues) {
+    println!(
+        "{prefix} pitch={} index={} rms={} protect={} f0={}",
+        values.pitch_shift,
+        values.index_rate,
+        values.rms_mix_rate,
+        values.protect,
+        values.f0_method
+    );
 }
 
 fn body_json<T: serde::Serialize>(value: &T) -> Result<Vec<u8>, CliError> {
@@ -1411,5 +1497,32 @@ mod tests {
         ));
         assert!(parse(&["config"]).is_err());
         assert!(parse(&["config", "set", "onlykey"]).is_err());
+    }
+
+    #[test]
+    fn preset_parses_save_use_list_and_json() {
+        assert!(matches!(
+            parse(&["preset", "save"]).unwrap().command,
+            Action::Preset {
+                action: PresetAction::Save
+            }
+        ));
+        assert!(matches!(
+            parse(&["preset", "use"]).unwrap().command,
+            Action::Preset {
+                action: PresetAction::Use
+            }
+        ));
+        let cli = parse(&["--json", "preset", "list"]).unwrap();
+        assert!(cli.json);
+        assert!(matches!(
+            cli.command,
+            Action::Preset {
+                action: PresetAction::List
+            }
+        ));
+        assert!(parse(&["preset"]).is_err());
+        assert!(parse(&["preset", "bogus"]).is_err());
+        assert!(parse(&["preset", "use", "default"]).is_err());
     }
 }

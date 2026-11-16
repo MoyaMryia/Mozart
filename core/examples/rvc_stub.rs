@@ -19,6 +19,8 @@
 //! 流在跑，模拟停流未实际生效（恢复起流会收到 Busy）。
 //! 测试旋钮 `MOZART_RVC_STUB_STATUS_FAIL_FILE=<path>`：该文件存在时 GetStatus
 //! 回 NotReady，模拟 rvc 不可达。
+//! 测试旋钮 `MOZART_RVC_STUB_MODELS=<a,b>`：可加载模型清单（缺省 demo），
+//! 供多模型切换用例使用。
 
 mod stub_common;
 
@@ -60,6 +62,7 @@ struct Batch {
 }
 
 struct State {
+    models: Vec<String>,
     model: Option<String>,
     streaming: bool,
     kind: Option<String>,
@@ -108,7 +111,19 @@ fn main() {
     let stop_keep_stream =
         std::env::var("MOZART_RVC_STUB_STOP_KEEP_STREAM").is_ok_and(|value| value == "1");
     let status_fail_file = std::env::var_os("MOZART_RVC_STUB_STATUS_FAIL_FILE").map(PathBuf::from);
+    let models = std::env::var("MOZART_RVC_STUB_MODELS")
+        .map(|text| {
+            text.split(',')
+                .map(str::trim)
+                .filter(|id| !id.is_empty())
+                .map(str::to_string)
+                .collect::<Vec<_>>()
+        })
+        .ok()
+        .filter(|models| !models.is_empty())
+        .unwrap_or_else(|| vec![STUB_MODEL.to_string()]);
     let mut state = State {
+        models,
         model: None,
         streaming: false,
         kind: None,
@@ -152,8 +167,8 @@ fn handle(msg: &Message, state: &mut State) -> Vec<u8> {
             let Some(model_id) = model_id.filter(|id| !id.is_empty()) else {
                 return fail(ctl::CODE_INVALID_ARGUMENT, "model_id is required");
             };
-            // 桩注册表固定 demo；未知 id 与真 rvc 同口径回 InvalidArgument。
-            if model_id != STUB_MODEL {
+            // 桩注册表默认固定 demo；未知 id 与真 rvc 同口径回 InvalidArgument。
+            if !state.models.iter().any(|known| known == model_id) {
                 return fail(
                     ctl::CODE_INVALID_ARGUMENT,
                     &format!("model not found: {model_id}"),
@@ -263,9 +278,19 @@ fn handle(msg: &Message, state: &mut State) -> Vec<u8> {
             }))
         }
         ctl::RVC_LIST_MODELS => {
-            // 桩注册表固定一个 demo（与 LoadModel 同一口径）。
-            let loaded = state.model.as_deref() == Some(STUB_MODEL);
-            ok(json!({"models": [{"id": STUB_MODEL, "exists": true, "loaded": loaded}]}))
+            // 与 LoadModel 同一注册表口径。
+            let models: Vec<Value> = state
+                .models
+                .iter()
+                .map(|id| {
+                    json!({
+                        "id": id,
+                        "exists": true,
+                        "loaded": state.model.as_deref() == Some(id.as_str()),
+                    })
+                })
+                .collect();
+            ok(json!({"models": models}))
         }
         _ => unreachable!("expect_known covers all commands"),
     }

@@ -2,6 +2,7 @@ mod device;
 mod file;
 mod hwmon;
 mod poller;
+mod preset;
 mod runtime;
 mod server;
 mod services;

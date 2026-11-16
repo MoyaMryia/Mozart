@@ -80,11 +80,15 @@ mozart-ctl speech stop        # 急停并清空待播队列
 
 ```bash
 mozart-ctl model list [--available]                # 查看已注册模型与加载状态；--available 只列资产存在的模型
+mozart-ctl preset list                              # 查看当前模型预设、live 参数与差异
+mozart-ctl preset save                              # 把当前调参保存为该模型的 default 预设
+mozart-ctl preset use                               # 重新载入当前模型的 default 预设
 mozart-ctl config get <键>                          # 读取配置基线
 mozart-ctl restart <pre|rvc|asr|tts|bridge|llama>  # 重启单个服务
 ```
 
 `config set` 支持设备键、daemon/file 运行时键和 RVC 会话参数；完整键表见 [config.md](config.md)。
+RVC 会话参数按模型保存：换模型时载入该模型的 `presets/default.toml`；调参后用 `preset save` 写回。文件链在 GPU 交接后取参数快照，任务开始后的改动留给下一任务。
 
 日志：`<run_dir>/logs/<进程名>.log`，运行目录由配置给出，目录规范见 [SETUP.md](SETUP.md)。
 

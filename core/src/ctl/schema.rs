@@ -1,6 +1,7 @@
 //! 控制面 JSON 体契约：应答信封、请求体与 daemon 状态快照。
 //! 字段名是 CLI 与以后网页适配器的稳定机器契约。
 
+use crate::config::RvcSessionValues;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 
@@ -557,6 +558,24 @@ pub struct RestartRequest {
     pub service: String,
 }
 
+/// DAEMON_PRESET_SAVE / DAEMON_PRESET_USE 的 data（SPEC-11）。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PresetApplyData {
+    pub model_id: String,
+    pub preset: String,
+    pub values: RvcSessionValues,
+}
+
+/// DAEMON_PRESET_LIST 的 data：预设值与 live 生效值及差异标记。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PresetListData {
+    pub model_id: String,
+    pub preset: String,
+    pub preset_values: RvcSessionValues,
+    pub live_values: RvcSessionValues,
+    pub dirty: bool,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -954,6 +973,53 @@ mod tests {
             ..capture
         };
         assert_eq!(round_trip(&playback)["kind"], "playback");
+    }
+
+    #[test]
+    fn preset_data_exposes_stable_fields() {
+        let apply = PresetApplyData {
+            model_id: "model-a".to_string(),
+            preset: "default".to_string(),
+            values: RvcSessionValues {
+                pitch_shift: 3,
+                index_rate: 0.5,
+                rms_mix_rate: 0.25,
+                protect: 0.33,
+                f0_method: "rmvpe".to_string(),
+            },
+        };
+        let json = round_trip(&apply);
+        for key in ["model_id", "preset", "values"] {
+            assert!(json.get(key).is_some(), "PresetApplyData 缺字段 {key}");
+        }
+        for key in [
+            "pitch_shift",
+            "index_rate",
+            "rms_mix_rate",
+            "protect",
+            "f0_method",
+        ] {
+            assert!(json["values"].get(key).is_some(), "values 缺字段 {key}");
+        }
+
+        let list = PresetListData {
+            model_id: "model-a".to_string(),
+            preset: "default".to_string(),
+            preset_values: apply.values.clone(),
+            live_values: RvcSessionValues::default(),
+            dirty: true,
+        };
+        let json = round_trip(&list);
+        for key in [
+            "model_id",
+            "preset",
+            "preset_values",
+            "live_values",
+            "dirty",
+        ] {
+            assert!(json.get(key).is_some(), "PresetListData 缺字段 {key}");
+        }
+        assert_eq!(json["dirty"], true);
     }
 
     #[test]

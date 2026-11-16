@@ -4,6 +4,7 @@
 pub mod config;
 pub mod ctl;
 pub mod dgram;
+pub mod preset;
 pub mod ring;
 pub mod thread;
 

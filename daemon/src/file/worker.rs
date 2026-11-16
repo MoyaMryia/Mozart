@@ -95,6 +95,11 @@ fn process(ctx: &JobContext) -> Result<(), StepError> {
     // （pre 确认释放完成才应答），daemon 再绑定同一 socket。次序不能反，
     // 否则撞绑；实时帧若未停发会污染整段攒帧（长文件死锁根因）。
     let mut handoff = FileHandoff::begin(ctx)?;
+    // 预设载入先于 LoadModel 与参数快照（SPEC-11）：同模型跳过，保留调参。
+    let stream_config = ctx
+        .presets
+        .prepare_for_model(&ctx.job.model_id)
+        .map_err(|(code, reason)| StepError::Failed(format!("preset load: {code}: {reason}")))?;
     handoff.bind_output()?;
     let handle = ctx
         .services
@@ -104,7 +109,7 @@ fn process(ctx: &JobContext) -> Result<(), StepError> {
     // 不停会留下一个等帧的文件流，下一个任务撞 Busy。
     handoff.stream_active = true;
     ctx.services
-        .file_start_stream(config, handle, total_frames, total_samples)
+        .file_start_stream(&stream_config, handle, total_frames, total_samples)
         .map_err(|(code, reason)| StepError::Failed(format!("start file stream: {code}: {reason}")))?;
 
     let input_path = config.rvc_input_socket();
@@ -380,9 +385,11 @@ mod tests {
     use crate::file::queue::FileQueue;
     use crate::file::storage::Storage;
     use crate::file::testutil::temp_dir;
+    use crate::preset::PresetManager;
     use crate::runtime::SharedConfig;
     use crate::services::Services;
     use crate::state::State;
+    use crate::state_file::StateFile;
     use mozart_core::config::Config;
     use mozart_core::INPUT_SAMPLES;
     use std::sync::atomic::{AtomicBool, Ordering};
@@ -416,14 +423,29 @@ mod tests {
         };
         let job_id = job.job_id.clone();
         let running = Arc::new(AtomicBool::new(true));
+        let shared = SharedConfig::new(config.as_ref().clone());
+        let services = Arc::new(Services::new(&shared));
+        let state = Arc::new(Mutex::new(State::new()));
+        let state_file = Arc::new(Mutex::new(
+            StateFile::load(dir.join("state.json")).unwrap(),
+        ));
+        let presets = Arc::new(PresetManager::new(
+            shared,
+            state.clone(),
+            services.clone(),
+            state_file,
+            None,
+            Arc::new(Mutex::new(())),
+        ));
         let ctx = JobContext {
             job,
             source: dir.join("a.wav"),
             storage,
             queue: queue.clone(),
-            services: Arc::new(Services::new(&SharedConfig::new(config.as_ref().clone()))),
-            state: Arc::new(Mutex::new(State::new())),
+            services,
+            state,
             config: config.clone(),
+            presets,
             running: running.clone(),
             handoff_active: Arc::new(AtomicBool::new(false)),
         };

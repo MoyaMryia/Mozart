@@ -271,6 +271,12 @@ impl State {
         }
     }
 
+    /// 某类持久降级原因解除后清除（如预设目录恢复可解析）。
+    pub fn clear_degraded_prefix(&mut self, prefix: &str) {
+        self.degraded_persistent
+            .retain(|reason| !reason.starts_with(prefix));
+    }
+
     /// 写重启键后登记受影响服务待重启（SPEC-04）。
     pub fn mark_pending_restart(&mut self, affected: &[String]) {
         for service in affected {
@@ -377,6 +383,19 @@ mod tests {
             "空轮询不得抹掉持久原因：{degraded:?}"
         );
         assert!(!degraded.iter().any(|reason| reason.contains("pre status")));
+    }
+
+    #[test]
+    fn clear_degraded_prefix_removes_only_matching() {
+        let mut state = State::new();
+        state.push_degraded("preset: cannot resolve model directory for 'a'".to_string());
+        state.push_degraded("preset: cannot resolve model directory for 'b'".to_string());
+        state.push_degraded("file stop stream: Busy".to_string());
+        state.clear_degraded_prefix("preset: cannot resolve model directory for 'a'");
+        let degraded = state.status().degraded;
+        assert!(!degraded.iter().any(|reason| reason.contains("for 'a'")));
+        assert!(degraded.iter().any(|reason| reason.contains("for 'b'")));
+        assert!(degraded.iter().any(|reason| reason.contains("file stop stream")));
     }
 
     #[test]

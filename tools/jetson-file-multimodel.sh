@@ -4,6 +4,8 @@
 # 前置：本仓库已 rsync 到设备并完成构建（tools/deploy-jetson.sh），BIN_DIR 内
 #   有 mozart-ctl/daemon/pre/rvc；snd-aloop 已加载；MODELS_DIR 下每个子目录是一
 #   个模型（config.json + 生成器；特征引擎取 FEATURE_MODEL，缺省用第一个模型）。
+# 模型文件经符号链接放入 SMOKE_DIR 下的临时模型目录：预设写入临时目录，
+#   不污染只读资产树。
 # 判据：每个模型 job completed、输出 48 kHz 单声道、输出采样数等于 3×输入采样数、
 #   RMS 非零；rvc 日志的 FileWorker 行必须 frames_in == frames_out，且本轮不得
 #   出现 TensorRT 回退 ONNX。MODEL_IDS 可指定子集（空格分隔），缺省为全部目录。
@@ -27,6 +29,7 @@ PB_SUB=${PB_SUB:-3}
 RUN=$SMOKE_DIR/run
 CFG=$SMOKE_DIR/multi.toml
 FILES=$SMOKE_DIR/files
+WORK_MODELS=$SMOKE_DIR/models
 RUNTIME_CFG=$HOME/mozart-runtime/mozart.toml
 LOG=$RUN/logs/rvc.log
 
@@ -93,7 +96,13 @@ done
 
 cleanup
 mkdir -p "$SMOKE_DIR" "$FILES"
-rm -rf "$RUN" "$FILES"
+rm -rf "$RUN" "$FILES" "$WORK_MODELS"
+mkdir -p "$WORK_MODELS"
+for m in $MODEL_IDS; do
+  mkdir -p "$WORK_MODELS/$m"
+  find "$MODELS_DIR/$m" -mindepth 1 -maxdepth 1 ! -name presets \
+    -exec ln -s {} "$WORK_MODELS/$m/" \;
+done
 rm -f "$SMOKE_DIR"/*.json "$SMOKE_DIR"/*.wav "$SMOKE_DIR"/*.tsv "$SMOKE_DIR"/*.toml \
       "$SMOKE_DIR"/*.log
 
@@ -145,7 +154,7 @@ output_socket = "rvc-out.sock"
 model_id = "$FEATURE_MODEL"
 f0_method = "rmvpe"
 index_rate = $INDEX_RATE
-models_dir = "$MODELS_DIR"
+models_dir = "$WORK_MODELS"
 device = "cuda"
 half = false
 cache_limit = 2
