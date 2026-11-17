@@ -25,6 +25,7 @@
 #include "mozart/frame.h"
 #include "transport/audio_stream.h"
 #include "rvc/pipeline.hpp"
+#include "rvc/realtime_geometry.hpp"
 #include "rvc/streaming_pipeline.hpp"
 
 namespace rvc {
@@ -34,11 +35,12 @@ public:
     struct Config {
         // 会话种类：true → 短块 realtime preset；false → quality/滑窗 preset。
         // 实时能力由入口（StreamSession）校验，此处不再复检。
+        // 旋钮默认值取 realtime_geometry.hpp（单一来源），入口已校验范围与整除。
         bool realtime_kind = true;
-        bool skip_silence = true;
-        uint32_t crossfade_ms = 50;
-        uint32_t sola_search_ms = 10;
-        uint32_t realtime_playout_delay_ms = 400;
+        bool skip_silence = kRealtimeDefaultSkipSilence;
+        uint32_t crossfade_ms = kRealtimeDefaultCrossfadeMs;
+        uint32_t sola_search_ms = kRealtimeDefaultSolaSearchMs;
+        uint32_t realtime_playout_delay_ms = kRealtimeDefaultStartupDelayMs;
     };
 
     // 数据面与推理侧丢弃/欠载计数，供状态快照发布。

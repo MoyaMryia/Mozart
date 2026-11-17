@@ -21,9 +21,10 @@ const EXIT_UNREACHABLE: u8 = 3;
 const EXIT_REJECTED: u8 = 4;
 const EXIT_TIMEOUT: u8 = 5;
 
-/// config set 在 daemon 侧最多串行约 6 次 RPC（重读 TOML、状态覆盖、
-/// rvc 停流/起流/失败恢复），客户端超时必须覆盖，否则误报超时。
-const CONFIG_SET_RPC_BUDGET: u64 = 6;
+/// 多 RPC 命令（config set / preset / model use）在 daemon 侧最多串行约 7 次
+/// RPC：model use 失败恢复最长（状态、停流、LoadModel、提交时状态、起流、
+/// 恢复 LoadModel、恢复起流）。客户端超时必须覆盖，否则误报超时。
+const CONFIG_SET_RPC_BUDGET: u64 = 7;
 const CONFIG_SET_TIMEOUT_FLOOR_MS: u64 = 15_000;
 
 #[derive(Parser)]
@@ -644,7 +645,12 @@ fn model_list(config: &Config, json_output: bool, available: bool) -> Result<(),
 fn model_use(config: &Config, json_output: bool, id: &str) -> Result<(), CliError> {
     let body = serde_json::to_string(&json!({"model_id": id}))
         .map_err(|err| CliError::new(EXIT_ERROR, format!("encode request: {err}")))?;
-    let data = call(config, ctl::DAEMON_MODEL_USE, body.as_bytes())?;
+    let data = call_with_timeout(
+        config,
+        ctl::DAEMON_MODEL_USE,
+        body.as_bytes(),
+        config_set_timeout_ms(config),
+    )?;
     if json_output {
         println!("{data}");
         return Ok(());
@@ -662,8 +668,8 @@ fn call(config: &Config, type_: u16, body: &[u8]) -> Result<Value, CliError> {
     call_with_timeout(config, type_, body, config.daemon.rpc_timeout_ms)
 }
 
-/// 同 `call`，客户端超时由调用方指定：config set 与 preset 命令覆盖 daemon 的
-/// 多次串行 RPC，其他命令沿用 rpc_timeout_ms。
+/// 同 `call`，客户端超时由调用方指定：config set、preset 与 model use 覆盖
+/// daemon 的多次串行 RPC（含 LoadModel），其他命令沿用 rpc_timeout_ms。
 fn call_with_timeout(
     config: &Config,
     type_: u16,
@@ -1093,7 +1099,7 @@ fn rpc_timeout(config: &Config) -> Option<Duration> {
     Some(Duration::from_millis(config.daemon.rpc_timeout_ms))
 }
 
-/// config set 的客户端超时：覆盖 daemon 最多 6 次串行 RPC，且不低于 15 s。
+/// 多 RPC 命令共用的客户端超时：覆盖 daemon 的串行 RPC 预算，且不低于 15 s。
 fn config_set_timeout_ms(config: &Config) -> u64 {
     config
         .daemon
@@ -1526,7 +1532,7 @@ mod tests {
         config.daemon.rpc_timeout_ms = 1000;
         assert_eq!(config_set_timeout_ms(&config), 15_000, "低于下限时取 15 s");
         config.daemon.rpc_timeout_ms = 3000;
-        assert_eq!(config_set_timeout_ms(&config), 18_000, "6 倍 RPC 超时覆盖串行调用");
+        assert_eq!(config_set_timeout_ms(&config), 21_000, "7 倍 RPC 超时覆盖串行调用");
     }
 
     #[test]

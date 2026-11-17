@@ -89,7 +89,9 @@ def derive_geometry(
     decoder_frames = return_frames
 
     hubert_samples = front_frames * hop
-    hubert_frames = (hubert_samples - 400) // 320 + 1
+    # HuBERT hop 由输入采样率与 HuBERT 帧率推导（JSON model_contract），不写字面量。
+    hubert_hop = in_sr // int(mc["hubert_frame_rate"])
+    hubert_frames = (hubert_samples - 400) // hubert_hop + 1
     decoder_out_samples = return_frames * (out_sr // frame_rate)
     output_hop = (w * out_sr) // in_sr
 

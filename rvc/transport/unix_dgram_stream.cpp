@@ -18,6 +18,8 @@
 #include <sys/un.h>
 #include <unistd.h>
 
+#include <spdlog/spdlog.h>
+
 namespace rvc {
 
 namespace {
@@ -226,6 +228,11 @@ bool UnixDgramStream::ReadFrame(void* out_frame_buf, size_t buf_size) {
             if (decode_input_packet(packet, static_cast<size_t>(n), *frame)) {
                 return true;
             }
+            if (static_cast<size_t>(n) != kInputPacketBytes) {
+                // 尺寸不符（多为新旧进程混跑）单独计数：热路径只加原子，
+                // 原因由控制线程按 kFrameSizeMismatchReason 记录一次。
+                recv_size_mismatch_.fetch_add(1, std::memory_order_relaxed);
+            }
             recv_dropped_.fetch_add(1, std::memory_order_relaxed);
             n = ::recv(fd, packet, sizeof(packet), MSG_DONTWAIT);
         }
@@ -316,7 +323,21 @@ bool UnixDgramStream::send_blocking(const uint8_t* packet) {
 
 DgramStreamStats UnixDgramStream::stats() const noexcept {
     return {send_dropped_.load(std::memory_order_relaxed),
-            recv_dropped_.load(std::memory_order_relaxed)};
+            recv_dropped_.load(std::memory_order_relaxed),
+            recv_size_mismatch_.load(std::memory_order_relaxed)};
+}
+
+void report_size_mismatch(const DgramStreamStats& transport, bool& reported,
+                          std::string& last_error) {
+    if (transport.recv_size_mismatch == 0) return;
+    if (!reported) {
+        reported = true;
+        spdlog::warn("rvc data plane: {} ({} packets)", kFrameSizeMismatchReason,
+                     transport.recv_size_mismatch);
+    }
+    // 覆盖而非只补空串：推理错误常驻时混跑原因会永不可查。last_error 每次
+    // stats() 由 worker 快照重建，故条件成立期间每次都要落（传输优先，同 pre 侧）。
+    last_error = kFrameSizeMismatchReason;
 }
 
 bool UnixDgramStream::try_reconnect() {

@@ -57,7 +57,7 @@ node_modules/
 # 帧字节共享夹具（core/examples/gen_frame_fixture.rs 生成，C++/Rust 读同一组字节对拍）：
 # input.bin 输入线包（1300 B：魔数 + 金标 meta + 320 点递增 f32）
 !tests/fixtures/frame/input.bin
-# output.bin 输出线包（3860 B：魔数 + 金标 meta + 960 点递增 f32）
+# output.bin 输出线包（长度取 kOutputPacketBytes：魔数 + 金标 meta + 采样率/有效样本 + 960 点递增 f32）
 !tests/fixtures/frame/output.bin
 # ctl_hello.bin 控制信封（DAEMON_HELLO 请求：16 B 头 + 体 {}）
 !tests/fixtures/frame/ctl_hello.bin

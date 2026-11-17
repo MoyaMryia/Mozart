@@ -424,4 +424,56 @@ mod tests {
         assert!((out40[0] - 0.0).abs() < 1e-6);
         assert!(out40[959] > 0.99);
     }
+
+    /// 32k→48k 边界重采样：只取 valid_samples 有效段插值到 960 样本，
+    /// 段外陈货不得泄漏；换采样率时重置插值历史，不跨率插值。
+    #[test]
+    fn boundary_resampler_handles_32k_and_rate_switch() {
+        let mut resampler = BoundaryResampler::new();
+        let meta = FrameMeta {
+            pts_ns: 0,
+            frame_idx: 0,
+            vad_flag: 1,
+            energy_db: 0,
+            conf: 0,
+            segment_id: 0,
+        };
+        let mut pcm32 = [0.0f32; OUTPUT_SAMPLES];
+        for (i, slot) in pcm32.iter_mut().enumerate().take(640) {
+            *slot = i as f32 / 640.0;
+        }
+        // 有效段之外模拟补零/陈货：不得参与插值。
+        for slot in pcm32[640..].iter_mut() {
+            *slot = 99.0;
+        }
+        let out = resampler.resample_to_48k(&OutputFrame::new(meta, 32000, 640, pcm32));
+        assert_eq!(out.len(), RAW_SAMPLES);
+        assert!(out.iter().all(|v| v.is_finite()));
+        assert!(
+            out.iter().all(|v| (0.0..=1.0).contains(v)),
+            "valid_samples 之外的样本不得泄漏到播放"
+        );
+        assert!(
+            out.windows(2).all(|pair| pair[1] >= pair[0]),
+            "斜坡插值必须单调不回折"
+        );
+        assert!((out[0]).abs() < 1e-6);
+        assert!((out[480] - 319.0 / 640.0).abs() < 1e-3);
+        assert!(out[959] > 0.99);
+
+        // 切到 40k：插值历史重置为新率首样本。
+        let mut pcm40 = [0.0f32; OUTPUT_SAMPLES];
+        for (i, slot) in pcm40.iter_mut().enumerate().take(800) {
+            *slot = 0.5 + i as f32 / 1600.0;
+        }
+        let out40 = resampler.resample_to_48k(&OutputFrame::new(meta, 40000, 800, pcm40));
+        assert!(
+            (out40[0] - 0.5).abs() < 1e-6,
+            "换率首帧必须从新率首样本起插值"
+        );
+
+        // valid_samples = 0：输出静音并重置历史。
+        let silent = resampler.resample_to_48k(&OutputFrame::new(meta, 32000, 0, pcm32));
+        assert!(silent.iter().all(|v| *v == 0.0));
+    }
 }

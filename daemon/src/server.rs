@@ -9,7 +9,7 @@ use crate::state_file::{self, StateFile};
 use crate::supervisor::{RestartHandle, Supervisor};
 use mozart_core::config::{
     device_key_kind, ensure_run_dir, get_key, runtime_key_owner, save_overrides, set_key,
-    state_file_path, write_rvc_model_baseline, Config,
+    state_file_path, Config,
 };
 use mozart_core::ctl::schema::{
     self, ConfigGetRequest, ConfigSetRequest, DeviceListRequest, FileCancelRequest, FileFetchRequest,
@@ -483,56 +483,33 @@ fn config_set_reply(ctx: &Ctx, request: &ConfigSetRequest) -> Vec<u8> {
     }
 }
 
+/// 实时换模型（SPEC-04 `model use <id>`）：StopStream → LoadModel → 预设提交
+/// （model_id 基线 + 五键基线 + applied + 生效配置）→ StartStream，全程持
+/// transition 锁。编排与失败恢复见 `services::switch_rvc_model_locked`：恢复
+/// 一律用切换前的生效配置（旧模型 + 旧参数），不套用目标预设。
+fn model_use_reply(ctx: &Ctx, model_id: &str) -> Vec<u8> {
+    let _transition = ctx.services.transition();
+    let old = ctx.config.snapshot();
+    match services::switch_rvc_model_locked(
+        &ctx.state,
+        &ctx.services,
+        &ctx.presets,
+        &old,
+        model_id,
+    ) {
+        Ok(previous) => schema::ok_body(json!({
+            "model_id": model_id,
+            "previous_model_id": previous,
+        })),
+        Err((code, reason)) => schema::error_body(&code, &reason),
+    }
+}
+
 /// 运行时键即时生效（SPEC-04）：清该键状态覆盖，重读 TOML 基线叠加剩余覆盖
 /// 重建生效配置，更新共享句柄与文件队列/存储阈值。服务侧每次操作读最新快照。
 /// rvc 会话键的生效配置只吸收本次写入的键（见 services::merge_session_key），
 /// 再按需重启实时流；编排与替换同处 transition 临界区，失败不替换生效配置
 /// （TOML 新基线保留，下一次对应键写入或 daemon 重启再尝试）。
-fn model_use_reply(ctx: &Ctx, model_id: &str) -> Vec<u8> {
-    let _transition = ctx.services.transition();
-    let resolution = if ctx.config_path.is_some() {
-        match ctx.presets.resolve_for_model_locked(model_id) {
-            Ok(res) => res,
-            Err((code, reason)) => return schema::error_body(&code, &reason),
-        }
-    } else {
-        crate::preset::PresetResolution::Skip
-    };
-    let mut cfg = (*ctx.config.snapshot()).clone();
-    if let crate::preset::PresetResolution::Ready(ref values) = resolution {
-        cfg.rvc.pitch_shift = values.pitch_shift;
-        cfg.rvc.index_rate = values.index_rate;
-        cfg.rvc.rms_mix_rate = values.rms_mix_rate;
-        cfg.rvc.protect = values.protect;
-        cfg.rvc.f0_method = values.f0_method.clone();
-    }
-    match services::switch_rvc_model_locked(&ctx.state, &ctx.services, &cfg.rvc, model_id) {
-        Ok((previous, next_rvc)) => {
-            cfg.rvc = next_rvc;
-            ctx.config.replace(cfg);
-            if let Some(path) = ctx.config_path.as_deref() {
-                {
-                    let _toml = ctx
-                        .toml_lock
-                        .lock()
-                        .unwrap_or_else(|poisoned| poisoned.into_inner());
-                    if let Err(err) = write_rvc_model_baseline(path, model_id) {
-                        return schema::error_body(ctl::CODE_INTERNAL, &err.to_string());
-                    }
-                }
-                if let Err((code, reason)) = ctx.presets.commit_for_model_locked(model_id, resolution) {
-                    return schema::error_body(&code, &reason);
-                }
-            }
-            schema::ok_body(json!({
-                "model_id": model_id,
-                "previous_model_id": previous,
-            }))
-        }
-        Err((code, reason)) => schema::error_body(&code, &reason),
-    }
-}
-
 /// 调用方须已持 transition 锁。
 fn apply_runtime_key(ctx: &Ctx, key: &str, old: &Config) -> Result<(), (String, String)> {
     lock_state_file(&ctx.state_file)
@@ -544,11 +521,9 @@ fn apply_runtime_key(ctx: &Ctx, key: &str, old: &Config) -> Result<(), (String, 
     state_file::overlay(&mut fresh, &overrides);
     if runtime_key_owner(key) == Some("rvc") {
         // 未生效的 rvc 基线（如失败恢复留下的 pitch）不得混入生效配置，
-        // 否则 status 与在跑流不一致。
+        // 否则 status 与在跑流不一致。merge_session_key 从旧生效配置克隆、
+        // 只改本次写入的键，model_id 等非会话键天然保留。
         fresh.rvc = services::merge_session_key(key, &old.rvc, &fresh.rvc)?;
-        if key != "rvc.model_id" {
-            fresh.rvc.model_id = old.rvc.model_id.clone();
-        }
         // 替换与 Stop/Start 同处调用方持有的 transition 临界区：释放后再替换
         // 会给轮询留下用旧快照起流的窄窗口。失败路径不替换，TOML 新基线保留。
         services::apply_rvc_session_params_locked(&ctx.state, &ctx.services, &old.rvc, &fresh.rvc)

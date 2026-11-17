@@ -42,6 +42,8 @@ StreamingRvc::StreamingRvc(Config config)
               + ((cfg_.crossfade_out + cfg_.sola_search_out) * kRealtimeInputSampleRate) / cfg_.output_sample_rate
           : cfg_.window_samples)
 {
+    // 样本域网格不变量；ms 旋钮的等价整除模数在 realtime_geometry.hpp 单点定义
+    // （StartStream 入口已校验），本构造另守 preset 与测试直接给出的 Config。
     if (!is_supported_realtime_sample_rate(cfg_.output_sample_rate)
         || cfg_.window_samples < 200
         || (cfg_.crossfade_out * kRealtimeInputSampleRate) % cfg_.output_sample_rate != 0

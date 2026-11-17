@@ -156,6 +156,10 @@ pub struct Shared {
     ai_recv_dropped: AtomicU64,
     /// TTS 播报帧坏包丢弃，接收线程发布绝对值。
     tts_recv_dropped: AtomicU64,
+    /// 输出帧尺寸不符计数（新旧进程混跑），接收线程发布绝对值；
+    /// 控制线程首次见到非零时记录原因，实时线程只写原子。
+    ai_recv_size_mismatch: AtomicU64,
+    tts_recv_size_mismatch: AtomicU64,
     /// direct 路由期间丢弃的 rvc 输出帧（旧 skipped_replies），播放线程累加。
     ai_skipped: AtomicU64,
     /// 扬声器分时状态，播放线程在帧边界写、控制线程只读。
@@ -189,6 +193,8 @@ impl Shared {
             dsp_target: AtomicU8::new(dsp.code()),
             ai_recv_dropped: AtomicU64::new(0),
             tts_recv_dropped: AtomicU64::new(0),
+            ai_recv_size_mismatch: AtomicU64::new(0),
+            tts_recv_size_mismatch: AtomicU64::new(0),
             ai_skipped: AtomicU64::new(0),
             speaker_state: AtomicU8::new(speaker_code(Speaker::Realtime)),
             tts_frames_played: AtomicU64::new(0),
@@ -282,6 +288,24 @@ impl Shared {
     /// 发布 TTS 播报帧坏包丢弃的累计绝对值（接收线程调用）。
     pub fn set_tts_recv_dropped(&self, total: u64) {
         self.tts_recv_dropped.store(total, Ordering::Relaxed);
+    }
+
+    /// 发布输出帧尺寸不符的累计绝对值（接收线程调用，只写原子）。
+    pub fn set_ai_recv_size_mismatch(&self, total: u64) {
+        self.ai_recv_size_mismatch.store(total, Ordering::Relaxed);
+    }
+
+    pub fn set_tts_recv_size_mismatch(&self, total: u64) {
+        self.tts_recv_size_mismatch.store(total, Ordering::Relaxed);
+    }
+
+    /// 尺寸不符计数（控制线程读，首次非零时记录混跑原因）。
+    pub fn ai_recv_size_mismatch(&self) -> u64 {
+        self.ai_recv_size_mismatch.load(Ordering::Relaxed)
+    }
+
+    pub fn tts_recv_size_mismatch(&self) -> u64 {
+        self.tts_recv_size_mismatch.load(Ordering::Relaxed)
     }
 
     /// direct 路由期间丢弃的 rvc 输出帧计数（播放线程调用）。

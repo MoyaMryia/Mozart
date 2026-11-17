@@ -5,7 +5,8 @@
 mod common;
 
 use common::{
-    call, example, status, submit_file, wait_job_state, wait_ready, wait_until, DaemonProcess,
+    call, example, file_job, status, submit_file, wait_job_state, wait_ready, wait_until,
+    DaemonProcess,
 };
 use mozart_core::ctl::schema::{
     FileJobState, PresetApplyData, PresetListData, Response, Route, RvcParams, Status,
@@ -46,16 +47,27 @@ struct Harness {
 impl Harness {
     /// 每个用例独立模型目录（不写仓库资产）；配置模型 id 为空表示不预载。
     fn new(tag: &str, models: &[&str], config_model: &str) -> Self {
-        Self::build(tag, models, config_model, None)
+        Self::build(tag, models, config_model, None, &[])
     }
 
     /// rvc 启动即已加载 `preload` 模型（不起流）：daemon 未经历预设载入，
     /// 参数来源记录为空。
     fn new_preloaded(tag: &str, models: &[&str], config_model: &str, preload: &str) -> Self {
-        Self::build(tag, models, config_model, Some(preload))
+        Self::build(tag, models, config_model, Some(preload), &[])
     }
 
-    fn build(tag: &str, models: &[&str], config_model: &str, preload: Option<&str>) -> Self {
+    /// 给 rvc 桩注入失败旋钮（StartStream 失败、文件批处理延迟等）。
+    fn new_with_env(tag: &str, models: &[&str], config_model: &str, env: &[(&str, &str)]) -> Self {
+        Self::build(tag, models, config_model, None, env)
+    }
+
+    fn build(
+        tag: &str,
+        models: &[&str],
+        config_model: &str,
+        preload: Option<&str>,
+        env: &[(&str, &str)],
+    ) -> Self {
         static SEQ: AtomicU64 = AtomicU64::new(0);
         let dir = std::env::temp_dir().join(format!(
             "mozart-preset-it-{}-{tag}-{}",
@@ -77,6 +89,9 @@ impl Harness {
         ));
         if let Some(preload) = preload {
             text.push_str(&format!("export MOZART_RVC_STUB_PRELOAD='{preload}'\n"));
+        }
+        for (key, value) in env {
+            text.push_str(&format!("export {key}='{value}'\n"));
         }
         text.push_str(&format!("exec '{}' \"$@\"\n", example("rvc_stub").display()));
         std::fs::write(&script, text).unwrap();
@@ -133,6 +148,41 @@ impl Harness {
 
     fn preset_path(&self, model: &str) -> PathBuf {
         self.models.join(model).join("presets/default.toml")
+    }
+
+    fn model_use(&self, model_id: &str) -> Response {
+        let body = json!({"model_id": model_id}).to_string();
+        self.call(ctl::DAEMON_MODEL_USE, body.as_bytes())
+    }
+
+    fn config_text(&self) -> String {
+        std::fs::read_to_string(self.daemon.dir.join("config.toml")).unwrap()
+    }
+
+    /// 给目标模型写一份与旧 live 参数可区分的预设（模型目录须已存在）。
+    fn write_preset(&self, model: &str, pitch: i32) {
+        std::fs::create_dir_all(self.models.join(model)).unwrap();
+        let mut values = mozart_core::config::RvcSessionValues::default();
+        values.pitch_shift = pitch;
+        mozart_core::preset::write_default(&self.models.join(model), &values).unwrap();
+    }
+
+    /// rvc 命令按下发顺序排列，供断言 Stop→Load→Start 次序与恢复所用参数。
+    fn rvc_commands(&self) -> Vec<(u16, Value)> {
+        self.entries()
+            .into_iter()
+            .filter(|entry| entry.stub == "mozart-rvc-stub")
+            .map(|entry| (entry.type_, entry.body))
+            .collect()
+    }
+
+    /// 实时载入 model-a、把 pitch 调成 3 并存回 A 预设：旧参数 3 与目标预设
+    /// 参数 7 可区分，恢复断言不会退化成自我比较。
+    fn load_a_with_pitch3(&self) {
+        self.set_route_rvc();
+        expect_ok(self.config_set("rvc.pitch_shift", "3"));
+        apply_data(self.preset_save());
+        self.wait_streaming();
     }
 
     fn clear_log(&self) {
@@ -581,6 +631,278 @@ fn model_use_loads_target_preset_and_rejects_corrupt_preset() {
         br#"{"key":"rvc.model_id"}"#,
     ));
     assert_eq!(get_after_bad["value"], "model-b");
+}
+
+/// 断言失败切换后的恢复序列：目标 LoadModel 之后重新 LoadModel 旧模型，再按
+/// 旧参数起实时流。恢复用目标预设参数会让旧模型跑新模型的音高，必须拦住。
+fn assert_restored_old_stream(
+    commands: &[(u16, Value)],
+    old_model: &str,
+    target_model: &str,
+    old_pitch: i64,
+) {
+    let target_load = commands
+        .iter()
+        .position(|(type_, body)| *type_ == ctl::RVC_LOAD_MODEL && body["model_id"] == target_model)
+        .expect("应尝试加载目标模型");
+    let restore_load = commands[target_load + 1..]
+        .iter()
+        .position(|(type_, body)| *type_ == ctl::RVC_LOAD_MODEL && body["model_id"] == old_model)
+        .map(|index| target_load + 1 + index)
+        .unwrap_or_else(|| panic!("恢复应重新加载旧模型 {old_model}：{commands:?}"));
+    let restore_start = commands[restore_load + 1..]
+        .iter()
+        .find(|(type_, body)| *type_ == ctl::RVC_START_STREAM && body["kind"] == "realtime")
+        .unwrap_or_else(|| panic!("恢复应重起实时流：{commands:?}"));
+    assert_eq!(
+        restore_start.1["pitch_shift"], old_pitch,
+        "恢复必须用旧模型旧参数：{:?}",
+        restore_start.1
+    );
+}
+
+/// LoadModel 失败：恢复的流用旧模型旧参数，生效配置、五键基线与 model_id
+/// 基线都不变，applied 仍属旧模型（preset list/save 可证）。
+#[test]
+fn model_use_load_failure_restores_old_model_and_old_params() {
+    // 桩注册表只有 model-a：model-b 目录与预设存在，但 LoadModel 必失败。
+    let h = Harness::new("use-load-fail", &["model-a"], "model-a");
+    h.load_a_with_pitch3();
+    h.write_preset("model-b", 7);
+    let baseline_before = h.config_text();
+    let live_before = h.rvc_params();
+    let preset_b_before = std::fs::read_to_string(h.preset_path("model-b")).unwrap();
+    h.clear_log();
+
+    let reason = expect_error(h.model_use("model-b"), ctl::CODE_INVALID_ARGUMENT);
+    assert!(reason.contains("model not found"), "{reason}");
+
+    let commands = h.rvc_commands();
+    assert_restored_old_stream(&commands, "model-a", "model-b", 3);
+    assert!(
+        commands
+            .iter()
+            .filter(|(type_, _)| *type_ == ctl::RVC_START_STREAM)
+            .all(|(_, body)| body["pitch_shift"] != 7),
+        "加载失败后任何起流都不得带目标预设参数：{commands:?}"
+    );
+
+    h.wait_streaming();
+    assert_eq!(h.rvc_params(), live_before, "恢复后生效配置仍是旧参数");
+    assert_eq!(h.config_text(), baseline_before, "五键与 model_id 基线都不得变");
+    assert_eq!(
+        std::fs::read_to_string(h.preset_path("model-b")).unwrap(),
+        preset_b_before,
+        "目标模型预设不得被改动"
+    );
+    let list = list_data(h.preset_list());
+    assert_eq!(list.model_id, "model-a", "applied 不得改成目标模型");
+    assert_eq!(list.live_values.pitch_shift, 3);
+    assert!(!list.dirty, "live 应仍等于 A 的预设：{list:?}");
+    assert_eq!(apply_data(h.preset_save()).values.pitch_shift, 3);
+}
+
+/// StartStream 失败：提交已落盘，必须整体回退（五键基线、model_id 基线、
+/// 生效配置、applied），再用旧模型旧参数恢复流。
+#[test]
+fn model_use_start_failure_rolls_back_and_restores_old_params() {
+    let h = Harness::new_with_env(
+        "use-start-fail",
+        &["model-a", "model-b"],
+        "model-a",
+        &[("MOZART_RVC_STUB_FAIL_START_PITCH", "7")],
+    );
+    h.load_a_with_pitch3();
+    h.write_preset("model-b", 7);
+    let baseline_before = h.config_text();
+    let live_before = h.rvc_params();
+    h.clear_log();
+
+    let reason = expect_error(h.model_use("model-b"), ctl::CODE_INFERENCE_FAILED);
+    assert!(reason.contains("model use start stream"), "{reason}");
+
+    let commands = h.rvc_commands();
+    assert!(
+        commands
+            .iter()
+            .any(|(type_, body)| *type_ == ctl::RVC_START_STREAM && body["pitch_shift"] == 7),
+        "应确实按目标预设参数尝试起流：{commands:?}"
+    );
+    assert_restored_old_stream(&commands, "model-a", "model-b", 3);
+
+    h.wait_streaming();
+    assert_eq!(h.rvc_params(), live_before, "回退后生效配置仍是旧参数");
+    assert_eq!(
+        h.config_text(),
+        baseline_before,
+        "五键与 model_id 基线都应回退到提交前"
+    );
+    let list = list_data(h.preset_list());
+    assert_eq!(list.model_id, "model-a", "applied 应回退到旧模型");
+    assert!(!list.dirty, "live 应仍等于 A 的预设：{list:?}");
+    assert_eq!(apply_data(h.preset_save()).values.pitch_shift, 3);
+}
+
+/// 起流与恢复都失败：返回组合错误，并留 status 可查询的持久降级原因；
+/// 基线与 applied 仍整体回退，不静默吞掉恢复失败。
+#[test]
+fn model_use_restore_failure_records_queryable_degraded() {
+    // setup 恰好起流两次（route set rvc、config set pitch）；此后全部失败。
+    let h = Harness::new_with_env(
+        "use-restore-fail",
+        &["model-a", "model-b"],
+        "model-a",
+        &[("MOZART_RVC_STUB_FAIL_START_AFTER", "2")],
+    );
+    h.load_a_with_pitch3();
+    h.write_preset("model-b", 7);
+    assert_eq!(
+        h.rvc_count(ctl::RVC_START_STREAM),
+        2,
+        "失败旋钮按起流次数计数，setup 次数必须确定"
+    );
+    let baseline_before = h.config_text();
+    let live_before = h.rvc_params();
+    h.clear_log();
+
+    let reason = expect_error(h.model_use("model-b"), ctl::CODE_INFERENCE_FAILED);
+    assert!(
+        reason.contains("model use start stream") && reason.contains("restore with old params"),
+        "错误应组合起流与恢复两段失败：{reason}"
+    );
+    assert_restored_old_stream(&h.rvc_commands(), "model-a", "model-b", 3);
+    assert!(
+        wait_until(POLL_TIMEOUT, || {
+            h.status().degraded.iter().any(|entry| {
+                entry.contains("rvc model use") && entry.contains("restore with old params")
+            })
+        }),
+        "恢复失败必须留可查询降级原因：{:?}",
+        h.status().degraded
+    );
+    assert_eq!(h.rvc_params(), live_before, "回退后生效配置仍是旧参数");
+    assert_eq!(h.config_text(), baseline_before, "基线应回退到提交前");
+    let list = list_data(h.preset_list());
+    assert_eq!(list.model_id, "model-a", "applied 应回退到旧模型");
+    assert!(!list.dirty);
+}
+
+/// 成功切换：只起一次新流（提交时流已停，编排不二次起停），五键基线与
+/// model_id 基线都已写，applied 为目标模型，preset list 不 dirty。
+#[test]
+fn model_use_success_commits_baseline_and_starts_one_stream() {
+    let h = Harness::new("use-success", &["model-a", "model-b"], "model-a");
+    h.load_a_with_pitch3();
+    h.write_preset("model-b", 7);
+    h.clear_log();
+
+    let data = expect_ok(h.model_use("model-b"));
+    assert_eq!(data["model_id"], "model-b");
+    assert_eq!(data["previous_model_id"], "model-a");
+
+    let commands = h.rvc_commands();
+    let stop = commands
+        .iter()
+        .position(|(type_, _)| *type_ == ctl::RVC_STOP_STREAM)
+        .expect("断流切换应先停流");
+    let load = commands
+        .iter()
+        .position(|(type_, body)| *type_ == ctl::RVC_LOAD_MODEL && body["model_id"] == "model-b")
+        .expect("应加载目标模型");
+    let starts: Vec<&Value> = commands
+        .iter()
+        .filter(|(type_, body)| *type_ == ctl::RVC_START_STREAM && body["kind"] == "realtime")
+        .map(|(_, body)| body)
+        .collect();
+    assert_eq!(starts.len(), 1, "成功路径只起一次流：{commands:?}");
+    assert_eq!(starts[0]["pitch_shift"], 7, "起流应带目标预设参数");
+    assert!(stop < load, "必须先停流再加载：{commands:?}");
+    assert_eq!(
+        h.rvc_count(ctl::RVC_STOP_STREAM),
+        1,
+        "不得 Stop/Start 两轮：{commands:?}"
+    );
+    assert_eq!(
+        h.rvc_count(ctl::RVC_LOAD_MODEL),
+        1,
+        "起流复用 LoadModel 的 handle，不重复加载：{commands:?}"
+    );
+
+    h.wait_streaming();
+    assert_eq!(h.rvc_params().pitch_shift, 7);
+    let config = h.config_text();
+    assert!(config.contains("pitch_shift = 7"), "五键基线应已写：{config}");
+    assert!(
+        config.contains("model_id = \"model-b\""),
+        "model_id 基线应已写：{config}"
+    );
+    let list = list_data(h.preset_list());
+    assert_eq!(list.model_id, "model-b");
+    assert!(!list.dirty, "载入后 live 应等于目标预设：{list:?}");
+    let saved = apply_data(h.preset_save());
+    assert_eq!(saved.model_id, "model-b", "applied 应为目标模型");
+    assert_eq!(saved.values.pitch_shift, 7);
+}
+
+/// 预设提交失败（TOML 基线被外部改坏，重建生效配置读不回来）：LoadModel 已
+/// 成功但五键与 applied 都未落盘，恢复仍用旧模型旧参数，live 与 applied 不变。
+#[test]
+fn model_use_commit_failure_restores_old_stream() {
+    let h = Harness::new("use-commit-fail", &["model-a", "model-b"], "model-a");
+    h.load_a_with_pitch3();
+    h.write_preset("model-b", 7);
+    let live_before = h.rvc_params();
+    // SPEC-04 允许用户手改 TOML：改坏后提交阶段重建生效配置必失败。
+    std::fs::write(h.daemon.dir.join("config.toml"), "not valid toml = [").unwrap();
+    h.clear_log();
+
+    let reason = expect_error(h.model_use("model-b"), ctl::CODE_INTERNAL);
+    assert!(reason.contains("model use preset commit"), "{reason}");
+    assert_restored_old_stream(&h.rvc_commands(), "model-a", "model-b", 3);
+
+    h.wait_streaming();
+    assert_eq!(h.rvc_params(), live_before, "提交失败不得改 live 参数");
+    let list = list_data(h.preset_list());
+    assert_eq!(list.model_id, "model-a", "applied 不得改成目标模型");
+    assert!(!list.dirty, "live 应仍等于 A 的预设：{list:?}");
+    assert_eq!(apply_data(h.preset_save()).values.pitch_shift, 3);
+}
+
+/// 文件任务占 GPU：拒绝切换（CODE_BUSY），不碰流、参数与基线。
+#[test]
+fn model_use_rejected_while_file_job_owns_gpu() {
+    let h = Harness::new_with_env(
+        "use-busy",
+        &["model-a", "model-b"],
+        "model-a",
+        &[("MOZART_RVC_STUB_FILE_DELAY_MS", "2000")],
+    );
+    h.run_file("a.wav", "model-a");
+    expect_ok(h.config_set("rvc.pitch_shift", "3"));
+    apply_data(h.preset_save());
+    h.write_preset("model-b", 7);
+    let baseline_before = h.config_text();
+
+    let job_id = h.submit("busy.wav", "model-a");
+    assert!(
+        wait_until(JOB_TIMEOUT, || {
+            file_job(&h.conn, &job_id).progress.stage == "infer"
+        }),
+        "任务应进入 infer 段占住 GPU"
+    );
+    h.clear_log();
+    let reason = expect_error(h.model_use("model-b"), ctl::CODE_BUSY);
+    assert!(reason.contains("file job owns GPU"), "{reason}");
+    assert!(
+        h.stream_starts("realtime").is_empty(),
+        "拒绝切换不得起实时流：{:?}",
+        h.entries()
+    );
+    assert_eq!(h.rvc_params().pitch_shift, 3);
+    assert_eq!(h.config_text(), baseline_before);
+
+    let job = wait_job_state(&h.conn, &job_id, FileJobState::Completed, JOB_TIMEOUT);
+    assert!(job.result_ready, "被拒的切换不得影响文件任务：{job:?}");
 }
 
 /// 生成 PCM16 单声道正弦 WAV（同 file_worker 用例）。

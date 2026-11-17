@@ -9,6 +9,7 @@ use mozart_core::ctl::schema::{
     error_body, ok_body, DspSetRequest, FileModeSetRequest, MuteSetRequest, RouteSetRequest,
 };
 use mozart_core::ctl::{self, Message, Seqpacket, ACCEPT_POLL, IDLE_TIMEOUT, RECV_POLL};
+use mozart_core::dgram::FRAME_SIZE_MISMATCH_REASON;
 use mozart_core::ring::Ring;
 use mozart_core::{OutputFrame, RawFrame};
 use serde_json::{json, Value};
@@ -27,16 +28,19 @@ const DROP_LOG_INTERVAL: Duration = Duration::from_secs(1);
 
 /// 环丢帧限频上报（SPEC-01）：实时热路径只计数不打日志，控制线程在
 /// GetStatus 发现增量时记录。距上次日志不足 DROP_LOG_INTERVAL 时不推进
-/// 基线，增量并入下一条日志。
+/// 基线，增量并入下一条日志。另承载报文尺寸不符的一次性诊断（混跑属部署态，
+/// 不随帧刷屏）。
 struct DropLog {
     /// 上次写入日志的各环累计值，顺序与 report 的环列表一致。
     last: [u64; 4],
     last_log: Option<Instant>,
+    /// 尺寸不符原因已记录：只记首次，之后计数仍经 consumer_drops 可查。
+    frame_size_mismatch_logged: bool,
 }
 
 impl DropLog {
     fn new() -> Self {
-        Self { last: [0; 4], last_log: None }
+        Self { last: [0; 4], last_log: None, frame_size_mismatch_logged: false }
     }
 
     /// `rings` 为（环名, 当前累计）。只在控制线程调用，允许分配与阻塞。
@@ -63,6 +67,27 @@ impl DropLog {
         if logged {
             self.last = rings.map(|(_, total)| total);
             self.last_log = Some(now);
+        }
+    }
+
+    /// 报文尺寸不符（新旧进程混跑，帧契约扩字段）首次出现时记录可查询原因。
+    /// 接收线程只发布原子计数，分配与加锁留在控制线程（AGENTS 实时线程约束）。
+    fn report_frame_size_mismatch(&mut self, shared: &Shared) {
+        if self.frame_size_mismatch_logged {
+            return;
+        }
+        for (label, total) in [
+            ("rvc output socket", shared.ai_recv_size_mismatch()),
+            ("tts output socket", shared.tts_recv_size_mismatch()),
+        ] {
+            if total > 0 {
+                let message =
+                    format!("{label}: {FRAME_SIZE_MISMATCH_REASON} (packets {total})");
+                shared.set_last_error(&message);
+                eprintln!("mozart-pre: {message}");
+                self.frame_size_mismatch_logged = true;
+                return;
+            }
         }
     }
 }
@@ -252,6 +277,7 @@ fn dispatch(
                 ("rvc", rvc_dropped),
                 ("tts", tts_dropped),
             ]);
+            drop_log.report_frame_size_mismatch(shared);
             let readout = QueueReadout {
                 depth: capture_ring.depth() as u64,
                 dropped: capture_dropped + trunk_dropped,
@@ -354,6 +380,28 @@ mod tests {
         );
         assert_eq!(status["last_error"], Value::Null);
         assert_eq!(status["version"], VERSION);
+    }
+
+    /// 混跑诊断：报文尺寸不符首次经 GetStatus 记录可查询原因，之后不重复
+    /// 记录（计数继续增长，原因文本保持首次值，不随帧刷屏）。
+    #[test]
+    fn status_records_frame_size_mismatch_once() {
+        let (shared, cap, trunk, rvc, tts, mut log) = context();
+        let reply = dispatch(&message(ctl::PRE_GET_STATUS, b"{}"), &shared, &cap, &trunk, &rvc, &tts, &mut log);
+        assert_eq!(data(&reply)["last_error"], Value::Null);
+
+        shared.set_ai_recv_size_mismatch(1);
+        let reply = dispatch(&message(ctl::PRE_GET_STATUS, b"{}"), &shared, &cap, &trunk, &rvc, &tts, &mut log);
+        let reason = data(&reply)["last_error"].as_str().unwrap().to_string();
+        assert!(
+            reason.contains(FRAME_SIZE_MISMATCH_REASON),
+            "原因须说明尺寸不符与同代重建：{reason}"
+        );
+        assert!(reason.contains("rvc output socket"), "须点名支路：{reason}");
+
+        shared.set_ai_recv_size_mismatch(50);
+        let reply = dispatch(&message(ctl::PRE_GET_STATUS, b"{}"), &shared, &cap, &trunk, &rvc, &tts, &mut log);
+        assert_eq!(data(&reply)["last_error"], json!(reason), "只记首次");
     }
 
     #[test]

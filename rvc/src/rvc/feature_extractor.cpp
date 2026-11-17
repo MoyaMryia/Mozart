@@ -133,7 +133,8 @@ void FeatureExtractor::ensure_quality_engines() {
                 const auto shape = trt->input_shape("mel");
                 const bool ok = shape.empty()
                     || (shape.size() == 3 && shape[0] == 1
-                        && shape[1] == 128 && shape[2] != 0);
+                        && shape[1] == static_cast<int64_t>(kRealtimeRmvpeMelBands)
+                        && shape[2] != 0);
                 if (!ok) {
                     spdlog::warn("RMVPE TRT 引擎形状不符（期望 [1,128,T]），回退 ONNX");
                     rmvpe_engine.reset();
@@ -143,7 +144,8 @@ void FeatureExtractor::ensure_quality_engines() {
                 const auto shape = rmvpe_engine->input_shape("mel");
                 if (shape.size() == 3 && shape[2] > 0) {
                     warmup_zeros(
-                        *rmvpe_engine, "mel", {1, 128, shape[2]}, "f0"
+                        *rmvpe_engine, "mel",
+                        {1, static_cast<int64_t>(kRealtimeRmvpeMelBands), shape[2]}, "f0"
                     );
                 }
                 spdlog::info("RMVPE engine loaded: {}", rmvpe_path_->string());
@@ -215,7 +217,8 @@ bool FeatureExtractor::supports_realtime_hubert_samples(size_t samples) const {
 bool FeatureExtractor::supports_realtime_rmvpe_frames(size_t frames) const {
     if (!realtime_rmvpe_engine_ || !realtime_rmvpe_engine_->loaded()) return false;
     const auto shape = realtime_rmvpe_engine_->input_shape("mel");
-    return shape.size() == 3 && shape[0] == 1 && shape[1] == 128
+    return shape.size() == 3 && shape[0] == 1
+        && shape[1] == static_cast<int64_t>(kRealtimeRmvpeMelBands)
         && shape[2] == static_cast<int64_t>(frames);
 }
 
@@ -476,7 +479,7 @@ std::vector<float> FeatureExtractor::extract_f0_impl(
         const auto profile_start = profile::Clock::now();
         auto mel = compute_mel(audio, sample_rate);
         const auto profile_mel = profile::Clock::now();
-        constexpr size_t mel_bins = 128;
+        constexpr size_t mel_bins = kRealtimeRmvpeMelBands;
         const size_t mel_frames = mel.size() / mel_bins;
         std::vector<float> hz(mel_frames, 0.0f);
         constexpr size_t pitch_bins = 360;
@@ -523,7 +526,9 @@ std::vector<float> FeatureExtractor::extract_f0_impl(
             }
         }
         const size_t padded_frames = mel_frames > 0
-            ? 32 * ((mel_frames - 1) / 32 + 1) : 0;
+            ? kRealtimeRmvpeBlockFrames
+                * ((mel_frames - 1) / kRealtimeRmvpeBlockFrames + 1)
+            : 0;
         const auto maximum_shape = rmvpe ? rmvpe->max_input_shape("mel") : std::vector<int64_t>{};
         const bool outside_profile = dynamic_time && maximum_shape.size() >= 3 && maximum_shape[2] > 0
             && padded_frames > static_cast<size_t>(maximum_shape[2]);

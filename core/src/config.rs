@@ -133,6 +133,30 @@ impl Default for PreConfig {
     }
 }
 
+/// `[rvc.realtime]` 旋钮的默认值、上限与整除模数：镜像单一来源
+/// `tools/model/realtime_chain_params.json`（geometry 段）与 C++ 侧
+/// `rvc/include/rvc/realtime_geometry.hpp`。跨语言双定义由
+/// `realtime_knobs_mirror_params_json` 测试读 JSON 对拍钉住。
+const REALTIME_CROSSFADE_MS_DEFAULT: u32 = 50;
+const REALTIME_SOLA_SEARCH_MS_DEFAULT: u32 = 10;
+const REALTIME_STARTUP_DELAY_MS_DEFAULT: u32 = 400;
+const REALTIME_SKIP_SILENCE_DEFAULT: bool = true;
+/// 上限按 48 kHz 契约换算成 ms（crossfade_max_out 2400、sola_search_max_out 480）；
+/// 各采样率的 max_out 同比缩放，故 ms 边界与采样率无关。
+const REALTIME_CROSSFADE_MS_MAX: u32 = 50;
+const REALTIME_SOLA_SEARCH_MS_MAX: u32 = 10;
+/// overlap 锁为定值而非范围：引擎资产形状按最大 overlap 固定，小于它会让
+/// StreamingRvc 的分析窗帧数与资产不符，推理层每块抛异常。
+const REALTIME_OVERLAP_MS_MAX: u32 = 60;
+/// 启动缓冲上限：C++ 输出环 16 s @48k，留 1 s 余量。
+const REALTIME_STARTUP_DELAY_MS_MAX: u32 = 15000;
+/// 整除模数来自 `StreamingRvc` 的几何要求：淡化 + SOLA 须落在模型帧网格
+/// （100 Hz → 10 ms），启动缓冲须落在契约帧网格（20 ms 帧 → 20 ms）。
+/// 违反会在推理层抛异常，故在配置入口拒绝。
+const REALTIME_MODEL_FRAME_RATE: u32 = 100;
+const REALTIME_OVERLAP_MS_QUANTUM: u32 = 1000 / REALTIME_MODEL_FRAME_RATE;
+const REALTIME_STARTUP_MS_QUANTUM: u32 = 1000 / (1000 / crate::FRAME_MS);
+
 /// `[rvc.realtime]` 非形状类实时旋钮（SPEC-03 实时几何与资产参数节）。
 #[derive(Debug, Clone, Deserialize)]
 #[serde(default, deny_unknown_fields)]
@@ -146,10 +170,10 @@ pub struct RvcRealtimeConfig {
 impl Default for RvcRealtimeConfig {
     fn default() -> Self {
         Self {
-            crossfade_ms: 50,
-            sola_search_ms: 10,
-            startup_delay_ms: 400,
-            skip_silence: true,
+            crossfade_ms: REALTIME_CROSSFADE_MS_DEFAULT,
+            sola_search_ms: REALTIME_SOLA_SEARCH_MS_DEFAULT,
+            startup_delay_ms: REALTIME_STARTUP_DELAY_MS_DEFAULT,
+            skip_silence: REALTIME_SKIP_SILENCE_DEFAULT,
         }
     }
 }
@@ -707,25 +731,37 @@ impl Config {
         validate_socket_name(&self.rvc.input_socket, "rvc.input_socket")?;
         validate_socket_name(&self.rvc.output_socket, "rvc.output_socket")?;
         validate_rvc_session_values(&self.rvc.session_values())?;
-        if self.rvc.realtime.crossfade_ms > 50 {
-            return Err(ConfigError::Invalid(
-                "rvc.realtime.crossfade_ms must be <= 50".to_string(),
-            ));
+        let realtime = &self.rvc.realtime;
+        if realtime.crossfade_ms > REALTIME_CROSSFADE_MS_MAX {
+            return Err(ConfigError::Invalid(format!(
+                "rvc.realtime.crossfade_ms must be <= {REALTIME_CROSSFADE_MS_MAX}"
+            )));
         }
-        if self.rvc.realtime.sola_search_ms > 10 {
-            return Err(ConfigError::Invalid(
-                "rvc.realtime.sola_search_ms must be <= 10".to_string(),
-            ));
+        if realtime.sola_search_ms > REALTIME_SOLA_SEARCH_MS_MAX {
+            return Err(ConfigError::Invalid(format!(
+                "rvc.realtime.sola_search_ms must be <= {REALTIME_SOLA_SEARCH_MS_MAX}"
+            )));
         }
-        if self.rvc.realtime.crossfade_ms + self.rvc.realtime.sola_search_ms > 60 {
-            return Err(ConfigError::Invalid(
-                "rvc.realtime.crossfade_ms + sola_search_ms must be <= 60".to_string(),
-            ));
+        let overlap_ms = realtime.crossfade_ms + realtime.sola_search_ms;
+        if overlap_ms != REALTIME_OVERLAP_MS_MAX {
+            return Err(ConfigError::Invalid(format!(
+                "rvc.realtime.crossfade_ms + sola_search_ms must equal \
+                 {REALTIME_OVERLAP_MS_MAX} ms: engine asset shapes are fixed at the \
+                 maximum overlap; adjustable overlap is not implemented yet"
+            )));
         }
-        if self.rvc.realtime.startup_delay_ms > 15000 {
-            return Err(ConfigError::Invalid(
-                "rvc.realtime.startup_delay_ms must be <= 15000".to_string(),
-            ));
+        // overlap 锁为定值后天然落在模型帧网格上，不再重复校验整除；
+        // 解耦分析窗与淡化量、放开范围时须恢复该约束（见 SPEC-03 改进点）。
+        if realtime.startup_delay_ms > REALTIME_STARTUP_DELAY_MS_MAX {
+            return Err(ConfigError::Invalid(format!(
+                "rvc.realtime.startup_delay_ms must be <= {REALTIME_STARTUP_DELAY_MS_MAX}"
+            )));
+        }
+        if realtime.startup_delay_ms % REALTIME_STARTUP_MS_QUANTUM != 0 {
+            return Err(ConfigError::Invalid(format!(
+                "rvc.realtime.startup_delay_ms must be a multiple of \
+                 {REALTIME_STARTUP_MS_QUANTUM} ms (output frame grid)"
+            )));
         }
         validate_socket_name(&self.asr.socket, "asr.socket")?;
         validate_socket_name(&self.asr.input_socket, "asr.input_socket")?;
@@ -2254,19 +2290,184 @@ mod tests {
         assert_eq!(cfg.rvc.realtime.startup_delay_ms, 400);
         assert!(cfg.rvc.realtime.skip_silence);
 
-        set_key(Some(&path), "rvc.realtime.crossfade_ms", "40").unwrap();
-        set_key(Some(&path), "rvc.realtime.sola_search_ms", "5").unwrap();
+        // overlap 锁为 60 ms（50 + 10）；startup_delay 与 skip_silence 仍可调。
+        set_key(Some(&path), "rvc.realtime.crossfade_ms", "50").unwrap();
+        set_key(Some(&path), "rvc.realtime.sola_search_ms", "10").unwrap();
         set_key(Some(&path), "rvc.realtime.startup_delay_ms", "200").unwrap();
         set_key(Some(&path), "rvc.realtime.skip_silence", "false").unwrap();
 
         let updated = Config::load_from(Some(&path)).unwrap();
-        assert_eq!(updated.rvc.realtime.crossfade_ms, 40);
-        assert_eq!(updated.rvc.realtime.sola_search_ms, 5);
+        assert_eq!(updated.rvc.realtime.crossfade_ms, 50);
+        assert_eq!(updated.rvc.realtime.sola_search_ms, 10);
         assert_eq!(updated.rvc.realtime.startup_delay_ms, 200);
         assert!(!updated.rvc.realtime.skip_silence);
 
         assert!(set_key(Some(&path), "rvc.realtime.crossfade_ms", "51").is_err());
         assert!(set_key(Some(&path), "rvc.realtime.sola_search_ms", "11").is_err());
+        // 上限内但 overlap 不等于 60：引擎形状对不上，入口拒绝且不写回文件。
+        assert!(set_key(Some(&path), "rvc.realtime.crossfade_ms", "40").is_err());
+        assert!(set_key(Some(&path), "rvc.realtime.sola_search_ms", "5").is_err());
+        // 上限内但违反启动缓冲整除：同样在入口拒绝。
+        assert!(set_key(Some(&path), "rvc.realtime.startup_delay_ms", "410").is_err());
+        let unchanged = Config::load_from(Some(&path)).unwrap();
+        assert_eq!(unchanged.rvc.realtime.crossfade_ms, 50);
+        assert_eq!(unchanged.rvc.realtime.sola_search_ms, 10);
+        assert_eq!(unchanged.rvc.realtime.startup_delay_ms, 200);
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 启动缓冲整除约束来自 StreamingRvc 的几何要求（落在契约帧网格）：
+    /// 上下限内的非法值必须在入口拒绝，不冒到推理层。overlap 锁定后
+    /// startup_delay_ms 仍可在整个合法范围内变动。
+    #[test]
+    fn rvc_realtime_grid_constraints_are_enforced_at_entry() {
+        let rejected = [
+            "[rvc.realtime]\nstartup_delay_ms = 410\n",
+            "[rvc.realtime]\nstartup_delay_ms = 1\n",
+        ];
+        for text in rejected {
+            let config: Config = toml::from_str(text).unwrap();
+            let err = config.validate().unwrap_err().to_string();
+            assert!(
+                err.contains("multiple of"),
+                "应因整除约束拒绝：{text}（实际 {err}）"
+            );
+        }
+
+        let accepted = [
+            "[rvc.realtime]\ncrossfade_ms = 50\nsola_search_ms = 10\nstartup_delay_ms = 15000\n",
+            "[rvc.realtime]\ncrossfade_ms = 50\nsola_search_ms = 10\nstartup_delay_ms = 0\n",
+            "[rvc.realtime]\ncrossfade_ms = 50\nsola_search_ms = 10\nstartup_delay_ms = 20\n",
+            "[rvc.realtime]\ncrossfade_ms = 50\nsola_search_ms = 10\nstartup_delay_ms = 200\n",
+        ];
+        for text in accepted {
+            let config: Config = toml::from_str(text).unwrap();
+            assert!(config.validate().is_ok(), "应接受：{text}");
+        }
+    }
+
+    /// overlap 锁为引擎形状对应的定值 60 ms：小于它时 StreamingRvc 的分析窗
+    /// 帧数与资产不符，推理层每块抛异常，故两个入口都必须在入口拒绝。
+    /// 与 C++ 侧 `validate_realtime_knobs` 同口径（tests/test_rvc_realtime_params.cpp）。
+    #[test]
+    fn rvc_realtime_overlap_is_locked_to_engine_shape() {
+        let rejected = [
+            "[rvc.realtime]\ncrossfade_ms = 40\nsola_search_ms = 10\n",
+            "[rvc.realtime]\ncrossfade_ms = 30\nsola_search_ms = 10\n",
+            "[rvc.realtime]\ncrossfade_ms = 45\nsola_search_ms = 0\n",
+            "[rvc.realtime]\ncrossfade_ms = 40\nsola_search_ms = 5\n",
+            "[rvc.realtime]\ncrossfade_ms = 0\nsola_search_ms = 5\n",
+            "[rvc.realtime]\ncrossfade_ms = 0\nsola_search_ms = 0\n",
+            "[rvc.realtime]\ncrossfade_ms = 50\nsola_search_ms = 0\n",
+            "[rvc.realtime]\ncrossfade_ms = 0\nsola_search_ms = 10\n",
+        ];
+        for text in rejected {
+            let config: Config = toml::from_str(text).unwrap();
+            let err = config.validate().unwrap_err().to_string();
+            assert!(
+                err.contains("must equal")
+                    && err.contains("fixed at the maximum overlap")
+                    && err.contains("not implemented"),
+                "应说明 overlap 是定值而非范围：{text}（实际 {err}）"
+            );
+        }
+
+        // 上限本身即定值：50 + 10 = 60 是唯一合法组合。
+        let config: Config =
+            toml::from_str("[rvc.realtime]\ncrossfade_ms = 50\nsola_search_ms = 10\n").unwrap();
+        assert!(config.validate().is_ok());
+        assert_eq!(
+            u64::from(REALTIME_CROSSFADE_MS_MAX + REALTIME_SOLA_SEARCH_MS_MAX),
+            u64::from(REALTIME_OVERLAP_MS_MAX),
+            "两项上限之和必须等于锁定的 overlap，否则定值无解"
+        );
+    }
+
+    /// 跨语言对拍：配置入口的默认值、上限与整除模数必须等于单一来源
+    /// `tools/model/realtime_chain_params.json`。C++ 镜像由
+    /// `tests/test_rvc_realtime_params.cpp` 读同一份 JSON 比对。
+    #[test]
+    fn realtime_knobs_mirror_params_json() {
+        let path = concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../tools/model/realtime_chain_params.json"
+        );
+        let text = std::fs::read_to_string(path)
+            .unwrap_or_else(|err| panic!("读不到实时参数单一来源 {path}: {err}"));
+        let params: serde_json::Value = serde_json::from_str(&text).unwrap();
+        let geometry = &params["geometry"];
+        let contract = &params["model_contract"];
+        let num = |value: &serde_json::Value| value.as_u64().expect("JSON 数值键");
+
+        let defaults = RvcRealtimeConfig::default();
+        assert_eq!(u64::from(defaults.crossfade_ms), num(&geometry["crossfade_ms"]));
+        assert_eq!(
+            u64::from(defaults.sola_search_ms),
+            num(&geometry["sola_search_ms"])
+        );
+        assert_eq!(
+            u64::from(defaults.startup_delay_ms),
+            num(&geometry["startup_delay_ms"])
+        );
+        assert_eq!(
+            defaults.skip_silence,
+            geometry["skip_silence"].as_bool().expect("JSON skip_silence")
+        );
+
+        let samples_per_ms = num(&contract["output_sample_rate"]) / 1000;
+        let crossfade_max_out = num(&geometry["crossfade_max_out"]);
+        let sola_max_out = num(&geometry["sola_search_max_out"]);
+        assert_eq!(
+            u64::from(REALTIME_CROSSFADE_MS_MAX),
+            crossfade_max_out / samples_per_ms
+        );
+        assert_eq!(
+            u64::from(REALTIME_SOLA_SEARCH_MS_MAX),
+            sola_max_out / samples_per_ms
+        );
+        assert_eq!(
+            u64::from(REALTIME_OVERLAP_MS_MAX),
+            (crossfade_max_out + sola_max_out) / samples_per_ms
+        );
+        assert_eq!(
+            u64::from(REALTIME_STARTUP_DELAY_MS_MAX),
+            num(&geometry["startup_delay_max_ms"])
+        );
+        assert_eq!(
+            u64::from(REALTIME_MODEL_FRAME_RATE),
+            num(&contract["feature_frame_rate"])
+        );
+        assert_eq!(
+            u64::from(REALTIME_OVERLAP_MS_QUANTUM),
+            1000 / num(&contract["feature_frame_rate"])
+        );
+        // 启动缓冲网格跨语言对拍：两侧模数各由本侧帧长推导（Rust 的 FRAME_MS、
+        // C++ 的 MOZART_OUTPUT_FRAME_MS），各自断言都是自等式。这里直接读 C 头
+        // 常量钉住，任一侧帧长漂移即失败（C++ 侧见 tests/test_rvc_realtime_params.cpp）。
+        let header_path = concat!(env!("CARGO_MANIFEST_DIR"), "/include/mozart/frame.h");
+        let header = std::fs::read_to_string(header_path)
+            .unwrap_or_else(|err| panic!("读不到帧契约头 {header_path}: {err}"));
+        let contract_frame_ms = header
+            .lines()
+            .find_map(|line| {
+                let rest = line.strip_prefix("#define MOZART_OUTPUT_FRAME_MS")?;
+                rest.split_whitespace().next()?.parse::<u32>().ok()
+            })
+            .expect("frame.h 缺少 MOZART_OUTPUT_FRAME_MS");
+        assert_eq!(u64::from(crate::FRAME_MS), u64::from(contract_frame_ms));
+        assert_eq!(
+            u64::from(REALTIME_STARTUP_MS_QUANTUM),
+            u64::from(contract_frame_ms)
+        );
+
+        // JSON 的出厂默认必须自身合法（含整除），否则部署即被入口拒绝。
+        let config = Config {
+            rvc: RvcConfig {
+                realtime: defaults,
+                ..RvcConfig::default()
+            },
+            ..Config::default()
+        };
+        assert!(config.validate().is_ok(), "JSON 默认旋钮必须通过入口校验");
     }
 }

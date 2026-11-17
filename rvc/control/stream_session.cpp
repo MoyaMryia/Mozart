@@ -280,52 +280,34 @@ std::vector<uint8_t> StreamSession::handle_start_stream(
                           "model has no offline generator; refusing file stream");
     }
 
-    RealtimeStreamOptions realtime_options{
-        kRealtimeDefaultCrossfadeMs,
-        kRealtimeDefaultSolaSearchMs,
-        kRealtimeDefaultStartupDelayMs,
-        kRealtimeDefaultSkipSilence,
-    };
+    // 旋钮按 JSON 原始宽度解析，范围与整除由 validate_realtime_knobs 单点判定
+    // （模数来自 StreamingRvc 的模型帧/契约帧网格），通过后再窄化到 u32：
+    // 先窄化会让超大值回绕成合法值，绕过上限。
+    RealtimeStreamOptions realtime_options;
     if (realtime) {
+        uint64_t crossfade_ms = realtime_options.crossfade_ms;
+        uint64_t sola_search_ms = realtime_options.sola_search_ms;
+        uint64_t startup_delay_ms = realtime_options.startup_delay_ms;
         if (body.contains("crossfade_ms")) {
             if (!body.at("crossfade_ms").is_number_unsigned()) {
                 return error_body(MOZART_CTL_CODE_INVALID_ARGUMENT,
                                   "crossfade_ms must be an unsigned integer");
             }
-            const uint64_t val = body.at("crossfade_ms").get<uint64_t>();
-            if (val > 50) {
-                return error_body(MOZART_CTL_CODE_INVALID_ARGUMENT,
-                                  "crossfade_ms must be <= 50");
-            }
-            realtime_options.crossfade_ms = static_cast<uint32_t>(val);
+            crossfade_ms = body.at("crossfade_ms").get<uint64_t>();
         }
         if (body.contains("sola_search_ms")) {
             if (!body.at("sola_search_ms").is_number_unsigned()) {
                 return error_body(MOZART_CTL_CODE_INVALID_ARGUMENT,
                                   "sola_search_ms must be an unsigned integer");
             }
-            const uint64_t val = body.at("sola_search_ms").get<uint64_t>();
-            if (val > 10) {
-                return error_body(MOZART_CTL_CODE_INVALID_ARGUMENT,
-                                  "sola_search_ms must be <= 10");
-            }
-            realtime_options.sola_search_ms = static_cast<uint32_t>(val);
-        }
-        if (realtime_options.crossfade_ms + realtime_options.sola_search_ms > 60) {
-            return error_body(MOZART_CTL_CODE_INVALID_ARGUMENT,
-                              "crossfade_ms + sola_search_ms must be <= 60");
+            sola_search_ms = body.at("sola_search_ms").get<uint64_t>();
         }
         if (body.contains("startup_delay_ms")) {
             if (!body.at("startup_delay_ms").is_number_unsigned()) {
                 return error_body(MOZART_CTL_CODE_INVALID_ARGUMENT,
                                   "startup_delay_ms must be an unsigned integer");
             }
-            const uint64_t val = body.at("startup_delay_ms").get<uint64_t>();
-            if (val > 15000) {
-                return error_body(MOZART_CTL_CODE_INVALID_ARGUMENT,
-                                  "startup_delay_ms must be <= 15000");
-            }
-            realtime_options.startup_delay_ms = static_cast<uint32_t>(val);
+            startup_delay_ms = body.at("startup_delay_ms").get<uint64_t>();
         }
         if (body.contains("skip_silence")) {
             if (!body.at("skip_silence").is_boolean()) {
@@ -334,6 +316,14 @@ std::vector<uint8_t> StreamSession::handle_start_stream(
             }
             realtime_options.skip_silence = body.at("skip_silence").get<bool>();
         }
+        const std::string invalid =
+            validate_realtime_knobs(crossfade_ms, sola_search_ms, startup_delay_ms);
+        if (!invalid.empty()) {
+            return error_body(MOZART_CTL_CODE_INVALID_ARGUMENT, invalid);
+        }
+        realtime_options.crossfade_ms = static_cast<uint32_t>(crossfade_ms);
+        realtime_options.sola_search_ms = static_cast<uint32_t>(sola_search_ms);
+        realtime_options.startup_delay_ms = static_cast<uint32_t>(startup_delay_ms);
     }
 
     std::string reason;
@@ -450,12 +440,14 @@ public:
         out.inference_ms_p95 = s.inference_ms_p95;
         out.queue_depth = s.queue_depth_frames;
         out.last_error = s.last_error;
+        report_size_mismatch(transport, size_mismatch_reported_, out.last_error);
         return out;
     }
 
 private:
     std::unique_ptr<UnixDgramStream> stream_;
     std::unique_ptr<AudioWorker> worker_;
+    bool size_mismatch_reported_ = false;   // stats() 只由控制线程调用（持 mutex_）
 };
 
 // StreamWorker 文件实现：持有数据面流（阻塞发送）与 FileWorker。
@@ -489,12 +481,14 @@ public:
         out.inference_ms_p95 = s.inference_ms_p95;
         out.queue_depth = 0;   // 整段批处理无输出环
         out.last_error = s.last_error;
+        report_size_mismatch(transport, size_mismatch_reported_, out.last_error);
         return out;
     }
 
 private:
     std::unique_ptr<UnixDgramStream> stream_;
     std::unique_ptr<FileWorker> worker_;
+    bool size_mismatch_reported_ = false;   // stats() 只由控制线程调用（持 mutex_）
 };
 
 } // namespace

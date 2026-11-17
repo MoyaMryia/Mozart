@@ -4,7 +4,8 @@
 //   1. Hello 版本报告与请求体校验
 //   2. LoadModel 三态：NotFound→InvalidArgument / Failed→InferenceFailed / 成功
 //   3. StartStream：NotLoaded / 参数边界 / 句柄校验 / Busy / 能力不足拒绝；
-//      kind=file 的 total_frames / output_socket 入口校验（D1/D2）
+//      kind=file 的 total_frames / output_socket 入口校验（D1/D2）；
+//      [rvc.realtime] 四旋钮的默认值、透传、上限、整除与类型校验
 //   4. ListModels：清单字段与 loaded 按当前模型 id 判定；真实 ModelManager
 //      目录扫描与 LoadModel 注册表路径解析（InferenceBackend，无 GPU）
 //   5. GetStatus：流式与停流后的原子快照字段（字段名 = RvcStatus 契约）
@@ -340,6 +341,135 @@ int main() {
                   MOZART_CTL_RVC_START_STREAM, start_body(1))))
                   .code == MOZART_CTL_CODE_BUSY,
               "second start while active is Busy");
+    }
+
+    std::printf("test_realtime_knob_parsing_and_validation\n");
+    {
+        auto [session, backend] = make_session();
+        parse_reply(session->handle(make_message(
+            MOZART_CTL_RVC_LOAD_MODEL, {{"model_id", "qiqi"}})));
+        auto start = [&](const nlohmann::json& body) {
+            return parse_reply(session->handle(make_message(
+                MOZART_CTL_RVC_START_STREAM, body)));
+        };
+        auto stop = [&] {
+            parse_reply(session->handle(make_message(
+                MOZART_CTL_RVC_STOP_STREAM, nlohmann::json::object())));
+        };
+
+        // 缺省携带：四个旋钮取 realtime_geometry.hpp 的规范默认值。
+        Reply ok = start(start_body(1));
+        CHECK(ok.status == "ok", "realtime start without knobs is accepted");
+        CHECK(backend->last_realtime_options.crossfade_ms == kRealtimeDefaultCrossfadeMs
+              && backend->last_realtime_options.sola_search_ms == kRealtimeDefaultSolaSearchMs
+              && backend->last_realtime_options.startup_delay_ms == kRealtimeDefaultStartupDelayMs
+              && backend->last_realtime_options.skip_silence == kRealtimeDefaultSkipSilence,
+              "backend receives the four canonical knob defaults");
+        stop();
+
+        // 显式合法值原样透传：overlap 锁为 50 + 10 = 60 ms，startup 与 skip 可调。
+        nlohmann::json body = start_body(1);
+        body["crossfade_ms"] = kRealtimeMaxCrossfadeMs;
+        body["sola_search_ms"] = kRealtimeMaxSolaSearchMs;
+        body["startup_delay_ms"] = 200;
+        body["skip_silence"] = false;
+        ok = start(body);
+        CHECK(ok.status == "ok"
+              && backend->last_realtime_options.crossfade_ms == kRealtimeMaxCrossfadeMs
+              && backend->last_realtime_options.sola_search_ms == kRealtimeMaxSolaSearchMs
+              && backend->last_realtime_options.startup_delay_ms == 200
+              && backend->last_realtime_options.skip_silence == false,
+              "explicit knobs reach the backend unchanged");
+        stop();
+
+        // 上限边界合法：50 + 10 = 60 ms、15000 ms 均为网格倍数。
+        body = start_body(1);
+        body["crossfade_ms"] = kRealtimeMaxCrossfadeMs;
+        body["sola_search_ms"] = kRealtimeMaxSolaSearchMs;
+        body["startup_delay_ms"] = kRealtimeMaxStartupDelayMs;
+        ok = start(body);
+        CHECK(ok.status == "ok"
+              && backend->last_realtime_options.crossfade_ms == kRealtimeMaxCrossfadeMs
+              && backend->last_realtime_options.startup_delay_ms == kRealtimeMaxStartupDelayMs,
+              "upper bounds are accepted when they stay on the grid");
+        stop();
+
+        // overlap 锁定只针对块几何：startup_delay_ms 在合法范围内变动仍被接受。
+        for (uint32_t delay : {0u, 20u, 200u, 400u, kRealtimeMaxStartupDelayMs}) {
+            body = start_body(1);
+            body["startup_delay_ms"] = delay;
+            ok = start(body);
+            CHECK(ok.status == "ok"
+                  && backend->last_realtime_options.startup_delay_ms == delay,
+                  "startup_delay_ms stays adjustable while overlap is locked");
+            stop();
+        }
+
+        auto rejected = [&](const nlohmann::json& bad, const char* msg) {
+            const Reply reply = start(bad);
+            CHECK(reply.code == MOZART_CTL_CODE_INVALID_ARGUMENT, msg);
+        };
+        body = start_body(1);
+        body["crossfade_ms"] = kRealtimeMaxCrossfadeMs + 1;
+        rejected(body, "crossfade above the bound is rejected");
+        body = start_body(1);
+        body["sola_search_ms"] = kRealtimeMaxSolaSearchMs + 1;
+        rejected(body, "sola above the bound is rejected");
+        body = start_body(1);
+        body["startup_delay_ms"] = kRealtimeMaxStartupDelayMs + 1;
+        rejected(body, "startup above the bound is rejected");
+        // overlap 小于引擎形状对应的定值：分析窗帧数与资产不符，入口拒绝。
+        // 原因必须说明是定值而非范围（与 core/src/config.rs 同口径）。
+        const uint32_t locked[][2] = {{40, 10}, {30, 10}, {40, 5}, {0, 0}, {50, 0}};
+        for (const auto& pair : locked) {
+            body = start_body(1);
+            body["crossfade_ms"] = pair[0];
+            body["sola_search_ms"] = pair[1];
+            const Reply reply = start(body);
+            const std::string label =
+                std::to_string(pair[0]) + "+" + std::to_string(pair[1]);
+            CHECK(reply.code == MOZART_CTL_CODE_INVALID_ARGUMENT
+                  && reply.reason.find("must equal") != std::string::npos
+                  && reply.reason.find("fixed at the maximum overlap") != std::string::npos
+                  && reply.reason.find("not implemented") != std::string::npos,
+                  (label + " below the locked overlap is rejected with a reason").c_str());
+        }
+        // 启动缓冲违反契约帧整除：入口拒绝，不冒到推理层。
+        body = start_body(1);
+        body["startup_delay_ms"] = 410;
+        Reply off_grid = start(body);
+        CHECK(off_grid.code == MOZART_CTL_CODE_INVALID_ARGUMENT
+              && off_grid.reason.find("multiple of") != std::string::npos,
+              "startup 410 off the contract frame grid is rejected with a reason");
+        // 类型与位宽：非无符号整数、超 u32（不得窄化回绕成合法值）。
+        body = start_body(1);
+        body["crossfade_ms"] = "30";
+        rejected(body, "string crossfade is rejected");
+        body = start_body(1);
+        body["sola_search_ms"] = -1;
+        rejected(body, "negative sola is rejected");
+        body = start_body(1);
+        body["startup_delay_ms"] = 200.5;
+        rejected(body, "fractional startup is rejected");
+        body = start_body(1);
+        body["skip_silence"] = "true";
+        rejected(body, "string skip_silence is rejected");
+        body = start_body(1);
+        body["crossfade_ms"] = 4'294'967'296ull + 30;   // 窄化后等于 30
+        rejected(body, "crossfade beyond u32 is rejected, not wrapped");
+
+        // 拒绝不得留下活动流：下一次合法 start 仍是 ok，而不是 Busy。
+        CHECK(start(start_body(1)).status == "ok",
+              "rejected knobs leave no active stream");
+        stop();
+
+        // kind=file 不读 realtime 旋钮：即使值非法也不校验。
+        body = start_body(1);
+        body["kind"] = "file";
+        body["total_frames"] = 10;
+        body["crossfade_ms"] = "bogus";
+        body["startup_delay_ms"] = 410;
+        CHECK(start(body).status == "ok", "file kind ignores realtime knobs");
     }
 
     std::printf("test_file_kind_capability_gate\n");

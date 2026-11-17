@@ -5,6 +5,8 @@
 //   1. mock 管线直通模式：1:1 泵（每帧必回帧，样本为 3x 上采样）
 //   2. 流式模式（滑窗 preset）：帧进 = 帧出，块调度异步推进
 //   3. stop() 关停次序：close stream 解除阻塞 → join 推理/泵线程
+//   4. 实时几何对拍：AudioWorker 按旋钮换算出的分析窗与请求帧数必须等于
+//      derive_realtime_geometry 的资产形状（两侧改歪即红）
 #include "rvc/audio_worker.hpp"
 #include "transport/unix_dgram_stream.h"
 
@@ -14,6 +16,7 @@
 #include <cstring>
 #include <filesystem>
 #include <functional>
+#include <mutex>
 #include <string>
 #include <thread>
 #include <vector>
@@ -31,6 +34,13 @@ int g_fail = 0;
 #define CHECK(cond, msg) do { \
     if (cond) std::printf("  ok  %s\n", msg); \
     else { std::printf("  FAIL %s\n", msg); ++g_fail; } } while (0)
+
+// 数值对拍：失败时打印两侧实际值，直接指出漂移方向。
+#define CHECK_NUM(actual, expected, msg) do { \
+    const unsigned long long a_ = static_cast<unsigned long long>(actual); \
+    const unsigned long long e_ = static_cast<unsigned long long>(expected); \
+    if (a_ == e_) std::printf("  ok  %s\n", msg); \
+    else { std::printf("  FAIL %s（实际 %llu，期望 %llu）\n", msg, a_, e_); ++g_fail; } } while (0)
 
 // 假管线：输入最近邻 3x 上采样（确定性；搬运自旧 tests/test_streaming.cpp）
 class Upsample3Pipeline : public RVCPipelineBase {
@@ -54,6 +64,56 @@ public:
         return audio;
     }
     bool is_mock() const override { return true; }   // 直通模式
+};
+
+// 实时能力假管线：记录 StreamingRvc 实际下发的分析窗与请求。AudioWorker 把
+// ms 旋钮换算成 Config，StreamingRvc 再据此算分析窗；本管线让这条换算链的
+// 结果可与 derive_realtime_geometry 的资产形状直接对拍（推理线程写，测试读）。
+class RealtimeShapePipeline : public RVCPipelineBase {
+public:
+    struct Snapshot {
+        size_t calls = 0;
+        size_t input_samples = 0;
+        RvcRealtimeRequest request;
+    };
+
+    explicit RealtimeShapePipeline(uint32_t output_sample_rate)
+        : sr_(output_sample_rate) {}
+
+    std::vector<float> process(const std::vector<float>& audio) override {
+        return std::vector<float>((audio.size() * sr_) / 16000, 0.25f);
+    }
+    std::vector<float> process_realtime(
+        const std::vector<float>& audio, const RvcRealtimeRequest& request) override {
+        const std::lock_guard<std::mutex> lock(mutex_);
+        ++snapshot_.calls;
+        snapshot_.input_samples = audio.size();
+        snapshot_.request = request;
+        // 镜像真实引擎的形状与覆盖校验（inferencer.cpp 的 frames/shape 检查），
+        // 否则 inference_errors == 0 是恒真断言，拦不住几何漂移。
+        const size_t frames = audio.size() / kRealtimeFeatureHop;
+        const auto geom = derive_realtime_geometry(sr_);
+        if (audio.size() % kRealtimeFeatureHop != 0
+            || request.skip_head_frames + request.return_frames != frames
+            || frames != geom.front_frames
+            || request.return_frames != geom.return_frames) {
+            throw std::invalid_argument("realtime shape does not match engine contract");
+        }
+        return std::vector<float>(request.output_samples, 0.25f);
+    }
+    bool is_mock() const override { return false; }
+    bool supports_realtime_streaming() const override { return true; }
+    uint32_t realtime_sample_rate() const override { return sr_; }
+
+    Snapshot snapshot() const {
+        const std::lock_guard<std::mutex> lock(mutex_);
+        return snapshot_;
+    }
+
+private:
+    uint32_t sr_;
+    mutable std::mutex mutex_;
+    Snapshot snapshot_;
 };
 
 struct Harness {
@@ -226,6 +286,49 @@ int main() {
         CHECK(!worker.running() && waited < 1500,
               "stop closes the stream and joins promptly");
         CHECK(!stream.IsOpen(), "stop closes the data plane stream");
+    }
+
+    // ---- 实时几何对拍：旋钮换算链 vs 资产形状 ----
+    // 引擎资产按最大 overlap 固定（front_frames/return_frames），AudioWorker 却
+    // 按旋钮值喂 StreamingRvc。两者一旦不一致，推理层每块抛异常、输出补零。
+    // 这里走真实换算链（AudioWorker→StreamingRvc→process_realtime），把两侧钉住。
+    std::printf("test_realtime_knob_geometry_matches_engine_shape\n");
+    for (uint32_t sr : {32000u, 40000u, 48000u}) {
+        const std::string tag = "rtgeom-" + std::to_string(sr);
+        Harness h(tag.c_str());
+        UnixDgramStream stream(h.in_path, h.out_path, 8);
+        RealtimeShapePipeline pipeline(sr);
+        AudioWorker::Config cfg;   // 规范默认旋钮：overlap 锁为 60 ms
+        AudioWorker worker(stream, pipeline, cfg);
+        worker.start();
+        const auto geom = derive_realtime_geometry(sr);
+
+        // 12 帧 = 240 ms，恰好攒满一个实时块。入站 SO_RCVBUF 只有 8 帧，
+        // 无间隔连发会偶发丢帧致超时假红，故留 2 ms 节拍。
+        for (uint32_t idx = 1; idx <= 12; ++idx) {
+            send_frame(h.in_path, input_frame(idx, 1));
+            std::this_thread::sleep_for(std::chrono::milliseconds(2));
+        }
+        CHECK(wait_for([&] { return pipeline.snapshot().calls >= 1; }, 5000),
+              "realtime block reaches the pipeline");
+        const auto snap = pipeline.snapshot();
+        CHECK_NUM(snap.input_samples / kRealtimeFeatureHop, geom.front_frames,
+                  "分析窗帧数 == 资产 front_frames");
+        CHECK_NUM(snap.request.block_samples_16k, geom.window_samples,
+                  "请求块长 == 资产 window_samples");
+        CHECK_NUM(snap.request.skip_head_frames, geom.skip_head,
+                  "请求 skip_head == 资产 skip_head");
+        CHECK_NUM(snap.request.return_frames, geom.return_frames,
+                  "请求 return_frames == 资产 return_frames");
+        CHECK_NUM(snap.request.output_samples, geom.decoder_out_samples,
+                  "请求输出样本 == 资产 decoder_out_samples");
+        // 推理层自身的覆盖校验：skip + return 必须铺满分析窗。
+        CHECK_NUM(snap.request.skip_head_frames + snap.request.return_frames,
+                  snap.input_samples / kRealtimeFeatureHop,
+                  "skip + return 铺满分析窗");
+        CHECK(worker.get_stream_stats().inference_errors == 0,
+              "合法旋钮下无推理失败");
+        worker.stop();
     }
 
     if (g_fail) {

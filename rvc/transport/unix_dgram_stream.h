@@ -2,8 +2,8 @@
 // ============================================================================
 // 替换旧 UdpStream（Mozart-Old/IO/include/mozart/udp_stream.hpp）：线包布局与
 // core/src/dgram.rs 逐字节一致（魔数小端 u32 + 16 B meta + 小端 f32 PCM），
-// 方向约定照 SPEC-02/03：rvc 绑定 input_socket 收 1300 B 输入线包，
-// connect 到 pre 绑定的 output_socket 发 3860 B 输出线包。
+// 方向约定照 SPEC-02/03：rvc 绑定 input_socket 收 kInputPacketBytes 输入线包，
+// connect 到 pre 绑定的 output_socket 发 kOutputPacketBytes 输出线包。
 //
 // 语义（对应 core/src/dgram.rs::FrameSocket）：
 //   - 非阻塞发送（实时，默认）：过载与对端不在（ENOENT/ECONNREFUSED/ENOTCONN）
@@ -14,6 +14,7 @@
 //     + poll(POLLOUT) 用户态等待：内核阻塞 send 无法被 Close() 唤醒，会挂死
 //     StopStream。
 //   - 接收：非阻塞排空 + 100 ms poll 等待，长度或魔数不符计数丢弃后继续收；
+//     长度不符另计 recv_size_mismatch（新旧进程混跑诊断，控制线程首次记录）；
 //     Close() 置关停标志并关闭 fd，解除阻塞中的 ReadFrame。
 //   - 热路径只使用栈缓冲，不分配、不加长锁。
 #ifndef RVC_UNIX_DGRAM_STREAM_H
@@ -24,6 +25,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <filesystem>
+#include <string>
 
 #include <sys/socket.h>
 #include <sys/un.h>
@@ -59,7 +61,23 @@ bool decode_output_packet(const uint8_t* bytes, size_t len,
 struct DgramStreamStats {
     uint64_t send_dropped = 0;
     uint64_t recv_dropped = 0;
+    // 尺寸不符的接收包数（recv_dropped 的子集）：魔数对但长度不等于契约线包长，
+    // 典型成因是新旧进程混跑（帧契约扩字段）。
+    uint64_t recv_size_mismatch = 0;
 };
+
+// 尺寸不符的可查询原因：热路径只计数，控制线程（GetStatus）首次记录一次。
+// 与 core/src/dgram.rs::FRAME_SIZE_MISMATCH_REASON 同口径。
+inline constexpr const char* kFrameSizeMismatchReason =
+    "frame packet size mismatch: peer uses a different frame contract; "
+    "rebuild pre/rvc/tts/daemon from the same revision";
+
+// 尺寸不符诊断（只在控制线程调用，允许分配与日志）：首次出现记一条 spdlog，
+// 并在条件成立期间把原因覆盖进 last_error（传输优先，同 pre 侧 set_last_error）；
+// reported 由调用方按流持有，只约束日志次数。
+// 实时帧路径只加 recv_size_mismatch 原子计数，不进本函数。
+void report_size_mismatch(const DgramStreamStats& transport, bool& reported,
+                          std::string& last_error);
 
 class UnixDgramStream final : public RealTimeAudioStream {
 public:
@@ -88,6 +106,7 @@ private:
     std::atomic<int> output_fd_{-1};
     std::atomic<uint64_t> send_dropped_{0};
     std::atomic<uint64_t> recv_dropped_{0};
+    std::atomic<uint64_t> recv_size_mismatch_{0};
     sockaddr_un peer_addr_{};
     socklen_t peer_len_ = 0;
 

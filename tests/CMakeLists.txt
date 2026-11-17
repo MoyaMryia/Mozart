@@ -58,3 +58,12 @@ add_executable(t_rvc_window_geometry test_rvc_window_geometry.cpp)
 target_link_libraries(t_rvc_window_geometry PRIVATE mozart_rvc_runtime mozart_warnings)
 add_test(NAME rvc_window_geometry COMMAND t_rvc_window_geometry)
 set_tests_properties(rvc_window_geometry PROPERTIES LABELS "unit" TIMEOUT 30)
+
+# 实时参数契约对拍：运行时读 tools/model/realtime_chain_params.json，逐项比对
+# realtime_geometry.hpp 常量并用 JSON 数值独立重算几何（拦两侧漂移）。
+add_executable(t_rvc_realtime_params test_rvc_realtime_params.cpp)
+target_link_libraries(t_rvc_realtime_params PRIVATE mozart_rvc_runtime mozart_warnings)
+target_compile_definitions(t_rvc_realtime_params PRIVATE
+    MOZART_REALTIME_PARAMS_JSON="${CMAKE_CURRENT_SOURCE_DIR}/../tools/model/realtime_chain_params.json")
+add_test(NAME rvc_realtime_params COMMAND t_rvc_realtime_params)
+set_tests_properties(rvc_realtime_params PROPERTIES LABELS "unit" TIMEOUT 30)

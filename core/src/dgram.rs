@@ -1,6 +1,6 @@
 //! 数据面帧传输：Unix `SOCK_DGRAM`，一帧一条线包。
 //! 线包布局对应 frame.h：4 B 魔数（u32 小端）+ 16 B meta（小端）+ f32 PCM（小端）；
-//! 输入线包 1300 B，输出线包 3860 B。
+//! 线包总长由各帧类型的 `WirePacket::PACKET_BYTES` 单点定义。
 //! 实时线程约束：send/recv 热路径只使用栈缓冲，不做堆分配。
 
 use crate::{FrameMeta, InputFrame, OutputFrame, PACKET_HEADER_SIZE};
@@ -26,7 +26,7 @@ pub trait WirePacket: Copy {
     fn decode(bytes: &[u8]) -> Self;
 }
 
-/// send/recv 栈缓冲上限：两种线包取较大者（输出 3860 B）。
+/// send/recv 栈缓冲上限：两种线包取较大者（`OutputFrame::PACKET_BYTES`）。
 /// 实际收发长度按各帧类型的 `PACKET_BYTES` 截取。
 const MAX_PACKET_BYTES: usize = <OutputFrame as WirePacket>::PACKET_BYTES;
 
@@ -135,7 +135,16 @@ fn decode_pcm_at<const N: usize>(bytes: &[u8], offset: usize) -> [f32; N] {
 pub struct DgramStats {
     pub send_dropped: u64,
     pub recv_dropped: u64,
+    /// 接收方尺寸不符的包数（`recv_dropped` 的子集）：魔数对但长度不等于
+    /// `PACKET_BYTES`，典型成因是新旧进程混跑（帧契约扩字段）。
+    pub recv_size_mismatch: u64,
 }
+
+/// 尺寸不符的可查询原因（降级记录用）。数据面只计数，控制线程首次出现时
+/// 记录本原因；不逐帧打日志，实时热路径不分配不加锁。
+pub const FRAME_SIZE_MISMATCH_REASON: &str =
+    "frame packet size mismatch: peer uses a different frame contract; \
+     rebuild pre/rvc/tts/daemon from the same revision";
 
 /// connect 方记录的对端地址，供对端重启后重连。
 struct PeerAddr {
@@ -150,6 +159,7 @@ pub struct FrameSocket<F: WirePacket> {
     peer: Option<PeerAddr>,
     send_dropped: AtomicU64,
     recv_dropped: AtomicU64,
+    recv_size_mismatch: AtomicU64,
     frame: std::marker::PhantomData<F>,
 }
 
@@ -209,6 +219,7 @@ impl<F: WirePacket> FrameSocket<F> {
             peer,
             send_dropped: AtomicU64::new(0),
             recv_dropped: AtomicU64::new(0),
+            recv_size_mismatch: AtomicU64::new(0),
             frame: std::marker::PhantomData,
         }
     }
@@ -355,6 +366,7 @@ impl<F: WirePacket> FrameSocket<F> {
 
     /// 接收一帧。`None` 阻塞等待，`Some(t)` 超时后返回 TimedOut。
     /// 长度或魔数不符的包（短包、超长包、坏魔数）计数丢弃后继续收，
+    /// 长度不符另计 `recv_size_mismatch`（混跑诊断），
     /// 等待预算以本次调用时刻为终点，坏包不清零预算。
     pub fn recv(&self, timeout: Option<Duration>) -> io::Result<F> {
         let deadline = timeout.map(|t| Instant::now() + t);
@@ -377,6 +389,11 @@ impl<F: WirePacket> FrameSocket<F> {
                     if n == F::PACKET_BYTES && buf[0..4] == F::MAGIC.to_le_bytes() {
                         return Ok(F::decode(&buf[..F::PACKET_BYTES]));
                     }
+                    if n != F::PACKET_BYTES {
+                        // 尺寸不符（多为新旧进程混跑）单独计数：热路径只加原子，
+                        // 原因由控制线程按 FRAME_SIZE_MISMATCH_REASON 记录一次。
+                        self.recv_size_mismatch.fetch_add(1, Relaxed);
+                    }
                     self.recv_dropped.fetch_add(1, Relaxed);
                     continue;
                 }
@@ -397,6 +414,7 @@ impl<F: WirePacket> FrameSocket<F> {
         DgramStats {
             send_dropped: self.send_dropped.load(Relaxed),
             recv_dropped: self.recv_dropped.load(Relaxed),
+            recv_size_mismatch: self.recv_size_mismatch.load(Relaxed),
         }
     }
 
@@ -772,7 +790,50 @@ mod tests {
         let got = rx.recv(Some(Duration::from_secs(1))).unwrap();
         assert_same_meta(got.meta, frame.meta);
         assert_eq!(rx.stats().recv_dropped, 3);
+        // 短包与超长包属尺寸不符；等长坏魔数只计丢弃，不计尺寸。
+        assert_eq!(rx.stats().recv_size_mismatch, 2);
         assert_eq!(tx.stats().send_dropped, 0);
+        cleanup(&path);
+    }
+
+    /// 新旧进程混跑：旧代输出线包（无 sample_rate/valid_samples 两字段）比当前
+    /// 契约短 8 B。全部丢弃但不错帧，且尺寸不符单独计数供控制线程记录原因。
+    #[test]
+    fn recv_counts_legacy_output_packet_size_mismatch() {
+        let path = socket_path("legacy-out");
+        let rx = FrameSocket::<OutputFrame>::bind(&path, 8).unwrap();
+        // SAFETY: socket() 不访问其他内存。
+        let raw = unsafe { libc::socket(libc::AF_UNIX, libc::SOCK_DGRAM | libc::SOCK_CLOEXEC, 0) };
+        assert!(raw >= 0);
+        let (addr, len) = sockaddr(&path).unwrap();
+        let legacy_bytes = <OutputFrame as WirePacket>::PACKET_BYTES - 8;
+        let mut legacy = vec![0u8; legacy_bytes];
+        legacy[0..4].copy_from_slice(&crate::OUTPUT_PACKET_MAGIC.to_le_bytes());
+        // SAFETY: legacy 有效；addr 指向已初始化的 sockaddr_un。
+        let rc = unsafe {
+            libc::sendto(
+                raw,
+                legacy.as_ptr().cast(),
+                legacy.len(),
+                libc::MSG_DONTWAIT | libc::MSG_NOSIGNAL,
+                (&addr as *const libc::sockaddr_un).cast(),
+                len,
+            )
+        };
+        assert_eq!(rc as usize, legacy_bytes);
+        // SAFETY: raw 是本用例创建且未复制的文件描述符。
+        drop(unsafe { OwnedFd::from_raw_fd(raw) });
+
+        // 旧代包之后：当前代帧仍照常送达（不卡死、不错帧）。
+        let tx = FrameSocket::<OutputFrame>::connect(&path, 8).unwrap();
+        let frame = sample_output(11);
+        tx.send(&frame).unwrap();
+        let got = rx.recv(Some(Duration::from_secs(1))).unwrap();
+        assert_same_meta(got.meta, frame.meta);
+        assert_same_pcm(got.pcm, frame.pcm);
+        let stats = rx.stats();
+        assert_eq!(stats.recv_dropped, 1);
+        assert_eq!(stats.recv_size_mismatch, 1);
         cleanup(&path);
     }
 

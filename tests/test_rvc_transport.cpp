@@ -8,6 +8,7 @@
 // 6. ReadFrame 阻塞可被 Close 解除
 // 7. 对端重启后自动重连，后续帧恢复送达
 // 8. 共享帧夹具对拍：读 tests/fixtures/frame/，与 Rust 侧比对同一组字节
+// 9. 报文尺寸不符（新旧进程混跑）的可查询原因只记一次
 #include "transport/unix_dgram_stream.h"
 
 #include <atomic>
@@ -263,6 +264,45 @@ int main() {
         CHECK(stream.ReadFrame(&got, sizeof(got)), "good frame arrives after bad ones");
         CHECK(got.meta.frame_idx == 5, "good frame is intact");
         CHECK(stream.stats().recv_dropped == 3, "three malformed packets counted");
+        // 短包与超长包属尺寸不符（混跑诊断）；等长坏魔数只计丢弃。
+        CHECK(stream.stats().recv_size_mismatch == 2,
+              "size mismatches are counted apart from bad magic");
+    }
+
+    std::printf("test_size_mismatch_reason_stays_queryable\n");
+    {
+        // 混跑诊断只在控制线程记录一次日志：实时路径只计数（上一用例）。
+        DgramStreamStats transport;
+        transport.recv_size_mismatch = 3;
+        bool reported = false;
+        std::string last_error;
+        report_size_mismatch(transport, reported, last_error);
+        CHECK(reported && last_error == kFrameSizeMismatchReason,
+              "first size mismatch records a queryable reason");
+
+        // 推理错误常驻时混跑原因仍必须可查：last_error 每次 stats() 由 worker
+        // 快照重建，只在空串时补写会让它永不可查。
+        transport.recv_size_mismatch = 99;
+        last_error = "realtime inference failed";
+        report_size_mismatch(transport, reported, last_error);
+        CHECK(last_error == kFrameSizeMismatchReason,
+              "a persistent inference error does not hide the mismatch reason");
+        last_error = "realtime inference failed";
+        report_size_mismatch(transport, reported, last_error);
+        CHECK(reported && last_error == kFrameSizeMismatchReason,
+              "the reason survives later status snapshots");
+
+        bool clean_reported = false;
+        std::string clean_error;
+        report_size_mismatch(DgramStreamStats{}, clean_reported, clean_error);
+        CHECK(!clean_reported && clean_error.empty(),
+              "healthy path records nothing");
+        // 无混跑时不得抹掉已有的推理失败原因。
+        std::string inference_error = "realtime inference failed";
+        bool healthy_reported = false;
+        report_size_mismatch(DgramStreamStats{}, healthy_reported, inference_error);
+        CHECK(!healthy_reported && inference_error == "realtime inference failed",
+              "a healthy transport leaves the inference reason intact");
     }
 
     std::printf("test_send_counts_drops_when_peer_stalls\n");

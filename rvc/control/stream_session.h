@@ -40,6 +40,7 @@
 
 #include "control/ctl_link.h"
 #include "rvc/pipeline.hpp"
+#include "rvc/realtime_geometry.hpp"
 
 namespace rvc {
 
@@ -80,12 +81,12 @@ struct ModelListing {
 };
 
 // kind=realtime 非形状旋钮（SPEC-03 [rvc.realtime]）：StartStream 可选携带，缺省取
-// realtime_geometry.hpp 规范默认值。
+// realtime_geometry.hpp 的规范默认值（单一来源，范围与整除校验也在该头）。
 struct RealtimeStreamOptions {
-    uint32_t crossfade_ms = 50;
-    uint32_t sola_search_ms = 10;
-    uint32_t startup_delay_ms = 400;
-    bool skip_silence = true;
+    uint32_t crossfade_ms = kRealtimeDefaultCrossfadeMs;
+    uint32_t sola_search_ms = kRealtimeDefaultSolaSearchMs;
+    uint32_t startup_delay_ms = kRealtimeDefaultStartupDelayMs;
+    bool skip_silence = kRealtimeDefaultSkipSilence;
 };
 
 // kind=file 批处理选项（计划 D1）；realtime 忽略。

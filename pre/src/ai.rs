@@ -99,6 +99,7 @@ fn recv_loop_inner(
     stop: &'static AtomicBool,
     label: &str,
     publish_recv_dropped: fn(&Shared, u64),
+    publish_size_mismatch: fn(&Shared, u64),
 ) -> Result<(), String> {
     loop {
         if stop.load(Ordering::Relaxed) {
@@ -110,7 +111,10 @@ fn recv_loop_inner(
             Err(err) => return Err(format!("{label}: {err}")),
         }
         // 坏包丢弃计数发布（绝对值）；接收环满丢弃由控制线程直接读环。
-        publish_recv_dropped(&shared, socket.stats().recv_dropped);
+        // 尺寸不符只发布计数，原因由控制线程记录（实时线程不分配不加锁）。
+        let stats = socket.stats();
+        publish_recv_dropped(&shared, stats.recv_dropped);
+        publish_size_mismatch(&shared, stats.recv_size_mismatch);
     }
 }
 
@@ -131,16 +135,20 @@ pub fn recv_loop(
     // 启动不绑定：socket 为 None，等 daemon 断言实时态后在活跃分支惰性绑定。
     let mut socket: Option<FrameSocket<OutputFrame>> = None;
     // 坏包丢弃按绝对值发布：重绑后新 socket 计数从零起，旧 socket 的计数
-    // 累入基线，保证发布值单调不回退。
+    // 累入基线，保证发布值单调不回退。尺寸不符计数同纪律。
     let mut dropped_base = 0u64;
+    let mut mismatch_base = 0u64;
     loop {
         if stop.load(Ordering::Relaxed) {
             return Ok(());
         }
         if !shared.rvc_ai_active() {
             if let Some(old) = socket.take() {
-                dropped_base += old.stats().recv_dropped;
+                let stats = old.stats();
+                dropped_base += stats.recv_dropped;
+                mismatch_base += stats.recv_size_mismatch;
                 shared.set_ai_recv_dropped(dropped_base);
+                shared.set_ai_recv_size_mismatch(mismatch_base);
                 // old 在此 drop：关闭 fd 解除绑定，文件留给 daemon bind 清理。
             }
             shared.set_output_released(true);
@@ -167,7 +175,9 @@ pub fn recv_loop(
             Err(err) if err.kind() == io::ErrorKind::TimedOut => {}
             Err(err) => return Err(format!("rvc output socket: {err}")),
         }
-        shared.set_ai_recv_dropped(dropped_base + current.stats().recv_dropped);
+        let stats = current.stats();
+        shared.set_ai_recv_dropped(dropped_base + stats.recv_dropped);
+        shared.set_ai_recv_size_mismatch(mismatch_base + stats.recv_size_mismatch);
     }
 }
 
@@ -186,6 +196,7 @@ pub fn tts_recv_loop(
         stop,
         "tts output socket",
         Shared::set_tts_recv_dropped,
+        Shared::set_tts_recv_size_mismatch,
     )
 }
 
@@ -439,6 +450,53 @@ mod tests {
         let got = ring.pop(Some(Duration::from_secs(1))).unwrap();
         let FrameMeta { frame_idx, .. } = got.meta;
         assert_eq!(frame_idx, 7, "接收线程必须把输出帧推入 AI 环");
+
+        stop.store(true, Ordering::Relaxed);
+        worker.join().unwrap().unwrap();
+        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_dir(&dir);
+    }
+
+    /// 混跑诊断数据面：尺寸不符的线包（此处把 1300 B 输入帧打到输出 socket）
+    /// 丢弃并计入尺寸不符，接收线程只发布原子计数；后续合法帧照常入环。
+    #[test]
+    fn recv_loop_publishes_size_mismatch_and_keeps_receiving() {
+        let dir = socket_dir("size-mismatch");
+        let path = dir.join("rvc-out.sock");
+        let ring = Arc::new(Ring::<OutputFrame>::new(RVC_QUEUE_FRAMES));
+        let shared = Arc::new(test_shared("cap", "play", "startup"));
+        shared.set_mode_asserted(true);
+        let stop: &'static AtomicBool = Box::leak(Box::new(AtomicBool::new(false)));
+        let worker = {
+            let ring = ring.clone();
+            let shared = shared.clone();
+            let path = path.clone();
+            std::thread::spawn(move || recv_loop(path, ring, shared, stop))
+        };
+        let tx = connect_output(&path, Duration::from_secs(2));
+        let wrong_size = FrameSocket::<InputFrame>::connect(&path, RVC_QUEUE_FRAMES).unwrap();
+        wrong_size.send(&sample_frame(1)).unwrap();
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while shared.ai_recv_size_mismatch() == 0 {
+            assert!(Instant::now() < deadline, "尺寸不符必须计数并发布");
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        assert!(
+            ring.pop(Some(Duration::from_millis(50))).is_none(),
+            "尺寸不符的包不得入环"
+        );
+
+        let frame = OutputFrame::new_48k(
+            FrameMeta {
+                pts_ns: 42, frame_idx: 7, vad_flag: 1, energy_db: 0, conf: 0, segment_id: 0,
+            },
+            [0.5; mozart_core::OUTPUT_SAMPLES],
+        );
+        tx.send(&frame).unwrap();
+        let got = ring.pop(Some(Duration::from_secs(1))).unwrap();
+        // packed 字段按值取出再断言，不取引用。
+        let FrameMeta { frame_idx, .. } = got.meta;
+        assert_eq!(frame_idx, 7, "坏包之后必须继续收帧");
 
         stop.store(true, Ordering::Relaxed);
         worker.join().unwrap().unwrap();

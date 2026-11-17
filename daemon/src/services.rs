@@ -914,7 +914,13 @@ pub(crate) fn apply_rvc_session_params_locked(
         let original = format!("rvc stop stream: {reason}");
         return match start_rvc_stream(services, old, &model_id, true) {
             Ok(_) => Err((code, original)),
-            Err(restore) => Err(restore_failure(state, code, original, restore)),
+            Err(restore) => Err(restore_failure(
+                state,
+                "rvc session params",
+                code,
+                original,
+                restore,
+            )),
         };
     }
     // 停流成功：先按新参重建，失败再按旧参恢复。
@@ -933,7 +939,13 @@ pub(crate) fn apply_rvc_session_params_locked(
                     );
                     Err((code, format!("{original}; restore busy, running params unknown")))
                 }
-                Err(restore) => Err(restore_failure(state, code, original, restore)),
+                Err(restore) => Err(restore_failure(
+                    state,
+                    "rvc session params",
+                    code,
+                    original,
+                    restore,
+                )),
             }
         }
     }
@@ -952,15 +964,24 @@ fn realtime_params_changed(old: &RvcConfig, new: &RvcConfig) -> bool {
         || old.realtime.skip_silence != new.realtime.skip_silence
 }
 
+/// 换模型降级原因前缀：记录与 status 查询共用一处定义。
+const MODEL_USE_CONTEXT: &str = "rvc model use";
+
 /// 实时/空闲换模型（SPEC-04 `model use <id>`）：采用断流切换
-/// （StopStream→LoadModel→StartStream），避免 8 GB 设备同时驻留双引擎 OOM，
-/// 并支持跨采样率（40k/48k）重建 `StreamingRvc`。失败尝试恢复原模型与流。
+/// （StopStream→LoadModel→预设提交→StartStream），避免 8 GB 设备同时驻留双引擎
+/// OOM，并支持跨采样率（40k/48k）重建 `StreamingRvc`。
+/// `old` 是切换前的生效配置：所有失败路径都用它恢复旧模型与旧参数，目标预设
+/// 参数只用于提交后的那一次起流。预设提交夹在 LoadModel 与 StartStream 之间
+/// （SPEC-11 两步契约）；提交时流已停，`apply_rvc_session_params_locked` 只更新
+/// 配置，成功路径因此只起一次流。起流失败先整体回退提交，再恢复旧流。
+/// 返回切换前已加载的模型 id。调用方须已持 transition 锁。
 pub(crate) fn switch_rvc_model_locked(
     state: &Mutex<State>,
     services: &Services,
-    rvc: &RvcConfig,
+    presets: &PresetManager,
+    old: &Config,
     model_id: &str,
-) -> Result<(Option<String>, RvcConfig), (String, String)> {
+) -> Result<Option<String>, (String, String)> {
     if model_id.is_empty() {
         return Err((
             ctl::CODE_INVALID_ARGUMENT.to_string(),
@@ -977,43 +998,101 @@ pub(crate) fn switch_rvc_model_locked(
     let previous = status.model_id.clone();
     let was_realtime_streaming =
         status.state == "streaming" && status.stream_kind.as_deref() == Some("realtime");
+    // 读校验在停流前：损坏预设不打断在跑的流，也不写任何基线。
+    let resolution = presets.resolve_for_model_locked(model_id)?;
 
     if was_realtime_streaming {
         stop_rvc_stream(services).map_err(|err| err.into_rejection())?;
     }
 
-    let mut next_rvc = rvc.clone();
-    next_rvc.model_id = model_id.to_string();
-
-    let load_res = services.load_model_handle(model_id);
-    match load_res {
-        Ok(_) => {
-            if was_realtime_streaming {
-                if let Err(err) = start_rvc_stream(services, &next_rvc, model_id, false) {
-                    let (code, reason) = err.into_rejection();
-                    if let Some(prev) = previous.as_deref() {
-                        let _ = start_rvc_stream(services, rvc, prev, true);
-                    }
-                    return Err((code, format!("model use start stream: {reason}")));
-                }
-            }
-            Ok((previous, next_rvc))
-        }
+    let handle = match services.load_model_handle(model_id) {
+        Ok(handle) => handle,
         Err(err) => {
             let (code, reason) = err.into_rejection();
-            if was_realtime_streaming {
-                if let Some(prev) = previous.as_deref() {
-                    let _ = start_rvc_stream(services, rvc, prev, true);
-                }
-            }
-            Err((code, reason))
+            return Err(restore_model_stream(
+                state,
+                services,
+                &old.rvc,
+                previous.as_deref(),
+                was_realtime_streaming,
+                code,
+                reason,
+            ));
         }
+    };
+
+    // LoadModel 成功才写基线与 applied；提交时流已停，不会二次起停。
+    let (fresh, undo) = match presets.commit_model_switch_locked(model_id, resolution) {
+        Ok(committed) => committed,
+        Err((code, reason)) => {
+            // 提交内部已回退它写下的基线；这里只恢复旧模型旧参数的流。
+            return Err(restore_model_stream(
+                state,
+                services,
+                &old.rvc,
+                previous.as_deref(),
+                was_realtime_streaming,
+                code,
+                format!("model use preset commit: {reason}"),
+            ));
+        }
+    };
+
+    if was_realtime_streaming {
+        if let Err(err) = start_rvc_stream_with_handle(services, &fresh.rvc, handle, false) {
+            let (code, reason) = err.into_rejection();
+            // 基线与 applied 已落目标模型：先整体回退，再恢复旧流，
+            // 否则留下「live 参数属目标模型、rvc 载旧模型」的错位。
+            presets.rollback_model_switch_locked(undo);
+            return Err(restore_model_stream(
+                state,
+                services,
+                &old.rvc,
+                previous.as_deref(),
+                true,
+                code,
+                format!("model use start stream: {reason}"),
+            ));
+        }
+    }
+    Ok(previous)
+}
+
+/// 换模型失败后恢复旧模型与旧参数的实时流。`old` 必须是切换前的生效会话参数：
+/// 用目标预设参数恢复会让旧模型跑新模型的音高。恢复失败记持久降级原因并组合
+/// 进返回错误；恢复遇 Busy 说明流仍在跑但参数不确定，同样记录。
+fn restore_model_stream(
+    state: &Mutex<State>,
+    services: &Services,
+    old: &RvcConfig,
+    previous: Option<&str>,
+    was_realtime_streaming: bool,
+    code: String,
+    original: String,
+) -> (String, String) {
+    // 切换前没有实时流或没有已加载模型：无流可恢复，rvc 停在加载态/空闲。
+    if !was_realtime_streaming {
+        return (code, original);
+    }
+    let Some(prev) = previous else {
+        return (code, original);
+    };
+    match start_rvc_stream(services, old, prev, true) {
+        Ok(StartOutcome::Started) => (code, original),
+        Ok(StartOutcome::Running) => {
+            let reason = format!("{original}; restore busy, running params unknown");
+            lock_state(state).push_degraded(format!("{MODEL_USE_CONTEXT}: {reason}"));
+            (code, reason)
+        }
+        Err(restore) => restore_failure(state, MODEL_USE_CONTEXT, code, original, restore),
     }
 }
 
 /// 恢复失败：组合原始错误与恢复错误，并留可查询的持久降级原因。
+/// `context` 标明编排来源（会话参数写入 / 换模型），status 据此区分。
 fn restore_failure(
     state: &Mutex<State>,
+    context: &str,
     code: String,
     original: String,
     restore: CallError,
@@ -1022,7 +1101,7 @@ fn restore_failure(
         "{original}; restore with old params: {}",
         restore.describe()
     );
-    lock_state(state).push_degraded(format!("rvc session params: {reason}"));
+    lock_state(state).push_degraded(format!("{context}: {reason}"));
     (code, reason)
 }
 

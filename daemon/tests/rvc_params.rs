@@ -595,23 +595,57 @@ fn write_wav(path: &Path, seconds: u32, sample_rate: u32) {
 
 /// `[rvc.realtime]` 旋钮经 `config set` 修改时触发实时流 StopStream→StartStream，
 /// 并携带新值到 rvc；`model use <id>` 在实时流期间执行 StopStream→LoadModel→StartStream。
+/// overlap 锁为引擎形状对应的 60 ms，故用仍可调的 `startup_delay_ms` 驱动编排；
+/// 偏离定值的 crossfade 必须在入口拒绝，不下发任何 Stop/Start。
 #[test]
 fn realtime_knob_and_model_use_orchestrate_stop_start() {
     let h = Harness::new("rt-knob-model-use", &[]);
     h.set_route_rvc();
 
     let stop_before = h.rvc_count(ctl::RVC_STOP_STREAM);
-    let reply = h.config_set("rvc.realtime.crossfade_ms", "40");
+    let reply = h.config_set("rvc.realtime.startup_delay_ms", "200");
     assert_eq!(reply.status, "ok", "reason: {}", reply.reason);
     assert!(
         h.rvc_count(ctl::RVC_STOP_STREAM) > stop_before,
-        "改 rvc.realtime.crossfade_ms 应触发 StopStream"
+        "改 rvc.realtime.startup_delay_ms 应触发 StopStream"
     );
     let last_start = h
         .stream_starts("realtime")
         .pop()
         .expect("应重起实时流");
-    assert_eq!(last_start["crossfade_ms"], 40);
+    assert_eq!(last_start["startup_delay_ms"], 200);
+    assert_eq!(last_start["crossfade_ms"], 50, "overlap 仍锁在 50 + 10");
+    assert_eq!(last_start["sola_search_ms"], 10);
+
+    // overlap 偏离定值：入口拒绝，不触发 Stop/Start，也不改 TOML 基线。
+    let stop_before_bad = h.rvc_count(ctl::RVC_STOP_STREAM);
+    let start_before_bad = h.stream_starts("realtime").len();
+    let baseline_path = h._daemon.dir.join("config.toml");
+    let baseline_before_bad = std::fs::read_to_string(&baseline_path).unwrap();
+    let bad = h.config_set("rvc.realtime.crossfade_ms", "40");
+    assert_eq!(bad.status, "error");
+    assert_eq!(bad.code, ctl::CODE_INVALID_ARGUMENT);
+    assert!(
+        bad.reason.contains("must equal")
+            && bad.reason.contains("fixed at the maximum overlap"),
+        "拒绝原因应说明 overlap 是定值：{}",
+        bad.reason
+    );
+    assert_eq!(
+        h.rvc_count(ctl::RVC_STOP_STREAM),
+        stop_before_bad,
+        "被拒的旋钮不得停流"
+    );
+    assert_eq!(
+        h.stream_starts("realtime").len(),
+        start_before_bad,
+        "被拒的旋钮不得起流"
+    );
+    assert_eq!(
+        std::fs::read_to_string(&baseline_path).unwrap(),
+        baseline_before_bad,
+        "被拒的 set 不得改动 TOML 基线"
+    );
 
     let stop_before_use = h.rvc_count(ctl::RVC_STOP_STREAM);
     let load_before_use = h.rvc_count(ctl::RVC_LOAD_MODEL);
@@ -633,7 +667,7 @@ fn realtime_knob_and_model_use_orchestrate_stop_start() {
         .stream_starts("realtime")
         .pop()
         .expect("换模型后应重起实时流");
-    assert_eq!(last_after_use["crossfade_ms"], 40);
+    assert_eq!(last_after_use["startup_delay_ms"], 200);
 
     // 不存在的模型：返回错误并恢复原模型流。
     h.conn

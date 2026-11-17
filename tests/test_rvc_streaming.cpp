@@ -8,7 +8,9 @@
 //      共享同一段输入、数值相等，混合后无失真）
 //   3. 静音窗跳过：VAD 全零窗口跳推理、输出等长静音
 //   4. frame_idx 缺口触发重置且流恢复
+//   5. 原生多采样率（40k/32k）：块节拍不变，输出帧与启动缓冲按模型采样率量化
 #include "rvc/streaming_pipeline.hpp"
+#include "rvc/realtime_geometry.hpp"
 
 #include <cmath>
 #include <cstdio>
@@ -443,6 +445,100 @@ int main()
         CHECK(s.output_sample_rate() == 40000, "40k output_sample_rate");
         CHECK(s.output_frame_samples() == 800, "40k output_frame_samples == 800");
         CHECK(s.stats().blocks.load() >= 2, "40k stream produces blocks");
+    }
+
+    printf("test_native_32k_realtime_streaming\n");
+    {
+        // 32k 原生流式：几何由 realtime_geometry.hpp 推导（与 40k/48k 同一公式），
+        // 块节拍仍是 240 ms，输出帧与启动缓冲按 32k 契约帧（640 样本）量化。
+        struct Pipe32k : public RVCPipelineBase {
+            std::vector<float> process(const std::vector<float>& audio) override {
+                return std::vector<float>((audio.size() * 32000) / 16000, 0.25f);
+            }
+            std::vector<float> process_realtime(
+                const std::vector<float>&, const RvcRealtimeRequest& request) override {
+                ++calls;
+                last_request = request;
+                return std::vector<float>(request.output_samples, 0.25f);
+            }
+            size_t calls = 0;
+            RvcRealtimeRequest last_request;
+        } pipe32k;
+
+        const auto geom = derive_realtime_geometry(32000);
+        CHECK(geom.crossfade_max_out == 1600, "32k crossfade max == 1600");
+        CHECK(geom.sola_search_max_out == 320, "32k sola max == 320");
+        CHECK(geom.output_frame_samples == 640, "32k contract frame == 640 samples");
+        CHECK(geom.output_hop == 7680, "32k output hop == 7680");
+        CHECK(geom.decoder_out_samples == 9600, "32k decoder out == 9600");
+
+        StreamingRvc::Config cfg;
+        cfg.output_sample_rate = 32000;
+        cfg.upstream_realtime = true;
+        cfg.window_samples = geom.window_samples;
+        cfg.past_context_samples = geom.past_context_samples;
+        cfg.crossfade_out = geom.crossfade_max_out;
+        cfg.sola_search_out = geom.sola_search_max_out;
+        cfg.startup_buffer_blocks = 1;
+        cfg.skip_silence = false;
+        StreamingRvc s(cfg);
+        CHECK(s.output_sample_rate() == 32000, "32k output_sample_rate");
+        CHECK(s.output_frame_samples() == 640, "32k output_frame_samples == 640");
+
+        uint32_t idx = 1;
+        for (size_t frame = 0; frame < 11; ++frame) {
+            s.push(make_frame(idx, 1, 0.1f, 1, idx * 20000000ull));
+            ++idx;
+            CHECK(!s.try_process_one(pipe32k), "32k realtime waits until the 240ms block");
+        }
+        s.push(make_frame(idx, 1, 0.1f, 1, idx * 20000000ull));
+        ++idx;
+        CHECK(s.try_process_one(pipe32k), "32k realtime starts after one 240ms block");
+        CHECK(pipe32k.calls == 1, "one realtime inference call");
+        CHECK(pipe32k.last_request.block_samples_16k == 3840,
+              "32k keeps the 16k input block at 3840 samples");
+        CHECK(pipe32k.last_request.skip_head_frames == 250,
+              "32k keeps the 2.5s past-frame crop");
+        CHECK(pipe32k.last_request.return_frames == 30,
+              "32k keeps 30 return frames");
+        CHECK(pipe32k.last_request.output_samples == 9600,
+              "32k block returns 30 frames x 320 samples");
+        const auto first = drain(s);
+        CHECK(first.size() == 7680, "32k emits exactly one 240ms block");
+        CHECK(first.size() % s.output_frame_samples() == 0,
+              "32k emit is a whole number of contract frames");
+        bool finite = true;
+        for (float value : first) finite = finite && std::isfinite(value);
+        CHECK(finite, "32k SOLA output is finite");
+
+        for (size_t frame = 0; frame < 12; ++frame) {
+            s.push(make_frame(idx, 1, 0.2f, 1, idx * 20000000ull));
+            ++idx;
+            while (s.try_process_one(pipe32k)) {}
+        }
+        CHECK(pipe32k.calls == 2, "32k cadence is one call per 240ms");
+        const auto second = drain(s);
+        CHECK(second.size() == 7680, "second 32k block has fixed length");
+        CHECK(s.stats().input_overruns.load() == 0,
+              "32k rolling history is pruned without overrun");
+        CHECK(s.stats().resets.load() == 0, "32k continuous stream does not reset");
+
+        // 启动缓冲按 32k 契约帧量化：400 ms = 12800 样本 = 20 帧 640。
+        auto reserved_cfg = cfg;
+        reserved_cfg.startup_delay_out = 400 * 32;
+        StreamingRvc reserved(reserved_cfg);
+        Pipe32k reserved_pipe;
+        for (uint32_t i = 1; i <= 12; ++i) {
+            reserved.push(make_frame(i, 1, 0.1f, 1, i * 20000000ull));
+        }
+        CHECK(reserved.try_process_one(reserved_pipe), "32k reserve block is ready");
+        float output[MOZART_OUTPUT_SAMPLES]{};
+        for (int i = 0; i < 20; ++i) {
+            CHECK(reserved.pop_output(output, 640) == 0,
+                  "32k startup budget holds 20 contract frames");
+        }
+        CHECK(reserved.pop_output(output, 640) == 640,
+              "32k playback resumes after its 400ms reserve");
     }
 
     if (g_fail) {
