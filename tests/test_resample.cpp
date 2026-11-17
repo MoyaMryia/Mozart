@@ -2,7 +2,8 @@
 // ============================================================================
 // 1. 同采样率/空输入短路，原样返回（现用 48 kHz 模型走这条，零回归）
 // 2. 输出长度符合 L/M 比例
-// 3. 上采样通带保留 + 抗镜像：40k→48k，18 kHz 音保留，22 kHz 镜像被压掉
+// 3. 上采样通带保留 + 抗镜像：40k→48k，18 kHz 音保留，22 kHz 镜像被压掉；
+//    32k→48k，14 kHz 音保留，18 kHz 镜像被压掉
 // 4. 下采样抗混叠：48k→16k，10 kHz 音的 6 kHz 混叠被压掉
 // 5. 下采样通带保留：3 kHz 音原样
 // 6. 低频上采样与解析正弦逐样本相关 ≈ 1（群延迟已补偿，无偏移）
@@ -102,6 +103,25 @@ int main() {
         CHECK(pass > 0.9, "上采样通带 18 kHz 保留");
         CHECK(image < 0.02, "上采样镜像 22 kHz 抑制 > 34 dB");
         CHECK(image < image_lin * 0.1, "镜像抑制显著优于线性插值");
+    }
+
+    // 3b. 32k→48k（文件链 32 kHz 模型收尾）：长度 3/2，14 kHz 通带与
+    // 18 kHz 镜像（32k-14k），低频保真。
+    {
+        auto x = sine(32000, 14000, 0.5);
+        auto y = resample_audio(x, 32000, 48000);
+        CHECK(y.size() == x.size() * 3 / 2, "32k→48k 输出长度 3/2");
+        const double pass = amplitude(y, 48000, 14000);
+        const double image = amplitude(y, 48000, 18000);
+        const double image_lin = amplitude(linear(x, 32000, 48000), 48000, 18000);
+        std::printf("    通带 14k=%.4f 镜像 18k=%.5f（线性插值镜像=%.4f）\n", pass, image, image_lin);
+        CHECK(pass > 0.9, "32k→48k 通带 14 kHz 保留");
+        CHECK(image < 0.02, "32k→48k 镜像 18 kHz 抑制 > 34 dB");
+        CHECK(image < image_lin * 0.1, "32k→48k 镜像抑制显著优于线性插值");
+        auto low = resample_audio(sine(32000, 1000, 0.5), 32000, 48000);
+        const double c = corr(low, sine(48000, 1000, 0.5));
+        std::printf("    32k→48k 1k corr=%.6f\n", c);
+        CHECK(c > 0.99, "32k→48k 低频上采样与解析正弦相关 > 0.99");
     }
 
     // 4. 下采样抗混叠：48k 的 10 kHz 音混叠到 6 kHz，应被压掉。

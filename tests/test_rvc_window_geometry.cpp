@@ -4,7 +4,7 @@
 //    （44800→139 与 feature_extractor.cpp 实时引擎校验常量一致）
 // 2. T=398 黄金常量：pad/淡化/窗长与旧流式契约一致
 // 3. T=200 / T=2400 具体值：pad 按 T/398 缩放并封顶、窗输入由帧数反推
-// 4. 偶数 T 扫描（200..4200，model_sr 40k/48k）：oracle 验证窗输入恰好产
+// 4. 偶数 T 扫描（200..4200，model_sr 32k/40k/48k）：oracle 验证窗输入恰好产
 //    T 帧、主窗覆盖无零尾、hop 对齐 160 样本、tgt 量纲换算
 // 奇数 T 的拒绝在 infer() 入口（需引擎），不在本单测范围。
 #include "rvc/inferencer.hpp"
@@ -73,6 +73,12 @@ int main() {
         CHECK(g.window_out == 95040, "T=398 window_out == 95040");
         CHECK(g.crossfade_out == 9600, "T=398 crossfade_out == 9600");
     }
+    {
+        const auto g = offline_window_geometry(398, 32000);
+        CHECK(g.pad_tgt == 32000, "T=398@32k pad_tgt == 32000");
+        CHECK(g.window_out == 63360, "T=398@32k window_out == 63360");
+        CHECK(g.crossfade_out == 6400, "T=398@32k crossfade_out == 6400");
+    }
 
     // 3. T=200：pad 按 T/398 缩放不封顶；T=2400：pad 封顶 16000。
     {
@@ -91,7 +97,7 @@ int main() {
     }
 
     // 4. 偶数 T 扫描：窗输入由独立 oracle 验证恰好产 T 帧，其余为几何关系。
-    for (uint32_t model_sr : {40000u, 48000u}) {
+    for (uint32_t model_sr : {32000u, 40000u, 48000u}) {
         const int fail_before = g_fail;
         size_t checked = 0;
         for (size_t t = 200; t <= 4200; t += 2) {
