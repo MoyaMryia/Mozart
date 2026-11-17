@@ -65,7 +65,7 @@
 
 ### 范围与迁移
 
-- [x] v1 单预设：只 `default.toml`。多预设、按名 use、delete、last-used 推迟 FUTURE。
+- [x] v1 单预设：只 `default.toml`。多预设、按名 use、delete、last-used 见本文件改进点。
 - [x] 实时调整语义 = 下任务生效：`config set` 即时写生效配置，当前文件任务用启动快照跑完，下一任务用新参。不做任务中途变参（FUTURE SetParams）。
 - [x] 迁移无例外：升级后首次加载按统一规则建 default 并载入。用户未手调过 `[rvc]`，无保护需求。
 - [x] `[rvc]` 语义变化：从「全局持久参数来源」变为「当前载入的 live 草稿」；持久来源改为按模型预设文件。`config set`/`config save` 机制不变，五参数仍归运行时键。`[rvc].model_id` 基线只由 `model use` 写回，预设文件仍不含模型身份。
@@ -146,7 +146,6 @@ v1 体均空（固定 default、当前模型）。多预设阶段体扩 `{"name"
 - SPEC-04-daemon.md：preset 命令面与载入编排引用本文件；快照时机后移；`model use` 命令契约、次序与回退（2026-11-17）。
 - config.md：`[rvc]` 会话语义注记（live 草稿）；preset 命令引用；`model_id` 只由 `model use` 写回（2026-11-17）。
 - GUIDE.md：`model use` 用法与失败自动恢复（2026-11-17）。
-- FUTURE.md：多预设、last-used、delete、命名字符集、设默认。
 - SPEC.md：模块索引加 SPEC-11 行；变更记录加 2026-11-16 与 2026-11-17 条目。
 - ARCHITECTURE-HIGHLIGHTS.md：预设层要点。
 

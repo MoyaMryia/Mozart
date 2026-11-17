@@ -155,3 +155,4 @@
 - 2026-11-17：新旧进程混跑诊断：数据面不做版本协商，尺寸不符只在热路径计数，控制线程首次出现时记可查询原因，要求同代重建 pre/rvc/tts/daemon（SPEC-01、SPEC-02）。
 - 2026-11-17：边界变更（用户确认，取代同日 overlap 范围可调部分）：`crossfade_ms + sola_search_ms` 锁为定值 60 ms（50 + 10），入口拒绝偏离，原因是引擎形状按最大 overlap 固定、分析窗尚未与之解耦；`startup_delay_ms` 与 `skip_silence` 仍可调；淡化/SOLA 解耦推迟，待办落 SPEC-03 改进点（SPEC-03、config.md、FUTURE）。
 - 2026-11-17：新增板端套件 `tools/jetson-realtime-mm.sh`（`--realtime-mm`）：跨采样率 `model use`、overlap 定值拒绝、`startup_delay` 可调、失败恢复、40 kHz 文件链与资产隔离；板端实测 48 kHz↔40 kHz 冒烟通过，32 kHz 与延迟/听感仍未验证（SPEC-03、SPEC-11、SETUP）。
+- 2026-11-17：FUTURE 清理：删「淡化与 SOLA 可调」「多预设与 last-used」两行，待办已分别由 SPEC-03、SPEC-11 完整跟踪；听感基准行删模型覆盖表述，文档不记模型数量；SPEC-11 交叉引用同步（FUTURE、SPEC-11）。
