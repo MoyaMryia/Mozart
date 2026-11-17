@@ -10,7 +10,7 @@ python3 -m venv ~/mozart-toolkit/rvc-env
 ~/mozart-toolkit/rvc-env/bin/pip install --upgrade pip
 ~/mozart-toolkit/rvc-env/bin/pip install \
     torch transformers==4.46.3 onnx onnxruntime \
-    librosa soundfile scipy numpy
+    librosa soundfile scipy numpy faiss-cpu praat-parselmouth
 ~/mozart-toolkit/rvc-env/bin/pip freeze > ~/mozart-toolkit/requirements.txt
 ```
 
@@ -29,6 +29,7 @@ python3 -m venv ~/mozart-toolkit/rvc-env
 | transformers | **4.46.3** | 导出脚本面向 4.x。实测 5.23 用本地路径 `from_pretrained` 直接报错。 |
 | onnx / onnxruntime | 跟随依赖 | 导出校验与 runtime 检查 |
 | librosa / soundfile / scipy / numpy | 跟随依赖 | 音频读写与重采样 |
+| faiss-cpu / praat-parselmouth | 跟随依赖 | index 检索；RVC pipeline 顶层 import parselmouth，run_reference 必需（PyPI 包名 praat-parselmouth，不是 parselmouth） |
 
 固定版本后写入 `requirements.txt`，新机器按它复现。
 
