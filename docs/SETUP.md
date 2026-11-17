@@ -116,6 +116,7 @@ MOZART_JETSON=<SSH目标> tools/jetson-e2e.sh
 | `--file` | `tools/jetson-file-test.sh` | 文件转换、取消、队列与入口校验 |
 | `--file-models` | `tools/jetson-file-multimodel.sh` | `models/rvc` 下全部模型的文件转换与帧守恒 |
 | `--preset` | `tools/jetson-preset-test.sh` | 模型预设首次自动建、save/use/list、实时载入、A→B→A 切换、加载失败与损坏预设保护、资产隔离（需两个模型，`MODEL_B` 可指定） |
+| `--realtime-mm` | `tools/jetson-realtime-mm.sh` | 实时多模型：跨采样率 `model use`、overlap 定值拒绝、`startup_delay` 可调、失败恢复、40 kHz 文件链（需两个采样率不同的模型，`MODEL_A`/`MODEL_B` 可指定） |
 | `--language` | `tools/jetson-language-test.sh` | ASR → 翻译 → TTS 播报 |
 | `--measure` | `tools/jetson-measure.sh` | 延迟、淡变、长跑、自愈测量 |
 

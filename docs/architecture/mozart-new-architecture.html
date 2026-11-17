@@ -127,7 +127,7 @@ function A(id,side,f){var n=N[id];
 var E={
  mic_pre:{a:A('mic','r',.5),b:A('pre','l',.5),c:'audio',lb:'ALSA 48kHz'},
  pre_rvc:{a:A('pre','r',.3),b:A('rvc','l',.3),c:'audio',lb:'InputFrame 16k · rvc-in'},
- rvc_pre:{a:A('rvc','l',.7),b:A('pre','r',.7),c:'audio',lb:'OutputFrame 48k · rvc-out'},
+ rvc_pre:{a:A('rvc','l',.7),b:A('pre','r',.7),c:'audio',lb:'OutputFrame 32/40/48k · rvc-out'},
  pre_spk:{a:A('pre','t',.5),m:[[285,20],[940,20]],b:A('spk','t',.5),c:'audio',lb:'ALSA 播放（实时/播报）'},
  pre_asr:{a:A('pre','b',.5),b:A('asr','t',.5),c:'audio',lb:'InputFrame · asr-in'},
  asr_br:{a:A('asr','r',.5),b:A('bridge','l',.5),c:'text',lb:'events · asr-events'},
@@ -172,24 +172,26 @@ Object.keys(N).forEach(function(id){var n=N[id];
 var CV='<svg class="cv" viewBox="0 0 16 16" fill="none"><path d="M6 4l4 4-4 4" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"/></svg>';
 var D={
  ctl:{bin:'mozart-ctl',desc:'所有整机操作入口。连 daemon 发命令、渲染状态；自身无权威状态。退出码 0/1/2/3/4/5。',pts:[
-  ['proto','命令集','v1','<p>经 daemon.sock 转发，<code>--json</code> 稳定输出。</p><span class="pill">up</span><span class="pill">down</span><span class="pill">status</span><span class="pill">route set</span><span class="pill">mute</span><span class="pill">translate on|off</span><span class="pill">speech on|off|stop</span><span class="pill">config get|set|save</span><span class="pill">restart</span><span class="pill">file …</span><span class="pill">model list</span>'],
+  ['proto','命令集','v1','<p>经 daemon.sock 转发，<code>--json</code> 稳定输出。</p><span class="pill">up</span><span class="pill">down</span><span class="pill">status</span><span class="pill">route set</span><span class="pill">mute</span><span class="pill">translate on|off</span><span class="pill">speech on|off|stop</span><span class="pill">config get|set|save</span><span class="pill">restart</span><span class="pill">file …</span><span class="pill">model list</span><span class="pill">model use</span><span class="pill">preset save|use|list</span>'],
   ['sock','daemon.sock','connect','<p>SEQPACKET 控制信封（见 daemon proto 层）。request_id 固定 1，超时 rpc_timeout_ms。</p>']]},
  daemon:{bin:'mozart-daemon',desc:'唯一权威。监管 6 子进程、每秒轮询 GetStatus 汇总成派生读模型；不碰音频数据面。',pts:[
-  ['thread','server','控制连接','<p>bind daemon.sock，listen(8)，每连接独立线程，空闲 30s 断开。</p><table class="kv"><tr><td>0x0101</td><td>Hello</td></tr><tr><td>0x0102</td><td>GetStatus</td></tr><tr><td>0x0103/04</td><td>RouteSet / MuteSet</td></tr><tr><td>0x0105</td><td>Shutdown</td></tr><tr><td>0x0106/07/08</td><td>Translate/SpeechSet/Stop → 转发桥</td></tr></table>'],
+  ['thread','server','控制连接','<p>bind daemon.sock，listen(8)，每连接独立线程，空闲 30s 断开。</p><table class="kv"><tr><td>0x0101</td><td>Hello</td></tr><tr><td>0x0102</td><td>GetStatus</td></tr><tr><td>0x0103/04</td><td>RouteSet / MuteSet</td></tr><tr><td>0x0105</td><td>Shutdown</td></tr><tr><td>0x0106/07/08</td><td>Translate/SpeechSet/Stop → 转发桥</td></tr><tr><td>0x0120</td><td>ModelUse → 断流换模型 + 预设提交</td></tr></table>'],
   ['thread','supervisor ×6','生命周期','<p>退避 500ms 倍增上限 10s，稳定 30s 重置；SIGTERM 2s 后 SIGKILL。llama 启动前清陈旧 socket。</p><table class="kv"><tr><td>mozart 子进程</td><td>--socket --config，各读自己段</td></tr><tr><td>llama-server</td><td>-m gguf -c 2048 -ngl 99 -np 1 -t 2 --host llama.sock --jinja</td></tr></table>'],
   ['thread','services+poller','轮询','<p>ServiceLink 惰性 connect+Hello；每秒 poll 五服务 GetStatus。llama 不轮询，可达性由桥带报。</p>'],
   ['thread','state+arbiter','权威','<p>Processes 6 角色 + 各 Option&lt;Status&gt; + 降级列表。GPU 实时/文件互斥；扬声器分时。mode 派生。</p>'],
+  ['thread','model use','断流换模型','<p>0x0120：resolve 读校验目标预设 → StopStream → LoadModel → 提交（同一把 toml 锁内写 model_id 基线 + 五键基线 + applied）→ StartStream 复用 handle 只起一次。全程持 transition 锁，避免 8GB 设备双引擎驻留 OOM，支持跨采样率重建 StreamingRvc。</p><p class="note">失败一律用旧模型 + 旧参数恢复流；起流失败先按 SwitchUndo 整体回退基线、生效配置与 applied。文件任务占 GPU 回 Busy。model_id 只由本命令写回基线，config set 拒绝。</p>'],
   ['proto','控制信封','SEQPACKET','<pre>magic u32 \'MCTL\'=0x4C54434D\nversion u16=1 | type u16 | request_id u32 | body_len u32\nbody JSON ≤64KiB → {status,code,reason,data}</pre><table class="kv"><tr><td>0x01xx</td><td>daemon</td></tr><tr><td>0x02xx</td><td>pre</td></tr><tr><td>0x03xx</td><td>rvc</td></tr><tr><td>0x04xx</td><td>asr</td></tr><tr><td>0x05xx</td><td>bridge</td></tr><tr><td>0x06xx</td><td>tts</td></tr></table>']]},
  pre:{bin:'mozart-pre',desc:'一次采集供所有链路。实时线程不分配不阻塞。AI 支路恒发。',pts:[
   ['thread','capture','ALSA 48k','<p>64 帧周期累积 960 样本 RawFrame；FL 立体声→单声道 f32。</p>'],
   ['thread','DSP','信号链','<p>80Hz 高通→WOLA 降噪→gate/AGC/limiter(默认关)→48k trunk→33 抽头 FIR 3:1 抽取→VAD。pack 出 16k InputFrame。</p>'],
   ['thread','ai 双路','LazySender','<p>同帧恒发 rvc+asr；惰性 connect 失败计丢弃。consumer_drops 分键 rvc/asr。</p>'],
-  ['thread','playback','扬声器分时','<p>播报优先：tts 环有帧→broadcast；空且 holdoff 200ms→realtime。</p>'],
+  ['thread','playback','扬声器分时','<p>播报优先：tts 环有帧→broadcast；空且 holdoff 200ms→realtime。</p><p>rvc 帧经 BoundaryResampler 统一到 48k：模型原生 32/40/48k，只取 valid_samples 有效段插值；48k/960 直通。栈数组、无锁无分配、循环前预创建，切率与缺帧重置历史。</p>'],
   ['sock','pre.sock','bind 0x02xx','<table class="kv"><tr><td>0x0201</td><td>Hello</td></tr><tr><td>0x0202/03</td><td>SetRoute/SetMute</td></tr><tr><td>0x0204</td><td>GetStatus</td></tr></table>'],
   ['sock','数据面 ×4','DGRAM','<table class="kv"><tr><td>rvc-in</td><td>connect→rvc 发 InputFrame</td></tr><tr><td>asr-in</td><td>connect→asr 发 InputFrame</td></tr><tr><td>rvc-out</td><td>bind←rvc 收 OutputFrame</td></tr><tr><td>tts-out</td><td>bind←tts 收 OutputFrame</td></tr></table>'],
-  ['proto','帧契约','frame.h','<pre>InputFrame 1300B = magic 0x4D5A5254 + meta16 + 320×f32 (16k)\nOutputFrame 3860B = magic 0x54525A4D + meta16 + 960×f32 (48k)\nmeta: pts_ns u64|frame_idx u32|vad u8|energy u8|conf u8|seg u8</pre>']]},
+  ['proto','帧契约','frame.h','<pre>InputFrame 1300B = magic 0x4D5A5254 + meta16 + 320×f32 (16k)\nOutputFrame 3868B = magic 0x54525A4D + meta16 + sample_rate u32 + valid_samples u32 + 960×f32\nmeta: pts_ns u64|frame_idx u32|vad u8|energy u8|conf u8|seg u8</pre><p class="note">输出采样率随模型（32/40/48k），valid_samples = 采样率/50，其余 pcm 补零。播放侧固定 48k，由 BoundaryResampler 在边界重采样。尺寸不符的线包丢帧计数，控制线程记可查询原因（新旧进程混跑诊断）。</p>']]},
  rvc:{bin:'mozart-rvc (C++)',desc:'C++ 推理，ONNX Runtime/TensorRT。流式 1:1 泵。',pts:[
-  ['thread','StreamSession','推理','<p>hubert+rmvpe+generator。window 3840(240ms)/crossfade 2400/past 40000/sola 480/emit 11520。</p>'],
+  ['thread','StreamSession','推理','<p>hubert+rmvpe+generator。几何按模型原生采样率推导（realtime_geometry.hpp）；48k 参考值 window 3840(240ms)/crossfade 2400/past 40000/sola 480/emit 11520，40k 与 32k 输出侧同比缩放。</p>'],
+  ['proto','实时旋钮','[rvc.realtime]','<p>crossfade 50ms + sola 10ms 锁为定值 60ms，偏离拒绝（引擎形状按最大 overlap 固定、分析窗未解耦）；startup 400ms（0..15000，20ms 倍数）与 skip_silence true 可调。默认值、上限与整除模数单一来源 tools/model/realtime_chain_params.json；StartStream 入口单点校验，违反回 InvalidArgument。</p><p class="note">解耦分析窗后才放开 overlap，待办见 docs/SPEC/SPEC-03-rvc.md。</p>'],
   ['sock','rvc.sock','bind 0x03xx','<table class="kv"><tr><td>0x0301</td><td>Hello</td></tr><tr><td>0x0302</td><td>LoadModel</td></tr><tr><td>0x0303/04/05</td><td>Start/Stop/ResetStream</td></tr><tr><td>0x0306</td><td>GetStatus</td></tr></table>'],
   ['sock','rvc-in/out','数据面','<p>rvc-in bind←pre(InputFrame)；rvc-out connect→pre(OutputFrame)。</p>']]},
  asr:{bin:'mozart-asr',desc:'Rust 单进程 sherpa-onnx 库链入。收包/解码/复核/输出四线程+控制。每次启动随机启动号。',pts:[
@@ -220,7 +222,7 @@ var D={
   ['file','路径','XDG','<p>默认 ~/.local/state/mozart/subtitles.jsonl，经 [bridge] subtitles_path 配置。v1 不轮转。</p>'],
   ['proto','记录格式','沿用旧','<p>见 bridge「字幕记录」层。revision 覆盖语义；译文先于投递落盘。</p>']]},
  mic:{bin:'ALSA',desc:'硬件输入，全系统只打开一次。',pts:[['proto','采集','48kHz','<p>48kHz 单声道 RawFrame(960 样本/20ms)。所有音频必经 pre。</p>']]},
- spk:{bin:'ALSA',desc:'硬件输出。同一时刻一路占用（扬声器分时）。',pts:[['proto','播放','分时','<p>实时/直出在 pre 内切换；播报时静音实时、播完恢复。</p>']]}
+ spk:{bin:'ALSA',desc:'硬件输出。同一时刻一路占用（扬声器分时）。',pts:[['proto','播放','分时','<p>实时/直出在 pre 内切换；播报时静音实时、播完恢复。播放采样率固定 48kHz，设备给不到 48000Hz 即报错退出，不按流协商。</p>']]}
 };
 
 var pop=R.querySelector('#pop'),curSel=null;

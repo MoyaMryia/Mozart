@@ -127,7 +127,7 @@ code {
 
 <p>下文先用全称定义，之后一律复用同一名称。</p>
 
-<p>契约帧：音频进程和推理进程之间传输的固定长度帧。输入 16 kHz、320 个采样点、20 ms；输出 48 kHz、960 个采样点、20 ms。</p>
+<p>契约帧：音频进程和推理进程之间传输的固定长度帧。输入 16 kHz、320 个采样点、20 ms；输出缓冲上限 960 个采样点、20 ms，采样率随模型（32000 / 40000 / 48000 Hz），有效样本数等于采样率除以 50。输出线包 3868 B。</p>
 
 <p>块：推理进程内部一次处理的新音频长度。实时链是 240 ms，等于 3840 个 16 kHz 采样点。</p>
 
@@ -150,7 +150,7 @@ code {
 <ul>
 <li><strong>〔生成时固定〕</strong>：这个值在导出 ONNX 时写进计算图。改了要重新导出，还要重新编译引擎。实时链的帧数大多属于这一类。</li>
 <li><strong>〔编译时固定〕</strong>：这个值在 TensorRT 编译时写进 engine。改了只需要重新编译，但编译必须在目标设备上做。</li>
-<li><strong>〔推理时可调〕</strong>：这个值在启动流或写配置时注入，不需要重新导出或编译。实时链能调的会话参数很少，只有五个。</li>
+<li><strong>〔推理时可调〕</strong>：这个值在启动流或写配置时注入，不需要重新导出或编译。实时链可调的是五个会话参数加启动缓冲、静音跳过两个旋钮；交叉淡化与 SOLA 搜索锁为定值，见第 8 站。</li>
 <li><strong>〔模型决定〕</strong>：这个值来自 pth 或模型目录里的 config.json。换模型可能变，但用户不直接填。</li>
 <li><strong>〔代码写死〕</strong>：这个值是 C++ 常量。配置改不了，换模型也不变。少数值由引擎导出固定，换引擎仍可能变。</li>
 </ul>
@@ -175,7 +175,7 @@ code {
 <dd>定长表示每次输入的形状固定，编译时就能完全优化；动态表示某些维度可以变，运行时才确定。实时链用定长。</dd>
 
 <dt>采样率</dt>
-<dd>每秒钟给声音“拍照”的次数，单位 Hz。实时链输入固定 16000 Hz，输出固定 48000 Hz。</dd>
+<dd>每秒钟给声音“拍照”的次数，单位 Hz。实时链输入固定 16000 Hz，输出随模型原生采样率（32000 / 40000 / 48000 Hz）。播放侧固定 48000 Hz。</dd>
 
 <dt>音高</dt>
 <dd>声音听起来的高低，单位 Hz。生成器不直接吃连续频率，而是吃量化后的音高编号。</dd>
@@ -185,24 +185,24 @@ code {
 
 <p>上游是 pre 音频进程。它把麦克风采集、降噪、整形和降采样处理成 16 kHz 契约帧，再通过 Unix 数据报发给 mozart-rvc。</p>
 
-<p>下游仍是 pre。mozart-rvc 把 48 kHz 输出帧发回去，pre 按路由决定播放直出声音还是变声后的声音。</p>
+<p>下游仍是 pre。mozart-rvc 把模型原生采样率的输出帧发回去，pre 按路由决定播放直出声音还是变声后的声音，并在播放边界统一重采样到 48 kHz。</p>
 
-<p class="flow">pre 的 16 kHz 帧 → mozart-rvc 实时推理 → 48 kHz 帧 → pre 播放</p>
+<p class="flow">pre 的 16 kHz 帧 → mozart-rvc 实时推理 → 模型原生采样率帧（32/40/48 kHz）→ pre 边界重采样到 48 kHz → 播放</p>
 
-<p>pre 的 DSP 细节不在本文范围。本文从“16 kHz 契约帧进入 mozart-rvc”开始，到“48 kHz 契约帧离开 mozart-rvc”结束。</p>
+<p>pre 的 DSP 细节不在本文范围。本文从“16 kHz 契约帧进入 mozart-rvc”开始，到“模型原生采样率契约帧离开 mozart-rvc”结束。</p>
 
 <aside class="why">
 <p class="why-label">补充解释</p>
 <ul>
 <li><strong>为什么把边界放在 pre：</strong>RVC 推理只关心 16 kHz 音频帧和元数据。麦克风、降噪和播放属于音频进程，混进来会把问题拆散。</li>
 <li><strong>输入帧里有什么：</strong>16 字节元数据加 320 个 float32 样本。元数据包含时间戳、帧号、VAD 标记、能量、置信度和分段号。</li>
-<li><strong>输出帧里有什么：</strong>同样的元数据加 960 个 float32 样本。推理进程每收到一帧输入就回一帧输出，输出不足补零。</li>
+<li><strong>输出帧里有什么：</strong>同样的元数据，加 <code>sample_rate</code> 与 <code>valid_samples</code> 两个 u32，再加 960 个 float32 样本的缓冲。有效样本数等于采样率除以 50，其余位置补零。推理进程每收到一帧输入就回一帧输出，输出不足补零。</li>
 </ul>
 </aside>
 
 <h2>总流程</h2>
 
-<p class="flow">16 kHz 契约帧 → 帧调度 → HuBERT 与 RMVPE → 音高映射 → 索引检索（可选）→ front → decoder → SOLA → 48 kHz 契约帧</p>
+<p class="flow">16 kHz 契约帧 → 帧调度 → HuBERT 与 RMVPE → 音高映射 → 索引检索（可选）→ front → decoder → SOLA → 模型原生采样率契约帧</p>
 
 <p>真实推理不是一帧一帧独立做，而是先攒成 240 ms 的块，再带上 2.5 秒过去上下文，凑成 2.8 秒分析窗。分析窗里只有最新一块会被回放，历史只用来提供上下文。</p>
 
@@ -219,25 +219,25 @@ code {
 
 <h2>第 1 站 帧调度与窗口</h2>
 
-<p>这一站决定什么时候推理、拿多长的音频推理、结果怎么排回 20 ms 帧节拍。它不产出引擎。</p>
+<p>这一站决定什么时候推理、拿多长的音频推理、结果怎么排回 20 ms 帧节拍。它不产出引擎。形状类常量的单一来源是 <code>tools/model/realtime_chain_params.json</code>，C++ 在 <code>rvc/include/rvc/realtime_geometry.hpp</code> 镜像同一套值，输出侧样本数按模型采样率推导。</p>
 
 <p>块长，3840 个 16 kHz 采样点<span class="src src-fixed">〔代码写死〕</span>。它等于 240 ms。每攒够一块新音频，才触发一次推理。</p>
 
 <p>过去上下文，40000 个 16 kHz 采样点<span class="src src-fixed">〔代码写死〕</span>。它等于 2.5 秒。每块重读这段历史，给生成器提供上下文。</p>
 
-<p>分析窗，44800 个 16 kHz 采样点<span class="src src-fixed">〔代码写死〕</span>。它等于 2.8 秒，由过去上下文、当前块和 960 个采样点的对齐余量组成。HuBERT 和 RMVPE 都吃这个窗。</p>
+<p>分析窗，44800 个 16 kHz 采样点<span class="src src-fixed">〔代码写死〕</span>。它等于 2.8 秒，由过去上下文、当前块和 960 个采样点的对齐余量组成。余量在 16 kHz 侧计算，与输出采样率无关。HuBERT 和 RMVPE 都吃这个窗。</p>
 
-<p>启动缓冲，400 ms<span class="src src-fixed">〔代码写死〕</span>。首次出声前先等这么久，再等输出环攒满一个完整块。它用来吸收推理耗时和送达抖动。</p>
+<p>启动缓冲，默认 400 ms<span class="src src-run">〔推理时可调〕</span>。首次出声前先等这么久，再等输出环攒满一个完整块。它用来吸收推理耗时和送达抖动。配置键 <code>startup_delay_ms</code>，范围 0 到 15000 ms 且须为 20 ms 的倍数，改动经停流再起流生效。</p>
 
-<p>输出环，16 秒<span class="src src-fixed">〔代码写死〕</span>。推理可以领先消费端数块。环满丢最旧并计数。</p>
+<p>输出环，768000 个采样点<span class="src src-fixed">〔代码写死〕</span>。在 48 kHz 下等于 16 秒，采样率越低可缓冲时长越长。推理可以领先消费端数块。环满丢最旧并计数。</p>
 
 <h3>帧调度接口</h3>
 
 <ul class="io">
-<li><strong>输入参数：</strong>没有用户参数。块长、过去上下文、启动缓冲、输出环都由代码固定。</li>
+<li><strong>输入参数：</strong>两个非形状旋钮可调：<code>startup_delay_ms</code>（默认 400，范围 0 到 15000，须为 20 ms 的倍数）、<code>skip_silence</code>（默认 true）。<code>crossfade_ms</code> 与 <code>sola_search_ms</code> 锁为定值 50 与 10，合计 60 ms，偏离在入口回 InvalidArgument。块长、过去上下文与输出环由几何常量固定。</li>
 <li><strong>输入信号：</strong>16 kHz 输入帧，每帧 320 个 float32 样本；元数据包含 <code>pts_ns</code>、<code>frame_idx</code>、<code>vad_flag</code>、<code>energy_db</code>、<code>conf</code>、<code>segment_id</code>。</li>
-<li><strong>输出：</strong>48 kHz 输出帧，每帧 960 个 float32 样本。每收到一帧输入就回一帧输出，输出环不足时补零。</li>
-<li><strong>内部中间量：</strong>分析窗 [44800]；单块 decoder 输出 [14400]；实际推进 [11520]；淡化尾 [2400]。</li>
+<li><strong>输出：</strong>模型原生采样率输出帧，缓冲 960 个 float32 样本，有效样本数等于采样率除以 50（48k 为 960、40k 为 800、32k 为 640）。每收到一帧输入就回一帧输出，输出环不足时补零。</li>
+<li><strong>内部中间量（48 kHz 参考值，输出侧按采样率同比缩放）：</strong>分析窗 [44800]；单块 decoder 输出 [14400]（40k [12000]、32k [9600]）；实际推进 [11520]（40k [9600]、32k [7680]）；淡化尾 [2400]（40k [2000]、32k [1600]）。</li>
 </ul>
 
 <aside class="why">
@@ -386,11 +386,11 @@ code {
 <ul class="io">
 <li><strong>生成时参数：</strong><code>--decoder-output</code> 指定 ONNX 输出；<code>--decoder-frames</code> 固定 30；<code>--return-frames</code> 固定 30；<code>--skip-head</code> 固定 250；<code>--opset</code> 默认 18；<code>--rvc-source</code> 必填。</li>
 <li><strong>编译时参数：</strong><code>--decoder</code> 指定 ONNX；<code>--fp16</code> 可选；<code>--trtexec</code> 可指定编译器路径。</li>
-<li><strong>输入信号：</strong><code>z</code> float32 [1, 192, 30]；<code>pitchf</code> float32 [1, 30]；<code>sid</code> [1]；<code>source_phase</code> float32 [1, 1, 1]；<code>source_noise</code> float32 [1, 14400, 1]。</li>
-<li><strong>输出：</strong><code>audio</code> float32 [1, 1, 14400]，48 kHz 下的 300 毫秒。40 kHz 模型输出 [1, 1, 12000]。</li>
+<li><strong>输入信号：</strong><code>z</code> float32 [1, 192, 30]；<code>pitchf</code> float32 [1, 30]；<code>sid</code> [1]；<code>source_phase</code> float32 [1, 1, 1]；<code>source_noise</code> float32 [1, 14400, 1]（48 kHz；40 kHz 为 [1, 12000, 1]，32 kHz 为 [1, 9600, 1]）。</li>
+<li><strong>输出：</strong><code>audio</code> float32 [1, 1, 14400]，48 kHz 下的 300 毫秒。40 kHz 模型输出 [1, 1, 12000]，32 kHz 模型输出 [1, 1, 9600]，都是 300 毫秒。</li>
 </ul>
 
-<p><code>source_phase</code> 和 <code>source_noise</code> 的最后一维是源维度，由 pth 决定。40 kHz 模型的 <code>source_noise</code> 是 [1, 12000, 1]。</p>
+<p><code>source_phase</code> 和 <code>source_noise</code> 的最后一维是源维度，由 pth 决定。<code>source_noise</code> 的长度按模型采样率算，等于 30 帧乘每帧样本数。</p>
 
 <aside class="why">
 <p class="why-label">补充解释</p>
@@ -398,7 +398,7 @@ code {
 <li><strong>为什么输出 300 ms、实际只推进 240 ms：</strong>多出来的 60 ms 用来和上一块做 SOLA 对齐和淡化，避免接缝咔哒声。</li>
 <li><strong>源噪声和源相位改什么：</strong>它们决定合成波形的相位和气息细节。运行时内部随机生成，不是用户参数。</li>
 <li><strong>为什么 decoder 帧数必须等于返回帧数：</strong>front 返回多少帧 z，decoder 就必须吃多少帧。脚本在导出时强制检查。</li>
-<li><strong>为什么 40 kHz 模型不能直接用：</strong>decoder 输出长度按采样率算。48 kHz 下 30 帧是 14400 样本，40 kHz 下是 12000 样本，运行时也会拒绝实时流。</li>
+<li><strong>为什么 40 kHz 模型要单独一套 decoder：</strong>decoder 输出长度按采样率算。48 kHz 下 30 帧是 14400 样本，40 kHz 下是 12000 样本，32 kHz 下是 9600 样本。运行时按模型采样率推导几何并校验引擎形状，资产必须按同一采样率导出与编译；front 形状与采样率无关。</li>
 </ul>
 </aside>
 
@@ -409,18 +409,18 @@ code {
 <h3>SOLA 接口</h3>
 
 <ul class="io">
-<li><strong>输入参数：</strong>没有用户参数。SOLA 搜索 480 个采样点、淡化 2400 个采样点、每块推进 11520 个采样点都写死。</li>
-<li><strong>输入信号：</strong>decoder 输出的单块音频 [14400]，48 kHz。</li>
-<li><strong>输出：</strong>每块 11520 个输出样本，等于 240 毫秒。前 2400 个样本与上一块淡化尾对齐，再取紧随其后的 2400 个样本作为下一块的淡化尾。</li>
-<li><strong>内部输出环：</strong>16 秒容量。播放侧每 20 ms 取 960 个样本，不够时补零。</li>
+<li><strong>输入参数：</strong>SOLA 搜索与交叉淡化是定值 10 ms 与 50 ms，样本数按模型采样率换算（48 kHz 为 480 与 2400）。每块推进 240 ms，48 kHz 下是 11520 个采样点。两者之和恒为 60 ms，配置键 <code>sola_search_ms</code> 与 <code>crossfade_ms</code> 只接受这两个值，偏离在入口回 InvalidArgument。</li>
+<li><strong>输入信号：</strong>decoder 输出的单块音频，48 kHz 下 [14400]，40 kHz 下 [12000]，32 kHz 下 [9600]。</li>
+<li><strong>输出：</strong>每块推进 240 毫秒，48 kHz 下是 11520 个输出样本。前 2400 个样本与上一块淡化尾对齐，再取紧随其后的 2400 个样本作为下一块的淡化尾；其他采样率按同比缩放的样本数执行同一逻辑。</li>
+<li><strong>内部输出环：</strong>768000 个采样点，48 kHz 下 16 秒。播放侧每 20 ms 取一帧，不够时补零。</li>
 </ul>
 
 <aside class="why">
 <p class="why-label">补充解释</p>
 <ul>
-<li><strong>为什么要 SOLA：</strong>decoder 每块独立生成，块边界可能有相位差。先在 480 个样本内找最对齐的位置，再淡化，接缝才不容易听到咔哒声。</li>
-<li><strong>为什么淡化是 2400 个样本：</strong>2400 个样本等于 50 ms，足够盖住块边界，又不会把两块的声音混得太久。</li>
-<li><strong>为什么输出环要 16 秒：</strong>推理偶尔会比播放快。输出环让推理领先几块，播放侧仍然按 20 ms 节拍稳定取帧。</li>
+<li><strong>为什么要 SOLA：</strong>decoder 每块独立生成，块边界可能有相位差。先在搜索窗内找最对齐的位置，再淡化，接缝才不容易听到咔哒声。</li>
+<li><strong>为什么淡化锁为 50 ms：</strong>50 ms 足够盖住块边界，又不会把两块的声音混得太久。引擎形状按最大 overlap 固定，分析窗还没与淡化量解耦，所以淡化与 SOLA 之和锁为定值 60 ms，机制与解除条件见 <code>docs/SPEC/SPEC-03-rvc.md</code>。降延迟靠启动缓冲，不靠调小淡化。</li>
+<li><strong>为什么输出环按 48 kHz 的 16 秒设计：</strong>推理偶尔会比播放快。输出环让推理领先几块，播放侧仍然按 20 ms 节拍稳定取帧。容量按样本数固定，低采样率模型可缓冲更久。</li>
 </ul>
 </aside>
 
@@ -442,14 +442,17 @@ code {
 <dt>f0_method</dt>
 <dd>音高提取方法。当前只接受 rmvpe，换别的值直接报错。</dd>
 
-<dt>block / past / startup</dt>
-<dd>块长、过去上下文和启动缓冲。它们决定延迟和连续性，写死在代码里。改它们等于改实时契约，不能只改一个值。</dd>
+<dt>block / past</dt>
+<dd>块长与过去上下文。它们决定延迟和连续性，值来自实时参数单一来源 JSON，C++ 镜像同一套。改它们等于改实时契约与资产形状，不能只改一个值。</dd>
+
+<dt>crossfade_ms / sola_search_ms / startup_delay_ms / skip_silence</dt>
+<dd>四个非形状旋钮，实时独有、不进模型预设。crossfade_ms 与 sola_search_ms 是定值 50 ms 与 10 ms，合计 60 ms，偏离在入口拒绝。startup_delay_ms 默认 400 ms，范围 0 到 15000 ms 且为 20 ms 的倍数；skip_silence 默认 true。可调两键改动经停流再起流生效。</dd>
 
 <dt>fp16</dt>
 <dd>编译时精度开关。开启后 engine 更小更快，可能有轻微数值差异。它不改变接口，只改变 engine 的数值和性能。</dd>
 
 <dt>sample_rate</dt>
-<dd>模型原生采样率。实时链要求它等于输出采样率 48000 Hz。40 kHz 模型会被能力门控拒绝。</dd>
+<dd>模型原生采样率。实时链接受 32000 / 40000 / 48000 Hz，它决定输出帧有效样本数与输出侧几何。不在支持集内的模型被能力门控拒绝。播放侧固定 48000 Hz，由 pre 在边界重采样。</dd>
 
 <dt>index / nprobe / neighbours</dt>
 <dd>检索库、候选表数和近邻数。index 按模型独立；候选表数 1 和近邻数 8 写死，改它们会改变检索范围和音色混合结果。</dd>
@@ -458,9 +461,9 @@ code {
 <aside class="why">
 <p class="why-label">补充解释：为什么只有这几个真正可调</p>
 <ul>
-<li><strong>会话参数只有五个：</strong>pitch_shift、index_rate、rms_mix_rate、protect、f0_method。它们在 StartStream 时固定，避免运行中改参数造成块边界状态不一致。</li>
+<li><strong>会话参数只有五个：</strong>pitch_shift、index_rate、rms_mix_rate、protect、f0_method。它们在 StartStream 时固定，避免运行中改参数造成块边界状态不一致。另有启动缓冲与静音跳过两个旋钮同样在 StartStream 时固定，改动经停流再起流生效；淡化与 SOLA 搜索为定值。</li>
 <li><strong>为什么 protect 和 rms_mix_rate 不生效：</strong>实时路径优先低延迟，没有做辅音保护和音量包络校正。参数仍然接受并校验范围，是为了保持控制面统一，将来补实现时不用改接口。</li>
-<li><strong>为什么块长这些不开放：</strong>改块长会牵动窗口、淡化、SOLA、启动缓冲和帧契约。单改一个值无法保持连续，所以它们被设计成代码常量。</li>
+<li><strong>为什么块长这些不开放：</strong>改块长会牵动窗口、淡化、SOLA、启动缓冲和资产形状。单改一个值无法保持连续，所以形状类归单一来源 JSON，不开放运行时调参。非形状旋钮里只开放启动缓冲与静音跳过；淡化与 SOLA 虽属非形状类，但引擎形状按最大 overlap 固定，当前也锁为定值。</li>
 <li><strong>为什么 fp16 是编译时开关：</strong>TensorRT 在编译时决定数值精度。运行时改配置不会改变已经编好的 engine。</li>
 </ul>
 </aside>
@@ -481,11 +484,11 @@ code {
 
 <p>文件链从 pth 导出一个动态生成器；实时链导出 front 和 decoder 两个定长引擎。</p>
 
-<p>文件链的形状可以用档位调；实时链的形状由音频代码锁死，不能通过编译参数改。</p>
+<p>文件链的形状可以用档位调；实时链的形状由单一来源 JSON 与模型采样率推导，不能通过编译参数改。</p>
 
 <p>文件链有辅音保护、音量包络和后处理；实时链目前不应用 <code>protect</code> 和 <code>rms_mix_rate</code>。</p>
 
-<p>文件链可以处理 40 kHz 模型；实时链只接受与输出采样率一致的 48 kHz 模型。</p>
+<p>文件链输出固定 48 kHz，离线收尾重采样；实时链按模型原生采样率输出，接受 32 / 40 / 48 kHz，重采样放在 pre 播放边界。</p>
 
 <h2>适用范围</h2>
 
@@ -495,9 +498,9 @@ code {
 
 <ul>
 <li><code>--fp16</code> 对实时音质和延迟的影响，未在本文范围实测。启用前应按目标模型做对比。</li>
-<li>40 kHz 模型的实时链路未实现。阻塞原因：帧契约与输出缓冲按 48 kHz 设计。解除条件：完成实时原生多采样率改造并板端验证。</li>
+<li>32 kHz 与 40 kHz 模型的实时链路已实现（几何按采样率推导、帧契约带 <code>sample_rate</code> 与 <code>valid_samples</code>），板端延迟、连续性、显存与音质未验证。阻塞原因与解除条件见 <code>docs/SPEC/SPEC-03-rvc.md</code> 板端条目。</li>
 <li>front 和 decoder 回退 ONNX 的实时延迟未测量。阻塞原因：实时链通常使用 TensorRT 引擎。解除条件：在目标设备上对比 ONNX 与 engine 的推理耗时。</li>
-<li>实时流中换模型的块边界状态语义未完全验证。阻塞原因：过去上下文、SOLA 状态和音高缓存在换模型时的归属规则尚未定稿。</li>
+<li>实时换模型已定为断流切换（<code>model use</code>）：过去上下文、SOLA 状态与音高缓存随流式调度器重建丢弃，不跨模型保留。板端切换接缝、延迟与帧守恒未验证，阻塞原因与解除条件同上。</li>
 </ul>
 
 <p class="readme">相关文档：<a href="rvc-module.html">RVC 模块（文件链）</a> · <a href="rvc-realtime-module.html">RVC 实时模块（系统运行时）</a></p>

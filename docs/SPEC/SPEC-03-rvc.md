@@ -15,7 +15,7 @@
 | 链路 | 目标 | 资产 | 几何与约束 |
 | --- | --- | --- | --- |
 | 文件 | 质量优先 | 整段、大窗或动态生成器；可用文件专用 profile | 无实时节拍；优先大窗，小窗只作回退 |
-| 实时 | 延迟优先 | 必须实时 front/decoder 与实时 HuBERT/RMVPE；模型可与文件链路不同 | 固定 240 ms 块、50 ms 淡化、2.5 s 过去上下文、SOLA、400 ms 启动；采样率与块几何单独评估 |
+| 实时 | 延迟优先 | 必须实时 front/decoder 与实时 HuBERT/RMVPE；模型可与文件链路不同 | 固定 240 ms 块、2.5 s 过去上下文；淡化 50 ms 与 SOLA 10 ms 为定值，启动 400 ms 可调；输出采样率随模型，块几何由采样率推导 |
 
 - 同一模型可以同时具备文件和实时能力；缺实时资产时只提供文件能力，不静默降级。
 - 文件链路的大窗/小窗策略不能直接搬到实时链路；实时链路已有的 SOLA、淡化与启动缓冲按实时约束单独优化。
@@ -26,15 +26,15 @@
 - [x] 非推理逻辑归 Rust。
 - [x] C++ 进程只保留推理：`StreamSession` 封装 `StreamingRvc` 和 `RVCInferencer`；`RealtimeRvcWorker` 与 `AudioWorker` 的外层传输、队列、模式、统计归 Rust。
 - [x] 静音和旁路归音频进程；C++ 不实现这两个概念。
-- [x] 参数在 `StartStream` 时固定；v1 运行时调参经 `config set rvc.<会话参数>` 写持久基线，由 daemon 编排应用（见 [SPEC-04](SPEC-04-daemon.md)）；模型切换时 `[rvc]` 会话参数由该模型的预设载入（见 [SPEC-11](SPEC-11-preset.md)），`StartStream` 契约不变。块边界 `SetParams` 仍推迟，见 [FUTURE.md](../FUTURE.md)。
-- [x] 输出节拍由输入帧驱动：C++ 每收到一帧输入就回一帧输出，输出环不足时补零。400 ms 启动缓冲留在 `StreamingRvc.startup_delay_out`，音频进程只保留小缓冲吸收送达抖动。大缓冲只有一个主人。
+- [x] 参数在 `StartStream` 时固定；v1 运行时调参经 `config set rvc.<会话参数>` 写持久基线，由 daemon 编排应用（见 [SPEC-04](SPEC-04-daemon.md)），`[rvc.realtime]` 四键同口径走 Stop→Start；模型切换时 `[rvc]` 会话参数由该模型的预设载入（见 [SPEC-11](SPEC-11-preset.md)），`StartStream` 契约不变。实时换模型由 daemon `model use` 断流编排（SPEC-04），rvc 不新增命令。块边界 `SetParams` 仍推迟，见 [FUTURE.md](../FUTURE.md)。
+- [x] 输出节拍由输入帧驱动：C++ 每收到一帧输入就回一帧输出，输出环不足时补零。启动缓冲留在 `StreamingRvc.startup_delay_out`（默认 400 ms，`startup_delay_ms` 旋钮），音频进程只保留小缓冲吸收送达抖动。大缓冲只有一个主人。
 - [ ] 1:1 泵假设采集与播放时钟同源；使用不同声卡时，长期漂移会导致周期性欠载或缓冲增长，需时钟漂移补偿（见 [FUTURE.md](../FUTURE.md)）。推迟项，未实现。
 - [x] 板端实测确认小缓冲布局成立：同源 60 s 长跑 49.86 帧/s 1:1、丢弃与欠载零增长，rvc 端到端净滞后约 0.5 s（400 ms 启动缓冲为主）。维持启动缓冲留 C++、音频进程小缓冲的现状；数据见 `reports/realtime-pipeline-20261112/RESULTS.md`。
 
 ## 接口约束
 
 - [x] 粗粒度边界：数据面只有“输入帧进、输出帧出”，控制面只有加载、启动、停止、重置和状态查询；不暴露张量、引擎和 stream。
-- [x] 数据面沿用 core 的帧契约：16 kHz 输入、48 kHz 输出，一帧一条消息。
+- [x] 数据面沿用 core 的帧契约：16 kHz 输入，一帧一条消息。实时输出按模型原生采样率（32/40/48 kHz）填 `sample_rate` 与 `valid_samples`；文件输出仍固定 48 kHz，离线收尾重采样。字段与偏移见 SPEC-01。（`rvc/src/rvc/audio_worker.cpp:137-139`、`rvc/src/rvc/file_worker.cpp:116-117`）
 - [x] 文件转换复用帧数据面：C++ 只收帧/发帧、不接触文件，对端是 pre（实时）还是 daemon（文件）无感知。文件帧发送必须不丢（阻塞/流控，区别于实时的非阻塞丢弃）；输出 socket 由数据面对端绑定（实时 pre、文件 daemon），实时/文件互斥故不冲突，切换时交接绑定。（`rvc/src/rvc/file_worker.cpp:67-127`、`rvc/transport/unix_dgram_stream.cpp:290-311`）
 - [x] 离线推理 v1 整段批处理：C++ 收齐 daemon 喂入的帧、攒成整段跑现有离线流程再回输出帧；质量参数沿用旧实现不动（峰值归一化 0.95、48 Hz 高通、整段 F0、按引擎形状整段一次过或滑窗 + 重叠淡化、RMS 混合、限幅 0.99）。滑窗窗长随生成器帧数 T 按 T/398 缩放（T=398 为 2 s 窗、1 s hop；T=200 为 1 s 窗、0.5 s hop）。内存由 300 s 时长上限兜底。分块流式推迟，见 [FUTURE.md](../FUTURE.md)。（`rvc/src/rvc/inferencer.cpp:24-26,85,234-235,284,330,374,430`）
 - [x] 错误用返回码或状态原因表达；不跨进程抛异常，不传 C++ 容器和指针。
@@ -50,7 +50,7 @@
 | --- | --- | --- |
 | 进程启动 | 部署配置 | `device`、`half`、`cache_limit`；模型路径由 `[[models]]` 注册表提供（回退 `models_dir` 扫描）；特征引擎路径可选，缺省自动发现 |
 | `LoadModel` | Rust 控制命令 | `model_id`；C++ 读 `config.json` 并报告 `capabilities` 和模型版本 |
-| `StartStream` | Rust 控制命令 | `kind`、`model_handle`、`pitch_shift`、`index_rate`、`rms_mix_rate`、`protect`、`f0_method`；文件模式另带 `total_frames`、可选 `total_samples`，见下文 |
+| `StartStream` | Rust 控制命令 | `kind`、`model_handle`、`pitch_shift`、`index_rate`、`rms_mix_rate`、`protect`、`f0_method`；实时模式另带四个 `[rvc.realtime]` 旋钮（可选，缺省用 JSON 默认）；文件模式另带 `total_frames`、可选 `total_samples`，见下文 |
 | C++ 内部 preset | C++ | `StreamingRvc` 的分块、历史、淡化、SOLA 和启动缓冲参数 |
 | Rust / 音频进程 | Rust | 播放侧小缓冲、静音 / 旁路、数据面队列；400 ms 启动缓冲留在 C++，不重复设大缓冲 |
 
@@ -90,53 +90,67 @@ TOML 顶层 `[[models]]` 数组声明可用模型，每项含 `id`、`type`（rv
 
 实时几何、资产形状与编译参数的单一来源是 `tools/model/realtime_chain_params.json`，三段：`model_contract` 只读训练常量、`geometry` 自由参数、`compile` 编译参数。运行时门控与导出/编译脚本镜像同一套公式，取代「C++ 常量、CLI 手填、门控字面量」三处手动同步。会话五参数归参数边界与 [SPEC-11](SPEC-11-preset.md) 预设（两链共用、按模型存）；文件链几何归 [SPEC-12](SPEC-12-file-chain-params.md)；`[rvc.realtime]` 旋钮文件链不读不扫。
 
+`geometry` 段还定义四个非形状旋钮的默认值（`crossfade_ms`、`sola_search_ms`、`startup_delay_ms`、`skip_silence`）与启动缓冲上限 `startup_delay_max_ms`。C++ 侧常量、默认值、上限与整除模数集中在 `rvc/include/rvc/realtime_geometry.hpp`，`validate_realtime_knobs` 单点判定范围、整除与 overlap 定值，`StartStream` 入口与 `AudioWorker` 默认值都引用它。Rust 侧 `core/src/config.rs:140-158` 镜像同一套值。两侧由对拍测试钉住：`tests/test_rvc_realtime_params.cpp` 运行时读 JSON 逐项比对 C++ 常量、按 32k/40k/48k 独立重算几何，并校验 `validate_realtime_knobs` 的接受与拒绝分支；`core/src/config.rs` 的 `realtime_knobs_mirror_params_json` 读同一 JSON 比对 Rust 常量。
+
 ### 推导公式
 
-帧率：生成器 100 Hz（hop 160 @ 16 kHz）、HuBERT 50 Hz、倍频 2；输入 16 kHz、输出 48 kHz，升采样比 3。设 `W = window_samples`、`P = past_context_samples`（16 kHz 样本），`C = crossfade_max_out`、`S = sola_search_max_out`（48 kHz 样本）：
+帧率：生成器 100 Hz（hop 160 @ 16 kHz）、HuBERT 50 Hz、倍频 2。输入固定 16 kHz；输出采样率 `sr` 取模型原生值（32000 / 40000 / 48000），升采样比 `sr / 16000`。设 `W = window_samples`、`P = past_context_samples`（16 kHz 样本），`C = crossfade_max_out`、`S = sola_search_max_out`（48 kHz 契约参考样本，运行时按 `sr` 同比缩放）：
 
-- `overlap_out = C + S`；`margin_16k = overlap_out / 3`
+- `overlap_out = (C + S) × sr / 48000`；`margin_16k = (C + S) / 3`（按契约参考值算，与 `sr` 无关）
 - `front_frames = (P + W + margin_16k) / 160`；`skip_head = P / 160`
 - `return_frames = decoder_frames = (W + margin_16k) / 160`
-- `hubert_samples = front_frames × 160`；`decoder_out_samples = return_frames × 480`；`output_hop = W × 3`（接缝网格周期）
+- `hubert_samples = front_frames × 160`；`model_frame_out = sr / 100`；`output_frame_samples = sr / 50`
+- `decoder_out_samples = return_frames × model_frame_out`；`output_hop = W × sr / 16000`（接缝网格周期）
 - `flow_head = skip_head − 24`；`latent_frames = front_frames − flow_head`；`decoder_head = skip_head − flow_head`
 
-当前值：overlap 2880、margin 960、front 280、skip 250、return/decoder 30、hubert 44800、decoder_out 14400、hop 11520、flow_head 226、latent 54、decoder_head 24。（代码确认：`rvc/src/rvc/audio_worker.cpp:66-72`、`tools/model/export_generator_split_onnx.py:139-148`）
+16 kHz 侧帧数与 `sr` 无关，输出侧样本数按 `sr` 缩放。48 kHz 当前值：overlap 2880、margin 960、front 280、skip 250、return/decoder 30、hubert 44800、decoder_out 14400、hop 11520、flow_head 226、latent 54、decoder_head 24、每帧 960。40 kHz：overlap 2400、decoder_out 12000、hop 9600、每帧 800。32 kHz：overlap 1920、decoder_out 9600、hop 7680、每帧 640。（代码确认：`rvc/include/rvc/realtime_geometry.hpp:119-201`、`rvc/src/rvc/audio_worker.cpp:64-73`、`tools/model/realtime_chain_params.py:50-137`）
 
-RMVPE 前端 mel 128 带、n_fft 1024、hop 160、30–8000 Hz、HTK Slaney（代码确认：`rvc/src/rvc/feature_extractor.cpp:342-343`）；实时定长 32 帧（`:76`），向上补 32 倍数（`:520`）。逐块帧推导待复核，暂按契约值 32 锁。`emb_channels`/`inter_channels`/`source_dim` 由模型定，门控校验 front emb 一致（`rvc/src/rvc/pipeline.cpp:222-226`），不入 JSON 常量。
+RMVPE 前端 mel 128 带、n_fft 1024、hop 160、30–8000 Hz、HTK Slaney（代码确认：`rvc/src/rvc/feature_extractor.cpp:342-343`）。实时块帧数 32 是契约常量（`realtime_geometry.hpp:27`），引擎形状校验与补整都引用它（`feature_extractor.cpp:80-82,525-528`）。逐块帧数由几何推导：`f0_samples = W + 800`，向上补到 `32 × 160` 的倍数再减 160，mel 帧数再向上补 32 倍数（`realtime_geometry.hpp:166-173`）；门控按推导值校验引擎（`feature_extractor.cpp:215-220`）。`emb_channels`/`inter_channels`/`source_dim` 由模型定，门控校验 front emb 一致（`rvc/src/rvc/pipeline.cpp:236-240`），不入 JSON 常量。
 
-边界：运行时 `crossfade + sola ≤ overlap_out` 且各自 ≤ max；`P`、`W`、`(P + W + margin_16k)` 整除 160；`return ≤ latent`；`decoder == return`；RMVPE 帧数 32 倍数；模型原生采样率须等于 48 kHz（多采样率见改进点）。
+边界：运行时 `crossfade + sola` 恒等于 `overlap_out`（两键锁为定值，见下方旋钮表）；`P`、`W`、`(P + W + margin_16k)` 整除 160；`return ≤ latent`；`decoder == return`；RMVPE 帧数 32 倍数；模型原生采样率须属 {32000, 40000, 48000}（`is_supported_realtime_sample_rate`）。ms 旋钮整除约束：`startup_delay_ms % 20 == 0`（契约帧网格 20 ms）。overlap 锁为定值 60 ms 后天然落在模型帧网格（10 ms）上，入口不再重复校验该整除（不写不会被触发的守卫）；解耦放开范围时须恢复。违反在入口回 InvalidArgument，不到推理层抛异常。
 
 ### 资产生产与运行时
 
-每模型一套 front/decoder（同 pth 成对），共享一套 hubert-realtime/rmvpe-realtime。导出默认值从 JSON 推（`--front-frames/--skip-head/--return-frames/--decoder-frames`、`--samples`、`--frames`），CLI 覆盖仅实验、登记注明偏离。编译校验定长与推导形状；`compile` 段当前写死脚本、`--fp16` 已暴露。引擎绑设备板上编译，build-manifest 记几何来源与哈希。形状类（W/P）改值即新资产变体，v1 单 profile，变体命名待多 profile 阶段定。
+每模型一套 front/decoder（同 pth 成对），共享一套 hubert-realtime/rmvpe-realtime。导出默认值从 JSON 推（`--front-frames/--skip-head/--return-frames/--decoder-frames`、`--samples`、`--frames`），CLI 覆盖仅实验、登记注明偏离。编译校验定长与推导形状；`compile` 段当前写死脚本、`--fp16` 已暴露。引擎绑设备板上编译，build-manifest 记几何来源与哈希。形状类（W/P）改值即新资产变体，v1 单 profile，变体命名待多 profile 阶段定。decoder 输出长度取模型 `dec.upp`（即原生采样率 / 100），采样率同样是资产变体维度；front 形状与采样率无关。（`tools/model/export_generator_split_onnx.py:176`）
 
-门控 `supports_realtime_streaming` 改读推导形状（当前字面量 280/30/44800/32，`pipeline.cpp:205-226`）。`[rvc.realtime]` 新段存非形状类旋钮，实时独有、不进预设（与模型无关，全局一套）：
+门控 `supports_realtime_streaming` 读 `derive_realtime_geometry(model_sr)` 的推导形状，不写字面量：采样率属支持集、HuBERT 样本数、RMVPE 帧数、front 帧数与 emb 通道、decoder 帧数逐项比对引擎形状（`rvc/src/rvc/pipeline.cpp:211-241`）。`[rvc.realtime]` 段存非形状类旋钮，实时独有、不进预设（与模型无关，全局一套）：
 
 | 键 | 默认 | 边界 | 生效 |
 | --- | --- | --- | --- |
-| `crossfade_ms` | 50 | ≤ `crossfade_max_out / 48` | StartStream |
-| `sola_search_ms` | 10 | ≤ `sola_search_max_out / 48`，与 crossfade 之和 ≤ overlap | StartStream |
-| `startup_delay_ms` | 400 | ≥ 0 | StartStream |
+| `crossfade_ms` | 50 | 定值 50，偏离拒绝 | StartStream |
+| `sola_search_ms` | 10 | 定值 10，偏离拒绝 | StartStream |
+| `startup_delay_ms` | 400 | 0..=15000，且 % 20 == 0 | StartStream |
 | `skip_silence` | true | bool | StartStream |
 
-ms 按输出采样率换算样本。四键归 R 类运行时键，`config set` 走 Stop→Start：需扩展 [SPEC-04](SPEC-04-daemon.md) 的 `config set rvc.<会话参数>` 编排判据（现仅 `pitch_shift`/`index_rate`/`f0_method` 触发打断）纳入本段键，复用其失败恢复与降级语义。形状类不做运行时调参。
+`crossfade_ms + sola_search_ms` 锁为定值 60 ms（50 + 10），等于最大 overlap。入口按「各自 ≤ 上限且和 == 60」判定，等价于两键各锁定值，任何偏离都拒绝；拒绝原因写明「引擎形状按最大 overlap 固定，可调 overlap 尚未实现」。定值按 48 kHz 契约换算：`crossfade_max_out 2400 / 48 = 50`、`sola_search_max_out 480 / 48 = 10`、两者之和 `2880 / 48 = 60`；各采样率的 max_out 同比缩放，故 ms 边界与采样率无关。ms 按模型输出采样率换算样本。`startup_delay_ms` 与 `skip_silence` 不参与块几何，保持可调；前者上限 15000 来自 C++ 输出环 16 s @48 kHz 留 1 s 余量（`rvc/src/rvc/streaming_pipeline.cpp:24`）。
 
-验收：形状推导 C++/Python 双镜像单测（沿用 `tests/test_rvc_window_geometry.cpp`）；流式 golden 对拍按变体跑（`run_streaming_reference.py` 24 帧窗参考需泛化到契约块长）；板端按 [RVC-FILE-BENCHMARK](../RVC-FILE-BENCHMARK.md) 四层适配实时（接缝网格 = `output_hop`），记推理耗时/净延迟/接缝伪影比/音分配对差，变体入 `reports/`；非形状类固定形状扫 crossfade/sola/startup，按延时 + 效果定值。
+锁定原因是分析窗尚未与引擎形状解耦（代码确认）。资产按 `overlap_ref = 2400 + 480 = 2880` 固定，推出 `margin_16k 960`、front 280 帧、decoder 30 帧（`rvc/include/rvc/realtime_geometry.hpp:142-159`）；`StreamingRvc` 的分析窗却按实际旋钮值算（`rvc/src/rvc/streaming_pipeline.cpp:40-43`）。淡化 40 ms + SOLA 10 ms 得分析窗 279 帧，与引擎 280 帧不符，推理层每块抛异常、输出补零（`rvc/src/rvc/streaming_pipeline.cpp:286-296`）。只有默认 50 + 10 = 60 ms 与引擎形状一致；main 上这两个值是写死常量，永远匹配。锁为定值即回到 main 的既有几何行为，音质不退化。解耦做法与解除条件见改进点「淡化与 SOLA 真正可调」。
+
+延迟影响（推断，按代码公式推算，非实测听感）：48 kHz 单块 decoder 输出 = 11520 样本 + 淡化 + SOLA，默认 14400 样本 = 300 ms。淡化调小 10 ms 只省 10 ms 块长，而净滞后约 0.5 s 中 400 ms 是启动缓冲（板端实测见 `reports/realtime-pipeline-20261112/RESULTS.md`）。降延迟的可用旋钮是 `startup_delay_ms`，不是调小淡化。
+
+四键归 R 类运行时键（overlap 两键只接受定值），`config set` 走 Stop→Start：[SPEC-04](SPEC-04-daemon.md) 的编排判据已纳入本段四键（`daemon/src/services.rs:957-965`），复用其失败恢复与降级语义。形状类不做运行时调参。
+
+验收：形状推导 C++/Python 双镜像单测（`tests/test_rvc_window_geometry.cpp` 黄金锚点、`tests/test_rvc_realtime_params.cpp` 读 JSON 对拍并按 32k/40k/48k 重算、`tools/model/test_realtime_chain_params.py`）；旋钮范围、整除与 overlap 定值拒绝由 `validate_realtime_knobs` 与 `core::config` 两侧单测钉住；流式 golden 对拍按变体跑（`run_streaming_reference.py` 24 帧窗参考需泛化到契约块长）；板端按 [RVC-FILE-BENCHMARK](../RVC-FILE-BENCHMARK.md) 四层适配实时（接缝网格 = `output_hop`），记推理耗时/净延迟/接缝伪影比/音分配对差，变体入 `reports/`；非形状类固定形状扫 `startup_delay_ms` 与 `skip_silence`，按延时 + 效果定值，crossfade/sola 扫描待解耦后做。
 
 ## 改进点
 
-- [ ] 模型主导参数动态化（多模型适配，总方向）：凡由模型决定的参数（采样率、帧率、hop、特征维度、上采样比、合成帧数 T、音高量化）从模型动态读取，据此推导分窗几何、推理模式（整段/动态/分窗）与重采样，不写死常量。实时契约的固定形状（front 280 / decoder 30 / hubert 44800 / rmvpe 32）也应由模型能力推导。（`rvc/src/rvc/pipeline.cpp:202-213`）前置的跨模型实测已覆盖 40k/48k 共 10 个模型（文件链路）；实时固定形状仍待模型能力推导，采样率方案见下条。
-- [ ] 实时原生多采样率（内部动态采样率）：实时链路内部按模型原生采样率工作，不再固定 48 kHz。窗、hop、交叉淡化、SOLA、启动缓冲、输出环和帧率都由模型采样率推导；40 kHz 模型不再逐块重采样。外部播放采样率由 `StartStream` 与 pre/ALSA 协商；设备不支持原生采样率时，才在边界做一次状态化重采样。播放中不切换采样率。影响 rvc、core、pre、daemon；帧契约与 pre 播放配置分别见 SPEC-01、SPEC-02 改进点。前置：先完成下条采样率生态调研；再以模型能力描述驱动 `StreamingRvc` 几何与帧契约（最大帧长 + 有效样本数）；pre 支持按流配置播放采样率；40 kHz 板端实时冒烟、延迟/连续性/音质测量；48 kHz 无回归；重配播放链的断流代价评估。
-- [ ] 采样率生态与原生多采样率方案调研：通过公开网络资料调研 RVC 模型常见采样率（32k/40k/48k/其他）、上游实时推理对采样率的假设、TensorRT/ONNX 导出与 front/decoder 形状、ALSA/USB/蓝牙常见播放采样率，以及社区处理多采样率的做法。为实时原生多采样率定范围、优先级和风险，不依赖本机私有资产。前置：公开文档、源码、issue 与模型仓库；输出采样率分布、上游约束、候选架构、验证成本与未验证项；调研结论写入 `reports/` 或对应文档后再定实现范围。
-- [ ] 实时流中换模型（推理侧）：`LoadModel` 已支持活动流期间原子换入 inferencer，空闲切换先释放旧 inferencer 防 OOM。（`rvc/src/rvc/pipeline.cpp:141-156`、`rvc/control/stream_session.cpp:468-489`）缺块边界状态语义：过去上下文、SOLA 状态与音高缓存在新模型换入后的归属与重置规则；板端验证切换接缝、延迟与帧守恒。命令与编排见 SPEC-04。
+- [ ] 模型主导参数动态化（多模型适配，总方向）：凡由模型决定的参数（采样率、帧率、hop、特征维度、上采样比、合成帧数 T、音高量化）从模型动态读取，据此推导分窗几何、推理模式（整段/动态/分窗）与重采样，不写死常量。实时形状已改为按 JSON 几何常量加模型采样率与 emb 通道推导，门控不再写字面量（`rvc/src/rvc/pipeline.cpp:211-241`）；`W`/`P` 仍是单 profile 自由参数，未由模型能力推导。前置的跨模型实测已覆盖 40k/48k 共 10 个模型（文件链路）。
+- [x] 实时原生多采样率（内部动态采样率）：实时链路内部按模型原生采样率工作（32k/40k/48k）。窗、hop、交叉淡化、SOLA、启动缓冲与输出帧长都由采样率推导，40 kHz 模型不再逐块重采样。播放侧不协商采样率：固定 48 kHz，由 pre 在播放边界重采样（SPEC-02）。帧契约扩 `sample_rate`/`valid_samples`（SPEC-01）。（`rvc/include/rvc/realtime_geometry.hpp:119-201`、`rvc/src/rvc/audio_worker.cpp:64-73,137-139`、`rvc/src/rvc/streaming_pipeline.cpp:31-42`）板端验收见下方板端条目。
+- [x] 采样率生态与原生多采样率方案调研：公开资料调研 RVC 常见采样率（32k/40k/48k）、上游实时推理假设、导出与 front/decoder 形状、ALSA/USB 播放采样率约束，结论与实现边界入 `reports/realtime-sample-rate-20261116/RESULTS.md`。
+- [x] 实时流中换模型（推理侧）：`LoadModel` 支持活动流期间原子换入 inferencer，空闲切换先释放旧 inferencer 防 OOM。（`rvc/src/rvc/pipeline.cpp:142-160`、`rvc/control/stream_session.cpp:519-540`）实时换模型定为断流切换（SPEC-04 `model use`）：`StartStream` 重建 `StreamingRvc` 并 `reset_realtime`，过去上下文、SOLA 状态与音高缓存不跨模型保留，跨采样率按新采样率重建几何。（`rvc/src/rvc/audio_worker.cpp:62-79`）板端接缝与帧守恒见下方板端条目。
 - [x] 文件链路多模型：静态定长、静态整段与动态生成器（40k/48k）共 10 个模型板端完成，输出按输入时长统一收口，`frames_in == frames_out`；空闲模型切换先释放旧 inferencer 并腾出缓存槽位，避免旧模型显存未释放时触发 TensorRT OOM 回退 ONNX；活动流期间保持旧模型直到新模型换入。（`rvc/src/rvc/inferencer.cpp:243-442`、`rvc/src/rvc/pipeline.cpp:136-151`、`rvc/src/rvc/model_loader.cpp:307-342`、`reports/multi-model-file-20261115/RESULTS.md`）
 - [ ] 文件分窗几何动态化：398 只作默认参考；窗长、hop、pad 和超 profile 分块由引擎 min/opt/max、T、采样率与输入时长推导；拟增 `[file].chunk_frames`。验收：10/30/120 s 的 F0、log-mel、内存和延迟，22 s 内整段结果不变。（`rvc/src/rvc/inferencer.cpp:26,262-266,336-346`）
 - [ ] 文件链路优先大窗资产：编译时为文件链路提供覆盖目标时长的大窗或动态大 profile；加载器区分实时/文件资产，长文件不默认 T=200。验收：同输入的窗数、F0、log-mel、显存和延迟。
 - [ ] 文件小窗质量方向：必须小窗时，先做互相关/SOLA 对齐，再用等功率淡化；评估真实前后文、跨窗 F0 平滑、窗级增益匹配和噪声/相位连续性。验收看 F0 P90、log-mel、边界阶跃、显存与延迟。
-- [ ] 实时链路单独优化：实时模型可与文件不同，能力区分仅文件/仅实时/两者；按 240 ms 块、50 ms 淡化、SOLA、400 ms 启动单独调优；40 kHz 见上方实时原生多采样率条。几何与旋钮契约见实时几何与资产参数节。验收：48 kHz 无回归，具备实时资产的新模型起流、延迟 P95 与连续性。
-- [ ] 实时几何单一来源落地：`realtime_chain_params.json` 脚本读取 + CLI 默认推导 + 编译形状校验 + C++ 门控/常量镜像（见实时几何与资产参数节）。
-- [ ] `[rvc.realtime]` 段：`core::config` 键 + 校验 + schema + StartStream 携带 + 扩展 SPEC-04 `config set` Stop/Start 判据纳入本段键。
-- [ ] RMVPE 逐块帧推导复核（`feature_extractor.cpp`）；架构文档「音高缓存 1024 帧」未定位代码常量（存疑）。
+- [ ] 实时链路单独优化：实时模型可与文件不同，能力区分仅文件/仅实时/两者；按 240 ms 块、overlap 定值 60 ms、400 ms 启动单独调优；40 kHz 见上方实时原生多采样率条。几何与旋钮契约见实时几何与资产参数节。验收：48 kHz 无回归，具备实时资产的新模型起流、延迟 P95 与连续性。
+- [ ] 淡化与 SOLA 真正可调（解耦分析窗与淡化量）：分析窗恒按引擎形状喂帧（16 kHz 侧 280 帧，与采样率无关，`margin_16k` 按最大 overlap 算），实际 `crossfade_ms`/`sola_search_ms` 只用于 overlap-add 与 SOLA 搜索，不再决定分析窗长度（耦合点 `rvc/src/rvc/streaming_pipeline.cpp:40-43`，拼接点同文件 `349-360`）。解耦后入口才放开两键范围；现状锁为定值 60 ms，原因见实时几何与资产参数节。现在不做：引擎形状按最大 overlap 固定，解耦要同时改取窗与拼接两处，且淡化量变化的音质与接缝收益须板端声学对拍才有意义，单独开一轮。解除条件：完成解耦，并通过板端 32k/40k/48k 声学对拍与接缝听感验证（按 [RVC-FILE-BENCHMARK](../RVC-FILE-BENCHMARK.md) 四层适配实时），再放开范围校验、恢复 overlap 的 10 ms 整除校验（锁定期间作为不可达守卫已移除），并扫淡化/SOLA 定值。
+- [x] 实时几何单一来源落地：`realtime_chain_params.json` 由 `tools/model/realtime_chain_params.py` 读取，导出与编译脚本取默认值并校验形状，C++ 门控与常量镜像在 `realtime_geometry.hpp`（见实时几何与资产参数节）。（`tools/model/export_generator_split_onnx.py`、`export_hubert_onnx.py`、`export_rmvpe_onnx.py`、`build_realtime_engines.py`、`tests/test_rvc_realtime_params.cpp`）
+- [x] `[rvc.realtime]` 段：`core::config` 四键 + 范围、整除与 overlap 定值校验 + schema + `StartStream` 携带 + SPEC-04 `config set` Stop/Start 判据纳入本段键。（`core/src/config.rs:140-158,735-765`、`rvc/control/stream_session.cpp:283-327`、`daemon/src/services.rs:189-192,957-965`）
+- [x] RMVPE 逐块帧推导复核：帧数由 `derive_realtime_geometry` 推导并进门控，补整引用同一常量；架构文档「音高缓存 1024 帧」已定位 `kRealtimePitchCacheFrames`。（`rvc/include/rvc/realtime_geometry.hpp:166-173`、`rvc/src/rvc/feature_extractor.cpp:525-528`、`rvc/src/rvc/inferencer.cpp:40`）
+- [x] 板端多采样率与换模型冒烟（2026-11-17 实测，`tools/jetson-e2e.sh --realtime-mm --file --preset` 全过：实时多模型 9 场景、文件链 9、预设 8）：48 kHz 实时基线帧守恒且无推理错误、overlap 定值偏离在入口被拒且不打断在跑的流、`startup_delay_ms` 可调、48 kHz↔40 kHz 跨采样率 `model use`、切回载入原模型预设、未知模型失败恢复旧模型旧参数、文件占 GPU 时回 Busy、40 kHz 模型文件链输出 48 kHz 单声道、资产树无 presets 残留。套件为 `tools/jetson-realtime-mm.sh`（需两个采样率不同的模型，`MODEL_A`/`MODEL_B` 可指定）。注意采集静音时须置 `skip_silence = false` 才真跑推理，否则块全被跳过、`blocks` 恒 0。
+- [ ] 板端剩余未验证：32 kHz 模型实时（本轮设备只提供 40 kHz 与 48 kHz 模型）、延迟 P95/连续性/长跑稳定性、`model use` 切换接缝听感与音质主观评价。阻塞原因：现有套件只断言帧守恒、块计数与 `last_error`，不测延迟统计也不做听感评价；设备无 32 kHz 资产。解除条件：接入 32 kHz 模型后重跑 `--realtime-mm`；延迟与音质按 `reports/` 测量流程单独跑。
+- 本机已实测（2026-11-17，overlap 锁定与验收修复后）：`tools/ci-local.sh all` 通过，native 10 个 C++ 用例全过（含 32k/40k/48k 几何对拍与流式用例），Rust 647 项、Python 工具链 7 项全过。几何对拍经两次反证（改歪资产常量、改歪旋钮默认值均转红）。
+- [ ] Python 镜像单测接入检查入口：`tools/model/test_realtime_chain_params.py` 覆盖 32k/40k 几何与旋钮边界，但 `tools/ci-local.sh` 与 CTest 都未调用它，目前只能人工运行。解除条件：在检查脚本加一个 Python 单测调用。
 - [x] 模型加载移出控制锁。（`rvc/control/stream_session.cpp:152,159`）
 - [ ] 长文件改分块，限制内存。（FUTURE）正文已定推迟（分块流式见 FUTURE），本条同步标推迟。
 - [x] 配置项必须与实际行为一致。原 LoadModel 入口预检与注册表定稿冲突已修复（见模型注册表第一节）。

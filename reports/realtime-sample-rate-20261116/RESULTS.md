@@ -1,6 +1,8 @@
 # 采样率生态与实时原生多采样率方案调研
 
 日期：2026-11-16
+修订：2026-11-17，按已落地代码校正第 4 节实现边界与常量名。
+修订：2026-11-17，按用户确认的边界变更把淡化与 SOLA 锁为定值 60 ms，校正第 4 节与适用范围。
 依据：`docs/SPEC/SPEC-03-rvc.md`「采样率生态与原生多采样率方案调研」
 
 ## 1. RVC 模型采样率分布
@@ -25,12 +27,15 @@
 
 结合上述生态事实与 `SPEC-03-rvc.md` 目标，采用**原生多采样率全链路 + 播放边界兜底重采样**：
 
-1. **推理层（`rvc`）**：`StreamingRvc` 内部按模型原生 `tgt_sr`（支持 32000 / 40000 / 48000 Hz）计算 `model_frame_out = tgt_sr / 100`、`output_frame_samples = tgt_sr / 50`（20 ms 帧）、`hop`、交叉淡化、SOLA 搜索窗与启动缓冲；不再在 `pipeline.cpp` 与 `inferencer.cpp` 写死 48000 Hz。
-2. **帧契约（`core`）**：`mozart_output_frame_t` 保留 48 kHz 20 ms 缓冲上限 `MOZART_OUTPUT_MAX_SAMPLES = 960`，新增 `sample_rate`（u32）与 `valid_samples`（u32）字段，同时支持 32k（640 样本）、40k（800 样本）与 48k（960 样本）原生输出帧。
-3. **音频前端（`pre`）**：播放线程维护轻量无分配状态化重采样器；仅当收到帧的 `sample_rate` 与实际打开的 ALSA 播放采样率不一致时在边界重采样一次，采样率一致时零重采样直出。
-4. **模型切换（`daemon` + `ctl`）**：新增 `model use <id>` 控制命令；考虑到 8 GB Jetson 显存紧张（同时驻留旧/新 TensorRT 引擎易触发 OOM 回退 ONNX）及跨采样率模型切换时 `StreamingRvc` 几何需重建，v1 采用**断流切换（`StopStream -> LoadModel -> StartStream`）**，失败时尝试恢复原模型与流状态。
+1. **推理层（`rvc`）**：`StreamingRvc` 内部按模型原生 `tgt_sr`（支持 32000 / 40000 / 48000 Hz）计算 `model_frame_out = tgt_sr / 100`、`output_frame_samples = tgt_sr / 50`（20 ms 帧）、`hop`、交叉淡化、SOLA 搜索窗与启动缓冲；实时链路不再写死 48000 Hz。文件链路不变，离线收尾仍重采样到 48 kHz。交叉淡化与 SOLA 搜索窗锁为定值 50 ms 与 10 ms（合计 60 ms，等于最大 overlap），入口拒绝偏离；启动缓冲与静音跳过仍可调。锁定原因与解耦待办见 [SPEC-03 实时几何与资产参数](../../docs/SPEC/SPEC-03-rvc.md#实时几何与资产参数)。
+2. **帧契约（`core`）**：`mozart_output_frame_t` 保留 960 样本缓冲上限（常量 `MOZART_OUTPUT_SAMPLES`，Rust 镜像 `OUTPUT_SAMPLES`），新增 `sample_rate`（u32）与 `valid_samples`（u32）字段，支持 32k（640 样本）、40k（800 样本）与 48k（960 样本）原生输出帧；输出线包由 3860 B 扩为 3868 B。
+3. **音频前端（`pre`）**：ALSA 播放采样率固定 48 kHz，`set_rate_near` 拿不到 48000 Hz 即报错退出，不按流协商。播放线程的 `BoundaryResampler` 无分配、无锁，只取 `valid_samples` 有效段做线性插值重采样到 48 kHz；`sample_rate` 为 48000 且 `valid_samples` 为 960 时直通。切率与缺帧时重置插值历史。
+4. **模型切换（`daemon` + `ctl`）**：新增 `model use <id>` 控制命令（`DAEMON_MODEL_USE` 0x0120）。考虑到 8 GB Jetson 显存紧张（同时驻留旧/新 TensorRT 引擎易触发 OOM 回退 ONNX）及跨采样率模型切换时 `StreamingRvc` 几何需重建，v1 采用**断流切换（`StopStream -> LoadModel -> 预设提交 -> StartStream`）**。失败一律用旧模型与旧参数恢复流；起流失败先整体回退 TOML 基线、生效配置与预设来源记录，再恢复旧流。
 
 ## 适用范围
 
-- 覆盖公开资料调研与 Mozart `core` / `pre` / `rvc` / `daemon` 架构范围界定。
-- 具体 40 kHz 模型在 Jetson 板端 USB/板载声卡上的实测延迟、显存与音质数据待板端 E2E 验证后补充。
+- 配置：本文是公开资料调研与实现边界界定，不含本机或板端测量，无音频样本、无计时起止点。第 4 节按已落地代码核对，覆盖 Mozart `core` / `pre` / `rvc` / `daemon`。
+- 样本数：引用 5 处公开来源（RVC CLI 文档、Issue #1565、`realtime_gui.py`、Linux Audio 讨论、ALSA 采样率说明）；无统计样本，完成率不适用。
+- 已验证（板端实测，2026-11-17）：`tools/jetson-e2e.sh --realtime-mm --file --preset` 全过（实时多模型 9 场景、文件链 9、预设 8），含 48 kHz↔40 kHz 跨采样率 `model use`、overlap 定值拒绝、40 kHz 文件链输出 48 kHz 单声道。
+- 已验证（本机实测，2026-11-17 overlap 锁定与验收修复后）：`tools/ci-local.sh all` 通过，native 10 个 C++ 用例全过（含 32k/40k/48k 几何对拍与流式用例），Rust 647 项、Python 工具链 7 项全过。板端未跑。
+- 未验证项：32 kHz 模型板端实时（本轮设备只有 40 kHz 与 48 kHz 模型）、实时延迟 P95/显存/连续性/长跑稳定性、`model use` 切换接缝听感与音质主观评价。已验证的板端冒烟范围与解除条件见 [SPEC-03 板端条目](../../docs/SPEC/SPEC-03-rvc.md)。

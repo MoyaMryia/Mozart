@@ -25,7 +25,7 @@
 - [x] 16 kHz 打包：主干 960 对齐帧经 33 抽头 FIR 3:1 降采样为 320 样本契约帧，FIR 历史跨帧连续；InputFrame 的 meta 时间轴与主干帧同窗。`pts_ns` 取采集时间戳（frame.h 语义）；`frame_idx` 为打包序号（旧 `++frame_idx`，从 1 起；旧 main.c 打包时刻改写 pts 的做法不沿用）。（`dsp/src/decimator.rs:9-58`）
 - [x] AI 支路发送：处理线程对每帧主干恒定发送 InputFrame 到 rvc `input_socket`，不随路由停发（旧 main.c「AI 路径永不停」）。唯一例外是文件接管：`SetFileMode{active:true}` 期间 rvc 支路停发，把 `input_socket` 让给 daemon 的文件数据面（SPEC-03 复用 + 状态门控交接），避免实时帧污染整段攒帧；`active:false` 恢复恒发。asr 识别支路不受文件接管影响，始终恒发。rvc AI 支路（发送 + 绑 `output_socket`）受 daemon 权威断言门控（SPEC-04 单一权威）：pre 启动/重启后未断言则静默，收到首个 `SetFileMode` 才激活，不单边绑定/恒发，杜绝重启无条件 reclaim 孤儿化 daemon 绑定；断言先置 `file_mode` 再置断言标志，避免激活窗口抢发实时帧。非阻塞发送，过载与对端不在一律丢弃计数；pre 对 input_socket 惰性建链——对端后起不阻塞 pre 启动，未建链期发送丢弃计数，对端就绪后自动接通。（`pre/src/ai.rs:19,57-108,170-217`）
 - [x] AI 支路接收：pre 经门控断言后惰性绑定 `output_socket` 收 OutputFrame，应用层接收环 8 帧（4–8 确认范围取上沿）满丢最旧计数；播放线程 rvc 路由取该环、缺帧补零续流，direct 路由逐帧排空该环并按帧计数。文件接管期间接收线程释放 `output_socket` 绑定（daemon 接管同一 socket），交还时重绑恢复接收；释放/重绑经握手标志确认，控制命令在释放完成后才应答（见 SPEC-03「切换时交接绑定」）。（`pre/src/ai.rs:177,196-208`、`pre/src/state.rs:247-265`）
-- [x] `consumer_drops` 口径：键随 `[[pre.consumers]]` 列表动态生成，每个消费者报告输入发送丢弃；名为 `rvc` 的消费者额外聚合输出链路——`rvc` = 输入发送丢弃 + 输出坏包丢弃 + 接收环满丢弃（链路异常计数，恒发下应接近 0），`rvc.skipped` = direct 路由期间丢弃的输出帧（设计内丢弃，对应旧 `skipped_replies`，direct 下随回显持续增长属正常）；`tts` 为播报链路固定键。（`pre/src/state.rs` Shared::status）
+- [x] `consumer_drops` 口径：键随 `[[pre.consumers]]` 列表动态生成，每个消费者报告输入发送丢弃；名为 `rvc` 的消费者额外聚合输出链路——`rvc` = 输入发送丢弃 + 输出坏包丢弃 + 接收环满丢弃（链路异常计数，恒发下应接近 0），`rvc.skipped` = direct 路由期间丢弃的输出帧（设计内丢弃，对应旧 `skipped_replies`，direct 下随回显持续增长属正常）；`tts` 为播报链路固定键。尺寸不符计数是坏包丢弃的子集，控制线程首次发现时把原因写进 `last_error`（守卫定义见 SPEC-01）。（`pre/src/state.rs` Shared::status、`pre/src/control.rs:75-91`）
 - [x] 路由与静音淡变为 10 ms（480 样本）线性增益；direct↔rvc 两个方向对称：先淡出完成再切源，帧内过零保持零增益，下一帧新源从零淡入，消除切换单样本跳变；静音为淡到零并保持。（`pre/src/route.rs:62-78`、`pre/tests/route.rs:234-249`）
 - [x] 分发：音频进程按配置消费者列表逐个 Unix socket 发送；一个消费者一个 socket，背压互不影响。`[[pre.consumers]]` 声明 name/socket/file_mode_affected（缺省 false 恒发）；未设置回退 rvc+asr 两支路，socket 沿用 `[rvc]/[asr]` 的 input_socket（rvc 受文件接管影响、asr 不受）。入口校验名字唯一、socket 唯一且纯文件名，"tts" 与含点名为保留键。（`core/src/config.rs` PreConsumerConfig/Config::pre_consumers、`pre/src/ai.rs` Sender、`pre/src/main.rs` process_thread）
 - [x] 扬声器仲裁的执行归音频进程（淡变、设备写入）；策略（何时切、切到哪、静音与否）由 daemon 下发。直出、变声、翻译播报共用播放设备。
@@ -46,4 +46,6 @@
 - [x] 禁用降噪时跳过全部计算。（`dsp/src/lib.rs:88-93`）
 - [x] 淡变逻辑加重入保护，参数做边界校验。（`pre/src/route.rs:72-75`）
 - [x] 拆开旧单体主程序。（pre 与 dsp 分 crate）
-- [ ] 实时原生多采样率：播放采样率按流配置；设备不支持原生采样率时在边界做一次状态化重采样；主条见 SPEC-03。
+- [x] 实时原生多采样率（播放端）：播放采样率固定 48 kHz，不按流协商。`BoundaryResampler` 在播放线程入口把模型原生帧重采样到 48 kHz，只取 `valid_samples` 有效段；`sample_rate` 48000 且 `valid_samples` 960 时直通。覆盖 32k/40k/48k 与运行中切率。主条见 SPEC-03。（`pre/src/playback.rs:85-137,198-209`，单测 `:400-478`）
+- [x] `BoundaryResampler` 实时线程约束：栈数组进出，无锁、无阻塞、无分配，播放循环前预创建。采样率变化时以新帧首样本重置插值历史；缺帧与切回 direct 时 reset 清零。（`pre/src/playback.rs:103-136,155,195,205`）
+- [x] 播放设备必须给到 48 kHz：`set_rate_near` 返回值不等于 48000 即报错退出，由 daemon 退避重启。设备不支持 48 kHz 时不在播放侧改率。（`pre/src/alsa_stream.rs:46-51`）

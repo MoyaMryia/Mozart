@@ -48,7 +48,14 @@ mozart-ctl route set rvc      # 切到变声
 mozart-ctl route set direct   # 切回直出
 mozart-ctl mute on            # 静音
 mozart-ctl mute off           # 取消静音
+mozart-ctl model use <模型id>  # 换模型（实时或空闲）
 ```
+
+`model use` 短暂断流：停流 → 载入新模型 → 载入该模型的 `presets/default.toml` → 重新起流。
+它把模型选择写回配置基线，重启后沿用；`config set rvc.model_id` 被拒绝。
+失败时自动恢复旧模型与旧参数；文件任务占用 GPU 时拒绝换模型。
+换模型要加载引擎，等待时间比一般命令长。
+输出采样率随模型（32k/40k/48k），播放固定 48 kHz，由 pre 在播放边界重采样。
 
 ## 五、文件转换
 
@@ -89,7 +96,8 @@ mozart-ctl restart <pre|rvc|asr|tts|bridge|llama>  # 重启单个服务
 
 `config get` 读基线值。键尚未重启生效时，值后追加一行 `pending` 提示，重启对应服务后消失。
 
-`config set` 支持设备键、daemon/file 运行时键和 RVC 会话参数；完整键表见 [config.md](config.md)。
+`config set` 支持设备键、daemon/file 运行时键、RVC 会话参数与 `[rvc.realtime]` 旋钮；完整键表见 [config.md](config.md)。
+实时旋钮中只有启动缓冲 `startup_delay_ms` 与静音跳过 `skip_silence` 可调。淡化与 SOLA 搜索是定值（合计 60 ms），写入其他值会被拒绝。
 RVC 会话参数按模型保存：换模型时载入该模型的 `presets/default.toml`；调参后用 `preset save` 写回。文件链在 GPU 交接后取参数快照，任务开始后的改动留给下一任务。
 
 日志：`<run_dir>/logs/<进程名>.log`，运行目录由配置给出，目录规范见 [SETUP.md](SETUP.md)。

@@ -1,6 +1,6 @@
 # SPEC 索引
 
-状态：讨论中。最后更新：2026-11-16。
+状态：讨论中。最后更新：2026-11-17。
 
 ## 总体
 
@@ -146,3 +146,12 @@
 - 2026-11-16：SPEC-11 模型预设实现：`preset save/use/list`、模型切换载入 `default.toml`、文件链 RVC 参数快照后移到交接后、板端 preset 套件。
 - 2026-11-16：SPEC-11 修订：载入拆为读校验与写基线两步、`LoadModel` 夹在中间，加载失败不留参数错位；模型存在性归推理层；损坏预设回 Internal；`preset save` 校验参数来源；CLI 三个 preset 命令统一长超时、`config set` 接受负值（SPEC-04、SPEC-11）。
 - 2026-11-16：待重启显示扩到键级：`GetStatus` 与 `config get` 应答带 `pending_restart_keys`，CLI 在值后提示尚未生效的键；键按受影响服务集合清除（SPEC-04、config.md）。
+- 2026-11-17：输出帧契约扩为 3868 B，新增 `sample_rate` 与 `valid_samples`（线包偏移 20 与 24），共享夹具更新为 48000/960（SPEC-01）。
+- 2026-11-17：实时链路原生多采样率（32k/40k/48k），几何按模型采样率推导；播放侧固定 48 kHz，pre 新增播放边界重采样，不做播放采样率协商（SPEC-02、SPEC-03）。
+- 2026-11-17：新增 `DAEMON_MODEL_USE` 0x0120 与 CLI `model use <id>`，定为断流切换（Stop→LoadModel→预设提交→Start），避免 8 GB 设备双引擎驻留 OOM，支持跨采样率重建 `StreamingRvc`（SPEC-03、SPEC-04）。
+- 2026-11-17：边界变更（用户确认）：`model use` 允许把 `[rvc].model_id` 写回 TOML 基线，写回只在 `LoadModel` 成功后的提交临界区、失败整体回退；预设载入路径仍不碰模型身份，`config set rvc.model_id` 仍拒绝（SPEC-11、SPEC-04、config.md）。
+- 2026-11-17：`[rvc.realtime]` 四旋钮热更新纳入 `config set` 的 Stop/Start 判据；新增整除约束（crossfade+sola 为 10 ms 倍数、startup 为 20 ms 倍数）与上限，违反在入口回 InvalidArgument（SPEC-03、SPEC-04）。
+- 2026-11-17：实时几何单一来源扩到旋钮默认值、上限与整除模数，C++ 集中在 `realtime_geometry.hpp` 并由 `validate_realtime_knobs` 单点判定，新增读 JSON 的对拍测试（SPEC-03）。
+- 2026-11-17：新旧进程混跑诊断：数据面不做版本协商，尺寸不符只在热路径计数，控制线程首次出现时记可查询原因，要求同代重建 pre/rvc/tts/daemon（SPEC-01、SPEC-02）。
+- 2026-11-17：边界变更（用户确认，取代同日 overlap 范围可调部分）：`crossfade_ms + sola_search_ms` 锁为定值 60 ms（50 + 10），入口拒绝偏离，原因是引擎形状按最大 overlap 固定、分析窗尚未与之解耦；`startup_delay_ms` 与 `skip_silence` 仍可调；淡化/SOLA 解耦推迟，待办落 SPEC-03 改进点（SPEC-03、config.md、FUTURE）。
+- 2026-11-17：新增板端套件 `tools/jetson-realtime-mm.sh`（`--realtime-mm`）：跨采样率 `model use`、overlap 定值拒绝、`startup_delay` 可调、失败恢复、40 kHz 文件链与资产隔离；板端实测 48 kHz↔40 kHz 冒烟通过，32 kHz 与延迟/听感仍未验证（SPEC-03、SPEC-11、SETUP）。
