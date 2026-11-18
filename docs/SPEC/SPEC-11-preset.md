@@ -12,7 +12,7 @@
 
 - 本规格 owns：预设文件契约、载入与保存编排、`preset` 命令面、首次自动创建。
 - 会话参数范围校验单一来源在 `core::config`（[config.md](../config.md)），本规格复用，不另定阈值。
-- 载入编排复用 [SPEC-04](SPEC-04-daemon.md) 的 `config set rvc.<会话参数>` 判据与 Stop/Start 编排，不新增重载语义。
+- 载入编排复用 [SPEC-04](SPEC-04-daemon.md) 的 `config set rvc.<会话参数>` 判据与 `SetParams` / `Stop/Start` 编排，不新增重载语义。
 - 资产目录规则见 [SPEC-10](SPEC-10-env.md) 与 [SETUP.md](../SETUP.md)；`presets/` 可写例外由 SETUP.md 声明。
 - `StartStream` 契约不变（[SPEC-03](SPEC-03-rvc.md)）：仍携带五个会话参数，取自 `[rvc]`。
 - 术语区分：**模型预设**指会话参数的按模型持久化快照；区别于 SPEC-03 参数边界表的「C++ 内部 preset」（`StreamingRvc` 流式几何参数）。
@@ -46,7 +46,7 @@
 - [x] 实时链路落点：模型切换 `LoadModel` 前读并校验，`LoadModel` 成功后写基线，再 `StartStream`；路由切换与对账同序。
 - [x] 载入动作分两步：resolve 读并校验预设（缺失则建 default），commit 一次 `toml_edit` 原子写五个参数键到 TOML 基线 → 重建生效配置 → `apply_rvc_session_params_locked` 编排（`daemon/src/services.rs:881`）。预设载入路径只写五键，不碰 `[rvc]` 其余键。
 - [x] `LoadModel` 夹在两步之间：预设损坏与模型加载失败都在写入前退出，live 参数与已加载模型不错位，仅剩「模型加载成功但写基线失败」的窄窗口。文件链两步之间放开 transition 锁，commit 重新取锁并复核记录与当前生效配置。
-- [x] 编排判据复用现有：实时流在跑且 pitch/index/f0 或 `[rvc.realtime]` 四键变化才 Stop/Start（判据见 SPEC-04）；文件交接后实时已停，自然只更新配置不打断。
+- [x] 编排判据复用现有：实时流在跑且 `pitch_shift`/`index_rate`/`f0_method` 变化时下发 `SetParams`（`0x0308`）无中断生效，`[rvc.realtime]` 中的 `startup_delay_ms`（及锁定的 `crossfade_ms`/`sola_search_ms`）变化才走 `Stop/Start`（判据见 SPEC-04）；文件交接后实时已停，自然只更新配置不打断。
 - [x] `model use` 的提交与回退：resolve 在停流前读校验（损坏预设不打断在跑的流）→ StopStream → LoadModel → `commit_model_switch_locked` 在同一把 toml 锁内先写 `[rvc].model_id` 基线再写五键基线 → 重建生效配置 → 编排 → 记录 applied，返回 `SwitchUndo` 回退快照 → StartStream 复用 handle 只起一次。任何失败都用旧模型 + 旧参数恢复流；起流失败先按 `SwitchUndo` 整体回退基线、生效配置与 applied，再恢复旧流。恢复失败记持久降级原因（前缀 `rvc model use`）。唯一残留窗口是回退时 TOML 写回本身失败，记 `preset: model switch baseline restore: …; TOML baseline may still name the target model`。命令契约与编排细节见 [SPEC-04](SPEC-04-daemon.md)。（`daemon/src/preset.rs:139-195,348-359`、`daemon/src/services.rs:978-1059`）
 - [x] `model use` 的两种跳过：预设跳过（同模型已载入或目录不可解析）与无 TOML 基线（daemon 未带 `--config`）时只落模型身份，保留 live 会话参数。（`daemon/src/preset.rs:151-170,339-345`）
 - [x] 首次自动创建：模型首次加载且无 `default.toml` → 用 `core::config` 规范默认值（pitch 0、index_rate 0.0、rms_mix_rate 1.0、protect 0.33、rmvpe）创建 → 载入。
@@ -66,7 +66,7 @@
 ### 范围与迁移
 
 - [x] v1 单预设：只 `default.toml`。多预设、按名 use、delete、last-used 见本文件改进点。
-- [x] 实时调整语义 = 下任务生效：`config set` 即时写生效配置，当前文件任务用启动快照跑完，下一任务用新参。不做任务中途变参（FUTURE SetParams）。
+- [x] 文件任务调整语义 = 下任务生效：`config set` 即时写生效配置，当前文件任务用启动快照跑完，下一任务用新参（不做文件任务中途变参）；实时流活动期间经 `SetParams` 在块边界无中断生效。
 - [x] 迁移无例外：升级后首次加载按统一规则建 default 并载入。用户未手调过 `[rvc]`，无保护需求。
 - [x] `[rvc]` 语义变化：从「全局持久参数来源」变为「当前载入的 live 草稿」；持久来源改为按模型预设文件。`config set`/`config save` 机制不变，五参数仍归运行时键。`[rvc].model_id` 基线只由 `model use` 写回，预设文件仍不含模型身份。
 
@@ -102,7 +102,7 @@ v1 体均空（固定 default、当前模型）。多预设阶段体扩 `{"name"
 - [x] 新模型首次 `file submit --model <id>`：自动建 `presets/default.toml`（规范默认值），任务用该值完成。
 - [x] `preset save` 后 `default.toml` 内容等于 save 时的 live 五参数；TOML 不变。
 - [x] `config set rvc.pitch_shift 5` 后下一文件任务用 5；当前任务不中断、用旧参。
-- [x] `preset use` 后 live 五参数回到 `default.toml`；实时流在跑且 pitch/index/f0 或 `[rvc.realtime]` 四键变化时短暂 Stop/Start。
+- [x] `preset use` 后 live 五参数回到 `default.toml`；实时流在跑且 `pitch_shift`/`index_rate`/`f0_method` 变化时经 `SetParams`（`0x0308`）无中断生效。
 - [x] 模型 A 切 B：B 的 default 载入 `[rvc]`；切回 A：A 的 default 载入。同模型连续任务不重载。
 - [x] 实时模型切换同样载入预设；文件切模型后实时切回不用错参数。
 - [x] 损坏预设：文件任务 failed 带原因（Internal）、队列继续；`preset use` 报错不写基线。
@@ -120,7 +120,7 @@ v1 体均空（固定 default、当前模型）。多预设阶段体扩 `{"name"
 ## 测试策略
 
 - 单元（Rust，各 crate `src/` 或 `tests/`）：预设解析与校验、首次自动建、save 原子写、载入批量写基线 + 编排、模型切换检测、NotReady 与损坏分支。
-- 集成（`daemon/tests/`）：模型切换载入、preset use 实时 Stop/Start、文件下任务生效、跨链不污染、`model use` 成功与四条失败路径。
+- 集成（`daemon/tests/`）：模型切换载入、preset use 实时 `SetParams` 热更与回退、文件下任务生效、跨链不污染、`model use` 成功与四条失败路径。
 - 板端（`tools/jetson-e2e.sh`）：新增 preset 功能套件；file-models 套件用临时模型目录副本或测后清理 `presets/`，避免污染资产。
 - 命令：本机 `tools/ci-local.sh all`；板端 `tools/jetson-e2e.sh <SSH目标> --file`（preset 套件并入或独立）。
 
@@ -155,7 +155,7 @@ v1 体均空（固定 default、当前模型）。多预设阶段体扩 `{"name"
 - [ ] last-used：切回模型恢复上次用的预设（需 per-model 持久状态）。
 - [ ] 设默认：把任意预设设为 default。
 - [ ] 命名字符集与校验（多预设阶段定）。
-- [ ] 无中断 SetParams（块边界调参，FUTURE 已有）。
+- [x] 无中断 SetParams（块边界调参）：`preset use` 与 `config set` 在实时流期间经 `RVC_SET_PARAMS`（`0x0308`）在块边界生效，不断流。
 
 ## 待讨论
 
@@ -167,6 +167,8 @@ v1 体均空（固定 default、当前模型）。多预设阶段体扩 `{"name"
 - 2026-11-16 修订（载入拆两步、损坏预设回 Internal、save 校验参数来源、CLI 三命令长超时）：本机 `tools/ci-local.sh all` 通过（repo、lint、native、rust；web 未建跳过）。
 - 集成（2026-11-16）：`daemon/tests/preset.rs` 11 项通过，覆盖首次自动建、save/use/list、模型切换、实时 Stop/Start、跨链、损坏、文件与实时加载失败保护、参数来源未知拒绝、模型目录缺失报错归推理层、NotReady。
 - 2026-11-17 本机（`model use` 与 `model_id` 写回边界）：`tools/ci-local.sh all` 通过（repo、lint、native、rust；web 未建跳过）。`daemon/tests/preset.rs` 18 项通过，新增 7 项覆盖 `model use` 成功只起一次流、LoadModel/提交/起流/恢复四条失败路径、文件占 GPU 回 Busy、损坏预设停流前拒绝。`daemon/tests/rvc_params.rs` 覆盖 `[rvc.realtime]` 旋钮与 `model use` 的 Stop/Start 编排。板端 `model use` 与跨采样率场景未跑，阻塞原因与解除条件见 SPEC-03 板端条目。
+- 2026-11-18 本机（`SetParams` 接入 `preset use` / `config set`）：`tools/ci-local.sh all` 通过（C++ 与 Rust 在线调参全量用例通过）。
+- 2026-11-18 板端：`tools/jetson-e2e.sh --unit --smoke --preset --realtime-mm --file` 全过（`--preset` 8 场景含实时 `preset use` 不断流载入、`--realtime-mm` 10 场景含 `SetParams 在线调参不断流`、设备端 `cargo test` 647 项 + `ctest` 10/10 全过）。带人声输出下 `preset use` 块边界热更的接缝主观听感仍未验证（阻塞原因：现有套件只校验 Loopback 下流不断裂、帧守恒与日志落盘；解除条件：向 Loopback 播放人声触发 `preset use` 并录制输出波形/听感验收）。
 - 2026-11-16 板端：`tools/jetson-e2e.sh --preset` 8 场景全过（真 daemon + pre + rvc，两个模型经符号链接放临时模型目录，资产树不写）。实测确认残缺模型的失败发生在 `LoadModel` 而非预设解析，live 参数、TOML 基线与已加载模型预设三者不变。
 - 板端与桩的行为差异：真 rvc 加载新模型前驱逐空闲模型，加载失败后可能无模型在载，此时 `preset save` 回 NotReady「no model loaded」属预期，不是来源守卫拒绝；桩不驱逐，故该分支只在板端可见。
 - 2026-11-16 板端回归：`tools/jetson-e2e.sh --file --preset` 全过（文件链 9 场景、preset 8 场景）。`--file` 首轮暴露一处回归：预设层曾以「模型目录不存在」抢在 `LoadModel` 前报 Internal，违反 SPEC-10「模型存在性归推理层」；已改为目录不存在时跳过载入，由 `LoadModel` 回 InvalidArgument「model not found」，并补集成用例 `missing_model_dir_reports_load_model_error_not_preset_error` 锁定该契约。

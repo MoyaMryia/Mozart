@@ -92,6 +92,9 @@ enum {
     MOZART_CTL_RVC_RESET_STREAM = 0x0305,
     MOZART_CTL_RVC_GET_STATUS   = 0x0306,
     MOZART_CTL_RVC_LIST_MODELS  = 0x0307,  // 体 {}（空），data {"models":[{"id","exists","loaded"}]}
+    // 体 {"pitch_shift","index_rate","rms_mix_rate","protect","f0_method","skip_silence"?}；
+    // 实时流活动时在下一推理块边界无中断生效（SPEC-03）。
+    MOZART_CTL_RVC_SET_PARAMS   = 0x0308,
 
     MOZART_CTL_ASR_HELLO      = 0x0401,
     MOZART_CTL_ASR_GET_STATUS = 0x0402,

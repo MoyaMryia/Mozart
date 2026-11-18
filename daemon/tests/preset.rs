@@ -209,6 +209,14 @@ impl Harness {
             .collect()
     }
 
+    fn set_params_calls(&self) -> Vec<Value> {
+        self.entries()
+            .into_iter()
+            .filter(|entry| entry.stub == "mozart-rvc-stub" && entry.type_ == ctl::RVC_SET_PARAMS)
+            .map(|entry| entry.body)
+            .collect()
+    }
+
     fn rvc_count(&self, type_: u16) -> usize {
         self.entries()
             .iter()
@@ -344,7 +352,7 @@ fn save_use_list_track_live_values_without_writing_config() {
 }
 
 #[test]
-fn preset_use_restarts_realtime_stream_when_realtime_params_change() {
+fn preset_use_applies_via_set_params_without_restarting_realtime_stream() {
     let h = Harness::new("realtime", &["model-a"], "model-a");
     h.set_route_rvc();
     expect_ok(h.config_set("rvc.pitch_shift", "3"));
@@ -356,23 +364,14 @@ fn preset_use_restarts_realtime_stream_when_realtime_params_change() {
     let used = apply_data(h.preset_use());
     assert_eq!(used.values.pitch_shift, 3);
 
-    let entries = h.entries();
-    let stop = entries
-        .iter()
-        .position(|entry| entry.stub == "mozart-rvc-stub" && entry.type_ == ctl::RVC_STOP_STREAM)
-        .expect("重置实时参数应先停流");
-    let (start_index, start) = entries
-        .iter()
-        .enumerate()
-        .find(|(_, entry)| {
-            entry.stub == "mozart-rvc-stub"
-                && entry.type_ == ctl::RVC_START_STREAM
-                && entry.body["kind"] == "realtime"
-        })
-        .map(|(index, entry)| (index, &entry.body))
-        .expect("停流后应重建实时流");
-    assert!(stop < start_index, "必须先停后起：{entries:?}");
-    assert_eq!(start["pitch_shift"], 3, "StartStream 应带预设值：{start}");
+    assert_eq!(h.rvc_count(ctl::RVC_STOP_STREAM), 0, "preset use 不得停流");
+    assert!(
+        h.stream_starts("realtime").is_empty(),
+        "preset use 不得重起实时流"
+    );
+    let calls = h.set_params_calls();
+    assert_eq!(calls.len(), 1, "preset use 应下发一次 SetParams：{calls:?}");
+    assert_eq!(calls[0]["pitch_shift"], 3, "SetParams 应带预设值：{calls:?}");
     assert_eq!(h.rvc_params().pitch_shift, 3);
     h.wait_streaming();
 }
@@ -747,18 +746,18 @@ fn model_use_start_failure_rolls_back_and_restores_old_params() {
 /// 基线与 applied 仍整体回退，不静默吞掉恢复失败。
 #[test]
 fn model_use_restore_failure_records_queryable_degraded() {
-    // setup 恰好起流两次（route set rvc、config set pitch）；此后全部失败。
+    // setup 恰好起流一次（route set rvc，config set pitch 走 SetParams 不起流）；此后全部失败。
     let h = Harness::new_with_env(
         "use-restore-fail",
         &["model-a", "model-b"],
         "model-a",
-        &[("MOZART_RVC_STUB_FAIL_START_AFTER", "2")],
+        &[("MOZART_RVC_STUB_FAIL_START_AFTER", "1")],
     );
     h.load_a_with_pitch3();
     h.write_preset("model-b", 7);
     assert_eq!(
         h.rvc_count(ctl::RVC_START_STREAM),
-        2,
+        1,
         "失败旋钮按起流次数计数，setup 次数必须确定"
     );
     let baseline_before = h.config_text();

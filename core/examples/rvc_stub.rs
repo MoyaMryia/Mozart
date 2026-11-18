@@ -13,6 +13,10 @@
 //! 模拟推理线程挂死（进程活着），让喂帧方填满缓冲后阻塞。
 //! 测试旋钮 `MOZART_RVC_STUB_FAIL_START_PITCH=<i32>`：StartStream 的
 //! pitch_shift 等于该值时回 InferenceFailed（仅一次），模拟新参起流失败。
+//! 测试旋钮 `MOZART_RVC_STUB_FAIL_START_DELAY_MS=<u32>`：StartStream 的
+//! startup_delay_ms 等于该值时回 InferenceFailed（仅一次），模拟旋钮起流失败。
+//! 测试旋钮 `MOZART_RVC_STUB_FAIL_SET_PARAMS_PITCH=<i32>`：SetParams 的
+//! pitch_shift 等于该值时回 InferenceFailed（仅一次），模拟在线调参失败。
 //! 测试旋钮 `MOZART_RVC_STUB_FAIL_START_AFTER=<n>`：前 n 次 StartStream 成功，
 //! 之后全部回 InferenceFailed，模拟新参与旧参恢复都失败。
 //! 测试旋钮 `MOZART_RVC_STUB_STOP_KEEP_STREAM=1`：StopStream 应答成功但保持
@@ -76,6 +80,10 @@ struct State {
     feed_pace: Duration,
     /// 一次性失败：pitch_shift 命中后清空，供失败恢复用例重试成功。
     fail_start_pitch: Option<i32>,
+    /// 一次性失败：startup_delay_ms 命中后清空，供 Stop/Start 失败恢复用例重试成功。
+    fail_start_delay_ms: Option<u32>,
+    /// 一次性失败：SetParams 的 pitch_shift 命中后清空，供 SetParams 失败用例重试成功。
+    fail_set_params_pitch: Option<i32>,
     /// 前 n 次 StartStream 成功，之后全部失败。
     fail_start_after: Option<u32>,
     /// 置位时 StopStream 应答成功但不结束流，模拟停流未生效。
@@ -105,6 +113,12 @@ fn main() {
         .map(Duration::from_millis)
         .unwrap_or(Duration::ZERO);
     let fail_start_pitch = std::env::var("MOZART_RVC_STUB_FAIL_START_PITCH")
+        .ok()
+        .and_then(|value| value.parse::<i32>().ok());
+    let fail_start_delay_ms = std::env::var("MOZART_RVC_STUB_FAIL_START_DELAY_MS")
+        .ok()
+        .and_then(|value| value.parse::<u32>().ok());
+    let fail_set_params_pitch = std::env::var("MOZART_RVC_STUB_FAIL_SET_PARAMS_PITCH")
         .ok()
         .and_then(|value| value.parse::<i32>().ok());
     let fail_start_after = std::env::var("MOZART_RVC_STUB_FAIL_START_AFTER")
@@ -139,6 +153,8 @@ fn main() {
         hang,
         feed_pace,
         fail_start_pitch,
+        fail_start_delay_ms,
+        fail_set_params_pitch,
         fail_start_after,
         stop_keep_stream,
         status_fail_file,
@@ -156,6 +172,7 @@ fn handle(msg: &Message, state: &mut State) -> Vec<u8> {
         ctl::RVC_RESET_STREAM,
         ctl::RVC_GET_STATUS,
         ctl::RVC_LIST_MODELS,
+        ctl::RVC_SET_PARAMS,
     ];
     if let Err(reply) = expect_known(msg, &known) {
         return reply;
@@ -199,13 +216,22 @@ fn handle(msg: &Message, state: &mut State) -> Vec<u8> {
                 .get("pitch_shift")
                 .and_then(Value::as_i64)
                 .and_then(|value| i32::try_from(value).ok());
+            let startup_delay = body
+                .get("startup_delay_ms")
+                .and_then(Value::as_u64)
+                .and_then(|value| u32::try_from(value).ok());
             let fail_by_count = state
                 .fail_start_after
                 .is_some_and(|limit| state.starts > limit);
             let fail_by_pitch = state.fail_start_pitch.is_some() && pitch == state.fail_start_pitch;
-            if fail_by_count || fail_by_pitch {
+            let fail_by_delay =
+                state.fail_start_delay_ms.is_some() && startup_delay == state.fail_start_delay_ms;
+            if fail_by_count || fail_by_pitch || fail_by_delay {
                 if fail_by_pitch {
                     state.fail_start_pitch = None;
+                }
+                if fail_by_delay {
+                    state.fail_start_delay_ms = None;
                 }
                 return fail(
                     ctl::CODE_INFERENCE_FAILED,
@@ -297,8 +323,75 @@ fn handle(msg: &Message, state: &mut State) -> Vec<u8> {
                 .collect();
             ok(json!({"models": models}))
         }
+        ctl::RVC_SET_PARAMS => {
+            let pitch = match validate_rvc_params(&body) {
+                Ok(pitch) => pitch,
+                Err(reply) => return reply,
+            };
+            if state.model.is_none() {
+                return fail(ctl::CODE_NOT_LOADED, "load a model first");
+            }
+            if !state.streaming {
+                return fail(ctl::CODE_NOT_READY, "no active stream");
+            }
+            if state.kind.as_deref() != Some("realtime") {
+                return fail(
+                    ctl::CODE_BUSY,
+                    "cannot change parameters during an active file stream",
+                );
+            }
+            if state.fail_set_params_pitch == Some(pitch) {
+                state.fail_set_params_pitch = None;
+                return fail(
+                    ctl::CODE_INFERENCE_FAILED,
+                    "stub rejects SetParams (test knob)",
+                );
+            }
+            ok(json!({}))
+        }
         _ => unreachable!("expect_known covers all commands"),
     }
+}
+
+/// SetParams 五参数与 skip_silence 校验（与 C++ StreamSession::handle_set_params 同口径）。
+fn validate_rvc_params(body: &Value) -> Result<i32, Vec<u8>> {
+    let invalid = |reason: &str| Err(fail(ctl::CODE_INVALID_ARGUMENT, reason));
+    let Some(pitch_shift) = body.get("pitch_shift").and_then(Value::as_i64) else {
+        return invalid("missing or malformed field: pitch_shift");
+    };
+    let Some(index_rate) = body.get("index_rate").and_then(Value::as_f64) else {
+        return invalid("missing or malformed field: index_rate");
+    };
+    let Some(rms_mix_rate) = body.get("rms_mix_rate").and_then(Value::as_f64) else {
+        return invalid("missing or malformed field: rms_mix_rate");
+    };
+    let Some(protect) = body.get("protect").and_then(Value::as_f64) else {
+        return invalid("missing or malformed field: protect");
+    };
+    let Some(f0_method) = body.get("f0_method").and_then(Value::as_str) else {
+        return invalid("missing or malformed field: f0_method");
+    };
+    if let Some(skip) = body.get("skip_silence") {
+        if !skip.is_boolean() {
+            return invalid("skip_silence must be a boolean");
+        }
+    }
+    if f0_method != "rmvpe" {
+        return invalid("parameter out of range: f0_method");
+    }
+    if !(-12..=12).contains(&pitch_shift) {
+        return invalid("parameter out of range: pitch_shift");
+    }
+    if !index_rate.is_finite() || !(0.0..=1.0).contains(&index_rate) {
+        return invalid("parameter out of range: index_rate");
+    }
+    if !rms_mix_rate.is_finite() || !(0.0..=1.0).contains(&rms_mix_rate) {
+        return invalid("parameter out of range: rms_mix_rate");
+    }
+    if !protect.is_finite() || !(0.0..=0.5).contains(&protect) {
+        return invalid("parameter out of range: protect");
+    }
+    Ok(pitch_shift as i32)
 }
 
 /// kind=file 入口校验一次（同 C++ StreamSession）：total_frames 正整数（u32）；

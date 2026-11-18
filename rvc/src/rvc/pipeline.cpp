@@ -130,7 +130,20 @@ std::shared_ptr<RVCInferencer> RealRVCPipeline::current_inferencer() const {
 bool RealRVCPipeline::set_parameters(const RvcParameters& parameters) {
     std::lock_guard<std::mutex> lock(mutex_);
     parameters_ = parameters;
-    rebuild_inferencer_locked();
+    // 模型已加载时原地更新 inferencer 参数，保留实时 pitch 缓存与随机状态（SetParams）；
+    // 尚未 LoadModel 时 inferencer_ 为空，rebuild_inferencer_locked() 早退等待 LoadModel 再建。
+    if (inferencer_) {
+        inferencer_->set_parameters(
+            parameters_.f0_method,
+            parameters_.pitch_shift,
+            static_cast<float>(parameters_.index_rate),
+            static_cast<float>(parameters_.rms_mix_rate),
+            static_cast<float>(parameters_.protect),
+            parameters_.index_nprobe
+        );
+    } else {
+        rebuild_inferencer_locked();
+    }
     return true;
 }
 

@@ -85,10 +85,16 @@ public:
     // 仅流式模式有效；无流时为空操作。
     void reset_stream();
 
+    // 运行中块边界更新静音跳过（SetParams 语义）：无锁原子更新。
+    // StreamSession 持会话锁且在 worker_ 就绪后调用；在 start() 建流期间
+    // 与本调用之间通过 start() 末尾重刷 skip_silence_ 保持一致。
+    void set_skip_silence(bool skip) noexcept;
+
 private:
     RealTimeAudioStream& stream_;
     RVCPipelineBase& pipeline_;
     Config config_;
+    std::atomic<bool> skip_silence_;
 
     bool stream_mode_ = false;
     std::unique_ptr<StreamingRvc> streaming_;

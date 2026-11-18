@@ -185,7 +185,7 @@ pub struct RvcStatus {
 }
 
 /// RVC 会话参数当前生效值（status.rvc_params，SPEC-04 config set 编排）。
-/// 取自 daemon 生效配置而不是 rvc 进程快照：参数在 StartStream 时固定，
+/// 取自 daemon 生效配置而不是 rvc 进程快照：参数经 StartStream / SetParams 下发，
 /// 失败回退后 status 须显示仍在生效的旧值。
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct RvcParams {

@@ -93,6 +93,9 @@ pub const RVC_RESET_STREAM: u16 = 0x0305;
 pub const RVC_GET_STATUS: u16 = 0x0306;
 /// 体：{}（空）；data {"models":[schema::ModelEntry]}。
 pub const RVC_LIST_MODELS: u16 = 0x0307;
+/// 体：{"pitch_shift","index_rate","rms_mix_rate","protect","f0_method","skip_silence"?}；
+/// 实时流活动时在块边界无中断更新参数（SPEC-03）。
+pub const RVC_SET_PARAMS: u16 = 0x0308;
 
 pub const ASR_HELLO: u16 = 0x0401;
 pub const ASR_GET_STATUS: u16 = 0x0402;
@@ -645,6 +648,7 @@ mod tests {
         assert_eq!(DAEMON_PRESET_LIST, 0x011F);
         assert_eq!(DAEMON_MODEL_USE, 0x0120);
         assert_eq!(RVC_LIST_MODELS, 0x0307);
+        assert_eq!(RVC_SET_PARAMS, 0x0308);
         assert_eq!(PRE_SET_FILE_MODE, 0x0206);
         assert_eq!(PRE_SET_DSP, 0x0207);
     }
@@ -690,6 +694,7 @@ mod tests {
         ("RVC_RESET_STREAM", RVC_RESET_STREAM),
         ("RVC_GET_STATUS", RVC_GET_STATUS),
         ("RVC_LIST_MODELS", RVC_LIST_MODELS),
+        ("RVC_SET_PARAMS", RVC_SET_PARAMS),
         ("ASR_HELLO", ASR_HELLO),
         ("ASR_GET_STATUS", ASR_GET_STATUS),
         ("BRIDGE_HELLO", BRIDGE_HELLO),

@@ -35,7 +35,8 @@ void upsample_16k_to_48k(const float* in, float* out) {
 AudioWorker::AudioWorker(RealTimeAudioStream& stream,
                          RVCPipelineBase& pipeline,
                          Config config)
-    : stream_(stream), pipeline_(pipeline), config_(std::move(config))
+    : stream_(stream), pipeline_(pipeline), config_(std::move(config)),
+      skip_silence_(config_.skip_silence)
 {}
 
 AudioWorker::~AudioWorker() {
@@ -55,7 +56,7 @@ void AudioWorker::start() {
     stream_mode_ = !pipeline_.is_mock();
     if (stream_mode_) {
         StreamingRvc::Config scfg;
-        scfg.skip_silence = config_.skip_silence;
+        scfg.skip_silence = skip_silence_.load(std::memory_order_relaxed);
         // kind=realtime 选短块 preset（实时能力由 StreamSession 入口校验，
         // 此处按能力探测置位）；kind=file 不用短块，走 quality 或滑窗。
         scfg.upstream_realtime =
@@ -81,6 +82,8 @@ void AudioWorker::start() {
             scfg.startup_buffer_blocks = 3;
         }
         streaming_ = std::make_unique<StreamingRvc>(scfg);
+        // 建流期间若有并发 set_skip_silence，启动推理线程前再同步一次最新值。
+        streaming_->set_skip_silence(skip_silence_.load(std::memory_order_relaxed));
         inference_thread_ = std::thread([this] {
             streaming_->inference_loop(pipeline_, running_);
         });
@@ -107,6 +110,11 @@ void AudioWorker::stop() {
 
 void AudioWorker::reset_stream() {
     if (streaming_) streaming_->reset();
+}
+
+void AudioWorker::set_skip_silence(bool skip) noexcept {
+    skip_silence_.store(skip, std::memory_order_relaxed);
+    if (streaming_) streaming_->set_skip_silence(skip);
 }
 
 void AudioWorker::set_last_error(const std::string& message) {
@@ -172,7 +180,7 @@ void AudioWorker::process_frame(const mozart_input_frame_t& input,
     output.sample_rate = MOZART_OUTPUT_SAMPLE_RATE;
     output.valid_samples = MOZART_OUTPUT_SAMPLES;
 
-    if (config_.skip_silence && input.meta.vad_flag == 0) {
+    if (skip_silence_.load(std::memory_order_relaxed) && input.meta.vad_flag == 0) {
         std::memset(output.pcm, 0, sizeof(output.pcm));
         return;
     }

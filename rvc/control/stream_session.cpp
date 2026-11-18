@@ -1,4 +1,4 @@
-// stream_session.cpp — SPEC-03 七命令服务端实现（见头文件说明）
+// stream_session.cpp — SPEC-03 八命令服务端实现（见头文件说明）
 #include "control/stream_session.h"
 
 #include <chrono>
@@ -58,6 +58,57 @@ nlohmann::json string_or_null(const std::string& value) {
     return value;
 }
 
+// StartStream 与 SetParams 共用的五参数解析与范围校验（单一入口校验，不重复）。
+bool parse_rvc_parameters(const nlohmann::json& body, RvcParameters& parameters,
+                          std::string& reason) {
+    const char* missing = nullptr;
+    if (!body.contains("pitch_shift") || !body.at("pitch_shift").is_number_integer())
+        missing = "pitch_shift";
+    else if (!body.contains("index_rate") || !body.at("index_rate").is_number())
+        missing = "index_rate";
+    else if (!body.contains("rms_mix_rate") || !body.at("rms_mix_rate").is_number())
+        missing = "rms_mix_rate";
+    else if (!body.contains("protect") || !body.at("protect").is_number())
+        missing = "protect";
+    else if (!body.contains("f0_method") || !body.at("f0_method").is_string())
+        missing = "f0_method";
+    if (missing) {
+        reason = std::string("missing or malformed field: ") + missing;
+        return false;
+    }
+    const int64_t pitch_shift = body.at("pitch_shift").get<int64_t>();
+    if (pitch_shift < std::numeric_limits<int>::min()
+        || pitch_shift > std::numeric_limits<int>::max()) {
+        reason = "parameter out of range: pitch_shift";
+        return false;
+    }
+    parameters.f0_method = body.at("f0_method").get<std::string>();
+    parameters.pitch_shift = static_cast<int>(pitch_shift);
+    parameters.index_rate = body.at("index_rate").get<double>();
+    parameters.rms_mix_rate = body.at("rms_mix_rate").get<double>();
+    parameters.protect = body.at("protect").get<double>();
+    if (const char* bad = invalid_rvc_parameter(parameters)) {
+        reason = std::string("parameter out of range: ") + bad;
+        return false;
+    }
+    return true;
+}
+
+bool parse_optional_skip_silence(const nlohmann::json& body,
+                                 std::optional<bool>& out,
+                                 std::string& reason) {
+    if (!body.contains("skip_silence")) {
+        out.reset();
+        return true;
+    }
+    if (!body.at("skip_silence").is_boolean()) {
+        reason = "skip_silence must be a boolean";
+        return false;
+    }
+    out = body.at("skip_silence").get<bool>();
+    return true;
+}
+
 } // namespace
 
 StreamSession::StreamSession(std::unique_ptr<SessionBackend> backend)
@@ -97,6 +148,8 @@ std::vector<uint8_t> StreamSession::handle(const CtlMessage& message) {
         }
         case MOZART_CTL_RVC_START_STREAM:
             return handle_start_stream(body);
+        case MOZART_CTL_RVC_SET_PARAMS:
+            return handle_set_params(body);
         case MOZART_CTL_RVC_STOP_STREAM: {
             shutdown();
             return ok_body(nlohmann::json::object());
@@ -192,24 +245,19 @@ std::vector<uint8_t> StreamSession::handle_load_model(
 
 std::vector<uint8_t> StreamSession::handle_start_stream(
     const nlohmann::json& body) {
-    // ---- 入口校验一次（SPEC-03：StartStream 参数此时固定）----
+    // ---- 入口校验一次 ----
     const char* missing = nullptr;
     if (!body.contains("kind") || !body.at("kind").is_string()) missing = "kind";
     else if (!body.contains("model_handle") || !body.at("model_handle").is_number_unsigned())
         missing = "model_handle";
-    else if (!body.contains("pitch_shift") || !body.at("pitch_shift").is_number_integer())
-        missing = "pitch_shift";
-    else if (!body.contains("index_rate") || !body.at("index_rate").is_number())
-        missing = "index_rate";
-    else if (!body.contains("rms_mix_rate") || !body.at("rms_mix_rate").is_number())
-        missing = "rms_mix_rate";
-    else if (!body.contains("protect") || !body.at("protect").is_number())
-        missing = "protect";
-    else if (!body.contains("f0_method") || !body.at("f0_method").is_string())
-        missing = "f0_method";
     if (missing) {
         return error_body(MOZART_CTL_CODE_INVALID_ARGUMENT,
                           std::string("missing or malformed field: ") + missing);
+    }
+    RvcParameters parameters;
+    std::string param_error;
+    if (!parse_rvc_parameters(body, parameters, param_error)) {
+        return error_body(MOZART_CTL_CODE_INVALID_ARGUMENT, param_error);
     }
     const std::string kind = body.at("kind").get<std::string>();
     if (kind != "realtime" && kind != "file") {
@@ -246,16 +294,6 @@ std::vector<uint8_t> StreamSession::handle_start_stream(
             }
             file_options.total_samples = total_samples;
         }
-    }
-    RvcParameters parameters;
-    parameters.f0_method = body.at("f0_method").get<std::string>();
-    parameters.pitch_shift = body.at("pitch_shift").get<int>();
-    parameters.index_rate = body.at("index_rate").get<double>();
-    parameters.rms_mix_rate = body.at("rms_mix_rate").get<double>();
-    parameters.protect = body.at("protect").get<double>();
-    if (const char* bad = invalid_rvc_parameter(parameters)) {
-        return error_body(MOZART_CTL_CODE_INVALID_ARGUMENT,
-                          std::string("parameter out of range: ") + bad);
     }
 
     std::lock_guard<std::mutex> lock(mutex_);
@@ -309,12 +347,13 @@ std::vector<uint8_t> StreamSession::handle_start_stream(
             }
             startup_delay_ms = body.at("startup_delay_ms").get<uint64_t>();
         }
-        if (body.contains("skip_silence")) {
-            if (!body.at("skip_silence").is_boolean()) {
-                return error_body(MOZART_CTL_CODE_INVALID_ARGUMENT,
-                                  "skip_silence must be a boolean");
-            }
-            realtime_options.skip_silence = body.at("skip_silence").get<bool>();
+        std::optional<bool> skip_silence;
+        std::string skip_reason;
+        if (!parse_optional_skip_silence(body, skip_silence, skip_reason)) {
+            return error_body(MOZART_CTL_CODE_INVALID_ARGUMENT, skip_reason);
+        }
+        if (skip_silence.has_value()) {
+            realtime_options.skip_silence = *skip_silence;
         }
         const std::string invalid =
             validate_realtime_knobs(crossfade_ms, sola_search_ms, startup_delay_ms);
@@ -340,6 +379,45 @@ std::vector<uint8_t> StreamSession::handle_start_stream(
     spdlog::info("StartStream kind={} model={} handle={}", kind, model_id_,
                  model_handle_);
     return ok_body({{"stream_kind", kind}});
+}
+
+std::vector<uint8_t> StreamSession::handle_set_params(
+    const nlohmann::json& body) {
+    RvcParameters parameters;
+    std::string param_error;
+    if (!parse_rvc_parameters(body, parameters, param_error)) {
+        return error_body(MOZART_CTL_CODE_INVALID_ARGUMENT, param_error);
+    }
+    std::optional<bool> skip_silence;
+    std::string skip_error;
+    if (!parse_optional_skip_silence(body, skip_silence, skip_error)) {
+        return error_body(MOZART_CTL_CODE_INVALID_ARGUMENT, skip_error);
+    }
+
+    std::string active_model_id;
+    {
+        std::lock_guard<std::mutex> lock(mutex_);
+        if (model_id_.empty() || model_handle_ == 0) {
+            return error_body(MOZART_CTL_CODE_NOT_LOADED, "load a model first");
+        }
+        if (!worker_) {
+            return error_body(MOZART_CTL_CODE_NOT_READY, "no active stream");
+        }
+        if (stream_kind_ != "realtime") {
+            return error_body(MOZART_CTL_CODE_BUSY,
+                              "cannot change parameters during an active file stream");
+        }
+        backend_->set_params(parameters);
+        if (skip_silence.has_value()) {
+            worker_->set_skip_silence(*skip_silence);
+        }
+        active_model_id = model_id_;
+    }
+    spdlog::info(
+        "SetParams model={} pitch_shift={} index_rate={} rms_mix_rate={} protect={} f0_method={}",
+        active_model_id, parameters.pitch_shift, parameters.index_rate,
+        parameters.rms_mix_rate, parameters.protect, parameters.f0_method);
+    return ok_body(nlohmann::json::object());
 }
 
 WorkerStats StreamSession::current_stats_locked() const {
@@ -426,6 +504,8 @@ public:
     }
 
     void reset() override { worker_->reset_stream(); }
+
+    void set_skip_silence(bool skip) override { worker_->set_skip_silence(skip); }
 
     WorkerStats stats() override {
         const AudioWorker::StreamStats s = worker_->get_stream_stats();
@@ -581,7 +661,7 @@ std::unique_ptr<StreamWorker> InferenceBackend::start_worker(
     const FileBatchOptions& file_options,
     const RealtimeStreamOptions& realtime_options,
     std::string& reason) {
-    // 会话参数在启动时固定（SPEC-03）；先落参数再造推理器。
+    // 会话参数初始值随 StartStream 下发（SPEC-03），运行中可经 SetParams 热更。
     pipeline_->set_parameters(params);
     try {
         // 数据面复用配置默认 socket（SPEC-03「复用帧数据面 / 切换时交接绑定」）：
@@ -616,6 +696,10 @@ std::unique_ptr<StreamWorker> InferenceBackend::start_worker(
         reason = std::string("start stream worker: ") + error.what();
         return nullptr;
     }
+}
+
+void InferenceBackend::set_params(const RvcParameters& params) {
+    pipeline_->set_parameters(params);
 }
 
 } // namespace rvc

@@ -140,6 +140,15 @@ impl Services {
             .map_err(CallError::into_rejection)
     }
 
+    /// SetParams：实时流活动期间在下一推理块边界无中断更新会话参数与 skip_silence。
+    pub fn set_rvc_params(&self, rvc: &RvcConfig) -> Result<(), (String, String)> {
+        let body = set_params_body(rvc).to_string();
+        self.rvc()
+            .call_ok(ctl::RVC_SET_PARAMS, body.as_bytes())
+            .map(|_| ())
+            .map_err(CallError::into_rejection)
+    }
+
     /// StopStream：实时切回 direct 与文件收尾/取消共用同一命令。
     /// 文件模式停在下一个推理检查点，可能超过 rpc_timeout_ms；超时按降级
     /// 处理（C++ 侧仍会停流），调用方不得因此卡住。
@@ -176,21 +185,27 @@ impl Services {
     }
 }
 
-/// StartStream 会话参数（SPEC-03 参数边界表）：实时与文件共用 `[rvc]` 一份。
-/// kind 与文件批处理字段由调用方补齐；实时流另带 `[rvc.realtime]` 旋钮。
-fn stream_body(rvc: &RvcConfig, model_handle: u64) -> Value {
+/// SetParams 载荷（SPEC-03）：五项会话参数加实时静音跳过开关。
+fn set_params_body(rvc: &RvcConfig) -> Value {
     json!({
-        "model_handle": model_handle,
         "pitch_shift": rvc.pitch_shift,
         "index_rate": rvc.index_rate,
         "rms_mix_rate": rvc.rms_mix_rate,
         "protect": rvc.protect,
         "f0_method": rvc.f0_method,
-        "crossfade_ms": rvc.realtime.crossfade_ms,
-        "sola_search_ms": rvc.realtime.sola_search_ms,
-        "startup_delay_ms": rvc.realtime.startup_delay_ms,
         "skip_silence": rvc.realtime.skip_silence,
     })
+}
+
+/// StartStream 会话参数（SPEC-03 参数边界表）：实时与文件共用 `[rvc]` 一份。
+/// kind 与文件批处理字段由调用方补齐；实时流另带 `[rvc.realtime]` 旋钮。
+fn stream_body(rvc: &RvcConfig, model_handle: u64) -> Value {
+    let mut body = set_params_body(rvc);
+    body["model_handle"] = json!(model_handle);
+    body["crossfade_ms"] = json!(rvc.realtime.crossfade_ms);
+    body["sola_search_ms"] = json!(rvc.realtime.sola_search_ms);
+    body["startup_delay_ms"] = json!(rvc.realtime.startup_delay_ms);
+    body
 }
 
 enum CallError {
@@ -868,24 +883,28 @@ pub(crate) fn merge_session_key(
     Ok(merged)
 }
 
-/// config set rvc.<会话参数> 的实时链路编排（SPEC-04）：写 TOML 由 core 完成，
-/// daemon 负责应用。调用方须持 transition 锁，并在返回 Ok 后、释放锁前替换
-/// 生效配置，避免轮询在替换前用旧快照起流。`new` 只含本次写入键的改动
-/// （见 `merge_session_key`），因此触发判据只看当前设置的键：只有实时链路
-/// 实际使用的 `pitch_shift`、`index_rate`、`f0_method` 值变化且实时流在跑时
-/// 才 StopStream→StartStream（短暂打断）；只改 `protect`/`rms_mix_rate` 或
-/// 其他键不触发，即使存在未生效的其他 RVC 基线。失败用旧参恢复实时流，
-/// 恢复失败返回组合错误并记录持久降级原因；不自动重试，下一次对应键写入
-/// 或 daemon 重启再应用。路由非 rvc、rvc 不可达或没有实时流时只更新生效
-/// 配置：文件任务使用启动时的配置快照，下一任务与下一次建流自然读到新值。
+/// config set rvc.<会话参数> 与 preset use 的实时链路编排（SPEC-04）：
+/// 写 TOML 由 core/preset 完成，daemon 负责应用。调用方须持 transition 锁，
+/// 并在返回 Ok 后、释放锁前替换生效配置，避免轮询在替换前用旧快照起流。
+/// `new` 只含本次写入键的改动（见 `merge_session_key`）：
+/// - `crossfade_ms` / `sola_search_ms` / `startup_delay_ms` 决定流缓冲结构，
+///   变化且实时流在跑时走 `StopStream`→`StartStream`（失败用旧参恢复）；
+/// - `pitch_shift` / `index_rate` / `f0_method` / `skip_silence` 变化且实时流
+///   在跑时走 `SetParams` 在下一推理块边界无中断生效（失败保留在跑旧参）；
+/// - 仅改 `protect` / `rms_mix_rate` 或值未变化时只更新 TOML 基线与生效配置。
+/// 失败恢复后不自动重试，下一次对应键写入或 daemon 重启再应用。路由非 rvc、
+/// rvc 不可达或没有实时流时只更新生效配置：文件任务使用启动时的配置快照，
+/// 下一任务与下一次建流自然读到新值。
 pub(crate) fn apply_rvc_session_params_locked(
     state: &Mutex<State>,
     services: &Services,
     old: &RvcConfig,
     new: &RvcConfig,
 ) -> Result<(), (String, String)> {
-    // 仅 protect/rms_mix_rate 变化或值未变化：实时链路不应用，无需停流。
-    if !realtime_params_changed(old, new) {
+    let restart_changed = realtime_restart_changed(old, new);
+    let hot_changed = realtime_hot_params_changed(old, new);
+    // 仅 protect/rms_mix_rate 变化或值未变化：实时链路不应用，无需下发 rvc。
+    if !restart_changed && !hot_changed {
         return Ok(());
     }
     // 文件任务只在 Direct 下启动（GPU 归文件期间 route set 只写 desired），
@@ -905,6 +924,11 @@ pub(crate) fn apply_rvc_session_params_locked(
     };
     if status.state != "streaming" || status.stream_kind.as_deref() != Some("realtime") {
         return Ok(());
+    }
+    if !restart_changed {
+        return services
+            .set_rvc_params(new)
+            .map_err(|(code, reason)| (code, format!("rvc set params: {reason}")));
     }
     let model_id = resolve_model_id(new, &status)?;
 
@@ -951,16 +975,19 @@ pub(crate) fn apply_rvc_session_params_locked(
     }
 }
 
-/// 实时链路实际使用的会话参数是否变化（SPEC-03 参数边界表）：
-/// `protect`、`rms_mix_rate` 只在文件链路生效，变化不打断实时流。
-/// `new` 只含本次写入键的改动，判定等价于“只看当前设置的键”。
-fn realtime_params_changed(old: &RvcConfig, new: &RvcConfig) -> bool {
+/// 决定流缓冲结构、须停流重起才生效的 `[rvc.realtime]` 旋钮是否变化。
+fn realtime_restart_changed(old: &RvcConfig, new: &RvcConfig) -> bool {
+    old.realtime.crossfade_ms != new.realtime.crossfade_ms
+        || old.realtime.sola_search_ms != new.realtime.sola_search_ms
+        || old.realtime.startup_delay_ms != new.realtime.startup_delay_ms
+}
+
+/// 实时链路实际使用的、可经 `SetParams` 块边界无中断生效的参数是否变化：
+/// `protect`、`rms_mix_rate` 只在文件链路生效，变化不触发 `SetParams`。
+fn realtime_hot_params_changed(old: &RvcConfig, new: &RvcConfig) -> bool {
     old.pitch_shift != new.pitch_shift
         || old.index_rate != new.index_rate
         || old.f0_method != new.f0_method
-        || old.realtime.crossfade_ms != new.realtime.crossfade_ms
-        || old.realtime.sola_search_ms != new.realtime.sola_search_ms
-        || old.realtime.startup_delay_ms != new.realtime.startup_delay_ms
         || old.realtime.skip_silence != new.realtime.skip_silence
 }
 

@@ -276,20 +276,96 @@ RVCInferencer::RVCInferencer(
     , feature_extractor_(feature_extractor)
     , input_sample_rate_(input_sample_rate)
     , output_sample_rate_(output_sample_rate)
-    , f0_method_(std::move(f0_method))
-    , pitch_shift_(pitch_shift)
-    , index_rate_(index_rate)
-    , rms_mix_rate_(rms_mix_rate)
-    , protect_(protect)
-    , index_nprobe_(index_nprobe)
+    , params_{std::move(f0_method), pitch_shift, index_rate, rms_mix_rate, protect, index_nprobe}
 {
     reset_realtime();
+}
+
+void RVCInferencer::set_parameters(
+    std::string f0_method,
+    int pitch_shift,
+    float index_rate,
+    float rms_mix_rate,
+    float protect,
+    int index_nprobe
+) {
+    std::lock_guard<std::mutex> lock(params_mutex_);
+    params_ = SessionParams{
+        std::move(f0_method), pitch_shift, index_rate, rms_mix_rate, protect, index_nprobe
+    };
+}
+
+RVCInferencer::SessionParams RVCInferencer::snapshot_params() const {
+    std::lock_guard<std::mutex> lock(params_mutex_);
+    return params_;
 }
 
 void RVCInferencer::reset_realtime() {
     realtime_pitch_cache_.assign(kRealtimePitchCacheFrames, 0);
     realtime_pitchf_cache_.assign(kRealtimePitchCacheFrames, 0.0f);
     realtime_random_.seed(114514);
+}
+
+void RVCInferencer::push_realtime_pitch_cache(
+    const std::vector<int64_t>& new_pitch,
+    const std::vector<float>& new_pitchf,
+    size_t shift
+) {
+    if (shift >= realtime_pitch_cache_.size()) {
+        std::fill(realtime_pitch_cache_.begin(), realtime_pitch_cache_.end(), 0);
+        std::fill(realtime_pitchf_cache_.begin(), realtime_pitchf_cache_.end(), 0.0f);
+    } else {
+        std::move(
+            realtime_pitch_cache_.begin() + static_cast<std::ptrdiff_t>(shift),
+            realtime_pitch_cache_.end(), realtime_pitch_cache_.begin()
+        );
+        std::fill(
+            realtime_pitch_cache_.end() - static_cast<std::ptrdiff_t>(shift),
+            realtime_pitch_cache_.end(), 0
+        );
+        std::move(
+            realtime_pitchf_cache_.begin() + static_cast<std::ptrdiff_t>(shift),
+            realtime_pitchf_cache_.end(), realtime_pitchf_cache_.begin()
+        );
+        std::fill(
+            realtime_pitchf_cache_.end() - static_cast<std::ptrdiff_t>(shift),
+            realtime_pitchf_cache_.end(), 0.0f
+        );
+    }
+
+    if (new_pitch.size() < 5 || new_pitchf.size() != new_pitch.size()) {
+        return;
+    }
+    // Upstream recomputes four overlap frames and drops three left-edge plus
+    // one right-edge RMVPE frames before updating its persistent pitch cache.
+    const size_t fresh_count = std::min(
+        new_pitch.size() - 4, realtime_pitch_cache_.size()
+    );
+    const size_t fresh_source = new_pitch.size() - fresh_count - 1;
+    const size_t fresh_target = realtime_pitch_cache_.size() - fresh_count;
+    std::copy_n(
+        new_pitch.begin() + static_cast<std::ptrdiff_t>(fresh_source),
+        fresh_count,
+        realtime_pitch_cache_.begin() + static_cast<std::ptrdiff_t>(fresh_target)
+    );
+    std::copy_n(
+        new_pitchf.begin() + static_cast<std::ptrdiff_t>(fresh_source),
+        fresh_count,
+        realtime_pitchf_cache_.begin() + static_cast<std::ptrdiff_t>(fresh_target)
+    );
+}
+
+uint32_t RVCInferencer::sample_realtime_random() {
+    return realtime_random_();
+}
+
+RVCInferencer::RealtimeStateSnapshot RVCInferencer::realtime_state_snapshot() const {
+    std::mt19937 peek = realtime_random_;
+    return RealtimeStateSnapshot{
+        realtime_pitch_cache_,
+        realtime_pitchf_cache_,
+        static_cast<uint32_t>(peek()),
+    };
 }
 
 std::vector<float> RVCInferencer::infer(
@@ -303,6 +379,7 @@ std::vector<float> RVCInferencer::infer(
         throw std::runtime_error("Offline Generator engine not loaded");
     }
 
+    const SessionParams params = snapshot_params();
     const auto profile_start = profile::Clock::now();
     std::vector<float> audio_16k;
     if (input_sample_rate_ != 16000) {
@@ -340,10 +417,10 @@ std::vector<float> RVCInferencer::infer(
     const auto profile_padded = profile::Clock::now();
     const size_t full_frames = padded.size() / kHop16k;
     check_cancelled(cancelled);
-    const auto f0_full = feature_extractor_->extract_f0(padded, 16000, f0_method_);
+    const auto f0_full = feature_extractor_->extract_f0(padded, 16000, params.f0_method);
     check_cancelled(cancelled);
     const auto profile_f0 = profile::Clock::now();
-    auto [pitch_full, pitchf_full] = f0_to_pitch(f0_full, pitch_shift_,
+    auto [pitch_full, pitchf_full] = f0_to_pitch(f0_full, params.pitch_shift,
         std::max(f0_full.size(), padded.size() / kHop16k + 1));
     const auto profile_pitch = profile::Clock::now();
 
@@ -366,7 +443,7 @@ std::vector<float> RVCInferencer::infer(
     // one reflect-padded prefix enters HuBERT and one Generator invocation.
     // Static engines retain the legacy fixed-window behavior below.
     if (dynamic_generator && full_shape_supported) {
-        auto converted = infer_window(padded, pitchf_full, pitch_full, cancelled);
+        auto converted = infer_window(padded, pitchf_full, pitch_full, params, cancelled);
         const size_t context = kPad16k * model_sr / 16000;
         if (converted.size() > 2 * context) {
             converted = std::vector<float>(
@@ -377,7 +454,7 @@ std::vector<float> RVCInferencer::infer(
         // 要求输出帧数等于输入帧数，按输入时长补齐（多出部分裁掉）。
         const size_t expected = samples_for(audio_16k.size(), model_sr);
         converted.resize(expected, 0.0f);
-        converted = apply_rms_mix(audio_16k, std::move(converted));
+        converted = apply_rms_mix(audio_16k, std::move(converted), params);
         if (model_sr != output_sample_rate_) {
             converted = resample(converted, model_sr, output_sample_rate_);
         }
@@ -409,14 +486,14 @@ std::vector<float> RVCInferencer::infer(
         auto pitchf = slice_or_pad(pitchf_full, 0, generator_frames);
         auto pitch = std::vector<int64_t>(generator_frames, 1);
         for (size_t t = 0; t < generator_frames; ++t) pitch[t] = pitch_full[t];
-        auto converted = infer_window(padded, pitchf, pitch, cancelled);
+        auto converted = infer_window(padded, pitchf, pitch, params, cancelled);
         const size_t context = kPad16k * model_sr / 16000;
         if (converted.size() > 2 * context) {
             converted = std::vector<float>(
                 converted.begin() + static_cast<std::ptrdiff_t>(context),
                 converted.end() - static_cast<std::ptrdiff_t>(context));
         }
-        converted = apply_rms_mix(audio_16k, std::move(converted));
+        converted = apply_rms_mix(audio_16k, std::move(converted), params);
         if (model_sr != output_sample_rate_) {
             converted = resample(converted, model_sr, output_sample_rate_);
         }
@@ -451,7 +528,7 @@ std::vector<float> RVCInferencer::infer(
             pitch[t] = pitch_full[source];
         }
         auto hubert_input = reflect_pad(audio_16k, pad_16k);
-        auto converted = infer_window(hubert_input, pitchf, pitch, cancelled);
+        auto converted = infer_window(hubert_input, pitchf, pitch, params, cancelled);
         if (converted.size() > 2 * pad_tgt) {
             converted = std::vector<float>(
                 converted.begin() + static_cast<std::ptrdiff_t>(pad_tgt),
@@ -460,7 +537,7 @@ std::vector<float> RVCInferencer::infer(
         if (converted.size() < window_out) {
             converted.resize(window_out, 0.0f);
         }
-        converted = apply_rms_mix(audio_16k, std::move(converted));
+        converted = apply_rms_mix(audio_16k, std::move(converted), params);
         if (model_sr != output_sample_rate_) {
             converted = resample(converted, model_sr, output_sample_rate_);
         }
@@ -513,7 +590,7 @@ std::vector<float> RVCInferencer::infer(
             absolute_cycles = -left_cycles;
         }
         auto converted = infer_window(
-            hubert_input, pitchf, pitch, cancelled,
+            hubert_input, pitchf, pitch, params, cancelled,
             true, pitch_start, absolute_cycles);
         if (converted.size() > 2 * pad_tgt) {
             converted = std::vector<float>(
@@ -548,7 +625,7 @@ std::vector<float> RVCInferencer::infer(
     const size_t expected = samples_for(audio_16k.size(), model_sr);
     if (assembled.size() > expected) assembled.resize(expected);
 
-    assembled = apply_rms_mix(audio_16k, std::move(assembled));
+    assembled = apply_rms_mix(audio_16k, std::move(assembled), params);
     if (model_sr != output_sample_rate_) {
         assembled = resample(assembled, model_sr, output_sample_rate_);
     }
@@ -572,6 +649,7 @@ std::vector<float> RVCInferencer::infer_realtime(
         throw std::invalid_argument("Unsupported realtime RVC contract");
     }
 
+    const SessionParams params = snapshot_params();
     const auto profile_start = profile::Clock::now();
     const size_t frames = audio.size() / kHop16k;
     if (request.skip_head_frames + request.return_frames != frames) {
@@ -598,7 +676,7 @@ std::vector<float> RVCInferencer::infer_realtime(
     }
 
     size_t f0_samples = request.block_samples_16k + 800;
-    if (f0_method_ == "rmvpe") {
+    if (params.f0_method == "rmvpe") {
         f0_samples = 5120 * ((f0_samples - 1) / 5120 + 1) - kHop16k;
     }
     if (f0_samples > audio.size()) {
@@ -608,54 +686,16 @@ std::vector<float> RVCInferencer::infer_realtime(
         audio.end() - static_cast<std::ptrdiff_t>(f0_samples), audio.end()
     );
     const auto f0 = feature_extractor_->extract_f0_realtime(
-        f0_audio, 16000, f0_method_);
+        f0_audio, 16000, params.f0_method);
     if (f0.size() < 5) {
         throw std::runtime_error("Realtime F0 extractor returned too few frames");
     }
     auto [new_pitch, new_pitchf] = f0_to_pitch(
-        f0, pitch_shift_, f0.size()
+        f0, params.pitch_shift, f0.size()
     );
 
     const size_t shift = request.block_samples_16k / kHop16k;
-    if (shift >= realtime_pitch_cache_.size()) {
-        std::fill(realtime_pitch_cache_.begin(), realtime_pitch_cache_.end(), 0);
-        std::fill(realtime_pitchf_cache_.begin(), realtime_pitchf_cache_.end(), 0.0f);
-    } else {
-        std::move(
-            realtime_pitch_cache_.begin() + static_cast<std::ptrdiff_t>(shift),
-            realtime_pitch_cache_.end(), realtime_pitch_cache_.begin()
-        );
-        std::fill(
-            realtime_pitch_cache_.end() - static_cast<std::ptrdiff_t>(shift),
-            realtime_pitch_cache_.end(), 0
-        );
-        std::move(
-            realtime_pitchf_cache_.begin() + static_cast<std::ptrdiff_t>(shift),
-            realtime_pitchf_cache_.end(), realtime_pitchf_cache_.begin()
-        );
-        std::fill(
-            realtime_pitchf_cache_.end() - static_cast<std::ptrdiff_t>(shift),
-            realtime_pitchf_cache_.end(), 0.0f
-        );
-    }
-
-    // Upstream recomputes four overlap frames and drops three left-edge plus
-    // one right-edge RMVPE frames before updating its persistent pitch cache.
-    const size_t fresh_count = std::min(
-        new_pitch.size() - 4, realtime_pitch_cache_.size()
-    );
-    const size_t fresh_source = new_pitch.size() - fresh_count - 1;
-    const size_t fresh_target = realtime_pitch_cache_.size() - fresh_count;
-    std::copy_n(
-        new_pitch.begin() + static_cast<std::ptrdiff_t>(fresh_source),
-        fresh_count,
-        realtime_pitch_cache_.begin() + static_cast<std::ptrdiff_t>(fresh_target)
-    );
-    std::copy_n(
-        new_pitchf.begin() + static_cast<std::ptrdiff_t>(fresh_source),
-        fresh_count,
-        realtime_pitchf_cache_.begin() + static_cast<std::ptrdiff_t>(fresh_target)
-    );
+    push_realtime_pitch_cache(new_pitch, new_pitchf, shift);
     if (frames > realtime_pitch_cache_.size()) {
         throw std::invalid_argument("Realtime pitch cache is smaller than analysis input");
     }
@@ -676,7 +716,7 @@ std::vector<float> RVCInferencer::infer_realtime(
         throw std::runtime_error("Realtime HuBERT feature shape is invalid");
     }
     const size_t feature_frames = feats.size() / emb_dim;
-    if (model_->index().loaded() && index_rate_ > 0.0f) {
+    if (model_->index().loaded() && params.index_rate > 0.0f) {
         const size_t index_start = std::min(
             request.skip_head_frames / 2, feature_frames
         );
@@ -685,8 +725,8 @@ std::vector<float> RVCInferencer::infer_realtime(
             feats.end()
         );
         if (!tail.empty()) {
-            model_->index().set_nprobe(static_cast<uint32_t>(index_nprobe_));
-            auto indexed = model_->index().search(tail, emb_dim, index_rate_);
+            model_->index().set_nprobe(static_cast<uint32_t>(params.index_nprobe));
+            auto indexed = model_->index().search(tail, emb_dim, params.index_rate);
             std::copy(
                 indexed.begin(), indexed.end(),
                 feats.begin() + static_cast<std::ptrdiff_t>(index_start * emb_dim)
@@ -818,6 +858,7 @@ std::vector<float> RVCInferencer::infer_window(
     const std::vector<float>& audio_16k,
     const std::vector<float>& pitchf,
     const std::vector<int64_t>& pitch,
+    const SessionParams& params,
     const std::atomic<bool>* cancelled,
     bool absolute_noise,
     int64_t absolute_frame_start,
@@ -829,11 +870,11 @@ std::vector<float> RVCInferencer::infer_window(
     check_cancelled(cancelled);
     const auto profile_hubert = profile::Clock::now();
     const auto unindexed = feats;
-    feats = apply_index(feats);
+    feats = apply_index(feats, params);
     check_cancelled(cancelled);
     const auto profile_index = profile::Clock::now();
     auto output = synthesize_window(
-        feats, pitchf, pitch, unindexed,
+        feats, pitchf, pitch, unindexed, params,
         absolute_noise, absolute_frame_start, absolute_cycles);
     check_cancelled(cancelled);
     // 窗完成才计数：取消时未完成的窗不计入文件批处理进度。
@@ -859,16 +900,17 @@ std::vector<float> RVCInferencer::resample(
     return resample_audio(audio, src_sr, dst_sr);
 }
 
-std::vector<float> RVCInferencer::apply_index(const std::vector<float>& feats) {
-    if (!model_->index().loaded() || index_rate_ <= 0.0f) {
+std::vector<float> RVCInferencer::apply_index(
+    const std::vector<float>& feats, const SessionParams& params) {
+    if (!model_->index().loaded() || params.index_rate <= 0.0f) {
         return feats;
     }
 
-    model_->index().set_nprobe(static_cast<uint32_t>(index_nprobe_));
+    model_->index().set_nprobe(static_cast<uint32_t>(params.index_nprobe));
     return model_->index().search(
         feats,
         model_->config().emb_channels,
-        index_rate_
+        params.index_rate
     );
 }
 
@@ -877,6 +919,7 @@ std::vector<float> RVCInferencer::synthesize_window(
     const std::vector<float>& pitchf,
     const std::vector<int64_t>& pitch,
     const std::vector<float>& unindexed_feats,
+    const SessionParams& params,
     bool absolute_noise,
     int64_t absolute_frame_start,
     double absolute_cycles
@@ -919,9 +962,9 @@ std::vector<float> RVCInferencer::synthesize_window(
         if (t < pitch.size()) pitch_fixed[t] = pitch[t];
     }
 
-    if (protect_ > 0.0f && protect_ < 1.0f) {
+    if (params.protect > 0.0f && params.protect < 1.0f) {
         for (size_t t = 0; t < T; ++t) {
-            const float feature_weight = pitchf_fixed[t] > 0.0f ? 1.0f : protect_;
+            const float feature_weight = pitchf_fixed[t] > 0.0f ? 1.0f : params.protect;
             for (size_t channel = 0; channel < emb_dim; ++channel) {
                 const size_t offset = t * emb_dim + channel;
                 feats_reshaped[offset] = feats_reshaped[offset] * feature_weight
@@ -1058,9 +1101,10 @@ std::vector<float> RVCInferencer::synthesize_window(
 
 std::vector<float> RVCInferencer::apply_rms_mix(
     const std::vector<float>& original_16k,
-    std::vector<float> audio_out
+    std::vector<float> audio_out,
+    const SessionParams& params
 ) {
-    if (rms_mix_rate_ >= 1.0f || original_16k.empty() || audio_out.empty()) {
+    if (params.rms_mix_rate >= 1.0f || original_16k.empty() || audio_out.empty()) {
         return audio_out;
     }
     const auto rms_curve = [](const std::vector<float>& samples, uint32_t sample_rate) {
@@ -1093,7 +1137,7 @@ std::vector<float> RVCInferencer::apply_rms_mix(
         const float in_level = interpolate(input_rms, i);
         const float out_level = std::max(interpolate(output_rms, i), 1e-6f);
         const float correction = std::pow(std::max(in_level, 1e-6f) / out_level,
-                                          1.0f - rms_mix_rate_);
+                                          1.0f - params.rms_mix_rate);
         audio_out[i] *= correction;
     }
     return audio_out;

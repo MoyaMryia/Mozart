@@ -1045,9 +1045,9 @@ pub fn device_key_kind(key: &str) -> Option<&'static str> {
 }
 
 /// 运行时键 → owning 服务（docs/config.md 的 R 类分类）。None 表示非运行时键。
-/// daemon/file 键由 daemon 自身即时应用；rvc 会话参数由 daemon 编排
-/// StopStream→StartStream 或只更新生效配置；pre/bridge 键需对端运行时命令
-/// 下发（未接入）。
+/// daemon/file 键由 daemon 自身即时应用；rvc 会话参数与实时旋钮由 daemon 按变更键
+/// 编排 `SetParams`、`StopStream`→`StartStream` 或只更新生效配置；pre/bridge 键
+/// 需对端运行时命令下发（未接入）。
 pub fn runtime_key_owner(key: &str) -> Option<&'static str> {
     match key {
         "daemon.poll_interval_ms"
@@ -1079,7 +1079,7 @@ pub fn runtime_key_owner(key: &str) -> Option<&'static str> {
 }
 
 /// 运行时状态文件可记录的键（SPEC-04，daemon 统一管）。
-/// v1 只有字幕开关；RVC 会话参数待运行时改参通道接入后加入。
+/// 当前只有字幕开关；RVC 会话参数与实时旋钮由 config set / preset use 直接写基线并下发。
 pub fn is_state_key(key: &str) -> bool {
     matches!(key, "bridge.translate_enabled" | "bridge.speech_enabled")
 }
@@ -1110,7 +1110,7 @@ pub struct KeyEffect {
 /// 未接入，明确拒绝。设备存在性校验由 daemon 在调用前做（需 ALSA 枚举）。
 ///
 /// rvc 会话参数只写 TOML 基线，返回 `restart_required=false`；实时/文件链路的
-/// 生效编排（按参数决定是否 StopStream→StartStream）归 daemon，见 SPEC-04。
+/// 生效编排（按变更键下发 SetParams 或 StopStream→StartStream）归 daemon，见 SPEC-04。
 pub fn set_key(path: Option<&Path>, key: &str, value: &str) -> Result<KeyEffect, ConfigError> {
     if device_key_kind(key).is_some() {
         validate_device_name(value, key)?;

@@ -7,6 +7,7 @@
 #include <atomic>
 #include <vector>
 #include <memory>
+#include <mutex>
 #include <cstdint>
 #include <cstddef>
 #include <random>
@@ -67,6 +68,41 @@ public:
     );
     void reset_realtime();
 
+    struct SessionParams {
+        std::string f0_method;
+        int pitch_shift;
+        float index_rate;
+        float rms_mix_rate;
+        float protect;
+        int index_nprobe;
+    };
+
+    // 块边界无中断更新会话参数：下次 infer() / infer_realtime() 入口取快照生效，
+    // 保留 realtime_pitch_cache_ 与随机状态，不重建引擎或环形缓冲。
+    void set_parameters(
+        std::string f0_method,
+        int pitch_shift,
+        float index_rate,
+        float rms_mix_rate,
+        float protect,
+        int index_nprobe = 1
+    );
+    SessionParams snapshot_params() const;
+
+    // 实时音高缓存与随机状态观测及推进接口（供 infer_realtime 与热更保留单测共用）。
+    struct RealtimeStateSnapshot {
+        std::vector<int64_t> pitch_cache;
+        std::vector<float> pitchf_cache;
+        uint32_t next_random = 0;
+    };
+    void push_realtime_pitch_cache(
+        const std::vector<int64_t>& new_pitch,
+        const std::vector<float>& new_pitchf,
+        size_t shift
+    );
+    uint32_t sample_realtime_random();
+    RealtimeStateSnapshot realtime_state_snapshot() const;
+
     // 文件批处理进度（SPEC-03）：已完成的 Generator 窗数，infer_window 每窗 +1，
     // 整段一次过计 1。GetStatus 只读快照；批处理开始时清零。
     uint64_t generator_window_count() const {
@@ -81,12 +117,8 @@ private:
     std::shared_ptr<FeatureExtractor> feature_extractor_;
     uint32_t input_sample_rate_;
     uint32_t output_sample_rate_;
-    std::string f0_method_;
-    int pitch_shift_;
-    float index_rate_;
-    float rms_mix_rate_;
-    float protect_;
-    int index_nprobe_;
+    mutable std::mutex params_mutex_;
+    SessionParams params_;
     std::vector<int64_t> realtime_pitch_cache_;
     std::vector<float> realtime_pitchf_cache_;
     std::mt19937 realtime_random_{114514};
@@ -97,13 +129,15 @@ private:
         uint32_t src_sr, uint32_t dst_sr
     );
 
-    std::vector<float> apply_index(const std::vector<float>& feats);
+    std::vector<float> apply_index(
+        const std::vector<float>& feats, const SessionParams& params);
 
     std::vector<float> synthesize_window(
         const std::vector<float>& feats,
         const std::vector<float>& pitchf,
         const std::vector<int64_t>& pitch,
         const std::vector<float>& unindexed_feats,
+        const SessionParams& params,
         bool absolute_noise,
         int64_t absolute_frame_start,
         double absolute_cycles
@@ -111,13 +145,15 @@ private:
 
     std::vector<float> apply_rms_mix(
         const std::vector<float>& original_16k,
-        std::vector<float> audio_out
+        std::vector<float> audio_out,
+        const SessionParams& params
     );
 
     std::vector<float> infer_window(
         const std::vector<float>& audio_16k,
         const std::vector<float>& pitchf,
         const std::vector<int64_t>& pitch,
+        const SessionParams& params,
         const std::atomic<bool>* cancelled = nullptr,
         bool absolute_noise = false,
         int64_t absolute_frame_start = 0,

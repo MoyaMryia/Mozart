@@ -264,6 +264,39 @@ ctl config set rvc.realtime.startup_delay_ms 400 >/dev/null 2>&1
 wait_streaming 40 >/dev/null
 end_scenario
 
+scenario "SetParams 在线调参不断流"
+START_BEFORE=$(grep -F "StartStream kind=realtime" "$LOG" 2>/dev/null | wc -l)
+SETPARAMS_BEFORE=$(grep -F "SetParams model=$MODEL_A" "$LOG" 2>/dev/null | wc -l)
+FIN_BEFORE=$(rvc_field frames_in)
+BLOCKS_BEFORE=$(rvc_field blocks)
+
+for cmd in \
+  "config set rvc.pitch_shift 4" \
+  "config set rvc.index_rate 0.25" \
+  "config set rvc.realtime.skip_silence true" \
+  "config set rvc.realtime.skip_silence false" \
+  "config set rvc.pitch_shift 0" \
+  "config set rvc.index_rate 0.0"; do
+  ctl $cmd >/dev/null 2>"$SMOKE_DIR/setparams.err" \
+    || bad "$cmd 失败：$(cat "$SMOKE_DIR/setparams.err")"
+done
+
+sleep 2
+START_AFTER=$(grep -F "StartStream kind=realtime" "$LOG" 2>/dev/null | wc -l)
+SETPARAMS_AFTER=$(grep -F "SetParams model=$MODEL_A" "$LOG" 2>/dev/null | wc -l)
+FIN_AFTER=$(rvc_field frames_in)
+BLOCKS_AFTER=$(rvc_field blocks)
+
+assert_eq "未重起实时流 (StartStream 次数不变)" "$START_AFTER" "$START_BEFORE"
+assert_eq "SetParams 日志增加" \
+  "$(if [ "${SETPARAMS_AFTER:-0}" -gt "${SETPARAMS_BEFORE:-0}" ]; then echo yes; else echo no; fi)" "yes"
+assert_eq "frames_in 单调递增 (未重建 worker)" \
+  "$(if [ "${FIN_AFTER:-0}" -gt "${FIN_BEFORE:-0}" ]; then echo yes; else echo no; fi)" "yes"
+assert_eq "blocks 单调递增 (skip_silence=false 恢复推理)" \
+  "$(if [ "${BLOCKS_AFTER:-0}" -gt "${BLOCKS_BEFORE:-0}" ]; then echo yes; else echo no; fi)" "yes"
+assert_stream_healthy "SetParams 热更"
+end_scenario
+
 scenario "model use 跨采样率 $SR_A → $SR_B"
 ctl preset save >/dev/null 2>&1 || bad "切换前保存 A 预设失败"
 A_PITCH=$(ctl preset list --json 2>/dev/null | jget preset_values.pitch_shift 2>/dev/null || true)

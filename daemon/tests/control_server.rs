@@ -16,6 +16,8 @@ fn serves_status_and_validates_commands() {
             let status = status(&conn);
             status.processes.pre.state == ProcessState::Running
                 && status.processes.rvc.state == ProcessState::Running
+                && status.pre.is_some()
+                && status.rvc.is_some()
         }),
         "children did not start"
     );
@@ -56,6 +58,8 @@ fn switch_applies_route_and_mute() {
             let status = status(&conn);
             status.processes.pre.state == ProcessState::Running
                 && status.processes.rvc.state == ProcessState::Running
+                && status.pre.is_some()
+                && status.rvc.is_some()
         }),
         "children did not start"
     );

@@ -1,15 +1,15 @@
-// stream_session.h — SPEC-03 控制面：七命令服务端
+// stream_session.h — SPEC-03 控制面：八命令服务端
 // ============================================================================
 // Unix SOCK_SEQPACKET + core/include/mozart/ctl.h 信封（16 B 头 + JSON 体），
 // 应答体 {"status","code","reason","data"} 与 core/src/ctl/schema.rs 一致。
 //
-// 七命令语义（SPEC-03 已确认条款）：
+// 八命令语义（SPEC-03 已确认条款）：
 //   Hello       版本握手；信封版本不兼容时拒绝并断链。
 //   LoadModel   持 ModelManager load_mutex 串行加载；返回 model_handle、
 //               capabilities 与 model_version；入口校验一次，内部信任。
 //   ListModels  模型目录清单 {id,exists,loaded}；只读、不加载、不阻塞推理
 //               线程；loaded 按当前模型 id 判定。
-//   StartStream 参数此时固定（kind/model_handle/pitch_shift/index_rate/
+//   StartStream 携带会话参数（kind/model_handle/pitch_shift/index_rate/
 //               rms_mix_rate/protect/f0_method）；kind=file 另需 total_frames
 //               （正整数 u32）；realtime 忽略该字段。数据面复用配置默认
 //               input_socket/output_socket（SPEC-03 状态门控交接）。
@@ -20,6 +20,9 @@
 //   ResetStream 断续重置：清环、清淡化尾并恢复启动缓冲；无流时空操作。
 //   GetStatus   只读原子快照，字段名与 core/src/ctl/schema.rs::RvcStatus
 //               一致（daemon 的解析契约），不阻塞推理线程。
+//   SetParams   实时流活动期间在下一推理块边界无中断更新会话参数与可选
+//               skip_silence；未加载回 NotLoaded、无活动流回 NotReady、
+//               文件流活动回 Busy、参数无效回 InvalidArgument。
 //
 // 后端 seam：SessionBackend 把「模型加载 / 能力查询 / 建 worker」抽象出来，
 // 控制语义可在无 GPU 主机上桩测；生产实现 InferenceBackend 组合搬运的
@@ -66,6 +69,7 @@ public:
     virtual ~StreamWorker() = default;
     virtual void stop() = 0;
     virtual void reset() = 0;
+    virtual void set_skip_silence(bool) {}
     virtual WorkerStats stats() = 0;
 };
 
@@ -124,6 +128,8 @@ public:
         const FileBatchOptions& file_options,
         const RealtimeStreamOptions& realtime_options,
         std::string& reason) = 0;
+    // 在推理块边界无中断更新实时会话参数（SetParams 语义）。
+    virtual void set_params(const RvcParameters& params) = 0;
 };
 
 class StreamSession {
@@ -162,6 +168,7 @@ private:
 
     std::vector<uint8_t> handle_load_model(const nlohmann::json& body);
     std::vector<uint8_t> handle_start_stream(const nlohmann::json& body);
+    std::vector<uint8_t> handle_set_params(const nlohmann::json& body);
     WorkerStats current_stats_locked() const;
 };
 
@@ -201,6 +208,7 @@ public:
         const FileBatchOptions& file_options,
         const RealtimeStreamOptions& realtime_options,
         std::string& reason) override;
+    void set_params(const RvcParameters& params) override;
 
 private:
     InferenceBackendConfig config_;

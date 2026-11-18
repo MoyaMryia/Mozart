@@ -446,7 +446,7 @@ code {
 <dd>块长与过去上下文。它们决定延迟和连续性，值来自实时参数单一来源 JSON，C++ 镜像同一套。改它们等于改实时契约与资产形状，不能只改一个值。</dd>
 
 <dt>crossfade_ms / sola_search_ms / startup_delay_ms / skip_silence</dt>
-<dd>四个非形状旋钮，实时独有、不进模型预设。crossfade_ms 与 sola_search_ms 是定值 50 ms 与 10 ms，合计 60 ms，偏离在入口拒绝。startup_delay_ms 默认 400 ms，范围 0 到 15000 ms 且为 20 ms 的倍数；skip_silence 默认 true。可调两键改动经停流再起流生效。</dd>
+<dd>四个非形状旋钮，实时独有、不进模型预设。crossfade_ms 与 sola_search_ms 是定值 50 ms 与 10 ms，合计 60 ms，偏离在入口拒绝。startup_delay_ms 默认 400 ms，范围 0 到 15000 ms 且为 20 ms 的倍数，改动经停流再起流生效；skip_silence 默认 true，改动经 SetParams（0x0308）在下一推理块边界无中断生效。</dd>
 
 <dt>fp16</dt>
 <dd>编译时精度开关。开启后 engine 更小更快，可能有轻微数值差异。它不改变接口，只改变 engine 的数值和性能。</dd>
@@ -461,7 +461,7 @@ code {
 <aside class="why">
 <p class="why-label">补充解释：为什么只有这几个真正可调</p>
 <ul>
-<li><strong>会话参数只有五个：</strong>pitch_shift、index_rate、rms_mix_rate、protect、f0_method。它们在 StartStream 时固定，避免运行中改参数造成块边界状态不一致。另有启动缓冲与静音跳过两个旋钮同样在 StartStream 时固定，改动经停流再起流生效；淡化与 SOLA 搜索为定值。</li>
+<li><strong>会话参数只有五个：</strong>pitch_shift、index_rate、rms_mix_rate、protect、f0_method。初始值随 StartStream 下发，实时流活动期间的调整与静音跳过 skip_silence 经 SetParams（0x0308）在下一推理块边界无中断生效，保留音高缓存与流缓冲；启动缓冲 startup_delay_ms 改动经停流再起流生效；淡化与 SOLA 搜索为定值。</li>
 <li><strong>为什么 protect 和 rms_mix_rate 不生效：</strong>实时路径优先低延迟，没有做辅音保护和音量包络校正。参数仍然接受并校验范围，是为了保持控制面统一，将来补实现时不用改接口。</li>
 <li><strong>为什么块长这些不开放：</strong>改块长会牵动窗口、淡化、SOLA、启动缓冲和资产形状。单改一个值无法保持连续，所以形状类归单一来源 JSON，不开放运行时调参。非形状旋钮里只开放启动缓冲与静音跳过；淡化与 SOLA 虽属非形状类，但引擎形状按最大 overlap 固定，当前也锁为定值。</li>
 <li><strong>为什么 fp16 是编译时开关：</strong>TensorRT 在编译时决定数值精度。运行时改配置不会改变已经编好的 engine。</li>

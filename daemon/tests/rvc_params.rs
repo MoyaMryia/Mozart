@@ -1,6 +1,6 @@
-//! RVC 会话参数运行时编排（SPEC-04）：`config set rvc.<会话参数>` 的 Stop/Start
-//! 决策、失败回退与 status.rvc_params 展示。桩经 MOZART_STUB_LOG 记录命令与
-//! StartStream 参数体；失败恢复用桩的 StartStream 失败旋钮，不做调用 mock。
+//! RVC 会话参数运行时编排（SPEC-04）：`config set rvc.<会话参数>` 的热更新（`SetParams`）
+//! 与结构旋钮 Stop/Start 决策、失败回退与 status.rvc_params 展示。桩经 MOZART_STUB_LOG
+//! 记录命令与请求体；失败恢复用桩的失败旋钮，不做调用 mock。
 
 mod common;
 
@@ -118,6 +118,14 @@ impl Harness {
             .collect()
     }
 
+    fn set_params_calls(&self) -> Vec<Value> {
+        self.entries()
+            .into_iter()
+            .filter(|entry| entry.stub == "mozart-rvc-stub" && entry.type_ == ctl::RVC_SET_PARAMS)
+            .map(|entry| entry.body)
+            .collect()
+    }
+
     fn set_route_rvc(&self) {
         let reply = self.call(ctl::DAEMON_ROUTE_SET, br#"{"route":"rvc"}"#);
         assert_eq!(reply.status, "ok", "route set rvc: {}", reply.reason);
@@ -146,10 +154,11 @@ impl Drop for Harness {
     }
 }
 
-/// 实时流在跑、改实时链路参数：StopStream → StartStream 带新值；生效配置与
-/// status.rvc_params 更新，响应维持 restart_required=false。
+/// 实时流在跑、改可热更参数与 `skip_silence`：下发 `SetParams` 在块边界生效，
+/// 不触发 `StopStream`→`StartStream`；生效配置与 status.rvc_params 更新，
+/// 响应维持 restart_required=false。
 #[test]
-fn pitch_shift_change_restarts_realtime_stream_with_new_value() {
+fn pitch_shift_and_skip_silence_update_via_set_params_without_restarting() {
     let h = Harness::new("pitch", &[]);
     h.set_route_rvc();
     assert_eq!(h.rvc_params().pitch_shift, 0);
@@ -166,33 +175,30 @@ fn pitch_shift_change_restarts_realtime_stream_with_new_value() {
         reply.data["affected"]
     );
 
-    let entries = h.entries();
-    let stop = entries
-        .iter()
-        .position(|entry| entry.stub == "mozart-rvc-stub" && entry.type_ == ctl::RVC_STOP_STREAM)
-        .expect("改实时参数应先下发 StopStream");
-    let (start_index, start) = entries
-        .iter()
-        .enumerate()
-        .find(|(_, entry)| {
-            entry.stub == "mozart-rvc-stub"
-                && entry.type_ == ctl::RVC_START_STREAM
-                && entry.body["kind"] == "realtime"
-        })
-        .map(|(index, entry)| (index, &entry.body))
-        .expect("StopStream 后应重建实时流");
-    assert!(stop < start_index, "必须先停流再起流：{entries:?}");
-    assert_eq!(start["pitch_shift"], 3, "StartStream 应带新值：{start}");
-    assert_eq!(start["index_rate"], 0.0);
-    assert_eq!(start["rms_mix_rate"], 1.0);
-    assert_eq!(start["protect"], 0.33);
-    assert_eq!(start["f0_method"], "rmvpe");
+    let reply = h.config_set("rvc.realtime.skip_silence", "false");
+    assert_eq!(reply.status, "ok", "reason: {}", reply.reason);
+
+    assert_eq!(h.rvc_count(ctl::RVC_STOP_STREAM), 0, "热更新不得停流");
+    assert!(
+        h.stream_starts("realtime").is_empty(),
+        "热更新不得重起实时流"
+    );
+    let calls = h.set_params_calls();
+    assert_eq!(calls.len(), 2, "两次热更新应各自下发一次 SetParams：{calls:?}");
+    assert_eq!(calls[0]["pitch_shift"], 3);
+    assert_eq!(calls[0]["index_rate"], 0.0);
+    assert_eq!(calls[0]["rms_mix_rate"], 1.0);
+    assert_eq!(calls[0]["protect"], 0.33);
+    assert_eq!(calls[0]["f0_method"], "rmvpe");
+    assert_eq!(calls[0]["skip_silence"], true);
+    assert_eq!(calls[1]["pitch_shift"], 3);
+    assert_eq!(calls[1]["skip_silence"], false);
 
     assert_eq!(h.rvc_params().pitch_shift, 3);
     h.wait_streaming();
 }
 
-/// 仅改 protect / rms_mix_rate：实时链路不应用，不触发 Stop/Start、不打断流。
+/// 仅改 protect / rms_mix_rate：实时链路不应用，不触发 SetParams 或 Stop/Start，不打断流。
 #[test]
 fn file_only_params_do_not_restart_realtime_stream() {
     let h = Harness::new("soft", &[]);
@@ -207,7 +213,7 @@ fn file_only_params_do_not_restart_realtime_stream() {
     assert_eq!(reply.status, "ok", "reason: {}", reply.reason);
     assert_eq!(h.rvc_params().rms_mix_rate, 0.5);
 
-    // 跨过至少一轮轮询：流仍在跑且没有任何停/起命令。
+    // 跨过至少一轮轮询：流仍在跑且没有任何热更/停/起命令。
     std::thread::sleep(Duration::from_millis(250));
     let status = h.status();
     assert_eq!(
@@ -215,11 +221,12 @@ fn file_only_params_do_not_restart_realtime_stream() {
         Some("streaming"),
         "改文件链路参数不得打断实时流"
     );
+    assert_eq!(h.rvc_count(ctl::RVC_SET_PARAMS), 0);
     assert_eq!(h.rvc_count(ctl::RVC_STOP_STREAM), 0);
     assert!(h.stream_starts("realtime").is_empty());
 }
 
-/// 参数值未变化：不触发 Stop/Start。
+/// 参数值未变化：不触发 SetParams 或 Stop/Start。
 #[test]
 fn unchanged_value_does_not_restart_realtime_stream() {
     let h = Harness::new("same", &[]);
@@ -231,20 +238,72 @@ fn unchanged_value_does_not_restart_realtime_stream() {
     std::thread::sleep(Duration::from_millis(250));
 
     assert_eq!(h.rvc_params().pitch_shift, 0);
+    assert_eq!(h.rvc_count(ctl::RVC_SET_PARAMS), 0);
     assert_eq!(h.rvc_count(ctl::RVC_STOP_STREAM), 0);
     assert!(h.stream_starts("realtime").is_empty());
     h.wait_streaming();
 }
 
-/// 新参起流失败：用旧参恢复实时流并返回错误；生效配置保留旧值，TOML 保留
-/// 新基线。不自动重试：等下一次对应键写入或 daemon 重启再应用。
+/// SetParams 失败：流不断、生效配置保留旧值、TOML 保留新基线；
+/// 存在待生效 pitch 基线时改 protect 不误发 SetParams，再写 pitch 才重试成功。
 #[test]
-fn start_failure_restores_old_params_and_keeps_toml_baseline() {
-    let h = Harness::new("restore", &[("MOZART_RVC_STUB_FAIL_START_PITCH", "3")]);
+fn set_params_failure_keeps_stream_and_pending_baseline_isolation() {
+    let h = Harness::new(
+        "set-params-fail",
+        &[("MOZART_RVC_STUB_FAIL_SET_PARAMS_PITCH", "3")],
+    );
     h.set_route_rvc();
     h.clear_log();
 
     let reply = h.config_set("rvc.pitch_shift", "3");
+    assert_eq!(reply.status, "error", "SetParams 失败必须报错");
+    assert_eq!(reply.code, "InferenceFailed");
+    assert!(
+        reply.reason.contains("rvc set params"),
+        "错误应指明 SetParams 失败：{}",
+        reply.reason
+    );
+    assert_eq!(h.rvc_count(ctl::RVC_STOP_STREAM), 0, "SetParams 失败不得停流");
+    h.wait_streaming();
+    assert_eq!(h.rvc_params().pitch_shift, 0, "失败后生效配置保留旧值");
+    let get = h.call(ctl::DAEMON_CONFIG_GET, br#"{"key":"rvc.pitch_shift"}"#);
+    assert_eq!(get.status, "ok");
+    assert_eq!(get.data["value"], 3, "TOML 保留新基线");
+
+    // 存在待生效 pitch 基线时只改 protect：不触发 SetParams，未生效 pitch 不混入。
+    h.clear_log();
+    let reply = h.config_set("rvc.protect", "0.4");
+    assert_eq!(reply.status, "ok", "reason: {}", reply.reason);
+    std::thread::sleep(Duration::from_millis(250));
+    let params = h.rvc_params();
+    assert_eq!(params.protect, 0.4);
+    assert_eq!(params.pitch_shift, 0, "未生效 pitch 基线不得混入生效配置");
+    assert_eq!(h.rvc_count(ctl::RVC_SET_PARAMS), 0);
+    assert_eq!(h.rvc_count(ctl::RVC_STOP_STREAM), 0);
+
+    // 下一次写 pitch 键：重读基线并经 SetParams 成功生效（带上已更新的 protect）。
+    h.clear_log();
+    let reply = h.config_set("rvc.pitch_shift", "3");
+    assert_eq!(reply.status, "ok", "reason: {}", reply.reason);
+    let calls = h.set_params_calls();
+    assert_eq!(calls.len(), 1, "重试应下发一次 SetParams：{calls:?}");
+    assert_eq!(calls[0]["pitch_shift"], 3);
+    assert_eq!(calls[0]["protect"], 0.4);
+    assert_eq!(h.rvc_count(ctl::RVC_STOP_STREAM), 0);
+    let params = h.rvc_params();
+    assert_eq!(params.pitch_shift, 3);
+    assert_eq!(params.protect, 0.4);
+}
+
+/// 须停流重起的旋钮（startup_delay_ms）新参起流失败：用旧参恢复实时流并
+/// 返回错误；TOML 保留新基线。不自动重试：等下一次对应键写入或 daemon 重启应用。
+#[test]
+fn start_failure_restores_old_params_and_keeps_toml_baseline() {
+    let h = Harness::new("restore", &[("MOZART_RVC_STUB_FAIL_START_DELAY_MS", "200")]);
+    h.set_route_rvc();
+    h.clear_log();
+
+    let reply = h.config_set("rvc.realtime.startup_delay_ms", "200");
     assert_eq!(reply.status, "error", "新参起流失败必须报错");
     assert_eq!(reply.code, "InferenceFailed");
     assert!(
@@ -253,73 +312,45 @@ fn start_failure_restores_old_params_and_keeps_toml_baseline() {
         reply.reason
     );
 
-    // 旧参恢复实时流：流继续在跑，status 显示旧值。
+    // 旧参恢复实时流：流继续在跑。
     h.wait_streaming();
-    assert_eq!(h.rvc_params().pitch_shift, 0, "失败后生效配置保留旧值");
     let starts = h.stream_starts("realtime");
     assert!(
-        starts.iter().any(|body| body["pitch_shift"] == 3),
+        starts.iter().any(|body| body["startup_delay_ms"] == 200),
         "应先按新参起流：{starts:?}"
     );
     assert!(
-        starts.iter().any(|body| body["pitch_shift"] == 0),
+        starts.iter().any(|body| body["startup_delay_ms"] == 400),
         "失败后应用旧参恢复：{starts:?}"
     );
 
     // TOML 保留新基线，等待下一次对应键写入或 daemon 重启应用。
-    let reply = h.call(ctl::DAEMON_CONFIG_GET, br#"{"key":"rvc.pitch_shift"}"#);
+    let reply = h.call(
+        ctl::DAEMON_CONFIG_GET,
+        br#"{"key":"rvc.realtime.startup_delay_ms"}"#,
+    );
     assert_eq!(reply.status, "ok", "reason: {}", reply.reason);
-    assert_eq!(reply.data["value"], 3);
-}
+    assert_eq!(reply.data["value"], 200);
 
-/// 存在待生效的 pitch 基线时只改 rvc.protect：触发判据只看当前设置的键，
-/// 不 Stop/Start、不打断实时流，生效 pitch 仍是旧值；之后写 pitch 键才按
-/// TOML 新基线重建实时流。
-#[test]
-fn protect_write_with_pending_pitch_baseline_keeps_stream() {
-    let h = Harness::new("pending", &[("MOZART_RVC_STUB_FAIL_START_PITCH", "3")]);
+    // 失败后 daemon 内存生效配置仍保持旧值 startup_delay_ms=400：
+    // 切换 direct → rvc 重建流时，StartStream 必须仍携带 400 而非 TOML 里的 200。
+    h.clear_log();
+    let direct = h.call(ctl::DAEMON_ROUTE_SET, br#"{"route":"direct"}"#);
+    assert_eq!(direct.status, "ok", "route set direct: {}", direct.reason);
+    assert!(
+        wait_until(POLL_TIMEOUT, || {
+            let status = h.status();
+            status.route.active == Route::Direct
+                && status.rvc.as_ref().is_some_and(|rvc| rvc.state != "streaming")
+        }),
+        "route direct 未就绪"
+    );
     h.set_route_rvc();
-    // 制造待生效基线：pitch=3 起流失败，旧参恢复，TOML 保留 3。
-    let reply = h.config_set("rvc.pitch_shift", "3");
-    assert_eq!(reply.status, "error", "新参起流失败必须报错");
-    h.wait_streaming();
-    h.clear_log();
-
-    let reply = h.config_set("rvc.protect", "0.4");
-    assert_eq!(reply.status, "ok", "reason: {}", reply.reason);
-
-    // 跨过至少一轮轮询：protect 只更新生效配置，未生效的 pitch 基线不混入。
-    std::thread::sleep(Duration::from_millis(250));
-    let params = h.rvc_params();
-    assert_eq!(params.protect, 0.4);
-    assert_eq!(params.pitch_shift, 0, "未生效的 pitch 基线不得混入生效配置");
-    assert_eq!(
-        h.status().rvc.as_ref().map(|rvc| rvc.state.as_str()),
-        Some("streaming"),
-        "protect 写入不得打断实时流"
-    );
-    assert_eq!(h.rvc_count(ctl::RVC_STOP_STREAM), 0, "protect 不得触发 StopStream");
-    assert!(
-        h.stream_starts("realtime").is_empty(),
-        "protect 不得触发 StartStream：{:?}",
-        h.stream_starts("realtime")
-    );
-
-    // 下一次对应键写入（pitch）重读基线：pitch=3 再次尝试并成功（桩只失败一次）。
-    h.clear_log();
-    let reply = h.config_set("rvc.pitch_shift", "3");
-    assert_eq!(reply.status, "ok", "reason: {}", reply.reason);
-    h.wait_streaming();
-    let params = h.rvc_params();
-    assert_eq!(params.pitch_shift, 3);
-    assert_eq!(params.protect, 0.4);
     let starts = h.stream_starts("realtime");
-    assert!(!starts.is_empty(), "写 pitch 键应重建实时流：{starts:?}");
+    assert!(!starts.is_empty(), "重建流应发送 StartStream");
     assert!(
-        starts
-            .iter()
-            .all(|body| body["pitch_shift"] == 3 && body["protect"] == 0.4),
-        "所有 StartStream 都应带新值：{starts:?}"
+        starts.iter().all(|body| body["startup_delay_ms"] == 400),
+        "生效配置必须保留旧 startup_delay_ms=400，不得被失败请求污染：{starts:?}"
     );
 }
 
@@ -329,8 +360,9 @@ fn failed_restore_returns_combined_error_and_records_degraded() {
     // 第一次 StartStream（route set rvc）成功，之后全部失败。
     let h = Harness::new("degraded", &[("MOZART_RVC_STUB_FAIL_START_AFTER", "1")]);
     h.set_route_rvc();
+    h.clear_log();
 
-    let reply = h.config_set("rvc.pitch_shift", "3");
+    let reply = h.config_set("rvc.realtime.startup_delay_ms", "200");
     assert_eq!(reply.status, "error", "起流与恢复都失败必须报错");
     assert!(
         reply.reason.contains("new params") && reply.reason.contains("old params"),
@@ -342,7 +374,6 @@ fn failed_restore_returns_combined_error_and_records_degraded() {
         "错误应提示 TOML 已保留新基线及恢复方式：{}",
         reply.reason
     );
-    assert_eq!(h.rvc_params().pitch_shift, 0, "失败后生效配置保留旧值");
     assert!(
         wait_until(POLL_TIMEOUT, || {
             h.status()
@@ -352,6 +383,29 @@ fn failed_restore_returns_combined_error_and_records_degraded() {
         }),
         "恢复失败必须留可查询降级原因：{:?}",
         h.status().degraded
+    );
+
+    // 失败后的恢复与轮询补流仍使用内存生效配置里的旧 startup_delay_ms=400。
+    let starts = h.stream_starts("realtime");
+    assert!(
+        starts.last().is_some_and(|body| body["startup_delay_ms"] == 400),
+        "失败后恢复/补流 StartStream 必须仍带旧 startup_delay_ms=400：{starts:?}"
+    );
+    // 写回其他会话参数（仅更新生效配置中的对应键）验证未混入未生效的 startup_delay_ms=200。
+    let pitch_reply = h.config_set("rvc.pitch_shift", "3");
+    assert_eq!(pitch_reply.status, "ok", "reason: {}", pitch_reply.reason);
+    assert_eq!(h.rvc_params().pitch_shift, 3);
+    h.clear_log();
+    assert!(
+        wait_until(POLL_TIMEOUT, || !h.stream_starts("realtime").is_empty()),
+        "轮询应持续尝试按当前生效配置补起实时流"
+    );
+    assert!(
+        h.stream_starts("realtime")
+            .iter()
+            .all(|body| body["startup_delay_ms"] == 400 && body["pitch_shift"] == 3),
+        "合并新 pitch_shift 时不得混入失败的 startup_delay_ms=200：{:?}",
+        h.stream_starts("realtime")
     );
 }
 
@@ -363,14 +417,13 @@ fn recovery_busy_records_unknown_running_params() {
     h.set_route_rvc();
     h.clear_log();
 
-    let reply = h.config_set("rvc.pitch_shift", "3");
+    let reply = h.config_set("rvc.realtime.startup_delay_ms", "200");
     assert_eq!(reply.status, "error", "流未停时新参无法起流，必须报错");
     assert!(
         reply.reason.contains("restore busy") && reply.reason.contains("running params unknown"),
         "错误应说明恢复遇 Busy、在跑参数未知：{}",
         reply.reason
     );
-    assert_eq!(h.rvc_params().pitch_shift, 0, "失败后生效配置保留旧值");
     assert!(
         wait_until(POLL_TIMEOUT, || {
             h.status()
@@ -380,6 +433,22 @@ fn recovery_busy_records_unknown_running_params() {
         }),
         "恢复遇 Busy 必须留可查询降级原因：{:?}",
         h.status().degraded
+    );
+
+    // 失败未替换内存生效配置：仍为 startup_delay_ms=400，因此再写回 400
+    // 判定未变化、不会触发 Stop/Start。
+    h.clear_log();
+    let noop = h.config_set("rvc.realtime.startup_delay_ms", "400");
+    assert_eq!(noop.status, "ok", "reason: {}", noop.reason);
+    assert_eq!(
+        h.rvc_count(ctl::RVC_STOP_STREAM),
+        0,
+        "生效配置保留旧值 400 时写回 400 不得触发停流重起"
+    );
+    assert!(
+        h.stream_starts("realtime").is_empty(),
+        "生效配置保留旧值 400 时写回 400 不得重起流：{:?}",
+        h.stream_starts("realtime")
     );
 }
 

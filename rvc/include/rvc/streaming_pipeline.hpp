@@ -168,6 +168,14 @@ public:
     uint32_t output_sample_rate() const noexcept { return cfg_.output_sample_rate; }
     size_t output_frame_samples() const noexcept { return output_frame_samples_; }
 
+    // 运行中块边界更新静音跳过（SetParams 语义）：原子写入，下次 try_process_one 生效。
+    void set_skip_silence(bool skip) noexcept {
+        skip_silence_.store(skip, std::memory_order_relaxed);
+    }
+    bool skip_silence() const noexcept {
+        return skip_silence_.load(std::memory_order_relaxed);
+    }
+
     // 断续重置：等价于 push 侧检测到不连续（ResetStream 控制命令）。
     // 仅流式语义有效；推理线程在代数变化后自行作废淡化尾并重置实时缓存。
     void reset() { handle_discontinuity(); }
@@ -181,6 +189,7 @@ public:
 
 private:
     Config cfg_;
+    std::atomic<bool> skip_silence_;
     Stats stats_;
 
     const size_t model_frame_out_;       // 模型单帧输出样本数（= output_sample_rate / 100）

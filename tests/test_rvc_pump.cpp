@@ -331,6 +331,41 @@ int main() {
         worker.stop();
     }
 
+    std::printf("test_audio_worker_dynamic_skip_silence\n");
+    {
+        Harness h("skip-toggle");
+        UnixDgramStream stream(h.in_path, h.out_path, 8);
+        Upsample3Pipeline pipeline;
+        AudioWorker::Config cfg;
+        cfg.realtime_kind = true;
+        cfg.skip_silence = true;
+        AudioWorker worker(stream, pipeline, cfg);
+        worker.start();
+
+        uint32_t idx = 1;
+        // 送 105 个静音帧（>100 窗）：skip_silence=true 时跳过推理，blocks=0。
+        for (size_t i = 0; i < 105; ++i) {
+            send_frame(h.in_path, input_frame(idx++, 0));
+            std::this_thread::sleep_for(std::chrono::milliseconds(2));
+        }
+        CHECK(wait_for([&] { return worker.get_stream_stats().skipped_blocks >= 1; }, 3000),
+              "initial skip_silence skips silent window");
+        CHECK(worker.get_stream_stats().blocks == 0,
+              "no block inferred while skip_silence=true");
+
+        // 运行中改 skip_silence=false，不重启 AudioWorker，下一窗静音直接推理出块。
+        worker.set_skip_silence(false);
+        for (size_t i = 0; i < 105; ++i) {
+            send_frame(h.in_path, input_frame(idx++, 0));
+            std::this_thread::sleep_for(std::chrono::milliseconds(2));
+        }
+        CHECK(wait_for([&] { return worker.get_stream_stats().blocks >= 1; }, 5000),
+              "set_skip_silence(false) enables inference without stopping worker");
+        CHECK(worker.get_stream_stats().resets == 0,
+              "dynamic skip_silence causes zero stream resets");
+        worker.stop();
+    }
+
     if (g_fail) {
         std::printf("\n%d test(s) FAILED\n", g_fail);
         return 1;

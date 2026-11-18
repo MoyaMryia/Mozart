@@ -26,14 +26,14 @@
 - [x] 非推理逻辑归 Rust。
 - [x] C++ 进程只保留推理：`StreamSession` 封装 `StreamingRvc` 和 `RVCInferencer`；`RealtimeRvcWorker` 与 `AudioWorker` 的外层传输、队列、模式、统计归 Rust。
 - [x] 静音和旁路归音频进程；C++ 不实现这两个概念。
-- [x] 参数在 `StartStream` 时固定；v1 运行时调参经 `config set rvc.<会话参数>` 写持久基线，由 daemon 编排应用（见 [SPEC-04](SPEC-04-daemon.md)），`[rvc.realtime]` 四键同口径走 Stop→Start；模型切换时 `[rvc]` 会话参数由该模型的预设载入（见 [SPEC-11](SPEC-11-preset.md)），`StartStream` 契约不变。实时换模型由 daemon `model use` 断流编排（SPEC-04），rvc 不新增命令。块边界 `SetParams` 仍推迟，见 [FUTURE.md](../FUTURE.md)。
+- [x] 初始参数随 `StartStream` 下发，实时流活动期间 `pitch_shift`、`index_rate`、`f0_method` 与 `[rvc.realtime].skip_silence` 经 `SetParams`（`0x0308`）在下一推理块边界无中断生效（保留 `StreamingRvc` 缓冲与 `RVCInferencer` 音高缓存/随机状态）；`startup_delay_ms` 仍走 `StopStream`→`StartStream`（见 [SPEC-04](SPEC-04-daemon.md)）；模型切换时 `[rvc]` 会话参数由该模型的预设载入（见 [SPEC-11](SPEC-11-preset.md)），`StartStream` 契约不变。实时换模型由 daemon `model use` 断流编排（SPEC-04），rvc 不新增命令。
 - [x] 输出节拍由输入帧驱动：C++ 每收到一帧输入就回一帧输出，输出环不足时补零。启动缓冲留在 `StreamingRvc.startup_delay_out`（默认 400 ms，`startup_delay_ms` 旋钮），音频进程只保留小缓冲吸收送达抖动。大缓冲只有一个主人。
 - [ ] 1:1 泵假设采集与播放时钟同源；使用不同声卡时，长期漂移会导致周期性欠载或缓冲增长，需时钟漂移补偿（见 [FUTURE.md](../FUTURE.md)）。推迟项，未实现。
 - [x] 板端实测确认小缓冲布局成立：同源 60 s 长跑 49.86 帧/s 1:1、丢弃与欠载零增长，rvc 端到端净滞后约 0.5 s（400 ms 启动缓冲为主）。维持启动缓冲留 C++、音频进程小缓冲的现状；数据见 `reports/realtime-pipeline-20261112/RESULTS.md`。
 
 ## 接口约束
 
-- [x] 粗粒度边界：数据面只有“输入帧进、输出帧出”，控制面只有加载、启动、停止、重置和状态查询；不暴露张量、引擎和 stream。
+- [x] 粗粒度边界：数据面只有“输入帧进、输出帧出”，控制面只有加载、清单查询、启动、停止、重置、在线调参和状态查询；不暴露张量、引擎和 stream。
 - [x] 数据面沿用 core 的帧契约：16 kHz 输入，一帧一条消息。实时输出按模型原生采样率（32/40/48 kHz）填 `sample_rate` 与 `valid_samples`；文件输出仍固定 48 kHz，离线收尾重采样。字段与偏移见 SPEC-01。（`rvc/src/rvc/audio_worker.cpp:137-139`、`rvc/src/rvc/file_worker.cpp:116-117`）
 - [x] 文件转换复用帧数据面：C++ 只收帧/发帧、不接触文件，对端是 pre（实时）还是 daemon（文件）无感知。文件帧发送必须不丢（阻塞/流控，区别于实时的非阻塞丢弃）；输出 socket 由数据面对端绑定（实时 pre、文件 daemon），实时/文件互斥故不冲突，切换时交接绑定。（`rvc/src/rvc/file_worker.cpp:67-127`、`rvc/transport/unix_dgram_stream.cpp:290-311`）
 - [x] 离线推理 v1 整段批处理：C++ 收齐 daemon 喂入的帧、攒成整段跑现有离线流程再回输出帧；质量参数沿用旧实现不动（峰值归一化 0.95、48 Hz 高通、整段 F0、按引擎形状整段一次过或滑窗 + 重叠淡化、RMS 混合、限幅 0.99）。滑窗窗长随生成器帧数 T 按 T/398 缩放（T=398 为 2 s 窗、1 s hop；T=200 为 1 s 窗、0.5 s hop）。内存由 300 s 时长上限兜底。分块流式推迟，见 [FUTURE.md](../FUTURE.md)。（`rvc/src/rvc/inferencer.cpp:24-26,85,234-235,284,330,374,430`）
@@ -51,12 +51,13 @@
 | 进程启动 | 部署配置 | `device`、`half`、`cache_limit`；模型路径由 `[[models]]` 注册表提供（回退 `models_dir` 扫描）；特征引擎路径可选，缺省自动发现 |
 | `LoadModel` | Rust 控制命令 | `model_id`；C++ 读 `config.json` 并报告 `capabilities` 和模型版本 |
 | `StartStream` | Rust 控制命令 | `kind`、`model_handle`、`pitch_shift`、`index_rate`、`rms_mix_rate`、`protect`、`f0_method`；实时模式另带四个 `[rvc.realtime]` 旋钮（可选，缺省用 JSON 默认）；文件模式另带 `total_frames`、可选 `total_samples`，见下文 |
+| `SetParams` | Rust 控制命令 | `pitch_shift`、`index_rate`、`rms_mix_rate`、`protect`、`f0_method`、可选 `skip_silence`；实时流活动时在下一推理块边界无中断生效 |
 | C++ 内部 preset | C++ | `StreamingRvc` 的分块、历史、淡化、SOLA 和启动缓冲参数 |
 | Rust / 音频进程 | Rust | 播放侧小缓冲、静音 / 旁路、数据面队列；400 ms 启动缓冲留在 C++，不重复设大缓冲 |
 
 - [x] `kind` 只分 `realtime` 和 `file`。C++ 按模型能力选择实时资产或 quality / full-history preset；缺实时资产时拒绝实时，不静默降级。
 - [x] 文件模式的 `total_frames` 必填，类型为正整数 u32，表示本次输入帧数。C++ 收齐后开始整段推理；取消仍用 `StopStream`。`total_samples` 可选，类型为 u64，表示 16 kHz 输入的有效采样数。显式传入时须在 `1..=total_frames × 320` 内；C++ 在推理前据此裁掉尾帧补零。省略时保留全部帧样本。实时模式忽略这两个字段。
-- [x] `StartStream` 会话参数取自 TOML `[rvc]` 会话默认值；模型切换时先由该模型的预设载入 `[rvc]`（SPEC-11），不新增控制命令，`StartStream` 仍携带五个会话参数。`config set rvc.<会话参数>` 是持久基线写回（编排见 SPEC-04）；将来无中断 `SetParams` 的运行时改动才记入 daemon 运行时状态文件，重启恢复，不回写 TOML。两者不混用。
+- [x] `StartStream` 会话参数取自 TOML `[rvc]` 会话默认值；模型切换时先由该模型的预设载入 `[rvc]`（SPEC-11），`StartStream` 仍携带五个会话参数。`config set rvc.<会话参数>` 与 `preset use` 在实时流活动期间对可热更参数下发 `SetParams`（`0x0308`）无中断生效（编排见 SPEC-04）。将来若增加不写 TOML 基线的独立运行时调参命令，其覆盖才记入 daemon 运行时状态文件。两者不混用。
 - [x] `config set rvc.<会话参数>` 的触发、失败恢复与重试见 [SPEC-04](SPEC-04-daemon.md)。
 - [x] `protect`、`rms_mix_rate` 在实时链路不应用，仍只对文件链路生效；实时补应用留 [FUTURE.md](../FUTURE.md)。
 - [x] `filter_radius` 在旧 C++ 里只保存、未参与计算，v1 不放进 `StartStream`、不暴露死参数；保留为 FUTURE 提升项，推迟实现 F0 中值滤波，见 [FUTURE.md](../FUTURE.md)。
@@ -66,11 +67,11 @@
 
 - [x] 控制面传输：Unix `SOCK_SEQPACKET`，可靠、保留消息边界；数据面保持 Unix `SOCK_DGRAM`。
 - [x] 消息格式：定长头 + JSON 体。头含 `magic`、`version`、`type`、`request_id`、`body_len`。
-- [x] 命令：`Hello`、`LoadModel`、`ListModels`、`StartStream`、`StopStream`、`ResetStream`、`GetStatus`。第一版不加 `UnloadModel` 和 `Shutdown`；退出用 SIGTERM。（`core/include/mozart/ctl.h:75-81`、`rvc/control/stream_session.cpp:79-137`、`rvc/src/main.cpp:100-101,307-344`）
+- [x] 命令：`Hello`、`LoadModel`、`ListModels`、`StartStream`、`StopStream`、`ResetStream`、`GetStatus`、`SetParams`（`0x0308`）。第一版不加 `UnloadModel` 和 `Shutdown`；退出用 SIGTERM。（`core/include/mozart/ctl.h:88-97`、`rvc/control/stream_session.cpp:115-150`、`rvc/main.cpp:100-101`）
 - [x] 响应：`request_id` + `status`（`ok` / `error`）+ `code` + `reason` + 可选体。
-- [x] 错误码：`InvalidArgument`、`NotLoaded`、`Busy`、`Unsupported`、`InferenceFailed`、`Internal`。
+- [x] 错误码：`InvalidArgument`、`NotLoaded`、`NotReady`、`Busy`、`Unsupported`、`InferenceFailed`、`Internal`。
 - [x] `Hello` 做协议版本握手；不兼容时拒绝并关闭连接。
-- [x] `StartStream` 携带参数边界表中的会话参数；已有活动流时返回 `Busy`，daemon 须先 `StopStream`。`StopStream` 停止收新帧，等当前推理块结束后返回：实时约 240 ms，文件停在下一个检查点（整段 F0 前后、Generator 窗/引擎调用前后）；`GetStatus` 只读原子快照，不阻塞推理线程。（`rvc/control/stream_session.cpp:295-303`、`rvc/src/rvc/audio_worker.cpp:63`、`rvc/src/rvc/file_worker.cpp:38-46`、`inferencer.cpp:219,253,382,698-708`）
+- [x] `StartStream` 携带参数边界表中的会话参数；已有活动流时返回 `Busy`，daemon 须先 `StopStream`。`SetParams` 在实时流活动期间于下一推理块边界无中断生效：未加载模型返回 `NotLoaded`，无活动流返回 `NotReady`，文件流活动返回 `Busy`，参数越界或类型不符返回 `InvalidArgument`（`rvc/control/stream_session.cpp`、`rvc/src/rvc/inferencer.cpp`、`rvc/src/rvc/streaming_pipeline.cpp`）。`StopStream` 停止收新帧，等当前推理块结束后返回：实时约 240 ms，文件停在下一个检查点（整段 F0 前后、Generator 窗/引擎调用前后）；`GetStatus` 只读原子快照，不阻塞推理线程。（`rvc/control/stream_session.cpp:295-303`、`rvc/src/rvc/audio_worker.cpp:63`、`rvc/src/rvc/file_worker.cpp:38-46`、`inferencer.cpp:219,253,382,698-708`）
 - [x] `ListModels` 返回模型目录清单，每项含 `id`、`exists`（资产齐全可加载）、`loaded`（当前已加载）。只读，不加载模型、不阻塞推理线程；供 CLI `model list`（入队不预检，见 SPEC-10）。（`rvc/model/model_loader.cpp:220-243`）
 - [x] 状态字段：`state`、`model_id`、`model_version`、`capabilities`、`stream_kind`、`frames_in`、`frames_out`、`frames_dropped`、`blocks`、`inference_ms_last` / `avg` / `p95`、`queue_depth`、`last_error`。（`rvc/control/stream_session.cpp:110-133`，共 14 字段）
 - [x] 文件模式下 `blocks` 按 Generator 窗计数，供 daemon 推导文件转换推理进度（见 SPEC-04）。（`rvc/src/rvc/file_worker.cpp:59,150`）
@@ -120,7 +121,7 @@ RMVPE 前端 mel 128 带、n_fft 1024、hop 160、30–8000 Hz、HTK Slaney（�
 | `crossfade_ms` | 50 | 定值 50，偏离拒绝 | StartStream |
 | `sola_search_ms` | 10 | 定值 10，偏离拒绝 | StartStream |
 | `startup_delay_ms` | 400 | 0..=15000，且 % 20 == 0 | StartStream |
-| `skip_silence` | true | bool | StartStream |
+| `skip_silence` | true | bool | StartStream / SetParams |
 
 `crossfade_ms + sola_search_ms` 锁为定值 60 ms（50 + 10），等于最大 overlap。入口按「各自 ≤ 上限且和 == 60」判定，等价于两键各锁定值，任何偏离都拒绝；拒绝原因写明「引擎形状按最大 overlap 固定，可调 overlap 尚未实现」。定值按 48 kHz 契约换算：`crossfade_max_out 2400 / 48 = 50`、`sola_search_max_out 480 / 48 = 10`、两者之和 `2880 / 48 = 60`；各采样率的 max_out 同比缩放，故 ms 边界与采样率无关。ms 按模型输出采样率换算样本。`startup_delay_ms` 与 `skip_silence` 不参与块几何，保持可调；前者上限 15000 来自 C++ 输出环 16 s @48 kHz 留 1 s 余量（`rvc/src/rvc/streaming_pipeline.cpp:24`）。
 
@@ -128,7 +129,7 @@ RMVPE 前端 mel 128 带、n_fft 1024、hop 160、30–8000 Hz、HTK Slaney（�
 
 延迟影响（推断，按代码公式推算，非实测听感）：48 kHz 单块 decoder 输出 = 11520 样本 + 淡化 + SOLA，默认 14400 样本 = 300 ms。淡化调小 10 ms 只省 10 ms 块长，而净滞后约 0.5 s 中 400 ms 是启动缓冲（板端实测见 `reports/realtime-pipeline-20261112/RESULTS.md`）。降延迟的可用旋钮是 `startup_delay_ms`，不是调小淡化。
 
-四键归 R 类运行时键（overlap 两键只接受定值），`config set` 走 Stop→Start：[SPEC-04](SPEC-04-daemon.md) 的编排判据已纳入本段四键（`daemon/src/services.rs:957-965`），复用其失败恢复与降级语义。形状类不做运行时调参。
+四键归 R 类运行时键（overlap 两键只接受定值）：`config set` 修改 `skip_silence` 走 `SetParams` 块边界无中断生效，`startup_delay_ms` 走 `StopStream`→`StartStream`（[SPEC-04](SPEC-04-daemon.md)，`daemon/src/services.rs`），复用同一失败恢复与降级语义。形状类不做运行时调参。
 
 验收：形状推导 C++/Python 双镜像单测（`tests/test_rvc_window_geometry.cpp` 黄金锚点、`tests/test_rvc_realtime_params.cpp` 读 JSON 对拍并按 32k/40k/48k 重算、`tools/model/test_realtime_chain_params.py`）；旋钮范围、整除与 overlap 定值拒绝由 `validate_realtime_knobs` 与 `core::config` 两侧单测钉住；流式 golden 对拍按变体跑（`run_streaming_reference.py` 24 帧窗参考需泛化到契约块长）；板端按 [RVC-FILE-BENCHMARK](../RVC-FILE-BENCHMARK.md) 四层适配实时（接缝网格 = `output_hop`），记推理耗时/净延迟/接缝伪影比/音分配对差，变体入 `reports/`；非形状类固定形状扫 `startup_delay_ms` 与 `skip_silence`，按延时 + 效果定值，crossfade/sola 扫描待解耦后做。
 
@@ -149,9 +150,11 @@ RMVPE 前端 mel 128 带、n_fft 1024、hop 160、30–8000 Hz、HTK Slaney（�
 - [x] RMVPE 逐块帧推导复核：帧数由 `derive_realtime_geometry` 推导并进门控，补整引用同一常量；架构文档「音高缓存 1024 帧」已定位 `kRealtimePitchCacheFrames`。（`rvc/include/rvc/realtime_geometry.hpp:166-173`、`rvc/src/rvc/feature_extractor.cpp:525-528`、`rvc/src/rvc/inferencer.cpp:40`）
 - [x] 板端多采样率与换模型冒烟（2026-11-17 实测，`tools/jetson-e2e.sh --realtime-mm --file --preset` 全过：实时多模型 9 场景、文件链 9、预设 8）：48 kHz 实时基线帧守恒且无推理错误、overlap 定值偏离在入口被拒且不打断在跑的流、`startup_delay_ms` 可调、48 kHz↔40 kHz 跨采样率 `model use`、切回载入原模型预设、未知模型失败恢复旧模型旧参数、文件占 GPU 时回 Busy、40 kHz 模型文件链输出 48 kHz 单声道、资产树无 presets 残留。套件为 `tools/jetson-realtime-mm.sh`（需两个采样率不同的模型，`MODEL_A`/`MODEL_B` 可指定）。注意采集静音时须置 `skip_silence = false` 才真跑推理，否则块全被跳过、`blocks` 恒 0。
 - [x] 32 kHz 模型接入与双链验收（asuka-v2-32k，2026-11-17 实测）：代码已具备 32k 能力（文件链几何与重采样按模型采样率通用推导，实时几何支持集含 32000），本轮补齐资产与验收闭环，未改运行时逻辑。文件链动态生成器 large 档（每帧 320 样本）与实时 front/decoder 定长资产（decoder 输出 9600 样本）导出编译，共享特征引擎以 onnx+engine 符号链接复用（链接 engine 的原因见实测报告）；登记 `[[models]]`。`--file-models` 11 模型全过（asuka 500/500 帧、整段单窗、无 ONNX 回退），`--realtime-mm` 48k↔32k 9 场景全过（32k 实时帧守恒 199=199、blocks>0）。测试补强：几何偶数 T 扫描纳入 32k 与 T=398@32k 锚点、重采样 32k→48k 用例。实测见 `reports/rvc-32k-onboarding-20261117/RESULTS.md`。
-- [ ] 板端剩余未验证：延迟 P95/连续性/长跑稳定性、`model use` 切换接缝听感与音质主观评价。阻塞原因：现有套件只断言帧守恒、块计数与 `last_error`，不测延迟统计也不做听感评价。解除条件：延迟与音质按 `reports/` 测量流程单独跑。32 kHz 实时冒烟已由上条覆盖。
-- 本机已实测（2026-11-17，overlap 锁定与验收修复后）：`tools/ci-local.sh all` 通过，native 10 个 C++ 用例全过（含 32k/40k/48k 几何对拍与流式用例），Rust 647 项、Python 工具链 7 项全过。几何对拍经两次反证（改歪资产常量、改歪旋钮默认值均转红）。
+- [ ] 板端剩余未验证：延迟 P95/连续性/长跑稳定性、`model use` 与 `SetParams` 在线调参（变调/调检索比/切换 `skip_silence`）期间的接缝声学听感与音质主观评价。阻塞原因：现有套件仅对 Loopback 静音流置 `skip_silence=false` 驱动推理并断言日志计数、块递增、帧守恒与 `last_error=None`，不测延迟 P95 也不做带人声输出的听感评价。解除条件：在 Jetson 上向 Loopback 播放测试人声同时执行在线调参与 `model use`，录制输出音频并按 `reports/` 测量流程做声学波形与主观听感验收。32 kHz 实时冒烟已由上条覆盖。
+- 板端已实测（2026-11-18，接入 `SetParams` 后）：`tools/jetson-e2e.sh --unit --smoke --preset --realtime-mm --file` 全部通过（设备端 `cargo test` 30 套 647 项、`ctest` 10/10 全部通过；三进程冒烟与 `--file` 通过；`--preset` 8 场景含实时 `preset use` 通过；`--realtime-mm` 10 场景全过，含新增 `SetParams 在线调参不断流` 场景：6 次调参均落入 `rvc.log`、`StartStream` 计数未增、`frames_in` 与 `blocks` 单调递增、`帧守恒=94`、`last_error=None`）。
+- 本机已实测（2026-11-18，接入 `SetParams` 后）：`tools/ci-local.sh all` 通过（repo、lint、native、rust 等全部本地检查；含 C++ `RVCInferencer`/`RealRVCPipeline`/`StreamSession` 与 Rust `rvc_params`/`preset` 在线调参用例）。
 - [ ] Python 镜像单测接入检查入口：`tools/model/test_realtime_chain_params.py` 覆盖 32k/40k 几何与旋钮边界，但 `tools/ci-local.sh` 与 CTest 都未调用它，目前只能人工运行。解除条件：在检查脚本加一个 Python 单测调用。
+- [x] 在线参数调整（SetParams）：新增 `MOZART_CTL_RVC_SET_PARAMS`（`0x0308`），`RVCInferencer` 在块边界取参数快照、`StreamingRvc` / `AudioWorker` 原子更新 `skip_silence`，不重建推理器与流缓冲。（`rvc/control/stream_session.cpp`、`rvc/src/rvc/inferencer.cpp`、`rvc/src/rvc/streaming_pipeline.cpp`）
 - [x] 模型加载移出控制锁。（`rvc/control/stream_session.cpp:152,159`）
 - [ ] 长文件改分块，限制内存。（FUTURE）正文已定推迟（分块流式见 FUTURE），本条同步标推迟。
 - [x] 配置项必须与实际行为一致。原 LoadModel 入口预检与注册表定稿冲突已修复（见模型注册表第一节）。

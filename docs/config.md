@@ -1,6 +1,6 @@
 # Mozart 配置规范（TOML schema）
 
-状态：定稿中。最后更新：2026-11-17。
+状态：定稿中。最后更新：2026-11-18。
 
 本文件是 TOML 配置的唯一 schema 依据：段、键、类型、默认、范围、运行时/重启分类。配置模型（TOML 基线 + 运行时状态文件、`config set`/`config save`、`restart_required` 契约）见 [SPEC-04](SPEC/SPEC-04-daemon.md)，本文件不复述。解析与校验实现于 `core/src/config.rs`，须与本文件一致。
 
@@ -147,7 +147,7 @@ path = "<资产根>/models/asr/<模型id>"
 
 跨键约束：`crossfade_ms + sola_search_ms` 恒为 60 ms（50 + 10），两键不可调，偏离在配置入口与 `StartStream` 入口拒绝；原因与解除条件见 [SPEC-03 实时几何与资产参数](SPEC/SPEC-03-rvc.md#实时几何与资产参数)。可调的是 `startup_delay_ms` 与 `skip_silence`：前者上限 15000 来自 C++ 输出环 16 s @48 kHz 留 1 s 余量，整除模数 20 ms 来自契约帧网格。定值与上限按 48 kHz 契约换算，各采样率的 max_out 同比缩放，故 ms 边界与采样率无关。违反在入口拒绝，不到推理层抛异常。
 
-四键归 R 类：`config set` 后实时流在跑且值变化时走 Stop→Start（见下文特殊机制说明）；overlap 两键只接受定值，实际可变的只有 `startup_delay_ms` 与 `skip_silence`。
+四键归 R 类：`config set` 修改 `skip_silence` 经 `SetParams`（`0x0308`）在块边界无中断生效，`startup_delay_ms` 走 Stop→Start（见下文特殊机制说明）；overlap 两键只接受定值，实际可变的只有 `startup_delay_ms` 与 `skip_silence`。
 
 ### [asr]
 
@@ -205,7 +205,7 @@ path = "<资产根>/models/asr/<模型id>"
 
 ## 特殊机制说明
 
-- **RVC 会话参数**（f0_method / pitch_shift / index_rate / rms_mix_rate / protect）：`config set rvc.<会话参数>` 写 TOML 持久基线。实时流在跑且本次写入的键属实时生效集（`pitch_shift`、`index_rate`、`f0_method` 与 `[rvc.realtime]` 四键）且值变化时，daemon 以 `StopStream`→`StartStream` 应用新参，短暂打断。仅改 `protect` / `rms_mix_rate` 更新基线与生效配置，不打断实时流。direct/空闲只更新生效配置。文件任务不中断：当前任务用旧参、下一任务用新参。触发细则与失败恢复见 [SPEC-04](SPEC/SPEC-04-daemon.md)。`protect` / `rms_mix_rate` 在实时链路不应用，仍只对文件链路生效；实时补应用与干净块边界 `SetParams` 见 [FUTURE.md](FUTURE.md)。
+- **RVC 会话参数**（f0_method / pitch_shift / index_rate / rms_mix_rate / protect）：`config set rvc.<会话参数>` 与 `preset use` 写 TOML 持久基线。实时流在跑时，`pitch_shift` / `index_rate` / `f0_method` 与 `[rvc.realtime].skip_silence` 变化由 daemon 下发 `SetParams`（`0x0308`）在下一推理块边界无中断生效，失败时保留在跑旧参、生效配置保留旧值、TOML 保留新基线；`startup_delay_ms` 决定启动缓冲，变化仍走 `StopStream`→`StartStream`（失败用旧参恢复）。仅改 `protect` / `rms_mix_rate` 或参数值未变化只更新 TOML 基线与生效配置，不下发 `rvc` 命令。direct/空闲只更新生效配置。文件任务不中断：当前任务用旧参、下一任务用新参。`status.rvc_params` 表示当前生效配置；存在待生效基线或 rvc 不可达时，可能不等于正在跑的流参数。`protect` / `rms_mix_rate` 在实时链路不应用，仍只对文件链路生效；实时补应用见 [FUTURE.md](FUTURE.md)。编排细节见 [SPEC-04](SPEC/SPEC-04-daemon.md)。
 - **模型预设**（SPEC-11）：每个 RVC 模型目录 `presets/default.toml` 保存五个会话参数。模型切换时 daemon 载入该文件到 `[rvc]` 并应用；`preset save` 把当前 live 五参数写回当前模型，`preset use` 重新载入，`preset list` 显示预设值、live 值与 dirty。`presets/` 是资产树唯一可写目录；daemon 是唯一写者，原子写。命令细节见 [SPEC-11](SPEC/SPEC-11-preset.md)。
 - **pre DSP 开关**经 `SetDsp`（0x0207，体含 denoise/gate/agc/limiter 四键）运行时生效：denoise 重新启用时重置 WOLA 流式状态、重新攒初始化帧，gate/agc/limiter 直接切换。
 - **逻辑上限 vs 预分配环**：`[file].queue_capacity` 是入队时查的逻辑上限（未预分配）→ R；`[pre].capture_queue_frames` 与 asr/tts/bridge 的 `*_capacity` 是预分配环/队列 → S。
@@ -215,4 +215,4 @@ path = "<资产根>/models/asr/<模型id>"
 
 ## 运行时状态文件交互
 
-运行时状态文件记录服务端运行时命令产生的覆盖，不记录 `config set` 的改动：`config set` 写 TOML 持久基线并即时应用，同时清掉该键已有覆盖。v1 状态文件只记录字幕开关（`bridge.translate_enabled` / `bridge.speech_enabled`），将来的无中断 RVC `SetParams` 也走这里。daemon 重启时在 TOML 基线上叠加覆盖恢复；活权威在各服务，启动恢复一次、运行时不对账。`config save` 把全部覆盖提升为基线后清空。详见 SPEC-04。
+运行时状态文件记录服务端运行时命令产生的覆盖，不记录 `config set` 的改动：`config set` 写 TOML 持久基线并即时应用，同时清掉该键已有覆盖。当前状态文件只记录字幕开关（`bridge.translate_enabled` / `bridge.speech_enabled`）；`config set rvc.*` 与 `preset use` 直接写 TOML 基线并按变更键走 `SetParams` 或 `StopStream`→`StartStream`。daemon 重启时在 TOML 基线上叠加覆盖恢复；活权威在各服务，启动恢复一次、运行时不对账。`config save` 把全部覆盖提升为基线后清空。详见 SPEC-04。

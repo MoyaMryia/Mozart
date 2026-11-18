@@ -28,6 +28,7 @@ constexpr size_t kModelFrame16k = 160;
 
 StreamingRvc::StreamingRvc(Config config)
     : cfg_(std::move(config)),
+      skip_silence_(cfg_.skip_silence),
       model_frame_out_(cfg_.output_sample_rate / 100),
       output_frame_samples_(cfg_.output_sample_rate / 50),
       hop_in_(cfg_.upstream_realtime
@@ -254,7 +255,7 @@ bool StreamingRvc::try_process_one(RVCPipelineBase& pipeline)
     }
 
     // ---- 静音窗：跳过推理，输出等长静音 ----
-    if (cfg_.skip_silence && !voiced) {
+    if (skip_silence_.load(std::memory_order_relaxed) && !voiced) {
         static std::atomic<uint64_t> skip_logged{0};
         if (skip_logged.fetch_add(1) < 3) {
             spdlog::warn("[stream] window skipped as silent (pushed={})", pushed_at_window);

@@ -1,4 +1,4 @@
-// test_rvc_control.cpp — StreamSession 七命令语义单测（无 GPU 依赖）
+// test_rvc_control.cpp — StreamSession 八命令语义单测（无 GPU 依赖）
 // ============================================================================
 // 用桩后端（SessionBackend seam）覆盖控制面契约：
 //   1. Hello 版本报告与请求体校验
@@ -52,6 +52,7 @@ struct FakeWorker : StreamWorker {
 
     void stop() override;
     void reset() override;
+    void set_skip_silence(bool skip) override;
     WorkerStats stats() override;
 
 private:
@@ -65,6 +66,9 @@ struct FakeBackend : SessionBackend {
     bool fail_start = false;
     std::atomic<int> stop_calls{0};
     std::atomic<int> reset_calls{0};
+    std::atomic<int> set_params_calls{0};
+    std::atomic<int> skip_silence_calls{0};
+    bool last_skip_silence = true;
     std::vector<ModelListing> listing{{"alpha", true}, {"beta", false}};
 
     LoadResult load_model(const std::string& model_id, bool, std::string& reason) override {
@@ -105,6 +109,10 @@ struct FakeBackend : SessionBackend {
         last_realtime_options = realtime_options;
         return std::make_unique<FakeWorker>(*this);
     }
+    void set_params(const RvcParameters& params) override {
+        last_params = params;
+        set_params_calls.fetch_add(1);
+    }
     RvcParameters last_params{};
     bool last_realtime = false;
     FileBatchOptions last_file_options{};
@@ -113,6 +121,10 @@ struct FakeBackend : SessionBackend {
 
 void FakeWorker::stop() { owner_.stop_calls.fetch_add(1); }
 void FakeWorker::reset() { owner_.reset_calls.fetch_add(1); }
+void FakeWorker::set_skip_silence(bool skip) {
+    owner_.last_skip_silence = skip;
+    owner_.skip_silence_calls.fetch_add(1);
+}
 WorkerStats FakeWorker::stats() {
     WorkerStats out{};
     out.frames_in = 10;
@@ -693,6 +705,224 @@ int main() {
                   MOZART_CTL_DAEMON_HELLO, nlohmann::json::object())))
                   .code == MOZART_CTL_CODE_UNKNOWN_COMMAND,
               "unknown command type is rejected");
+    }
+
+    std::printf("test_set_params_validation_and_state_gates\n");
+    {
+        auto [session, backend] = make_session();
+        auto params_body = [] {
+            return nlohmann::json{
+                {"pitch_shift", 4},
+                {"index_rate", 0.5},
+                {"rms_mix_rate", 0.8},
+                {"protect", 0.25},
+                {"f0_method", "rmvpe"},
+            };
+        };
+
+        CHECK(parse_reply(session->handle(make_message(
+                  MOZART_CTL_RVC_SET_PARAMS, params_body())))
+                  .code == MOZART_CTL_CODE_NOT_LOADED,
+              "set_params before load is NotLoaded");
+
+        parse_reply(session->handle(make_message(
+            MOZART_CTL_RVC_LOAD_MODEL, {{"model_id", "qiqi"}})));
+        CHECK(parse_reply(session->handle(make_message(
+                  MOZART_CTL_RVC_SET_PARAMS, params_body())))
+                  .code == MOZART_CTL_CODE_NOT_READY,
+              "set_params without an active stream is NotReady");
+
+        nlohmann::json file_start = start_body(1);
+        file_start["kind"] = "file";
+        file_start["total_frames"] = 10;
+        parse_reply(session->handle(make_message(
+            MOZART_CTL_RVC_START_STREAM, file_start)));
+        CHECK(parse_reply(session->handle(make_message(
+                  MOZART_CTL_RVC_SET_PARAMS, params_body())))
+                  .code == MOZART_CTL_CODE_BUSY,
+              "set_params during a file stream is Busy");
+        parse_reply(session->handle(make_message(
+            MOZART_CTL_RVC_STOP_STREAM, nlohmann::json::object())));
+
+        parse_reply(session->handle(make_message(
+            MOZART_CTL_RVC_START_STREAM, start_body(1))));
+        const int stops_before = backend->stop_calls.load();
+
+        auto bad_set = [&](const nlohmann::json& bad, const char* msg) {
+            CHECK(parse_reply(session->handle(make_message(
+                      MOZART_CTL_RVC_SET_PARAMS, bad)))
+                      .code == MOZART_CTL_CODE_INVALID_ARGUMENT,
+                  msg);
+        };
+        nlohmann::json bad = params_body();
+        bad.erase("protect");
+        bad_set(bad, "missing parameter in set_params is rejected");
+        bad = params_body();
+        bad["pitch_shift"] = 13;
+        bad_set(bad, "out-of-range pitch_shift in set_params is rejected");
+        bad = params_body();
+        bad["pitch_shift"] = 4'294'967'296ll;
+        bad_set(bad, "overflowing pitch_shift in set_params is rejected");
+        bad = params_body();
+        bad["f0_method"] = "harvest";
+        bad_set(bad, "unsupported f0_method in set_params is rejected");
+        bad = params_body();
+        bad["skip_silence"] = "false";
+        bad_set(bad, "non-boolean skip_silence in set_params is rejected");
+        CHECK(backend->set_params_calls.load() == 0
+              && backend->last_params.pitch_shift == 0,
+              "rejected set_params does not mutate backend parameters");
+
+        Reply ok = parse_reply(session->handle(make_message(
+            MOZART_CTL_RVC_SET_PARAMS, params_body())));
+        CHECK(ok.status == "ok", "valid set_params succeeds during realtime stream");
+        CHECK(backend->set_params_calls.load() == 1
+              && backend->last_params.pitch_shift == 4
+              && std::fabs(backend->last_params.index_rate - 0.5) < 1e-6
+              && std::fabs(backend->last_params.rms_mix_rate - 0.8) < 1e-6
+              && std::fabs(backend->last_params.protect - 0.25) < 1e-6
+              && backend->skip_silence_calls.load() == 0
+              && backend->stop_calls.load() == stops_before,
+              "set_params updates session parameters without stopping stream");
+
+        nlohmann::json with_skip = params_body();
+        with_skip["pitch_shift"] = -3;
+        with_skip["skip_silence"] = false;
+        ok = parse_reply(session->handle(make_message(
+            MOZART_CTL_RVC_SET_PARAMS, with_skip)));
+        CHECK(ok.status == "ok"
+              && backend->set_params_calls.load() == 2
+              && backend->last_params.pitch_shift == -3
+              && backend->skip_silence_calls.load() == 1
+              && !backend->last_skip_silence
+              && backend->stop_calls.load() == stops_before,
+              "set_params updates optional skip_silence without stopping stream");
+
+        parse_reply(session->handle(make_message(
+            MOZART_CTL_RVC_STOP_STREAM, nlohmann::json::object())));
+        CHECK(parse_reply(session->handle(make_message(
+                  MOZART_CTL_RVC_SET_PARAMS, params_body())))
+                  .code == MOZART_CTL_CODE_NOT_READY,
+              "set_params after stop is NotReady");
+    }
+
+    std::printf("test_inferencer_and_pipeline_set_parameters\n");
+    {
+        const auto dir = std::filesystem::temp_directory_path()
+            / ("mozart-rvc-params-unit-" + std::to_string(::getpid()));
+        std::filesystem::remove_all(dir);
+        std::filesystem::create_directories(dir);
+
+        // 1. 直接测 RVCInferencer::set_parameters() + snapshot_params()（无 GPU 构造）。
+        auto model = std::make_shared<RVCModel>("dummy", dir);
+        auto extractor = std::make_shared<FeatureExtractor>(
+            std::filesystem::path{}, std::nullopt, "cpu", false,
+            /*mock_hubert=*/true, /*mock_rmvpe=*/true,
+            std::nullopt, std::nullopt, /*defer_quality=*/true);
+        RVCInferencer inferencer(
+            model, extractor, 16000, 48000, "rmvpe", 2, 0.4f, 0.8f, 0.25f, 1);
+
+        auto snap = inferencer.snapshot_params();
+        CHECK(snap.f0_method == "rmvpe" && snap.pitch_shift == 2
+              && std::fabs(snap.index_rate - 0.4f) < 1e-6f
+              && std::fabs(snap.rms_mix_rate - 0.8f) < 1e-6f
+              && std::fabs(snap.protect - 0.25f) < 1e-6f
+              && snap.index_nprobe == 1,
+              "inferencer snapshot starts with initial parameters");
+
+        inferencer.set_parameters("rmvpe", -5, 0.75f, 0.6f, 0.15f, 2);
+        snap = inferencer.snapshot_params();
+        CHECK(snap.f0_method == "rmvpe" && snap.pitch_shift == -5
+              && std::fabs(snap.index_rate - 0.75f) < 1e-6f
+              && std::fabs(snap.rms_mix_rate - 0.6f) < 1e-6f
+              && std::fabs(snap.protect - 0.15f) < 1e-6f
+              && snap.index_nprobe == 2,
+              "inferencer set_parameters updates snapshot in-place");
+
+        // 多线程并发读写不得出现撕裂快照。
+        std::atomic<bool> stop_race{false};
+        std::atomic<bool> torn{false};
+        std::thread writer([&] {
+            for (int i = 0; i < 2000; ++i) {
+                if ((i & 1) == 0) {
+                    inferencer.set_parameters("rmvpe", 3, 0.2f, 0.4f, 0.1f, 1);
+                } else {
+                    inferencer.set_parameters("rmvpe", -4, 0.9f, 0.7f, 0.45f, 3);
+                }
+            }
+            stop_race.store(true, std::memory_order_release);
+        });
+        std::thread reader([&] {
+            while (!stop_race.load(std::memory_order_acquire)) {
+                const auto s = inferencer.snapshot_params();
+                const bool is_a = s.pitch_shift == 3
+                    && std::fabs(s.index_rate - 0.2f) < 1e-6f
+                    && std::fabs(s.rms_mix_rate - 0.4f) < 1e-6f
+                    && std::fabs(s.protect - 0.1f) < 1e-6f
+                    && s.index_nprobe == 1;
+                const bool is_b = s.pitch_shift == -4
+                    && std::fabs(s.index_rate - 0.9f) < 1e-6f
+                    && std::fabs(s.rms_mix_rate - 0.7f) < 1e-6f
+                    && std::fabs(s.protect - 0.45f) < 1e-6f
+                    && s.index_nprobe == 3;
+                const bool is_init = s.pitch_shift == -5
+                    && std::fabs(s.index_rate - 0.75f) < 1e-6f;
+                if (!is_a && !is_b && !is_init) {
+                    torn.store(true, std::memory_order_relaxed);
+                }
+            }
+        });
+        writer.join();
+        reader.join();
+        CHECK(!torn.load(), "concurrent set_parameters and snapshot_params never tear");
+
+        // 1b. set_parameters 不得清空实时 pitch 缓存与随机状态；reset_realtime 才会重置。
+        const auto init_rt = inferencer.realtime_state_snapshot();
+        std::vector<int64_t> step_pitch = {10, 11, 12, 13, 14, 15, 16, 17, 18, 19};
+        std::vector<float> step_pitchf = {110.0f, 120.0f, 130.0f, 140.0f, 150.0f,
+                                          160.0f, 170.0f, 180.0f, 190.0f, 200.0f};
+        inferencer.push_realtime_pitch_cache(step_pitch, step_pitchf, 6);
+        for (int i = 0; i < 8; ++i) {
+            (void)inferencer.sample_realtime_random();
+        }
+        const auto before_hot = inferencer.realtime_state_snapshot();
+        CHECK(before_hot.pitch_cache != init_rt.pitch_cache
+              && before_hot.pitchf_cache != init_rt.pitchf_cache
+              && before_hot.next_random != init_rt.next_random,
+              "realtime state diverged from initial state before set_parameters");
+        inferencer.set_parameters("rmvpe", 7, 0.35f, 0.9f, 0.4f, 4);
+        const auto after_hot = inferencer.realtime_state_snapshot();
+        CHECK(after_hot.pitch_cache == before_hot.pitch_cache
+              && after_hot.pitchf_cache == before_hot.pitchf_cache
+              && after_hot.next_random == before_hot.next_random,
+              "set_parameters preserves realtime pitch cache and RNG state");
+        inferencer.reset_realtime();
+        const auto after_reset = inferencer.realtime_state_snapshot();
+        CHECK(after_reset.pitch_cache == init_rt.pitch_cache
+              && after_reset.pitchf_cache == init_rt.pitchf_cache
+              && after_reset.next_random == init_rt.next_random,
+              "reset_realtime restores pitch cache and RNG seed");
+
+        // 2. RealRVCPipeline::set_parameters 未加载模型时不崩溃且更新持久 parameters_。
+        auto manager = std::make_shared<ModelManager>(dir, "cpu", false, 1);
+        RealRVCPipeline pipeline(
+            manager, dir / "missing_hubert.onnx", std::nullopt, 16000, 48000,
+            "cpu", false, RvcMockConfig{true, true, true}, RvcParameters{},
+            dir / "missing_rt_hubert.onnx", dir / "missing_rt_rmvpe.onnx");
+        RvcParameters updated;
+        updated.pitch_shift = 6;
+        updated.index_rate = 0.55;
+        updated.rms_mix_rate = 0.7;
+        updated.protect = 0.2;
+        CHECK(pipeline.set_parameters(updated), "pipeline set_parameters returns ok");
+        CHECK(pipeline.parameters().pitch_shift == 6
+              && std::fabs(pipeline.parameters().index_rate - 0.55) < 1e-6
+              && std::fabs(pipeline.parameters().rms_mix_rate - 0.7) < 1e-6
+              && std::fabs(pipeline.parameters().protect - 0.2) < 1e-6
+              && pipeline.current_model_id().empty(),
+              "pipeline set_parameters updates stored parameters without loaded model");
+
+        std::filesystem::remove_all(dir);
     }
 
     std::printf("test_wire_roundtrip_and_version_gate\n");

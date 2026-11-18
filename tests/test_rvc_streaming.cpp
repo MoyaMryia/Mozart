@@ -541,6 +541,87 @@ int main()
               "32k playback resumes after its 400ms reserve");
     }
 
+    printf("test_block_boundary_param_and_skip_silence_update\n");
+    {
+        struct ParamSwitchRealtimePipeline : public RVCPipelineBase {
+            std::vector<float> process(const std::vector<float>& audio) override {
+                return std::vector<float>(audio.size() * 3, gain_.load());
+            }
+            std::vector<float> process_realtime(
+                const std::vector<float>&, const RvcRealtimeRequest& request) override {
+                ++calls;
+                const float g = gain_.load();
+                observed_gains.push_back(g);
+                return std::vector<float>(request.output_samples, g);
+            }
+            bool is_mock() const override { return false; }
+            void set_gain(float g) { gain_.store(g); }
+
+            std::atomic<float> gain_{0.25f};
+            size_t calls = 0;
+            std::vector<float> observed_gains;
+        } pipe;
+
+        const auto geom = derive_realtime_geometry(48000);
+        StreamingRvc::Config cfg;
+        cfg.output_sample_rate = 48000;
+        cfg.upstream_realtime = true;
+        cfg.window_samples = geom.window_samples;
+        cfg.past_context_samples = geom.past_context_samples;
+        cfg.crossfade_out = geom.crossfade_max_out;
+        cfg.sola_search_out = geom.sola_search_max_out;
+        cfg.startup_buffer_blocks = 1;
+        cfg.skip_silence = true;
+        StreamingRvc s(cfg);
+
+        uint32_t idx = 1;
+        // 12 个静音帧：skip_silence=true 应跳过推理。
+        for (size_t i = 0; i < 12; ++i) {
+            s.push(make_frame(idx, 0, 0.0f, 1, idx * 20000000ull));
+            ++idx;
+            while (s.try_process_one(pipe)) {}
+        }
+        CHECK(pipe.calls == 0 && s.stats().skipped_blocks.load() == 1,
+              "initial skip_silence skips silent block");
+        drain(s);
+
+        // 在流运行期间块边界关闭 skip_silence 并改参数：下一块立刻生效且无重置。
+        s.set_skip_silence(false);
+        pipe.set_gain(0.5f);
+        for (size_t i = 0; i < 12; ++i) {
+            s.push(make_frame(idx, 0, 0.0f, 1, idx * 20000000ull));
+            ++idx;
+            while (s.try_process_one(pipe)) {}
+        }
+        CHECK(pipe.calls == 1 && pipe.observed_gains.back() == 0.5f,
+              "skip_silence=false and new param take effect on next block");
+        const auto second_out = drain(s);
+        CHECK(second_out.size() == geom.output_hop
+              && std::fabs(second_out.back() - 0.5f) < 1e-6f,
+              "emitted samples reflect updated block parameter");
+
+        // 再次改回 skip_silence=true 与参数：有声块跑新参，静音块跳过，全程无重置。
+        pipe.set_gain(0.75f);
+        s.set_skip_silence(true);
+        for (size_t i = 0; i < 12; ++i) {
+            s.push(make_frame(idx, 1, 0.1f, 1, idx * 20000000ull));
+            ++idx;
+            while (s.try_process_one(pipe)) {}
+        }
+        CHECK(pipe.calls == 2 && pipe.observed_gains.back() == 0.75f,
+              "voiced block uses latest parameter without restarting stream");
+        drain(s);
+
+        for (size_t i = 0; i < 12; ++i) {
+            s.push(make_frame(idx, 0, 0.0f, 1, idx * 20000000ull));
+            ++idx;
+            while (s.try_process_one(pipe)) {}
+        }
+        CHECK(pipe.calls == 2 && s.stats().skipped_blocks.load() == 2
+              && s.stats().resets.load() == 0,
+              "re-enabled skip_silence skips next silent block with zero resets");
+    }
+
     if (g_fail) {
         printf("\n%d test(s) FAILED\n", g_fail);
         return 1;
