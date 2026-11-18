@@ -184,6 +184,7 @@ enum ModelAction {
 #[derive(Clone, Copy, ValueEnum)]
 enum ServiceArg {
     Pre,
+    Enhance,
     Rvc,
     Asr,
     Tts,
@@ -698,6 +699,7 @@ fn restart(config: &Config, service: ServiceArg, json_output: bool) -> Result<()
 fn service_name(service: ServiceArg) -> &'static str {
     match service {
         ServiceArg::Pre => "pre",
+        ServiceArg::Enhance => "enhance",
         ServiceArg::Rvc => "rvc",
         ServiceArg::Asr => "asr",
         ServiceArg::Tts => "tts",
@@ -1178,6 +1180,7 @@ fn print_status(status: &Status) {
     println!("mute     {}", on_off(status.mute));
     for (name, info) in [
         ("pre", &status.processes.pre),
+        ("enhance", &status.processes.enhance),
         ("rvc", &status.processes.rvc),
         ("asr", &status.processes.asr),
         ("tts", &status.processes.tts),
@@ -1210,6 +1213,10 @@ fn print_status(status: &Status) {
             pre.frames_dropped,
             pre.queue_depth
         );
+    }
+    if let Some(enhance) = &status.enhance {
+        println!("enhance  backend={} frames={}/{} delay_samples={}",
+            enhance.backend, enhance.frames_in, enhance.frames_out, enhance.algorithm_delay_samples);
     }
     if let Some(rvc) = &status.rvc {
         println!(
@@ -1479,6 +1486,10 @@ mod tests {
 
     #[test]
     fn restart_parses_all_service_names() {
+        assert!(matches!(
+            parse(&["restart", "enhance"]).unwrap().command,
+            Action::Restart { service: ServiceArg::Enhance }
+        ));
         assert!(matches!(
             parse(&["restart", "pre"]).unwrap().command,
             Action::Restart { service: ServiceArg::Pre }

@@ -9,7 +9,7 @@ cd "$(git rev-parse --show-toplevel)"
 MAX_TRACKED_BYTES=$((5 * 1024 * 1024))
 
 # 阶段名与触发路径（扩展正则，匹配暂存文件路径）。
-NATIVE_PATHS='^(core|pre|rvc|daemon|api|tests)/|^CMakeLists\.txt$|^CMakePresets\.json$|^cmake/'
+NATIVE_PATHS='^(core|pre|enhance|rvc|daemon|api|tests)/|^CMakeLists\.txt$|^CMakePresets\.json$|^cmake/'
 RUST_PATHS='^(core|dsp|pre|daemon|ctl|asr|tts|bridge)/|^Cargo\.toml$|^Cargo\.lock$'
 WEB_PATHS='^web/'
 
@@ -71,6 +71,8 @@ stage_rust() {
         return 0
     fi
     cargo check --workspace
+    cargo build -p mozart-core --examples
+    cargo build -p mozart-daemon --example enhance_stub
     cargo test --workspace
 }
 

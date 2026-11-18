@@ -8,7 +8,8 @@ use crate::state::{lock_state, State};
 use crate::state_file::BridgeRestore;
 use mozart_core::config::{Config, RvcConfig};
 use mozart_core::ctl::schema::{
-    Activity, AsrStatus, BridgeStatus, ModelEntry, PreStatus, Response, Route, RvcStatus, TtsStatus,
+    Activity, AsrStatus, BridgeStatus, EnhanceStatus, ModelEntry, PreStatus, Response, Route,
+    RvcStatus, TtsStatus,
 };
 use mozart_core::ctl::{self, Seqpacket};
 use serde_json::{json, Value};
@@ -18,6 +19,8 @@ use std::sync::{Mutex, MutexGuard, TryLockError};
 use std::time::Duration;
 
 pub struct Services {
+    enhance: Mutex<Option<ServiceLink>>,
+    config: SharedConfig,
     pre: Mutex<ServiceLink>,
     rvc: Mutex<ServiceLink>,
     asr: Mutex<ServiceLink>,
@@ -29,6 +32,14 @@ pub struct Services {
 impl Services {
     pub fn new(config: &SharedConfig) -> Self {
         Self {
+            enhance: Mutex::new(config.snapshot().enhance.as_ref().map(|_| {
+                ServiceLink::new(
+                    ctl::ENHANCE_HELLO,
+                    config.snapshot().enhance_socket(),
+                    config.clone(),
+                )
+            })),
+            config: config.clone(),
             pre: Mutex::new(ServiceLink::new(
                 ctl::PRE_HELLO,
                 config.snapshot().pre_socket(),
@@ -56,6 +67,19 @@ impl Services {
             )),
             transition: Mutex::new(()),
         }
+    }
+
+    pub fn refresh_enhance(&self, config: &Config) {
+        *self
+            .enhance
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = config.enhance.as_ref().map(|_| {
+            ServiceLink::new(
+                ctl::ENHANCE_HELLO,
+                config.enhance_socket(),
+                self.config.clone(),
+            )
+        });
     }
 
     fn pre(&self) -> MutexGuard<'_, ServiceLink> {
@@ -92,6 +116,20 @@ impl Services {
         self.transition
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
+    /// 调用方持 transition 锁；只在 pre 确认成功后提交共享配置。
+    pub(crate) fn set_dsp(
+        &self,
+        dsp: &mozart_core::config::PreDspConfig,
+    ) -> Result<(), (String, String)> {
+        let body = serde_json::to_vec(dsp)
+            .map_err(|err| (ctl::CODE_INTERNAL.to_string(), err.to_string()))?;
+        let data = self
+            .pre()
+            .call_ok(ctl::PRE_SET_DSP, &body)
+            .map_err(CallError::into_rejection)?;
+        validate_dsp_echo(data.data, dsp)
     }
 
     // ---- rvc 控制入口：实时路由与文件数据面共用一条链路 ----
@@ -170,9 +208,7 @@ impl Services {
     }
 
     fn stop_stream_inner(&self) -> Result<(), CallError> {
-        self.rvc()
-            .call_ok(ctl::RVC_STOP_STREAM, b"{}")
-            .map(|_| ())
+        self.rvc().call_ok(ctl::RVC_STOP_STREAM, b"{}").map(|_| ())
     }
 }
 
@@ -400,7 +436,9 @@ pub fn speech_stop(state: &Mutex<State>, services: &Services) -> Result<Value, (
 /// 成功一项清一项；桥未就绪下一轮重试。活权威在桥，运行时不对账。
 pub fn restore_bridge_switches(services: &Services, pending: &Mutex<BridgeRestore>) {
     let (translate, speech) = {
-        let guard = pending.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        let guard = pending
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         (guard.translate, guard.speech)
     };
     if let Some(enabled) = translate {
@@ -437,16 +475,12 @@ pub(crate) fn list_models(services: &Services) -> Result<Vec<ModelEntry>, (Strin
         .rvc()
         .call_ok(ctl::RVC_LIST_MODELS, b"{}")
         .map_err(CallError::into_rejection)?;
-    let models = response
-        .data
-        .get("models")
-        .cloned()
-        .ok_or_else(|| {
-            (
-                ctl::CODE_INTERNAL.to_string(),
-                "ListModels response missing models".to_string(),
-            )
-        })?;
+    let models = response.data.get("models").cloned().ok_or_else(|| {
+        (
+            ctl::CODE_INTERNAL.to_string(),
+            "ListModels response missing models".to_string(),
+        )
+    })?;
     serde_json::from_value::<Vec<ModelEntry>>(models)
         .map_err(|err| (ctl::CODE_INTERNAL.to_string(), err.to_string()))
 }
@@ -576,6 +610,7 @@ pub fn poll(
     pre_handoff_active: bool,
 ) {
     let mut degraded = Vec::new();
+    let enhance_status = poll_enhance(services, &mut degraded);
     let pre_status = poll_pre(services, &mut degraded);
     let rvc_status = poll_rvc(services, &mut degraded);
     let asr_status = poll_asr(services, &mut degraded);
@@ -591,7 +626,13 @@ pub fn poll(
         }
     };
     if let Some(_transition) = transition {
-        reconcile_pre_mode(state, services, pre_status.as_ref(), pre_handoff_active, &mut degraded);
+        reconcile_pre_mode(
+            state,
+            services,
+            pre_status.as_ref(),
+            pre_handoff_active,
+            &mut degraded,
+        );
         reconcile(
             state,
             services,
@@ -604,6 +645,7 @@ pub fn poll(
     }
 
     let mut state = lock_state(state);
+    state.set_enhance_status(enhance_status);
     state.set_pre_status(pre_status);
     state.set_rvc_status(rvc_status);
     state.set_asr_status(asr_status);
@@ -612,11 +654,53 @@ pub fn poll(
     state.set_degraded(degraded);
 }
 
+fn poll_enhance(services: &Services, degraded: &mut Vec<String>) -> Option<EnhanceStatus> {
+    let mut link = services
+        .enhance
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let enhance = link.as_mut()?;
+    match enhance.call_ok(ctl::ENHANCE_GET_STATUS, b"{}") {
+        Ok(response) => match serde_json::from_value::<EnhanceStatus>(response.data) {
+            Ok(status) => {
+                if let Some(error) = &status.last_error {
+                    degraded.push(format!("enhance: {error}"));
+                }
+                Some(status)
+            }
+            Err(err) => {
+                degraded.push(format!("enhance status parse: {err}"));
+                None
+            }
+        },
+        Err(err) => {
+            degraded.push(format!("enhance status: {}", err.describe()));
+            None
+        }
+    }
+}
+
+fn pre_enhancement_degraded(status: &PreStatus, degraded: &mut Vec<String>) {
+    if let Some(enhancement) = &status.enhancement {
+        if enhancement.enabled {
+            if !enhancement.connected {
+                degraded.push("pre enhancement: disconnected".to_string());
+            }
+            if let Some(error) = &enhancement.last_error {
+                degraded.push(format!("pre enhancement: {error}"));
+            }
+        }
+    }
+}
+
 fn poll_pre(services: &Services, degraded: &mut Vec<String>) -> Option<PreStatus> {
     let mut pre = services.pre();
     match pre.call_ok(ctl::PRE_GET_STATUS, b"{}") {
         Ok(response) => match serde_json::from_value::<PreStatus>(response.data) {
-            Ok(status) => Some(status),
+            Ok(status) => {
+                pre_enhancement_degraded(&status, degraded);
+                Some(status)
+            }
             Err(err) => {
                 degraded.push(format!("pre status parse: {err}"));
                 None
@@ -937,7 +1021,10 @@ pub(crate) fn apply_rvc_session_params_locked(
                     lock_state(state).push_degraded(
                         "rvc session params: recovery busy; running params unknown".to_string(),
                     );
-                    Err((code, format!("{original}; restore busy, running params unknown")))
+                    Err((
+                        code,
+                        format!("{original}; restore busy, running params unknown"),
+                    ))
                 }
                 Err(restore) => Err(restore_failure(
                     state,
@@ -1105,9 +1192,55 @@ fn restore_failure(
     (code, reason)
 }
 
+fn validate_dsp_echo(
+    data: serde_json::Value,
+    expected: &mozart_core::config::PreDspConfig,
+) -> Result<(), (String, String)> {
+    let echoed: ctl::schema::DspSetRequest = serde_json::from_value(data).map_err(|err| {
+        (
+            ctl::CODE_INTERNAL.to_string(),
+            format!("pre SetDsp invalid echo: {err}"),
+        )
+    })?;
+    if (echoed.denoise, echoed.gate, echoed.agc, echoed.limiter)
+        != (
+            expected.denoise,
+            expected.gate,
+            expected.agc,
+            expected.limiter,
+        )
+    {
+        return Err((
+            ctl::CODE_INTERNAL.to_string(),
+            "pre SetDsp echo differs from request".to_string(),
+        ));
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn dsp_echo_requires_all_boolean_fields_and_exact_requested_values() {
+        let expected = mozart_core::config::PreDspConfig::default();
+        assert!(validate_dsp_echo(
+            serde_json::json!({"denoise":true,"gate":false,"agc":false,"limiter":false}),
+            &expected
+        )
+        .is_ok());
+        for invalid in [
+            serde_json::json!({"denoise":true}),
+            serde_json::json!({"denoise":"true","gate":false,"agc":false,"limiter":false}),
+            serde_json::json!({"denoise":false,"gate":false,"agc":false,"limiter":false}),
+            serde_json::json!({"denoise":true,"gate":false,"agc":false,"limiter":false,"extra":true}),
+        ] {
+            let (code, reason) = validate_dsp_echo(invalid, &expected).unwrap_err();
+            assert_eq!(code, ctl::CODE_INTERNAL);
+            assert!(reason.contains("echo"));
+        }
+    }
 
     /// core 新增 RVC 运行时键但 daemon 未实现编排时返回错误，不 panic 控制线程。
     #[test]

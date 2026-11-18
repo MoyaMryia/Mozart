@@ -4,7 +4,7 @@
 use mozart_core::config::{PreConsumerConfig, PreDspConfig};
 use mozart_core::ctl::schema::{PreStatus, Route};
 use std::collections::BTreeMap;
-use std::sync::atomic::{AtomicBool, AtomicU64, AtomicU8, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicU8, AtomicUsize, Ordering};
 use std::sync::Mutex;
 
 /// 版本号，Hello 与 GetStatus 一致上报。
@@ -137,11 +137,12 @@ pub struct Shared {
     mute_target: AtomicBool,
     /// 文件接管状态（SPEC-03 状态门控交接）：控制线程写，处理线程与
     /// rvc 接收线程只读。true 时 rvc AI 发送暂停、output_socket 释放给 daemon。
-    file_mode: AtomicBool,
+    file_gate: AtomicU64,
+    in_flight: AtomicUsize,
     /// daemon 权威断言标志（SPEC-04 单一权威）：启动为 false，rvc AI 支路
     /// （发 input_socket + 绑 output_socket）静默，等 daemon 首个 PRE_SET_FILE_MODE
     /// 断言才激活。控制线程写，处理线程与 rvc 接收线程只读。pre 不单边 reclaim。
-    mode_asserted: AtomicBool,
+
     /// 输出 socket 交接握手：rvc 接收线程解绑后置 true、重绑后清 false；
     /// 控制线程在 PRE_SET_FILE_MODE{active:true} 应答前等它置位。
     output_released: AtomicBool,
@@ -151,7 +152,8 @@ pub struct Shared {
     /// 处理线程发布绝对值，控制线程组装 status 时读取。
     consumers: Vec<Consumer>,
     /// DSP 级开关目标：控制线程（SetDsp）写，处理线程逐帧读、变化时应用。
-    dsp_target: AtomicU8,
+    dsp_target: AtomicU64,
+    pub enhancement: Option<std::sync::Arc<crate::enhancement::Enhancement>>,
     /// AI 输出帧坏包丢弃，接收线程发布绝对值。
     ai_recv_dropped: AtomicU64,
     /// TTS 播报帧坏包丢弃，接收线程发布绝对值。
@@ -173,6 +175,14 @@ pub struct Shared {
     startup_id: String,
 }
 
+pub struct SendPermit<'a>(&'a Shared);
+
+impl Drop for SendPermit<'_> {
+    fn drop(&mut self) {
+        self.0.in_flight.fetch_sub(1, Ordering::SeqCst);
+    }
+}
+
 impl Shared {
     pub fn new(
         capture_device: String,
@@ -184,13 +194,14 @@ impl Shared {
         Self {
             route_target: AtomicU8::new(route_code(Route::Direct)),
             mute_target: AtomicBool::new(false),
-            file_mode: AtomicBool::new(false),
-            mode_asserted: AtomicBool::new(false),
+            file_gate: AtomicU64::new(0),
+            in_flight: AtomicUsize::new(0),
             output_released: AtomicBool::new(false),
             frames_captured: AtomicU64::new(0),
             frames_played: AtomicU64::new(0),
             consumers: consumers.into_iter().map(Consumer::from_config).collect(),
-            dsp_target: AtomicU8::new(dsp.code()),
+            dsp_target: AtomicU64::new(dsp.code().into()),
+            enhancement: None,
             ai_recv_dropped: AtomicU64::new(0),
             tts_recv_dropped: AtomicU64::new(0),
             ai_recv_size_mismatch: AtomicU64::new(0),
@@ -211,7 +222,8 @@ impl Shared {
     }
 
     pub fn set_route_target(&self, route: Route) {
-        self.route_target.store(route_code(route), Ordering::Relaxed);
+        self.route_target
+            .store(route_code(route), Ordering::Relaxed);
     }
 
     pub fn mute_target(&self) -> bool {
@@ -224,36 +236,77 @@ impl Shared {
 
     /// 文件接管状态；处理线程据此门控 rvc AI 发送，接收线程据此交接绑定。
     pub fn file_mode(&self) -> bool {
-        self.file_mode.load(Ordering::Relaxed)
+        self.file_gate.load(Ordering::SeqCst) & 1 != 0
     }
 
     pub fn set_file_mode(&self, active: bool) {
-        self.file_mode.store(active, Ordering::Relaxed);
+        self.update_file_gate(1, active);
     }
 
     /// daemon 是否已权威断言模式；启动为 false，首个 PRE_SET_FILE_MODE 置 true。
     pub fn mode_asserted(&self) -> bool {
-        self.mode_asserted.load(Ordering::Relaxed)
+        self.file_gate.load(Ordering::SeqCst) & 2 != 0
     }
 
     pub fn set_mode_asserted(&self, asserted: bool) {
-        self.mode_asserted.store(asserted, Ordering::Relaxed);
+        self.update_file_gate(2, asserted);
     }
 
     /// rvc AI 支路是否活跃（SPEC-04 单一权威不变量）：仅当 daemon 已断言
     /// 且非文件接管时为 true。处理线程据此门控发送、接收线程据此门控绑定。
-    /// 只读两个原子，实时热路径不分配不阻塞。asr 支路与主干直出不受此门控。
+    /// 读取一致门控，热路径不分配不阻塞。asr 支路与主干直出不受此门控。
     pub fn rvc_ai_active(&self) -> bool {
-        self.mode_asserted() && !self.file_mode()
+        self.file_gate.load(Ordering::SeqCst) & 3 == 2
+    }
+
+    fn update_file_gate(&self, bit: u64, enabled: bool) {
+        self.file_gate
+            .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |old| {
+                if (old & bit != 0) == enabled {
+                    None
+                } else {
+                    Some(((old + 4) & !bit) | if enabled { bit } else { 0 })
+                }
+            })
+            .ok();
+    }
+
+    #[cfg(test)]
+    pub fn file_generation(&self) -> u64 {
+        self.file_gate.load(Ordering::SeqCst) >> 2
+    }
+
+    /// 采集侧一次读取许可与代次，避免交接期间将旧许可标为新代次。
+    pub fn file_snapshot(&self) -> (bool, u64) {
+        let gate = self.file_gate.load(Ordering::SeqCst);
+        (gate & 3 == 2, gate >> 2)
+    }
+
+    /// 先登记再复核；关闭门控后控制线程等待已获许可的发送退出。
+    pub fn begin_ai_send(&self, source_generation: u64) -> Option<SendPermit<'_>> {
+        let expected = (source_generation << 2) | 2;
+        if self.file_gate.load(Ordering::SeqCst) != expected {
+            return None;
+        }
+        self.in_flight.fetch_add(1, Ordering::SeqCst);
+        let permit = SendPermit(self);
+        if self.file_gate.load(Ordering::SeqCst) != expected {
+            return None;
+        }
+        Some(permit)
+    }
+
+    pub fn sends_idle(&self) -> bool {
+        self.in_flight.load(Ordering::SeqCst) == 0
     }
 
     /// 输出 socket 已释放（接收线程解绑后置位，重绑后清零）。
     pub fn output_released(&self) -> bool {
-        self.output_released.load(Ordering::Relaxed)
+        self.output_released.load(Ordering::Acquire)
     }
 
     pub fn set_output_released(&self, released: bool) {
-        self.output_released.store(released, Ordering::Relaxed);
+        self.output_released.store(released, Ordering::Release);
     }
 
     pub fn add_captured(&self, frames: u64) {
@@ -272,12 +325,37 @@ impl Shared {
 
     /// DSP 级开关目标；处理线程逐帧读，与已应用值比较，变化时应用。
     pub fn dsp_target(&self) -> DspSwitches {
-        DspSwitches::from_code(self.dsp_target.load(Ordering::Relaxed))
+        self.dsp_snapshot().0
     }
 
     /// SetDsp 命令目标：控制线程写，处理线程在一帧内应用。
     pub fn set_dsp_target(&self, dsp: DspSwitches) {
-        self.dsp_target.store(dsp.code(), Ordering::Relaxed);
+        self.dsp_target
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |old| {
+                let epoch = (old >> 4) + u64::from((old as u8 & 1) != (dsp.code() & 1));
+                Some((epoch << 4) | u64::from(dsp.code()))
+            })
+            .unwrap();
+    }
+
+    /// 开关与 epoch 同一原子快照，避免快速关开漏掉会话重置。
+    pub fn dsp_snapshot(&self) -> (DspSwitches, u64) {
+        let value = self.dsp_target.load(Ordering::Acquire);
+        (DspSwitches::from_code(value as u8), value >> 4)
+    }
+
+    pub fn enhancement_epoch(&self) -> u64 {
+        self.dsp_snapshot().1
+    }
+
+    pub fn configure_enhancement(
+        &mut self,
+        config: &mozart_core::config::EnhanceConfig,
+        run_dir: &std::path::Path,
+    ) {
+        self.enhancement = Some(std::sync::Arc::new(crate::enhancement::Enhancement::new(
+            config, run_dir,
+        )));
     }
 
     /// 发布 AI 输出帧坏包丢弃的累计绝对值（接收线程调用）。
@@ -364,6 +442,16 @@ impl Shared {
         );
         PreStatus {
             state: "running".to_string(),
+            denoise_backend: if self.enhancement.is_some() {
+                "ulunas"
+            } else {
+                "wola"
+            }
+            .to_string(),
+            enhancement: self
+                .enhancement
+                .as_ref()
+                .map(|enhance| enhance.status(self.dsp_target().denoise)),
             // 路由与静音上报命令目标；淡变在 20 ms 内完成，属执行细节。
             route: self.route_target(),
             mute: self.mute_target(),
@@ -425,13 +513,23 @@ mod tests {
     fn status_reports_speaker_state_and_tts_frames() {
         let shared = test_shared("cap", "play", "startup");
         // 默认实时、零播报帧。
-        let status = shared.status(QueueReadout { depth: 0, dropped: 0, rvc_dropped: 0, tts_dropped: 0 });
+        let status = shared.status(QueueReadout {
+            depth: 0,
+            dropped: 0,
+            rvc_dropped: 0,
+            tts_dropped: 0,
+        });
         assert_eq!(status.speaker_state, "realtime");
         assert_eq!(status.tts_frames_played, 0);
 
         shared.set_speaker_state(Speaker::Broadcast);
         shared.add_tts_frames_played(5);
-        let status = shared.status(QueueReadout { depth: 0, dropped: 0, rvc_dropped: 0, tts_dropped: 0 });
+        let status = shared.status(QueueReadout {
+            depth: 0,
+            dropped: 0,
+            rvc_dropped: 0,
+            tts_dropped: 0,
+        });
         assert_eq!(status.speaker_state, "broadcast");
         assert_eq!(status.tts_frames_played, 5);
         assert_eq!(shared.speaker_state(), Speaker::Broadcast);
@@ -469,7 +567,12 @@ mod tests {
     #[test]
     fn rvc_ai_active_gated_by_assertion_and_file_mode() {
         let shared = test_shared("cap", "play", "boot-1");
-        let readout = QueueReadout { depth: 0, dropped: 0, rvc_dropped: 0, tts_dropped: 0 };
+        let readout = QueueReadout {
+            depth: 0,
+            dropped: 0,
+            rvc_dropped: 0,
+            tts_dropped: 0,
+        };
         // 启动：未断言，AI 支路静默（即便 file_mode=false）。
         assert!(!shared.mode_asserted());
         assert!(!shared.rvc_ai_active(), "未断言不得激活 rvc AI 支路");

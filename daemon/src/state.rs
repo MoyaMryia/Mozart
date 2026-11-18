@@ -1,12 +1,14 @@
 use mozart_core::ctl::schema::{
-    Activity, ArbiterState, AsrStatus, BridgeStatus, DaemonInfo, ExitInfo, GpuState, HardwareStatus,
-    PreStatus, ProcessInfo, ProcessState, Processes, Route, RouteState, RvcStatus, Status, TtsStatus,
+    Activity, ArbiterState, AsrStatus, BridgeStatus, DaemonInfo, EnhanceStatus, ExitInfo, GpuState,
+    HardwareStatus, PreStatus, ProcessInfo, ProcessState, Processes, Route, RouteState, RvcStatus,
+    Status, TtsStatus,
 };
 use std::sync::{Mutex, MutexGuard};
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub enum Role {
+    Enhance,
     Pre,
     Rvc,
     Asr,
@@ -18,6 +20,7 @@ pub enum Role {
 impl Role {
     pub fn name(self) -> &'static str {
         match self {
+            Role::Enhance => "enhance",
             Role::Pre => "pre",
             Role::Rvc => "rvc",
             Role::Asr => "asr",
@@ -30,6 +33,7 @@ impl Role {
     /// 控制面服务名 → Role；未知名返回 None，由入口拒绝（InvalidArgument）。
     pub fn from_name(name: &str) -> Option<Self> {
         match name {
+            "enhance" => Some(Role::Enhance),
             "pre" => Some(Role::Pre),
             "rvc" => Some(Role::Rvc),
             "asr" => Some(Role::Asr),
@@ -55,6 +59,7 @@ pub struct State {
     mute: bool,
     gpu_owner: Option<Activity>,
     processes: Processes,
+    enhance: Option<EnhanceStatus>,
     pre: Option<PreStatus>,
     /// 最近一次对账见过的 pre 启动号；变化即 pre 重启，须重新断言模式
     /// （SPEC-04 单一权威：pre 不单边 reclaim，daemon 据 startup_id 重断言）。
@@ -90,6 +95,7 @@ impl State {
             gpu_owner: None,
             pre_startup_id: None,
             processes: Processes {
+                enhance: ProcessInfo::stopped(),
                 pre: ProcessInfo::stopped(),
                 rvc: ProcessInfo::stopped(),
                 asr: ProcessInfo::stopped(),
@@ -97,6 +103,7 @@ impl State {
                 bridge: ProcessInfo::stopped(),
                 llama: ProcessInfo::stopped(),
             },
+            enhance: None,
             pre: None,
             rvc: None,
             asr: None,
@@ -130,6 +137,7 @@ impl State {
                 },
             },
             processes: self.processes.clone(),
+            enhance: self.enhance.clone(),
             pre: self.pre.clone(),
             rvc: self.rvc.clone(),
             // rvc_params 由 server 生成 DAEMON_GET_STATUS 应答时按生效配置填入。
@@ -220,6 +228,10 @@ impl State {
 
     pub fn commit_mute(&mut self, mute: bool) {
         self.mute = mute;
+    }
+
+    pub fn set_enhance_status(&mut self, status: Option<EnhanceStatus>) {
+        self.enhance = status;
     }
 
     pub fn set_pre_status(&mut self, status: Option<PreStatus>) {
@@ -347,6 +359,7 @@ impl State {
 
     fn process_mut(&mut self, role: Role) -> &mut ProcessInfo {
         match role {
+            Role::Enhance => &mut self.processes.enhance,
             Role::Pre => &mut self.processes.pre,
             Role::Rvc => &mut self.processes.rvc,
             Role::Asr => &mut self.processes.asr,
@@ -391,7 +404,9 @@ mod tests {
         state.set_degraded(vec!["pre status: connection refused".to_string()]);
         let degraded = state.status().degraded;
         assert!(
-            degraded.iter().any(|reason| reason.contains("pre file mode restore")),
+            degraded
+                .iter()
+                .any(|reason| reason.contains("pre file mode restore")),
             "持久原因必须与轮询原因并存：{degraded:?}"
         );
         assert!(degraded.iter().any(|reason| reason.contains("pre status")));
@@ -400,7 +415,9 @@ mod tests {
         state.set_degraded(Vec::new());
         let degraded = state.status().degraded;
         assert!(
-            degraded.iter().any(|reason| reason.contains("pre file mode restore")),
+            degraded
+                .iter()
+                .any(|reason| reason.contains("pre file mode restore")),
             "空轮询不得抹掉持久原因：{degraded:?}"
         );
         assert!(!degraded.iter().any(|reason| reason.contains("pre status")));
@@ -416,7 +433,9 @@ mod tests {
         let degraded = state.status().degraded;
         assert!(!degraded.iter().any(|reason| reason.contains("for 'a'")));
         assert!(degraded.iter().any(|reason| reason.contains("for 'b'")));
-        assert!(degraded.iter().any(|reason| reason.contains("file stop stream")));
+        assert!(degraded
+            .iter()
+            .any(|reason| reason.contains("file stop stream")));
     }
 
     #[test]
@@ -428,12 +447,19 @@ mod tests {
         state.set_degraded(vec!["rvc status: new".to_string()]);
         let degraded = state.status().degraded;
         assert_eq!(
-            degraded.iter().filter(|reason| reason.contains("file stop stream")).count(),
+            degraded
+                .iter()
+                .filter(|reason| reason.contains("file stop stream"))
+                .count(),
             1,
             "同一持久原因只报一次：{degraded:?}"
         );
-        assert!(degraded.iter().any(|reason| reason.contains("rvc status: new")));
-        assert!(!degraded.iter().any(|reason| reason.contains("rvc status: old")));
+        assert!(degraded
+            .iter()
+            .any(|reason| reason.contains("rvc status: new")));
+        assert!(!degraded
+            .iter()
+            .any(|reason| reason.contains("rvc status: old")));
     }
 
     #[test]

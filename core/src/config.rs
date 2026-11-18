@@ -13,6 +13,7 @@ pub struct Config {
     pub daemon: DaemonConfig,
     pub process: ProcessConfig,
     pub pre: PreConfig,
+    pub enhance: Option<EnhanceConfig>,
     pub rvc: RvcConfig,
     pub asr: AsrConfig,
     pub tts: TtsConfig,
@@ -47,12 +48,40 @@ pub struct DaemonConfig {
 #[serde(default, deny_unknown_fields)]
 pub struct ProcessConfig {
     pub pre_bin: PathBuf,
+    pub enhance_bin: PathBuf,
     pub rvc_bin: PathBuf,
     pub asr_bin: PathBuf,
     pub tts_bin: PathBuf,
     pub bridge_bin: PathBuf,
     pub llama_bin: PathBuf,
     pub env: HashMap<String, String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct EnhanceConfig {
+    pub model: PathBuf,
+    #[serde(default = "default_enhance_socket")]
+    pub socket: String,
+    #[serde(default = "default_enhance_audio_socket")]
+    pub audio_socket: String,
+    #[serde(default = "default_enhance_queue_frames")]
+    pub queue_frames: u32,
+    #[serde(default = "default_enhance_timeout")]
+    pub request_timeout_ms: u32,
+}
+
+fn default_enhance_socket() -> String {
+    "enhance.sock".to_string()
+}
+fn default_enhance_audio_socket() -> String {
+    "enhance-audio.sock".to_string()
+}
+fn default_enhance_queue_frames() -> u32 {
+    8
+}
+fn default_enhance_timeout() -> u32 {
+    100
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -95,7 +124,7 @@ pub struct PreConsumerConfig {
 /// DSP 阶段配置。开关默认沿用旧 main.c 的代码默认（生产脚本曾用 --no-denoise
 /// 显式关闭、--gate/--agc/--limiter 显式开启）；禁用降噪时整级跳过，
 /// 禁用整形级时逐位恒等（SPEC-02 已确认）。
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct PreDspConfig {
     /// WOLA 谱降噪开关，默认 true；false 时该级全部计算跳过。
@@ -277,6 +306,7 @@ impl Default for ProcessConfig {
     fn default() -> Self {
         Self {
             pre_bin: PathBuf::from("mozart-pre"),
+            enhance_bin: PathBuf::from("mozart-enhance"),
             rvc_bin: PathBuf::from("mozart-rvc"),
             asr_bin: PathBuf::from("mozart-asr"),
             tts_bin: PathBuf::from("mozart-tts"),
@@ -449,6 +479,7 @@ impl Default for Config {
             daemon: DaemonConfig::default(),
             process: ProcessConfig::default(),
             pre: PreConfig::default(),
+            enhance: None,
             rvc: RvcConfig::default(),
             asr: AsrConfig::default(),
             tts: TtsConfig::default(),
@@ -476,9 +507,18 @@ impl Default for DaemonConfig {
 
 #[derive(Debug)]
 pub enum ConfigError {
-    Read { path: PathBuf, source: io::Error },
-    Write { path: PathBuf, source: io::Error },
-    Parse { path: PathBuf, source: toml::de::Error },
+    Read {
+        path: PathBuf,
+        source: io::Error,
+    },
+    Write {
+        path: PathBuf,
+        source: io::Error,
+    },
+    Parse {
+        path: PathBuf,
+        source: toml::de::Error,
+    },
     Invalid(String),
 }
 
@@ -533,18 +573,41 @@ impl Config {
         };
         config.apply_env()?;
         let home = std::env::var_os("HOME").map(PathBuf::from);
-        config.bridge.subtitles_path =
-            expand_tilde(&config.bridge.subtitles_path, home.as_deref());
+        config.bridge.subtitles_path = expand_tilde(&config.bridge.subtitles_path, home.as_deref());
         if let Some(path) = &config.bridge.corrections_path {
             config.bridge.corrections_path = Some(expand_tilde(path, home.as_deref()));
         }
         config.file.storage_dir = expand_tilde(&config.file.storage_dir, home.as_deref());
         config.validate()?;
+        if let Some(enhance) = &mut config.enhance {
+            if enhance.model.is_relative() {
+                let base = path
+                    .and_then(Path::parent)
+                    .unwrap_or_else(|| Path::new("."));
+                enhance.model = base.join(&enhance.model);
+            }
+        }
         Ok(config)
     }
 
     pub fn daemon_socket(&self) -> PathBuf {
         self.daemon.run_dir.join(&self.daemon.socket)
+    }
+
+    pub fn enhance_socket(&self) -> PathBuf {
+        self.daemon
+            .run_dir
+            .join(&self.enhance.as_ref().expect("enhance configured").socket)
+    }
+
+    pub fn enhance_audio_socket(&self) -> PathBuf {
+        self.daemon.run_dir.join(
+            &self
+                .enhance
+                .as_ref()
+                .expect("enhance configured")
+                .audio_socket,
+        )
     }
 
     pub fn pre_socket(&self) -> PathBuf {
@@ -628,6 +691,9 @@ impl Config {
     fn apply_env(&mut self) -> Result<(), ConfigError> {
         if let Some(dir) = std::env::var_os("MOZART_RUN_DIR") {
             self.daemon.run_dir = PathBuf::from(dir);
+        }
+        if let Some(bin) = std::env::var_os("MOZART_ENHANCE_BIN") {
+            self.process.enhance_bin = PathBuf::from(bin);
         }
         if let Some(bin) = std::env::var_os("MOZART_PRE_BIN") {
             self.process.pre_bin = PathBuf::from(bin);
@@ -871,6 +937,12 @@ impl Config {
                 "process.llama_bin must not be empty".to_string(),
             ));
         }
+        if self.process.enhance_bin.as_os_str().is_empty() {
+            return Err(ConfigError::Invalid(
+                "process.enhance_bin must not be empty".to_string(),
+            ));
+        }
+        self.validate_enhance(self.enhance.as_ref())?;
         let mut seen = std::collections::HashSet::new();
         for entry in &self.models {
             if entry.id.is_empty() {
@@ -897,6 +969,69 @@ impl Config {
                     "[[models]] duplicate id='{}' type='{}'",
                     entry.id, entry.model_type
                 )));
+            }
+        }
+        Ok(())
+    }
+
+    /// Apply the supervisor's effective backend snapshot from external JSON.
+    /// Validate only enhancement settings against the already loaded configuration.
+    pub fn apply_effective_enhance(
+        &mut self,
+        enhance: Option<EnhanceConfig>,
+    ) -> Result<(), ConfigError> {
+        self.validate_enhance(enhance.as_ref())?;
+        self.enhance = enhance;
+        Ok(())
+    }
+
+    fn validate_enhance(&self, enhance: Option<&EnhanceConfig>) -> Result<(), ConfigError> {
+        if let Some(enhance) = enhance {
+            if enhance.model.as_os_str().is_empty() {
+                return Err(ConfigError::Invalid(
+                    "enhance.model must not be empty".to_string(),
+                ));
+            }
+            if !(1..=1024).contains(&enhance.queue_frames) {
+                return Err(ConfigError::Invalid(
+                    "enhance.queue_frames must be within 1..=1024".to_string(),
+                ));
+            }
+            if !(1..=1000).contains(&enhance.request_timeout_ms) {
+                return Err(ConfigError::Invalid(
+                    "enhance.request_timeout_ms must be within 1..=1000".to_string(),
+                ));
+            }
+            let mut sockets: std::collections::HashSet<&str> = [
+                self.daemon.socket.as_str(),
+                self.pre.socket.as_str(),
+                self.rvc.socket.as_str(),
+                self.rvc.input_socket.as_str(),
+                self.rvc.output_socket.as_str(),
+                self.asr.socket.as_str(),
+                self.asr.input_socket.as_str(),
+                self.asr.events_socket.as_str(),
+                self.tts.socket.as_str(),
+                self.tts.jobs_socket.as_str(),
+                self.tts.output_socket.as_str(),
+                self.bridge.socket.as_str(),
+                self.bridge.llama_socket.as_str(),
+            ]
+            .into_iter()
+            .collect();
+            if let Some(consumers) = &self.pre.consumers {
+                sockets.extend(consumers.iter().map(|consumer| consumer.socket.as_str()));
+            }
+            for (name, field) in [
+                (&enhance.socket, "enhance.socket"),
+                (&enhance.audio_socket, "enhance.audio_socket"),
+            ] {
+                validate_socket_name(name, field)?;
+                if !sockets.insert(name.as_str()) {
+                    return Err(ConfigError::Invalid(format!(
+                        "{field} conflicts with another socket"
+                    )));
+                }
             }
         }
         Ok(())
@@ -1106,12 +1241,33 @@ pub struct KeyEffect {
 }
 
 /// 写单个键的持久基线（SPEC-04 模型甲，原子写）。支持重启类设备键、
-/// daemon/file 运行时键与 rvc 会话参数键；pre/bridge 运行时键的对端下发命令
-/// 未接入，明确拒绝。设备存在性校验由 daemon 在调用前做（需 ALSA 枚举）。
+/// daemon/file、pre DSP 与 rvc 会话参数键；bridge 运行时键尚未接入。
+/// 设备存在性校验由 daemon 在调用前做（需 ALSA 枚举）。
 ///
 /// rvc 会话参数只写 TOML 基线，返回 `restart_required=false`；实时/文件链路的
 /// 生效编排（按参数决定是否 StopStream→StartStream）归 daemon，见 SPEC-04。
 pub fn set_key(path: Option<&Path>, key: &str, value: &str) -> Result<KeyEffect, ConfigError> {
+    if matches!(
+        key,
+        "enhance.model"
+            | "enhance.socket"
+            | "enhance.audio_socket"
+            | "enhance.queue_frames"
+            | "enhance.request_timeout_ms"
+            | "process.enhance_bin"
+    ) {
+        let typed = match key {
+            "enhance.queue_frames" | "enhance.request_timeout_ms" => {
+                parse_runtime_value(key, value)?
+            }
+            _ => toml_edit::value(value),
+        };
+        write_runtime_key(path, key, typed)?;
+        return Ok(KeyEffect {
+            restart_required: true,
+            affected: vec!["enhance".to_string(), "pre".to_string()],
+        });
+    }
     if device_key_kind(key).is_some() {
         validate_device_name(value, key)?;
         write_toml_key(path, key, toml_edit::value(value))?;
@@ -1121,7 +1277,7 @@ pub fn set_key(path: Option<&Path>, key: &str, value: &str) -> Result<KeyEffect,
         });
     }
     if let Some(owner) = runtime_key_owner(key) {
-        if !matches!(owner, "daemon" | "rvc") {
+        if !matches!(owner, "daemon" | "rvc" | "pre") {
             return Err(ConfigError::Invalid(format!(
                 "config set 暂不支持键 {key}（{owner} 的运行时下发命令未接入）"
             )));
@@ -1134,18 +1290,23 @@ pub fn set_key(path: Option<&Path>, key: &str, value: &str) -> Result<KeyEffect,
         });
     }
     Err(ConfigError::Invalid(format!(
-        "config set 暂不支持键 {key}（当前支持设备键、daemon/file 运行时键与 rvc 会话参数键）"
+        "config set 暂不支持键 {key}（当前支持设备键、daemon/file 运行时键、pre DSP 与 rvc 会话参数键）"
     )))
 }
 
-/// daemon/file 运行时键与 rvc 会话参数键的字符串值 → 带类型 TOML 值。
-/// 这里只做类型转换：file.denoise 为 bool；file.ffmpeg_path、rvc.f0_method 为
+/// daemon/file、pre DSP 与 rvc 会话参数键的字符串值 → 带类型 TOML 值。
+/// 这里只做类型转换：DSP 开关与 file.denoise 为 bool；file.ffmpeg_path、rvc.f0_method 为
 /// string；rvc.index_rate/rms_mix_rate/protect 为 float；其余（含 rvc.pitch_shift）
 /// 为整数。取值范围与 f0_method 白名单只在 `Config::validate()` 定义，由
 /// write_runtime_key 写入前的整体校验拒绝非法值，不落盘。
 fn parse_runtime_value(key: &str, value: &str) -> Result<toml_edit::Item, ConfigError> {
     match key {
-        "file.denoise" | "rvc.realtime.skip_silence" => match value {
+        "file.denoise"
+        | "rvc.realtime.skip_silence"
+        | "pre.dsp.denoise"
+        | "pre.dsp.gate"
+        | "pre.dsp.agc"
+        | "pre.dsp.limiter" => match value {
             "true" => Ok(toml_edit::value(true)),
             "false" => Ok(toml_edit::value(false)),
             _ => Err(ConfigError::Invalid(format!("键 {key} 需要 true/false"))),
@@ -1228,9 +1389,8 @@ fn load_doc(path: &Path) -> Result<toml_edit::DocumentMut, ConfigError> {
             })
         }
     };
-    text.parse::<toml_edit::DocumentMut>().map_err(|err| {
-        ConfigError::Invalid(format!("parse config {}: {err}", path.display()))
-    })
+    text.parse::<toml_edit::DocumentMut>()
+        .map_err(|err| ConfigError::Invalid(format!("parse config {}: {err}", path.display())))
 }
 
 /// 在文档里按点分键路径设值，保留注释与排版；中间段不是表则拒绝。
@@ -1355,6 +1515,116 @@ mod tests {
     }
 
     #[test]
+    fn enhance_optional_defaults_paths_and_restart_keys() {
+        let dir = temp_config_dir("enhance");
+        let path = dir.join("mozart.toml");
+        std::fs::write(&path, "").unwrap();
+        assert!(Config::load_from(Some(&path)).unwrap().enhance.is_none());
+        assert_eq!(
+            Config::default().process.enhance_bin,
+            PathBuf::from("mozart-enhance")
+        );
+        let effect = set_key(Some(&path), "enhance.model", "models/test.onnx").unwrap();
+        assert!(effect.restart_required);
+        assert_eq!(effect.affected, ["enhance", "pre"]);
+        let config = Config::load_from(Some(&path)).unwrap();
+        let enhance = config.enhance.as_ref().unwrap();
+        assert_eq!(enhance.model, dir.join("models/test.onnx"));
+        assert_eq!(enhance.queue_frames, 8);
+        assert_eq!(enhance.request_timeout_ms, 100);
+        assert_eq!(
+            config.enhance_socket(),
+            config.daemon.run_dir.join("enhance.sock")
+        );
+        assert_eq!(
+            config.enhance_audio_socket(),
+            config.daemon.run_dir.join("enhance-audio.sock")
+        );
+        set_key(Some(&path), "enhance.model", "/external/model.onnx").unwrap();
+        assert_eq!(
+            Config::load_from(Some(&path))
+                .unwrap()
+                .enhance
+                .unwrap()
+                .model,
+            PathBuf::from("/external/model.onnx")
+        );
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn effective_enhance_validates_only_snapshot_and_preserves_on_failure() {
+        let mut config = Config::default();
+        // Unrelated config is already checked by the file loader, not this JSON boundary.
+        config.daemon.poll_interval_ms = 0;
+        let valid: EnhanceConfig = serde_json::from_str(r#"{"model":"/model.onnx"}"#).unwrap();
+        config.apply_effective_enhance(Some(valid.clone())).unwrap();
+        for (field, value) in [
+            ("model", serde_json::json!("")),
+            ("queue_frames", serde_json::json!(0)),
+            ("request_timeout_ms", serde_json::json!(1001)),
+            ("socket", serde_json::json!("../bad")),
+            ("audio_socket", serde_json::json!("rvc-in.sock")),
+            ("audio_socket", serde_json::json!("enhance.sock")),
+        ] {
+            let mut json = serde_json::to_value(&valid).unwrap();
+            json[field] = value;
+            let invalid = serde_json::from_value(json).unwrap();
+            assert!(config.apply_effective_enhance(Some(invalid)).is_err());
+            assert_eq!(config.enhance.as_ref().unwrap().model, valid.model);
+        }
+        config.apply_effective_enhance(None).unwrap();
+        assert!(config.enhance.is_none());
+    }
+
+    #[test]
+    fn enhance_rejects_invalid_config_and_socket_conflicts() {
+        for body in [
+            "[enhance]", "[enhance]\nmodel = ''",
+            "[enhance]\nmodel = 'a'\nunknown = 1",
+            "[enhance]\nmodel = 'a'\nqueue_frames = 0",
+            "[enhance]\nmodel = 'a'\nqueue_frames = 1025",
+            "[enhance]\nmodel = 'a'\nrequest_timeout_ms = 0",
+            "[enhance]\nmodel = 'a'\nrequest_timeout_ms = 1001",
+            "[enhance]\nmodel = 'a'\nsocket = '../bad'",
+            "[enhance]\nmodel = 'a'\naudio_socket = '/bad'",
+            "[enhance]\nmodel = 'a'\nsocket = 'rvc-in.sock'",
+            "[enhance]\nmodel = 'a'\naudio_socket = 'asr-events.sock'",
+            "[enhance]\nmodel = 'a'\naudio_socket = 'enhance.sock'",
+            "[[pre.consumers]]\nname = 'custom'\nsocket = 'enhance-audio.sock'\n[enhance]\nmodel = 'a'",
+        ] {
+            let result = toml::from_str::<Config>(body).map_err(|err| err.to_string())
+                .and_then(|config| config.validate().map_err(|err| err.to_string()));
+            assert!(result.is_err(), "accepted {body}");
+        }
+        for (queue, timeout) in [(1, 1), (1024, 1000)] {
+            let config: Config = toml::from_str(&format!(
+                "[enhance]\nmodel = 'a'\nqueue_frames = {queue}\nrequest_timeout_ms = {timeout}"
+            ))
+            .unwrap();
+            config.validate().unwrap();
+        }
+    }
+
+    #[test]
+    fn enhance_invalid_write_keeps_baseline() {
+        let dir = temp_config_dir("enhance-invalid-write");
+        let path = dir.join("mozart.toml");
+        let baseline = "# retained\n[enhance]\nmodel = 'model.onnx'\n";
+        std::fs::write(&path, baseline).unwrap();
+        for (key, value) in [
+            ("enhance.queue_frames", "0"),
+            ("enhance.request_timeout_ms", "1001"),
+            ("enhance.socket", "pre.sock"),
+            ("enhance.model", ""),
+        ] {
+            assert!(set_key(Some(&path), key, value).is_err());
+            assert_eq!(std::fs::read_to_string(&path).unwrap(), baseline);
+        }
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
     fn device_key_kind_classification() {
         assert_eq!(device_key_kind("pre.capture_device"), Some("capture"));
         assert_eq!(device_key_kind("pre.playback_device"), Some("playback"));
@@ -1412,7 +1682,10 @@ mod tests {
         assert_eq!(runtime_key_owner("file.denoise"), Some("daemon"));
         assert_eq!(runtime_key_owner("pre.dsp.denoise"), Some("pre"));
         assert_eq!(runtime_key_owner("rvc.pitch_shift"), Some("rvc"));
-        assert_eq!(runtime_key_owner("bridge.translate_enabled"), Some("bridge"));
+        assert_eq!(
+            runtime_key_owner("bridge.translate_enabled"),
+            Some("bridge")
+        );
         // 重启类与未知键不是运行时键。
         assert_eq!(runtime_key_owner("pre.capture_device"), None);
         assert_eq!(runtime_key_owner("file.storage_dir"), None);
@@ -1457,9 +1730,21 @@ mod tests {
         assert!(set_key(Some(&path), "daemon.rpc_timeout_ms", "abc").is_err());
         assert!(set_key(Some(&path), "file.denoise", "yes").is_err());
         assert!(set_key(Some(&path), "rvc.models_dir", "/opt/models").is_err());
-        assert!(set_key(Some(&path), "pre.dsp.denoise", "false").is_err());
+        for key in [
+            "pre.dsp.denoise",
+            "pre.dsp.gate",
+            "pre.dsp.agc",
+            "pre.dsp.limiter",
+        ] {
+            assert!(set_key(Some(&path), key, "yes").is_err());
+            assert!(!set_key(Some(&path), key, "false").unwrap().restart_required);
+        }
+        assert!(!Config::load_from(Some(&path)).unwrap().pre.dsp.denoise);
         let config = Config::load_from(Some(&path)).unwrap();
-        assert_eq!(config.daemon.rpc_timeout_ms, 1500, "被拒绝的 set 不得改基线");
+        assert_eq!(
+            config.daemon.rpc_timeout_ms, 1500,
+            "被拒绝的 set 不得改基线"
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -1631,14 +1916,21 @@ mod tests {
                 "应拒绝 {key}={value}"
             );
         }
-        let err = set_key(Some(&path), "rvc.f0_method", "harvest").err().unwrap();
-        assert!(err.to_string().contains("rmvpe"), "错误信息应指明 rmvpe：{err}");
+        let err = set_key(Some(&path), "rvc.f0_method", "harvest")
+            .err()
+            .unwrap();
+        assert!(
+            err.to_string().contains("rmvpe"),
+            "错误信息应指明 rmvpe：{err}"
+        );
         let err = set_key(Some(&path), "rvc.pitch_shift", "13").err().unwrap();
         assert!(
             err.to_string().contains("-12..=12"),
             "错误信息应带范围：{err}"
         );
-        let err = set_key(Some(&path), "rvc.index_rate", "1.01").err().unwrap();
+        let err = set_key(Some(&path), "rvc.index_rate", "1.01")
+            .err()
+            .unwrap();
         assert!(
             err.to_string().contains("0.0..=1.0"),
             "错误信息应带范围：{err}"
@@ -1660,8 +1952,14 @@ mod tests {
         let path = dir.join("mozart.toml");
         std::fs::write(&path, "# 顶部注释\n[bridge]\ntranslate_enabled = true\n").unwrap();
         let mut overrides = std::collections::BTreeMap::new();
-        overrides.insert("bridge.translate_enabled".to_string(), serde_json::json!(false));
-        overrides.insert("bridge.speech_enabled".to_string(), serde_json::json!(false));
+        overrides.insert(
+            "bridge.translate_enabled".to_string(),
+            serde_json::json!(false),
+        );
+        overrides.insert(
+            "bridge.speech_enabled".to_string(),
+            serde_json::json!(false),
+        );
         let saved = save_overrides(Some(&path), &overrides).unwrap();
         assert_eq!(saved, 2);
         let text = std::fs::read_to_string(&path).unwrap();
@@ -1683,7 +1981,10 @@ mod tests {
     fn defaults_match_confirmed_paths() {
         let config = Config::default();
         assert_eq!(config.daemon.run_dir, PathBuf::from("/run/mozart"));
-        assert_eq!(config.daemon_socket(), PathBuf::from("/run/mozart/daemon.sock"));
+        assert_eq!(
+            config.daemon_socket(),
+            PathBuf::from("/run/mozart/daemon.sock")
+        );
         assert_eq!(config.pre_socket(), PathBuf::from("/run/mozart/pre.sock"));
         assert_eq!(config.rvc_socket(), PathBuf::from("/run/mozart/rvc.sock"));
         assert_eq!(
@@ -1731,10 +2032,8 @@ mod tests {
         let denoise_off: Config = toml::from_str("[pre.dsp]\ndenoise = false\n").unwrap();
         assert!(!denoise_off.pre.dsp.denoise);
 
-        let stages_on: Config = toml::from_str(
-            "[pre.dsp]\ngate = true\nagc = true\nlimiter = true\n",
-        )
-        .unwrap();
+        let stages_on: Config =
+            toml::from_str("[pre.dsp]\ngate = true\nagc = true\nlimiter = true\n").unwrap();
         assert!(stages_on.pre.dsp.gate);
         assert!(stages_on.pre.dsp.agc);
         assert!(stages_on.pre.dsp.limiter);
@@ -1849,12 +2148,10 @@ mod tests {
         let zero_queue: Config = toml::from_str("[pre]\ncapture_queue_frames = 0\n").unwrap();
         assert!(zero_queue.validate().is_err());
 
-        let huge_queue: Config =
-            toml::from_str("[pre]\ncapture_queue_frames = 1025\n").unwrap();
+        let huge_queue: Config = toml::from_str("[pre]\ncapture_queue_frames = 1025\n").unwrap();
         assert!(huge_queue.validate().is_err());
 
-        let max_queue: Config =
-            toml::from_str("[pre]\ncapture_queue_frames = 1024\n").unwrap();
+        let max_queue: Config = toml::from_str("[pre]\ncapture_queue_frames = 1024\n").unwrap();
         assert!(max_queue.validate().is_ok());
 
         let bad_pitch: Config = toml::from_str("[rvc]\npitch_shift = 13\n").unwrap();
@@ -1889,7 +2186,10 @@ mod tests {
         assert_eq!(startup.rvc.device, "cuda");
         assert!(!startup.rvc.half);
         assert_eq!(startup.rvc.cache_limit, 2);
-        assert_eq!(startup.rvc.realtime_rmvpe_path, "/opt/mozart/rmvpe-realtime.onnx");
+        assert_eq!(
+            startup.rvc.realtime_rmvpe_path,
+            "/opt/mozart/rmvpe-realtime.onnx"
+        );
         assert!(startup.validate().is_ok());
         assert_eq!(Config::default().rvc.models_dir, "");
 
@@ -1950,7 +2250,10 @@ mod tests {
             config.bridge_socket(),
             PathBuf::from("/run/mozart/bridge.sock")
         );
-        assert_eq!(config.llama_socket(), PathBuf::from("/run/mozart/llama.sock"));
+        assert_eq!(
+            config.llama_socket(),
+            PathBuf::from("/run/mozart/llama.sock")
+        );
 
         assert_eq!(config.asr.model_dir, PathBuf::new());
         assert_eq!(config.asr.review_model_dir, PathBuf::new());
@@ -2033,7 +2336,10 @@ mod tests {
             config.tts_jobs_socket(),
             PathBuf::from("/run/mozart/synth-jobs.sock")
         );
-        assert_eq!(config.tts.reference_wav, PathBuf::from("/opt/mozart/voice.wav"));
+        assert_eq!(
+            config.tts.reference_wav,
+            PathBuf::from("/opt/mozart/voice.wav")
+        );
         assert_eq!(config.tts.threads, 3);
         assert_eq!(config.tts.provider, "cuda");
         assert_eq!(config.tts.queue_capacity, 4);
@@ -2044,7 +2350,10 @@ mod tests {
         assert!(!config.bridge.translate_enabled);
         assert!(!config.bridge.speech_enabled);
         assert_eq!(config.llama_socket(), PathBuf::from("/run/mozart/llm.sock"));
-        assert_eq!(config.bridge.llama_model, PathBuf::from("/opt/mozart/qwen.gguf"));
+        assert_eq!(
+            config.bridge.llama_model,
+            PathBuf::from("/opt/mozart/qwen.gguf")
+        );
         assert_eq!(config.bridge.translate_queue_capacity, 64);
         assert_eq!(config.bridge.speech_queue_capacity, 8);
         assert_eq!(config.bridge.retry_max, 1);
@@ -2400,7 +2709,10 @@ mod tests {
         let num = |value: &serde_json::Value| value.as_u64().expect("JSON 数值键");
 
         let defaults = RvcRealtimeConfig::default();
-        assert_eq!(u64::from(defaults.crossfade_ms), num(&geometry["crossfade_ms"]));
+        assert_eq!(
+            u64::from(defaults.crossfade_ms),
+            num(&geometry["crossfade_ms"])
+        );
         assert_eq!(
             u64::from(defaults.sola_search_ms),
             num(&geometry["sola_search_ms"])
@@ -2411,7 +2723,9 @@ mod tests {
         );
         assert_eq!(
             defaults.skip_silence,
-            geometry["skip_silence"].as_bool().expect("JSON skip_silence")
+            geometry["skip_silence"]
+                .as_bool()
+                .expect("JSON skip_silence")
         );
 
         let samples_per_ms = num(&contract["output_sample_rate"]) / 1000;

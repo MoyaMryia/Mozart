@@ -112,6 +112,8 @@ impl ProcessInfo {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Processes {
+    #[serde(default = "ProcessInfo::stopped")]
+    pub enhance: ProcessInfo,
     pub pre: ProcessInfo,
     pub rvc: ProcessInfo,
     #[serde(default = "ProcessInfo::stopped")]
@@ -127,6 +129,10 @@ pub struct Processes {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PreStatus {
+    #[serde(default)]
+    pub enhancement: Option<PreEnhanceStatus>,
+    #[serde(default = "default_denoise_backend")]
+    pub denoise_backend: String,
     pub state: String,
     pub route: Route,
     pub mute: bool,
@@ -160,6 +166,32 @@ pub struct PreStatus {
     pub startup_id: String,
     pub last_error: Option<String>,
     pub version: String,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct PreEnhanceStatus {
+    pub enabled: bool,
+    pub connected: bool,
+    pub frames_in: u64,
+    pub frames_out: u64,
+    pub dropped_frames: u64,
+    pub queue_depth: u64,
+    pub last_error: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct EnhanceStatus {
+    pub version: String,
+    pub backend: String,
+    pub frames_in: u64,
+    pub frames_out: u64,
+    pub sessions: u64,
+    pub algorithm_delay_samples: u32,
+    pub last_error: Option<String>,
+}
+
+fn default_denoise_backend() -> String {
+    "wola".to_string()
 }
 
 fn default_speaker_state() -> String {
@@ -219,6 +251,8 @@ pub struct HardwareStatus {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Status {
+    #[serde(default)]
+    pub enhance: Option<EnhanceStatus>,
     pub daemon: DaemonInfo,
     pub route: RouteState,
     pub mute: bool,
@@ -827,7 +861,10 @@ mod tests {
             r#"{"active":true,"x":1}"#,
             "not json",
         ] {
-            assert!(serde_json::from_str::<FileModeSetRequest>(bad).is_err(), "应拒绝：{bad}");
+            assert!(
+                serde_json::from_str::<FileModeSetRequest>(bad).is_err(),
+                "应拒绝：{bad}"
+            );
         }
     }
 
@@ -847,7 +884,10 @@ mod tests {
             r#"{"denoise":true,"gate":false,"agc":false,"limiter":false,"x":1}"#,
             "not json",
         ] {
-            assert!(serde_json::from_str::<DspSetRequest>(bad).is_err(), "应拒绝：{bad}");
+            assert!(
+                serde_json::from_str::<DspSetRequest>(bad).is_err(),
+                "应拒绝：{bad}"
+            );
         }
     }
 
@@ -863,7 +903,10 @@ mod tests {
             r#"{"enabled":true,"x":1}"#,
             "not json",
         ] {
-            assert!(serde_json::from_str::<SwitchSetRequest>(bad).is_err(), "应拒绝：{bad}");
+            assert!(
+                serde_json::from_str::<SwitchSetRequest>(bad).is_err(),
+                "应拒绝：{bad}"
+            );
         }
     }
 
@@ -1047,7 +1090,10 @@ mod tests {
             r#"{"path":"/tmp/a.wav","x":1}"#,
             "not json",
         ] {
-            assert!(serde_json::from_str::<FileSubmitRequest>(bad).is_err(), "应拒绝：{bad}");
+            assert!(
+                serde_json::from_str::<FileSubmitRequest>(bad).is_err(),
+                "应拒绝：{bad}"
+            );
         }
     }
 
@@ -1058,8 +1104,14 @@ mod tests {
         let status: FileStatusRequest = serde_json::from_str(r#"{"job_id":"job_1"}"#).unwrap();
         assert_eq!(status.job_id, "job_1");
         for bad in ["{}", r#"{"job_id":1}"#, r#"{"job_id":"job_1","x":1}"#] {
-            assert!(serde_json::from_str::<FileCancelRequest>(bad).is_err(), "应拒绝：{bad}");
-            assert!(serde_json::from_str::<FileStatusRequest>(bad).is_err(), "应拒绝：{bad}");
+            assert!(
+                serde_json::from_str::<FileCancelRequest>(bad).is_err(),
+                "应拒绝：{bad}"
+            );
+            assert!(
+                serde_json::from_str::<FileStatusRequest>(bad).is_err(),
+                "应拒绝：{bad}"
+            );
         }
     }
 
@@ -1076,7 +1128,10 @@ mod tests {
             r#"{"job_id":"job_1","output":1}"#,
             r#"{"job_id":"job_1","x":1}"#,
         ] {
-            assert!(serde_json::from_str::<FileFetchRequest>(bad).is_err(), "应拒绝：{bad}");
+            assert!(
+                serde_json::from_str::<FileFetchRequest>(bad).is_err(),
+                "应拒绝：{bad}"
+            );
         }
     }
 
@@ -1085,7 +1140,10 @@ mod tests {
         let request: RestartRequest = serde_json::from_str(r#"{"service":"rvc"}"#).unwrap();
         assert_eq!(request.service, "rvc");
         for bad in ["{}", r#"{"service":1}"#, r#"{"service":"rvc","x":1}"#] {
-            assert!(serde_json::from_str::<RestartRequest>(bad).is_err(), "应拒绝：{bad}");
+            assert!(
+                serde_json::from_str::<RestartRequest>(bad).is_err(),
+                "应拒绝：{bad}"
+            );
         }
     }
 }

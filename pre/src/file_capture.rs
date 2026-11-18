@@ -35,8 +35,8 @@ fn u32_at(bytes: &[u8], offset: usize) -> u32 {
 /// RIFF/WAVE 结构、PCM16、48000 Hz、至少 1 声道、数据非空。
 /// 末尾不足一个采样块的字节忽略。
 pub fn load_wav(path: &Path) -> Result<Vec<i16>, String> {
-    let bytes = std::fs::read(path)
-        .map_err(|err| format!("capture file {}: {err}", path.display()))?;
+    let bytes =
+        std::fs::read(path).map_err(|err| format!("capture file {}: {err}", path.display()))?;
     let fail = |reason: &str| format!("capture file {}: {reason}", path.display());
 
     if bytes.len() < 12 || &bytes[0..4] != b"RIFF" || &bytes[8..12] != b"WAVE" {
@@ -110,7 +110,7 @@ pub fn load_wav(path: &Path) -> Result<Vec<i16>, String> {
 /// daemon 按退避重启（与设备打开失败同语义）。
 pub fn run(
     path: &Path,
-    ring: Arc<Ring<RawFrame>>,
+    ring: Arc<Ring<crate::capture::CapturedFrame>>,
     shared: Arc<Shared>,
     stop: &'static AtomicBool,
 ) -> Result<(), String> {
@@ -154,7 +154,7 @@ pub fn run(
             },
             pcm: block,
         };
-        ring.push(frame);
+        crate::capture::enqueue(&ring, frame, &shared);
         frame_idx = frame_idx.wrapping_add(1);
         shared.add_captured(1);
         emitted += 1;
@@ -239,10 +239,7 @@ mod tests {
     }
 
     fn temp_wav(tag: &str, bytes: &[u8]) -> std::path::PathBuf {
-        let dir = std::env::temp_dir().join(format!(
-            "mozart-filecap-{}-{tag}",
-            std::process::id()
-        ));
+        let dir = std::env::temp_dir().join(format!("mozart-filecap-{}-{tag}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join("input.wav");
         std::fs::write(&path, bytes).unwrap();
@@ -309,89 +306,144 @@ mod tests {
         let cases: Vec<(&str, Vec<u8>, &str)> = vec![
             ("empty", Vec::new(), "RIFF/WAVE"),
             ("short-header", good[..8].to_vec(), "RIFF/WAVE"),
-            ("bad-magic", {
-                let mut b = good.clone();
-                b[0] = b'X';
-                b
-            }, "RIFF/WAVE"),
-            ("not-wave", {
-                let mut b = good.clone();
-                b[8..12].copy_from_slice(b"AVI ");
-                b
-            }, "RIFF/WAVE"),
-            ("float-format", {
-                let mut w = WavBuilder::mono(&ramp(16));
-                w.format = 3;
-                w.bytes()
-            }, "PCM"),
-            ("8-bit", {
-                let mut w = WavBuilder::mono(&ramp(16));
-                w.bits = 8;
-                w.bytes()
-            }, "16-bit"),
-            ("rate-16k", {
-                let mut w = WavBuilder::mono(&ramp(16));
-                w.rate = 16_000;
-                w.bytes()
-            }, "48000"),
-            ("rate-44k", {
-                let mut w = WavBuilder::mono(&ramp(16));
-                w.rate = 44_100;
-                w.bytes()
-            }, "48000"),
-            ("zero-channels", {
-                let mut w = WavBuilder::mono(&ramp(16));
-                w.channels = 0;
-                w.bytes()
-            }, "channel count"),
+            (
+                "bad-magic",
+                {
+                    let mut b = good.clone();
+                    b[0] = b'X';
+                    b
+                },
+                "RIFF/WAVE",
+            ),
+            (
+                "not-wave",
+                {
+                    let mut b = good.clone();
+                    b[8..12].copy_from_slice(b"AVI ");
+                    b
+                },
+                "RIFF/WAVE",
+            ),
+            (
+                "float-format",
+                {
+                    let mut w = WavBuilder::mono(&ramp(16));
+                    w.format = 3;
+                    w.bytes()
+                },
+                "PCM",
+            ),
+            (
+                "8-bit",
+                {
+                    let mut w = WavBuilder::mono(&ramp(16));
+                    w.bits = 8;
+                    w.bytes()
+                },
+                "16-bit",
+            ),
+            (
+                "rate-16k",
+                {
+                    let mut w = WavBuilder::mono(&ramp(16));
+                    w.rate = 16_000;
+                    w.bytes()
+                },
+                "48000",
+            ),
+            (
+                "rate-44k",
+                {
+                    let mut w = WavBuilder::mono(&ramp(16));
+                    w.rate = 44_100;
+                    w.bytes()
+                },
+                "48000",
+            ),
+            (
+                "zero-channels",
+                {
+                    let mut w = WavBuilder::mono(&ramp(16));
+                    w.channels = 0;
+                    w.bytes()
+                },
+                "channel count",
+            ),
             ("empty-data", WavBuilder::mono(&[]).bytes(), "empty data"),
-            ("data-one-byte", {
-                let mut w = WavBuilder::mono(&[]);
-                w.data = vec![0x7f];
-                w.bytes()
-            }, "one sample block"),
-            ("data-less-than-block", {
-                let mut w = WavBuilder::mono(&[]);
-                w.channels = 3;
-                w.data = vec![0; 4];
-                w.bytes()
-            }, "one sample block"),
-            ("missing-fmt", {
-                // 只留 data 块：手工拼 RIFF 头 + data。
-                let mut body = Vec::new();
-                body.extend_from_slice(b"data");
-                body.extend_from_slice(&4u32.to_le_bytes());
-                body.extend_from_slice(&[0u8; 4]);
-                let mut out = Vec::new();
-                out.extend_from_slice(b"RIFF");
-                out.extend_from_slice(&((body.len() + 4) as u32).to_le_bytes());
-                out.extend_from_slice(b"WAVE");
-                out.extend_from_slice(&body);
-                out
-            }, "missing fmt"),
-            ("missing-data", {
-                let mut b = good.clone();
-                let data_pos = b.len() - 8 - 32; // data 头在末尾 32 字节数据前
-                b.truncate(data_pos);
-                b
-            }, "missing data"),
-            ("truncated-body", {
-                let mut b = good.clone();
-                b.truncate(b.len() - 10);
-                b
-            }, "truncated chunk"),
-            ("short-fmt", {
-                let mut b = good.clone();
-                // fmt 块长度字段改成 8：块体不足 16 字节。
-                let fmt_pos = 12 + 4; // 无 extra chunk 时 fmt 紧跟 WAVE 头
-                b[fmt_pos..fmt_pos + 4].copy_from_slice(&8u32.to_le_bytes());
-                b
-            }, "fmt chunk too short"),
+            (
+                "data-one-byte",
+                {
+                    let mut w = WavBuilder::mono(&[]);
+                    w.data = vec![0x7f];
+                    w.bytes()
+                },
+                "one sample block",
+            ),
+            (
+                "data-less-than-block",
+                {
+                    let mut w = WavBuilder::mono(&[]);
+                    w.channels = 3;
+                    w.data = vec![0; 4];
+                    w.bytes()
+                },
+                "one sample block",
+            ),
+            (
+                "missing-fmt",
+                {
+                    // 只留 data 块：手工拼 RIFF 头 + data。
+                    let mut body = Vec::new();
+                    body.extend_from_slice(b"data");
+                    body.extend_from_slice(&4u32.to_le_bytes());
+                    body.extend_from_slice(&[0u8; 4]);
+                    let mut out = Vec::new();
+                    out.extend_from_slice(b"RIFF");
+                    out.extend_from_slice(&((body.len() + 4) as u32).to_le_bytes());
+                    out.extend_from_slice(b"WAVE");
+                    out.extend_from_slice(&body);
+                    out
+                },
+                "missing fmt",
+            ),
+            (
+                "missing-data",
+                {
+                    let mut b = good.clone();
+                    let data_pos = b.len() - 8 - 32; // data 头在末尾 32 字节数据前
+                    b.truncate(data_pos);
+                    b
+                },
+                "missing data",
+            ),
+            (
+                "truncated-body",
+                {
+                    let mut b = good.clone();
+                    b.truncate(b.len() - 10);
+                    b
+                },
+                "truncated chunk",
+            ),
+            (
+                "short-fmt",
+                {
+                    let mut b = good.clone();
+                    // fmt 块长度字段改成 8：块体不足 16 字节。
+                    let fmt_pos = 12 + 4; // 无 extra chunk 时 fmt 紧跟 WAVE 头
+                    b[fmt_pos..fmt_pos + 4].copy_from_slice(&8u32.to_le_bytes());
+                    b
+                },
+                "fmt chunk too short",
+            ),
         ];
         for (tag, bytes, reason) in cases {
             let path = temp_wav(tag, &bytes);
             let err = load_wav(&path).expect_err(tag);
-            assert!(err.contains(reason), "{tag}: 期望「{reason}」，实际「{err}」");
+            assert!(
+                err.contains(reason),
+                "{tag}: 期望「{reason}」，实际「{err}」"
+            );
             let _ = std::fs::remove_dir_all(path.parent().unwrap());
         }
     }
@@ -410,7 +462,7 @@ mod tests {
         static STOP: AtomicBool = AtomicBool::new(false);
         let samples = ramp(RAW_SAMPLES * 2);
         let path = temp_wav("run", &WavBuilder::mono(&samples).bytes());
-        let ring = Arc::new(Ring::<RawFrame>::new(8));
+        let ring = Arc::new(Ring::<crate::capture::CapturedFrame>::new(8));
         let shared = Arc::new(crate::state::test_shared("cap", "play", "startup"));
 
         // 计时起点先于线程启动：run 内部起点不早于此，下界断言无竞态。
@@ -454,7 +506,7 @@ mod tests {
     fn single_sample_wraps_inside_block() {
         static STOP: AtomicBool = AtomicBool::new(false);
         let path = temp_wav("one", &WavBuilder::mono(&[12345]).bytes());
-        let ring = Arc::new(Ring::<RawFrame>::new(4));
+        let ring = Arc::new(Ring::<crate::capture::CapturedFrame>::new(4));
         let shared = Arc::new(crate::state::test_shared("cap", "play", "startup"));
         let worker = {
             let ring = ring.clone();
@@ -476,7 +528,7 @@ mod tests {
         static STOP: AtomicBool = AtomicBool::new(false);
         let samples = ramp(RAW_SAMPLES + 100);
         let path = temp_wav("wrap", &WavBuilder::mono(&samples).bytes());
-        let ring = Arc::new(Ring::<RawFrame>::new(4));
+        let ring = Arc::new(Ring::<crate::capture::CapturedFrame>::new(4));
         let shared = Arc::new(crate::state::test_shared("cap", "play", "startup"));
         let worker = {
             let ring = ring.clone();
@@ -503,7 +555,7 @@ mod tests {
         use crate::state::QueueReadout;
         static STOP: AtomicBool = AtomicBool::new(false);
         let path = temp_wav("bad", b"not a wav at all");
-        let ring = Arc::new(Ring::<RawFrame>::new(4));
+        let ring = Arc::new(Ring::<crate::capture::CapturedFrame>::new(4));
         let shared = Arc::new(crate::state::test_shared("cap", "play", "startup"));
         let err = run(&path, ring, shared.clone(), &STOP).expect_err("契约失败必须报错");
         assert!(err.contains("capture file"));
@@ -522,7 +574,7 @@ mod tests {
     fn stop_responds_within_sleep_step() {
         static STOP: AtomicBool = AtomicBool::new(false);
         let path = temp_wav("stop", &WavBuilder::mono(&ramp(RAW_SAMPLES)).bytes());
-        let ring = Arc::new(Ring::<RawFrame>::new(4));
+        let ring = Arc::new(Ring::<crate::capture::CapturedFrame>::new(4));
         let shared = Arc::new(crate::state::test_shared("cap", "play", "startup"));
         let worker = {
             let ring = ring.clone();

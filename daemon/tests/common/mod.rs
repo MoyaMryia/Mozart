@@ -19,10 +19,7 @@ pub fn example(name: &str) -> PathBuf {
         .components()
         .next()
         .expect("缺少 profile 目录");
-    let path = target
-        .join(profile.as_os_str())
-        .join("examples")
-        .join(name);
+    let path = target.join(profile.as_os_str()).join("examples").join(name);
     assert!(
         path.is_file(),
         "找不到 {}；先运行 cargo build -p mozart-core --examples",
@@ -72,7 +69,15 @@ impl DaemonProcess {
         config_body: &str,
     ) -> Self {
         Self::start_full_fresh(
-            tag, pre_bin, rvc_bin, asr_bin, tts_bin, bridge_bin, llama_bin, config_body, true,
+            tag,
+            pre_bin,
+            rvc_bin,
+            asr_bin,
+            tts_bin,
+            bridge_bin,
+            llama_bin,
+            config_body,
+            true,
         )
     }
 
@@ -112,11 +117,7 @@ impl DaemonProcess {
             .spawn()
             .unwrap();
         let socket = dir.join("daemon.sock");
-        Self {
-            child,
-            dir,
-            socket,
-        }
+        Self { child, dir, socket }
     }
 
     /// 文件链路测试用：`storage` 指向受管目录，`file_extra` 追加 `[file]` 键，
@@ -160,11 +161,7 @@ impl DaemonProcess {
         }
         let child = command.spawn().unwrap();
         let socket = dir.join("daemon.sock");
-        Self {
-            child,
-            dir,
-            socket,
-        }
+        Self { child, dir, socket }
     }
 
     pub fn connect(&self) -> Seqpacket {

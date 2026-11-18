@@ -38,7 +38,7 @@
 
 | 键 | 类型 | 默认 | 范围 | 类别 |
 | --- | --- | --- | --- | --- |
-| pre_bin / rvc_bin / asr_bin / tts_bin / bridge_bin / llama_bin | path | 各裸名 | 非空 | S |
+| pre_bin / enhance_bin / rvc_bin / asr_bin / tts_bin / bridge_bin / llama_bin | path | 各裸名 | 非空 | S |
 
 ### [process.env]
 
@@ -74,6 +74,24 @@ LD_LIBRARY_PATH = "<资产根>/lib:<资产根>/llama"
 | gate | bool | false | — | R |
 | agc | bool | false | — | R |
 | limiter | bool | false | — | R |
+
+### [enhance]（可选）
+
+此段存在时，`pre.dsp.denoise` 选择 UL-UNAS，旧 WOLA 不叠加。省略此段保持旧默认。
+增强仅作用于 RVC／ASR 共用的 16 kHz 支路；48 kHz 直通不经过模型。
+
+| 键 | 类型 | 默认 | 范围 | 类别 |
+| --- | --- | --- | --- | --- |
+| model | path | 必填 | 非空；相对路径按配置目录解析，只读引用已有 ONNX | S |
+| socket | string | enhance.sock | 纯文件名，不能与其他 socket 冲突 | S |
+| audio_socket | string | enhance-audio.sock | 同上 | S |
+| queue_frames | int | 8 | 1..=1024 | S |
+| request_timeout_ms | int | 100 | 1..=1000；覆盖连接、发送与接收 | S |
+
+修改本段已配置字段后，`restart pre` 或 `restart enhance` 会联动重建两者。
+新增或移除本段要求重启 daemon。崩溃自动恢复仍使用生效快照，不提前吸收待重启键。
+状态在 `status.enhance` 与 `status.pre.enhancement`；禁用时不调用网络，真实增强帧后清除当前故障。
+文件任务原有的 `[file].denoise` 行为不变；增强进程的独立离线模式用于同一模型核的对拍。
 
 ### [[pre.consumers]]
 

@@ -59,6 +59,7 @@ Mozart 是面向 NVIDIA Jetson Orin Nano Super 8 GB 的本地语音处理系统�
 | --- | --- | --- |
 | `core/` | 帧契约 C 头（单一来源）、Rust 镜像、传输、环形队列 | Cargo `mozart-core` + CMake INTERFACE `mozart_core` |
 | `pre/` | 音频进程：采集、DSP、播放、分发 | Cargo `mozart-pre` |
+| `enhance/` | pre 的可选 C++ 增强工作进程；daemon 监管 | CMake `mozart-enhance` |
 | `daemon/` | 控制进程：生命周期、控制命令、模式/路由策略 | Cargo `mozart-daemon` |
 | `rvc/` | C++ 推理进程：StreamSession、旧 rvc-backend | CMake `mozart-rvc` |
 | `web/` | TypeScript 前端（后续） | npm |

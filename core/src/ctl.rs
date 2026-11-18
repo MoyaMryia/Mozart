@@ -116,9 +116,12 @@ pub const TTS_JOB_SUBMIT: u16 = 0x0610;
 pub const TTS_JOB_REPLY: u16 = 0x0611;
 /// 任务面停止：体 {}（空）；TTS 清空任务队列并中止在途合成，应答 data {"stopped":true}。
 pub const TTS_JOB_STOP: u16 = 0x0612;
+pub const ENHANCE_HELLO: u16 = 0x0701;
+pub const ENHANCE_GET_STATUS: u16 = 0x0702;
 
 /// 控制连接空闲断开，各进程控制面同一纪律（SPEC-04）。
-pub const IDLE_TIMEOUT: Duration = Duration::from_secs(30);
+pub const IDLE_TIMEOUT_MS: u64 = 30_000;
+pub const IDLE_TIMEOUT: Duration = Duration::from_millis(IDLE_TIMEOUT_MS);
 /// recv 轮询步长：让停止标志在秒级内生效，再按累计空闲判断断开。
 pub const RECV_POLL: Duration = Duration::from_secs(1);
 /// accept 轮询间隔：无连接时周期检查停止标志，保证 SIGTERM 可退出。
@@ -393,14 +396,8 @@ impl Seqpacket {
         let mut buf = vec![0u8; HEADER_BYTES + MAX_BODY_BYTES + 1];
         loop {
             // SAFETY: buf 有效且长度与传入一致。
-            let n = unsafe {
-                libc::recv(
-                    self.fd.as_raw_fd(),
-                    buf.as_mut_ptr().cast(),
-                    buf.len(),
-                    0,
-                )
-            };
+            let n =
+                unsafe { libc::recv(self.fd.as_raw_fd(), buf.as_mut_ptr().cast(), buf.len(), 0) };
             if n < 0 {
                 let err = io::Error::last_os_error();
                 if err.kind() == io::ErrorKind::Interrupted {
@@ -445,14 +442,8 @@ impl Seqpacket {
         let mut buf = vec![0u8; MAX_BODY_BYTES + 1];
         loop {
             // SAFETY: buf 有效且长度与传入一致。
-            let n = unsafe {
-                libc::recv(
-                    self.fd.as_raw_fd(),
-                    buf.as_mut_ptr().cast(),
-                    buf.len(),
-                    0,
-                )
-            };
+            let n =
+                unsafe { libc::recv(self.fd.as_raw_fd(), buf.as_mut_ptr().cast(), buf.len(), 0) };
             if n < 0 {
                 let err = io::Error::last_os_error();
                 if err.kind() == io::ErrorKind::Interrupted {
@@ -519,13 +510,7 @@ impl Seqpacket {
 
 fn new_seqpacket() -> io::Result<OwnedFd> {
     // SAFETY: socket() 不访问其他内存。CLOEXEC 防止套接字泄漏给子进程。
-    let raw = unsafe {
-        libc::socket(
-            libc::AF_UNIX,
-            libc::SOCK_SEQPACKET | libc::SOCK_CLOEXEC,
-            0,
-        )
-    };
+    let raw = unsafe { libc::socket(libc::AF_UNIX, libc::SOCK_SEQPACKET | libc::SOCK_CLOEXEC, 0) };
     if raw < 0 {
         return Err(io::Error::last_os_error());
     }
@@ -580,7 +565,8 @@ mod tests {
     fn socketpair() -> (Seqpacket, Seqpacket) {
         let mut fds = [0; 2];
         // SAFETY: fds 指向可写数组；AF_UNIX + SOCK_SEQPACKET 由内核支持。
-        let rc = unsafe { libc::socketpair(libc::AF_UNIX, libc::SOCK_SEQPACKET, 0, fds.as_mut_ptr()) };
+        let rc =
+            unsafe { libc::socketpair(libc::AF_UNIX, libc::SOCK_SEQPACKET, 0, fds.as_mut_ptr()) };
         assert_eq!(rc, 0, "socketpair: {}", io::Error::last_os_error());
         // SAFETY: fds 内是新建且未复制的文件描述符。
         unsafe {
@@ -746,7 +732,10 @@ mod tests {
 
     #[test]
     fn header_decode_rejects_bad_frames() {
-        assert_eq!(Header::from_bytes(&[0u8; 15]), Err(ProtocolError::ShortFrame));
+        assert_eq!(
+            Header::from_bytes(&[0u8; 15]),
+            Err(ProtocolError::ShortFrame)
+        );
 
         let mut bytes = Header::new(PRE_HELLO, 1, 0).to_bytes();
         bytes[0] ^= 0xFF;
@@ -868,8 +857,7 @@ mod tests {
         let second = Seqpacket::connect(&path).unwrap();
 
         let started = Instant::now();
-        let err =
-            Seqpacket::connect_timeout(&path, Some(Duration::from_millis(120))).unwrap_err();
+        let err = Seqpacket::connect_timeout(&path, Some(Duration::from_millis(120))).unwrap_err();
         assert_eq!(err.kind(), io::ErrorKind::TimedOut);
         // poll 毫秒超时允许内核略提前醒来，留 5 ms 容差。
         assert!(started.elapsed() >= Duration::from_millis(115));

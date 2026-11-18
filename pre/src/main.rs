@@ -20,6 +20,7 @@ mod ai;
 mod alsa_stream;
 mod capture;
 mod control;
+mod enhancement;
 mod file_capture;
 mod playback;
 mod route;
@@ -84,23 +85,44 @@ fn new_startup_id() -> String {
 struct Args {
     socket: PathBuf,
     config: Option<PathBuf>,
+    effective_enhance: Option<Option<mozart_core::config::EnhanceConfig>>,
+    effective_dsp: Option<mozart_core::config::PreDspConfig>,
 }
 
 fn parse_args() -> Result<Args, String> {
+    parse_args_from(std::env::args().skip(1))
+}
+
+fn parse_args_from(mut args: impl Iterator<Item = String>) -> Result<Args, String> {
     let mut socket = None;
     let mut config = None;
-    let mut args = std::env::args().skip(1);
+    let mut effective_enhance = None;
+    let mut effective_dsp = None;
     while let Some(arg) = args.next() {
         match arg.as_str() {
             "--socket" => {
-                socket = Some(PathBuf::from(
-                    args.next().ok_or("--socket needs a path")?,
-                ));
+                socket = Some(PathBuf::from(args.next().ok_or("--socket needs a path")?));
             }
             "--config" => {
-                config = Some(PathBuf::from(
-                    args.next().ok_or("--config needs a path")?,
-                ));
+                config = Some(PathBuf::from(args.next().ok_or("--config needs a path")?));
+            }
+            "--effective-enhance" => {
+                let json = args.next().ok_or("--effective-enhance needs JSON")?;
+                effective_enhance = Some(
+                    serde_json::from_str(&json)
+                        .map_err(|err| format!("--effective-enhance: {err}"))?,
+                );
+            }
+            "--effective-dsp" => {
+                let json = args.next().ok_or("--effective-dsp needs JSON")?;
+                let dsp: mozart_core::ctl::schema::DspSetRequest =
+                    serde_json::from_str(&json).map_err(|err| format!("--effective-dsp: {err}"))?;
+                effective_dsp = Some(mozart_core::config::PreDspConfig {
+                    denoise: dsp.denoise,
+                    gate: dsp.gate,
+                    agc: dsp.agc,
+                    limiter: dsp.limiter,
+                });
             }
             other => return Err(format!("unknown argument: {other}")),
         }
@@ -108,6 +130,8 @@ fn parse_args() -> Result<Args, String> {
     Ok(Args {
         socket: socket.ok_or("missing required argument: --socket <path>")?,
         config,
+        effective_enhance,
+        effective_dsp,
     })
 }
 
@@ -121,19 +145,32 @@ fn parse_args() -> Result<Args, String> {
 /// DSP 级开关：启动取 [pre.dsp] 基线，运行中 SetDsp 写目标原子，
 /// 此处逐帧读、变化时应用（denoise 重新启用在 Dsp 内重置 WOLA 状态）。
 fn process_thread(
-    capture_ring: Arc<Ring<RawFrame>>,
+    capture_ring: Arc<Ring<capture::CapturedFrame>>,
     trunk: Arc<Ring<RawFrame>>,
     shared: Arc<Shared>,
     mut senders: Vec<ai::Sender>,
 ) -> Result<(), String> {
     // DSP 状态为定长数组，构造后热路径零分配。
     let mut applied = shared.dsp_target();
-    let mut dsp = mozart_dsp::Dsp::new(applied.denoise, applied.gate, applied.agc, applied.limiter);
+    let nn = shared.enhancement.is_some();
+    let mut dsp = mozart_dsp::Dsp::new(
+        applied.denoise && !nn,
+        applied.gate,
+        applied.agc,
+        applied.limiter,
+    );
     while !STOP.load(Ordering::Relaxed) {
-        if let Some(mut frame) = capture_ring.pop(Some(PROCESS_POLL)) {
-            let target = shared.dsp_target();
+        if let Some(captured) = capture_ring.pop(Some(PROCESS_POLL)) {
+            let mut frame = captured.frame;
+            let source_active = captured.rvc_ai_active;
+            let (target, epoch) = shared.dsp_snapshot();
             if target != applied {
-                dsp.set_switches(target.denoise, target.gate, target.agc, target.limiter);
+                dsp.set_switches(
+                    target.denoise && !nn,
+                    target.gate,
+                    target.agc,
+                    target.limiter,
+                );
                 applied = target;
             }
             let conf = dsp.process_frame(&mut frame);
@@ -143,12 +180,18 @@ fn process_thread(
             // （SPEC-04 单一权威）：未断言（启动/重启）或文件接管期间停发——
             // 避免实时帧污染整段攒帧，也避免 pre 单边 reclaim。
             // 只读原子，不分配不阻塞；其余消费者恒发不受影响。
-            let ai_active = shared.rvc_ai_active();
-            for (index, sender) in senders.iter_mut().enumerate() {
-                if shared.consumers()[index].file_mode_affected && !ai_active {
-                    continue;
-                }
-                sender.send(&input_frame, &shared);
+            let item = enhancement::WorkItem {
+                frame: input_frame,
+                source_idx: frame.meta.frame_idx,
+                rvc_ai_active: source_active,
+                file_generation: captured.file_generation,
+                epoch: if nn { captured.epoch } else { epoch },
+                enabled: target.denoise,
+            };
+            if let Some(enhance) = &shared.enhancement {
+                enhance.queue.push(item);
+            } else {
+                enhancement::fanout(&item, &shared, &mut senders);
             }
         }
     }
@@ -203,7 +246,15 @@ fn main() -> ExitCode {
         }
     };
     // 入口校验一次：[pre] 设备名与队列容量在 Config::load 内完成。
-    let config = match Config::load(args.config.as_deref()) {
+    let config = match Config::load(args.config.as_deref()).and_then(|mut config| {
+        if let Some(effective) = args.effective_enhance {
+            config.apply_effective_enhance(effective)?;
+        }
+        if let Some(effective) = args.effective_dsp {
+            config.pre.dsp = effective;
+        }
+        Ok(config)
+    }) {
         Ok(config) => config,
         Err(err) => {
             eprintln!("mozart-pre: {err}");
@@ -231,15 +282,19 @@ fn main() -> ExitCode {
     // 消费者列表（SPEC-02 分发配置化）：显式 [[pre.consumers]] 优先，
     // 未设置回退 rvc+asr 两支路（Config::pre_consumers）。
     let consumers = config.pre_consumers();
-    let shared = Arc::new(Shared::new(
+    let mut shared = Shared::new(
         capture_label,
         config.pre.playback_device.clone(),
         new_startup_id(),
         consumers.clone(),
         state::DspSwitches::from_config(&config.pre.dsp),
-    ));
+    );
+    if let Some(enhance) = &config.enhance {
+        shared.configure_enhancement(enhance, &config.daemon.run_dir);
+    }
+    let shared = Arc::new(shared);
     // 容量已由配置校验保证 ≥ 1；Ring::new 对 0 会 panic。
-    let capture_ring = Arc::new(Ring::<RawFrame>::new(
+    let capture_ring = Arc::new(Ring::<capture::CapturedFrame>::new(
         config.pre.capture_queue_frames as usize,
     ));
     let trunk = Arc::new(Ring::<RawFrame>::new(TRUNK_QUEUE_FRAMES));
@@ -278,19 +333,17 @@ fn main() -> ExitCode {
 
     // 播报支路输出侧：pre 绑定 tts_output_socket 收 TTS 播报帧（SPEC-05 方向
     // 约定：pre 绑定、TTS 连接）。绑定失败立即退出：部署路径属配置错误。
-    let tts_out_socket = match FrameSocket::<OutputFrame>::bind(
-        &config.tts_output_socket(),
-        ai::TTS_QUEUE_FRAMES,
-    ) {
-        Ok(socket) => socket,
-        Err(err) => {
-            eprintln!(
-                "mozart-pre: bind {}: {err}",
-                config.tts_output_socket().display()
-            );
-            return ExitCode::FAILURE;
-        }
-    };
+    let tts_out_socket =
+        match FrameSocket::<OutputFrame>::bind(&config.tts_output_socket(), ai::TTS_QUEUE_FRAMES) {
+            Ok(socket) => socket,
+            Err(err) => {
+                eprintln!(
+                    "mozart-pre: bind {}: {err}",
+                    config.tts_output_socket().display()
+                );
+                return ExitCode::FAILURE;
+            }
+        };
 
     // 播放设备先就绪，后拉线程；采集源二选一：测试文件（SPEC-02 文件采集源）
     // 或 ALSA 设备。文件契约在采集线程启动时入口校验，失败走致命错误传播。
@@ -342,7 +395,27 @@ fn main() -> ExitCode {
             Err(err) => return spawn_failure("capture", err),
         }
     };
-    let control_circles = (capture_ring.clone(), trunk.clone(), rvc_ring.clone(), tts_ring.clone());
+    let control_circles = (
+        capture_ring.clone(),
+        trunk.clone(),
+        rvc_ring.clone(),
+        tts_ring.clone(),
+    );
+    let (enhancement_handle, senders) = if let Some(enhance) = shared.enhancement.clone() {
+        let worker_shared = shared.clone();
+        let handle = match spawn_thread("mozart-enhance", move || {
+            stop_on_fatal(
+                &STOP,
+                guard_panic(move || enhancement::run(enhance, worker_shared, senders, &STOP)),
+            )
+        }) {
+            Ok(handle) => handle,
+            Err(err) => return spawn_failure("enhance", err),
+        };
+        (Some(handle), Vec::new())
+    } else {
+        (None, senders)
+    };
     let process_handle = {
         let from = capture_ring.clone();
         let to = trunk.clone();
@@ -399,7 +472,15 @@ fn main() -> ExitCode {
         let shared = shared.clone();
         let (capture_ring, trunk, rvc_ring, tts_ring) = control_circles;
         match spawn_thread("mozart-control", move || {
-            control::serve(listener, shared, capture_ring, trunk, rvc_ring, tts_ring, &STOP);
+            control::serve(
+                listener,
+                shared,
+                capture_ring,
+                trunk,
+                rvc_ring,
+                tts_ring,
+                &STOP,
+            );
             Ok(())
         }) {
             Ok(handle) => handle,
@@ -407,14 +488,18 @@ fn main() -> ExitCode {
         }
     };
 
-    let failure = join_threads(vec![
+    let mut handles = vec![
         ("capture", capture_handle),
         ("process", process_handle),
         ("rvc-recv", rvc_recv_handle),
         ("tts-recv", tts_recv_handle),
         ("playback", playback_handle),
         ("control", control_handle),
-    ]);
+    ];
+    if let Some(handle) = enhancement_handle {
+        handles.push(("enhance", handle));
+    }
+    let failure = join_threads(handles);
     match failure {
         Some(message) => {
             eprintln!("mozart-pre: {message}");
@@ -432,7 +517,9 @@ fn spawn_failure(role: &str, err: std::io::Error) -> ExitCode {
 fn log_stream_setup(role: &str, device: &str, pcm: &alsa::pcm::PCM) {
     match pcm.get_params() {
         Ok((buffer, period)) => {
-            eprintln!("mozart-pre: {role} device {device} ready (period {period}, buffer {buffer})");
+            eprintln!(
+                "mozart-pre: {role} device {device} ready (period {period}, buffer {buffer})"
+            );
         }
         Err(err) => eprintln!("mozart-pre: {role} device {device} ready (params unknown: {err})"),
     }
@@ -440,6 +527,67 @@ fn log_stream_setup(role: &str, device: &str, pcm: &alsa::pcm::PCM) {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn effective_dsp_args_require_four_booleans() {
+        let parse = |values: &[&str]| {
+            parse_args_from(
+                ["--socket", "/tmp/pre-test.sock"]
+                    .into_iter()
+                    .chain(values.iter().copied())
+                    .map(str::to_string),
+            )
+        };
+        assert!(parse(&[]).unwrap().effective_dsp.is_none());
+        let json = r#"{"denoise":false,"gate":true,"agc":false,"limiter":true}"#;
+        let dsp = parse(&["--effective-dsp", json])
+            .unwrap()
+            .effective_dsp
+            .unwrap();
+        assert!(!dsp.denoise && dsp.gate && !dsp.agc && dsp.limiter);
+        for invalid in [
+            "{}",
+            "null",
+            r#"{"denoise":"false","gate":true,"agc":false,"limiter":true}"#,
+        ] {
+            assert!(parse(&["--effective-dsp", invalid]).is_err());
+        }
+        assert!(parse(&["--effective-dsp"]).is_err());
+    }
+
+    #[test]
+    fn effective_enhance_args_preserve_absent_null_and_config() {
+        let parse = |extra: &[&str]| {
+            super::parse_args_from(
+                ["--socket", "/tmp/pre.sock"]
+                    .into_iter()
+                    .chain(extra.iter().copied())
+                    .map(str::to_owned),
+            )
+        };
+        assert!(parse(&[]).unwrap().effective_enhance.is_none());
+        assert!(matches!(
+            parse(&["--effective-enhance", "null"])
+                .unwrap()
+                .effective_enhance,
+            Some(None)
+        ));
+        let config = mozart_core::config::EnhanceConfig {
+            model: "unused.onnx".into(),
+            socket: "enhance.sock".into(),
+            audio_socket: "enhance-audio.sock".into(),
+            queue_frames: 4,
+            request_timeout_ms: 100,
+        };
+        let json = serde_json::to_string(&config).unwrap();
+        let parsed = parse(&["--effective-enhance", &json]).unwrap();
+        assert_eq!(
+            serde_json::to_value(parsed.effective_enhance.unwrap().unwrap()).unwrap(),
+            serde_json::to_value(config).unwrap()
+        );
+        assert!(parse(&["--effective-enhance"]).is_err());
+        assert!(parse(&["--effective-enhance", "{}"]).is_err());
+    }
+
     use super::*;
 
     /// 本模块两条用例都操纵全局 STOP，用互斥锁串行：并行置位会让
@@ -478,7 +626,10 @@ mod tests {
         // 还阻塞在 capture join，靠它让 capture 有序退出。
         STOP.store(false, Ordering::Relaxed);
         assert!(stop_on_fatal(&STOP, Err("fatal stream error".to_string())).is_err());
-        assert!(STOP.load(Ordering::Relaxed), "设备线程返回 Err 前必须置停止标志");
+        assert!(
+            STOP.load(Ordering::Relaxed),
+            "设备线程返回 Err 前必须置停止标志"
+        );
         STOP.store(false, Ordering::Relaxed);
         assert!(stop_on_fatal(&STOP, Ok(())).is_ok());
         assert!(!STOP.load(Ordering::Relaxed), "正常退出不得置停止标志");
@@ -507,12 +658,8 @@ mod tests {
         // panic → guard_panic 捕获为 Err → stop_on_fatal 置停止标志。
         // 模拟 main 的包装次序：spawn + stop_on_fatal(guard_panic(body))。
         STOP.store(false, Ordering::Relaxed);
-        let handle = std::thread::spawn(|| {
-            stop_on_fatal(
-                &STOP,
-                guard_panic(|| panic!("device exploded")),
-            )
-        });
+        let handle =
+            std::thread::spawn(|| stop_on_fatal(&STOP, guard_panic(|| panic!("device exploded"))));
         // 主线程此刻可以先收尾其他线程的 Err 再 join 本线程：停止标志在线程
         // 退出时已置，不依赖 join 结果。
         let result = handle.join().expect("guard_panic 不让 panic 外逸");
@@ -525,10 +672,7 @@ mod tests {
 
         // join 侧收到 Ok(Err(panic 消息))：走既有 Err 传播链（补置幂等）。
         let handle = std::thread::spawn(|| {
-            stop_on_fatal(
-                &STOP,
-                guard_panic(|| panic!("with payload {}", 42)),
-            )
+            stop_on_fatal(&STOP, guard_panic(|| panic!("with payload {}", 42)))
         });
         let joined = join_threads(vec![("panic", handle)]);
         assert_eq!(joined, Some("panic: with payload 42".to_string()));
@@ -537,17 +681,20 @@ mod tests {
 
         // 非 panic 路径不变：正常与 Err 语义保持原样。
         assert!(guard_panic(|| Ok(())).is_ok());
-        assert_eq!(guard_panic(|| Err("fatal".to_string())), Err("fatal".to_string()));
+        assert_eq!(
+            guard_panic(|| Err("fatal".to_string())),
+            Err("fatal".to_string())
+        );
         assert!(!STOP.load(Ordering::Relaxed), "guard_panic 不改变正常路径");
 
         // 无法 downcast 的 payload（如非字符串）降级为通用消息。
         let handle = std::thread::spawn(|| {
-            stop_on_fatal(
-                &STOP,
-                guard_panic(|| std::panic::panic_any(7_i32)),
-            )
+            stop_on_fatal(&STOP, guard_panic(|| std::panic::panic_any(7_i32)))
         });
-        assert_eq!(join_threads(vec![("opaque", handle)]), Some("opaque: panicked".to_string()));
+        assert_eq!(
+            join_threads(vec![("opaque", handle)]),
+            Some("opaque: panicked".to_string())
+        );
         assert!(STOP.load(Ordering::Relaxed));
         STOP.store(false, Ordering::Relaxed);
     }
@@ -573,7 +720,7 @@ mod tests {
         let shared = Arc::new(state::test_shared("cap", "play", "startup"));
         // daemon 断言实时态：rvc AI 支路激活。
         shared.set_mode_asserted(true);
-        let capture = Arc::new(Ring::<RawFrame>::new(8));
+        let capture = Arc::new(Ring::<capture::CapturedFrame>::new(8));
         let trunk = Arc::new(Ring::<RawFrame>::new(8));
         let worker = {
             let capture = capture.clone();
@@ -587,21 +734,35 @@ mod tests {
         };
         let raw = RawFrame {
             meta: mozart_core::FrameMeta {
-                pts_ns: 0, frame_idx: 0, vad_flag: 1, energy_db: 0, conf: 0, segment_id: 0,
+                pts_ns: 0,
+                frame_idx: 0,
+                vad_flag: 1,
+                energy_db: 0,
+                conf: 0,
+                segment_id: 0,
             },
             pcm: [0.0; mozart_core::RAW_SAMPLES],
         };
         let recv_timeout = Duration::from_secs(2);
 
         // 实时态：两条支路都送达。
-        capture.push(raw);
-        assert!(rvc_rx.recv(Some(recv_timeout)).is_ok(), "实时态 rvc 支路必须送达");
-        assert!(asr_rx.recv(Some(recv_timeout)).is_ok(), "实时态 asr 支路必须送达");
+        capture::enqueue(&capture, raw, &shared);
+        assert!(
+            rvc_rx.recv(Some(recv_timeout)).is_ok(),
+            "实时态 rvc 支路必须送达"
+        );
+        assert!(
+            asr_rx.recv(Some(recv_timeout)).is_ok(),
+            "实时态 asr 支路必须送达"
+        );
 
         // 文件接管：rvc 停发，asr 恒发。asr 送达证明该帧确已被处理。
         shared.set_file_mode(true);
-        capture.push(raw);
-        assert!(asr_rx.recv(Some(recv_timeout)).is_ok(), "接管期间 asr 支路必须恒发");
+        capture::enqueue(&capture, raw, &shared);
+        assert!(
+            asr_rx.recv(Some(recv_timeout)).is_ok(),
+            "接管期间 asr 支路必须恒发"
+        );
         assert!(
             rvc_rx.recv(Some(Duration::from_millis(300))).is_err(),
             "接管期间 rvc 支路必须停发"
@@ -609,8 +770,11 @@ mod tests {
 
         // 交还：rvc 恢复发送。
         shared.set_file_mode(false);
-        capture.push(raw);
-        assert!(rvc_rx.recv(Some(recv_timeout)).is_ok(), "交还后 rvc 支路必须恢复");
+        capture::enqueue(&capture, raw, &shared);
+        assert!(
+            rvc_rx.recv(Some(recv_timeout)).is_ok(),
+            "交还后 rvc 支路必须恢复"
+        );
         assert!(asr_rx.recv(Some(recv_timeout)).is_ok());
 
         STOP.store(true, Ordering::Relaxed);
@@ -660,7 +824,7 @@ mod tests {
                 limiter: false,
             },
         ));
-        let capture = Arc::new(Ring::<RawFrame>::new(8));
+        let capture = Arc::new(Ring::<capture::CapturedFrame>::new(8));
         let trunk = Arc::new(Ring::<RawFrame>::new(8));
         let worker = {
             let capture = capture.clone();
@@ -674,15 +838,23 @@ mod tests {
         };
         let raw = RawFrame {
             meta: mozart_core::FrameMeta {
-                pts_ns: 0, frame_idx: 0, vad_flag: 1, energy_db: 0, conf: 0, segment_id: 0,
+                pts_ns: 0,
+                frame_idx: 0,
+                vad_flag: 1,
+                energy_db: 0,
+                conf: 0,
+                segment_id: 0,
             },
             pcm: [0.0; mozart_core::RAW_SAMPLES],
         };
         let recv_timeout = Duration::from_secs(2);
 
         // 未断言：gated 静默（启动门控），always 恒发。
-        capture.push(raw);
-        assert!(always_rx.recv(Some(recv_timeout)).is_ok(), "未断言时 always 支路必须恒发");
+        capture::enqueue(&capture, raw, &shared);
+        assert!(
+            always_rx.recv(Some(recv_timeout)).is_ok(),
+            "未断言时 always 支路必须恒发"
+        );
         assert!(
             gated_rx.recv(Some(Duration::from_millis(300))).is_err(),
             "未断言时 gated 支路必须静默"
@@ -690,21 +862,30 @@ mod tests {
 
         // 断言实时态：两支路都送达。
         shared.set_mode_asserted(true);
-        capture.push(raw);
-        assert!(gated_rx.recv(Some(recv_timeout)).is_ok(), "断言后 gated 支路必须送达");
+        capture::enqueue(&capture, raw, &shared);
+        assert!(
+            gated_rx.recv(Some(recv_timeout)).is_ok(),
+            "断言后 gated 支路必须送达"
+        );
         assert!(always_rx.recv(Some(recv_timeout)).is_ok());
 
         // 文件接管：gated 停发，always 恒发；交还后恢复。
         shared.set_file_mode(true);
-        capture.push(raw);
-        assert!(always_rx.recv(Some(recv_timeout)).is_ok(), "接管期间 always 支路必须恒发");
+        capture::enqueue(&capture, raw, &shared);
+        assert!(
+            always_rx.recv(Some(recv_timeout)).is_ok(),
+            "接管期间 always 支路必须恒发"
+        );
         assert!(
             gated_rx.recv(Some(Duration::from_millis(300))).is_err(),
             "接管期间 gated 支路必须停发"
         );
         shared.set_file_mode(false);
-        capture.push(raw);
-        assert!(gated_rx.recv(Some(recv_timeout)).is_ok(), "交还后 gated 支路必须恢复");
+        capture::enqueue(&capture, raw, &shared);
+        assert!(
+            gated_rx.recv(Some(recv_timeout)).is_ok(),
+            "交还后 gated 支路必须恢复"
+        );
         assert!(always_rx.recv(Some(recv_timeout)).is_ok());
 
         STOP.store(true, Ordering::Relaxed);

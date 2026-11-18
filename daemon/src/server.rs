@@ -12,9 +12,9 @@ use mozart_core::config::{
     state_file_path, Config,
 };
 use mozart_core::ctl::schema::{
-    self, ConfigGetRequest, ConfigSetRequest, DeviceListRequest, FileCancelRequest, FileFetchRequest,
-    FileStatusRequest, FileSubmitRequest, MuteSetRequest, RestartRequest, RouteSetRequest,
-    RvcParams, SwitchSetRequest,
+    self, ConfigGetRequest, ConfigSetRequest, DeviceListRequest, FileCancelRequest,
+    FileFetchRequest, FileStatusRequest, FileSubmitRequest, MuteSetRequest, RestartRequest,
+    RouteSetRequest, RvcParams, SwitchSetRequest,
 };
 use mozart_core::ctl::{self, Message, Seqpacket};
 use serde_json::json;
@@ -96,6 +96,7 @@ pub fn serve(config: &Config, config_path: Option<&Path>) -> io::Result<()> {
         }
     });
     let supervisors = [
+        Role::Enhance,
         Role::Pre,
         Role::Rvc,
         Role::Asr,
@@ -261,7 +262,10 @@ fn handle_request(ctx: &Ctx, msg: &Message) -> (Vec<u8>, bool) {
             });
             match serde_json::to_value(status) {
                 Ok(status) => (schema::ok_body(status), false),
-                Err(err) => (schema::error_body(ctl::CODE_INTERNAL, &err.to_string()), false),
+                Err(err) => (
+                    schema::error_body(ctl::CODE_INTERNAL, &err.to_string()),
+                    false,
+                ),
             }
         }
         ctl::DAEMON_ROUTE_SET => match parse_body::<RouteSetRequest>(&msg.body) {
@@ -334,9 +338,9 @@ fn handle_request(ctx: &Ctx, msg: &Message) -> (Vec<u8>, bool) {
             Err(reply) => (reply, false),
         },
         ctl::DAEMON_FILE_LIST => file_reply(ctx.file.list()),
-        ctl::DAEMON_MODEL_LIST => file_reply(
-            services::list_models(&ctx.services).map(|models| json!({"models": models})),
-        ),
+        ctl::DAEMON_MODEL_LIST => {
+            file_reply(services::list_models(&ctx.services).map(|models| json!({"models": models})))
+        }
         ctl::DAEMON_MODEL_USE => match parse_body::<schema::ModelUseRequest>(&msg.body) {
             Ok(request) => (model_use_reply(ctx, &request.model_id), false),
             Err(reply) => (reply, false),
@@ -361,7 +365,10 @@ fn handle_request(ctx: &Ctx, msg: &Message) -> (Vec<u8>, bool) {
                     let data = json!({"value": value, "pending_restart_keys": pending});
                     (schema::ok_body(data), false)
                 }
-                Err(err) => (schema::error_body(ctl::CODE_INVALID_ARGUMENT, &err.to_string()), false),
+                Err(err) => (
+                    schema::error_body(ctl::CODE_INVALID_ARGUMENT, &err.to_string()),
+                    false,
+                ),
             },
             Err(reply) => (reply, false),
         },
@@ -387,6 +394,11 @@ fn record_switch(ctx: &Ctx, key: &str, enabled: bool) {
 /// 单服务重启（SPEC-04 重启两粒度）：入口重读 TOML，失败拒绝、不动运行进程；
 /// 成功则交监管线程停子进程后以新配置重起，整栈不受影响。重启受理即清待重启标记。
 fn restart_service(ctx: &Ctx, service: &str) -> Vec<u8> {
+    let _transition = ctx.services.transition();
+    let _toml = ctx
+        .toml_lock
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
     let Some(role) = Role::from_name(service) else {
         return schema::error_body(
             ctl::CODE_INVALID_ARGUMENT,
@@ -397,19 +409,33 @@ fn restart_service(ctx: &Ctx, service: &str) -> Vec<u8> {
         Ok(config) => config,
         Err(err) => return schema::error_body(ctl::CODE_INVALID_ARGUMENT, &err.to_string()),
     };
-    let handle = ctx
-        .restarts
-        .iter()
-        .find(|handle| handle.role() == role)
-        .expect("serve 为每个 Role 建了重启句柄");
-    match handle.restart(Arc::new(config)) {
-        Ok(()) => {
-            lock_state(&ctx.state).clear_pending_restart(service);
-            schema::ok_body(json!({"service": service, "state": "restarting"}))
-        }
-        // 发送失败仅当监管线程已退出：daemon 正在关停。
-        Err(_) => schema::error_body(ctl::CODE_BUSY, "daemon is shutting down"),
+    let active = ctx.config.snapshot();
+    if matches!(role, Role::Pre | Role::Enhance)
+        && config.enhance.is_some() != active.enhance.is_some()
+    {
+        return schema::error_body(
+            ctl::CODE_INVALID_ARGUMENT,
+            "changing the denoise backend requires restarting daemon",
+        );
     }
+    let coupled = matches!(role, Role::Pre | Role::Enhance) && config.enhance.is_some();
+    let config = Arc::new(config);
+    for handle in ctx.restarts.iter().filter(|handle| {
+        handle.role() == role || (coupled && matches!(handle.role(), Role::Pre | Role::Enhance))
+    }) {
+        if handle.restart(config.clone()).is_err() {
+            return schema::error_body(ctl::CODE_BUSY, "daemon is shutting down");
+        }
+        lock_state(&ctx.state).clear_pending_restart(handle.role().name());
+    }
+    if coupled {
+        ctx.services.refresh_enhance(&config);
+        let mut live = (*active).clone();
+        live.enhance = config.enhance.clone();
+        live.process.enhance_bin = config.process.enhance_bin.clone();
+        ctx.config.replace(live);
+    }
+    schema::ok_body(json!({"service": service, "state": "restarting"}))
 }
 
 /// 请求体解析：失败即 InvalidArgument 应答。
@@ -462,7 +488,10 @@ fn config_set_reply(ctx: &Ctx, request: &ConfigSetRequest) -> Vec<u8> {
     // 锁顺序 transition → toml：预设载入在持 transition 时也要写 TOML 基线，
     // 反向加锁会与预设路径互等。非 rvc 键也持 transition，代价是短暂延后轮询。
     let _transition = ctx.services.transition();
-    let _toml = ctx.toml_lock.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+    let _toml = ctx
+        .toml_lock
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
     // 写键前的生效配置：rvc 会话参数判断变化与失败回退都以它为旧值。
     let old = ctx.config.snapshot();
     match set_key(ctx.config_path.as_deref(), &request.key, &request.value) {
@@ -490,13 +519,8 @@ fn config_set_reply(ctx: &Ctx, request: &ConfigSetRequest) -> Vec<u8> {
 fn model_use_reply(ctx: &Ctx, model_id: &str) -> Vec<u8> {
     let _transition = ctx.services.transition();
     let old = ctx.config.snapshot();
-    match services::switch_rvc_model_locked(
-        &ctx.state,
-        &ctx.services,
-        &ctx.presets,
-        &old,
-        model_id,
-    ) {
+    match services::switch_rvc_model_locked(&ctx.state, &ctx.services, &ctx.presets, &old, model_id)
+    {
         Ok(previous) => schema::ok_body(json!({
             "model_id": model_id,
             "previous_model_id": previous,
@@ -519,6 +543,29 @@ fn apply_runtime_key(ctx: &Ctx, key: &str, old: &Config) -> Result<(), (String, 
         .map_err(|err| (ctl::CODE_INTERNAL.to_string(), err.to_string()))?;
     let overrides = lock_state_file(&ctx.state_file).overrides().clone();
     state_file::overlay(&mut fresh, &overrides);
+    // Restart-only enhancement settings must not leak through an unrelated runtime write.
+    fresh.enhance = old.enhance.clone();
+    fresh.process.enhance_bin = old.process.enhance_bin.clone();
+    let requested_dsp = fresh.pre.dsp.clone();
+    fresh.pre.dsp = old.pre.dsp.clone();
+    if runtime_key_owner(key) == Some("pre") {
+        match key {
+            "pre.dsp.denoise" => fresh.pre.dsp.denoise = requested_dsp.denoise,
+            "pre.dsp.gate" => fresh.pre.dsp.gate = requested_dsp.gate,
+            "pre.dsp.agc" => fresh.pre.dsp.agc = requested_dsp.agc,
+            "pre.dsp.limiter" => fresh.pre.dsp.limiter = requested_dsp.limiter,
+            _ => {
+                return Err((
+                    ctl::CODE_INTERNAL.to_string(),
+                    format!("no DSP orchestration for {key}"),
+                ))
+            }
+        }
+        ctx.services.set_dsp(&fresh.pre.dsp).map_err(|(code, reason)| (
+            code,
+            format!("pre SetDsp: {reason}; effective DSP unchanged; TOML baseline kept; retry config set for the same key or restart daemon to apply"),
+        ))?;
+    }
     if runtime_key_owner(key) == Some("rvc") {
         // 未生效的 rvc 基线（如失败恢复留下的 pitch）不得混入生效配置，
         // 否则 status 与在跑流不一致。merge_session_key 从旧生效配置克隆、
@@ -549,7 +596,10 @@ fn apply_runtime_key(ctx: &Ctx, key: &str, old: &Config) -> Result<(), (String, 
 /// config save（SPEC-04）：状态文件覆盖批量写进 TOML 基线，随后清空状态文件。
 /// 不改生效值（覆盖本已生效），无需重启。写 TOML 失败则保留状态文件。
 fn config_save_reply(ctx: &Ctx) -> Vec<u8> {
-    let _toml = ctx.toml_lock.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+    let _toml = ctx
+        .toml_lock
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
     let mut state_file = lock_state_file(&ctx.state_file);
     let overrides = state_file.overrides().clone();
     match save_overrides(ctx.config_path.as_deref(), &overrides) {

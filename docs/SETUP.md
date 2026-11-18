@@ -57,6 +57,14 @@
 - `~/mozart-assets` 只读；例外是各 RVC 模型目录内的 `presets/`，由 daemon 写入模型预设（SPEC-11）。其余测试只写 `/tmp/mozart-*` 与 `~/mozart-runtime/{run,state,out}`。
 - 历史实验目录只放 `~/mozart-archive/legacy/`；旧报告中的路径视为历史记录。
 
+## 隔离开发例外
+
+用户指定的 `~/MozartMryia/` 用于 UL-UNAS 分支验证，不作为正式部署入口。
+源码与构建位于该目录；`runtime/` 存放独立配置、程序、socket、状态与输出。
+测试进程统一设置 `MOZART_STATE_DIR=~/MozartMryia/runtime/state/daemon`，不读取或修改正式用户级状态文件。
+模型配置只读指向板端既有资产路径；同步时排除模型、engine、音频及原部署构建缓存，不复制模型。
+测试不覆盖 `~/Mozart` 或 `~/mozart-runtime`。运行前确认没有其他测试；构建前暂停本实例，独占设备时先确认正式栈状态并在结束后恢复。
+
 ## 工作流
 
 本机执行，三条命令职责分开：
@@ -95,7 +103,7 @@ MOZART_JETSON=<SSH目标> tools/jetson-e2e.sh
 3. 构建 Rust 全部二进制与示例；构建 `jetson-release` C++ 产物；rvc 对齐到 `target/debug`。增量时 cargo/ninja 只重编受影响部分。
 4. 安装前比对构建产物与运行位，按字节差异决定重启范围。
 5. 备份 `~/mozart-runtime/bin` 到 `bin.prev`；安装 7 个程序与 `examples/rvc_stub`。安装用临时文件加原子替换，不打断运行中的进程。
-6. 默认：不停机，`mozart-ctl restart` 只重启二进制变化的服务；健康检查只等待原本 running 的服务恢复，`pre` 另需控制面就绪。daemon 变化、运行时未运行或 `--full`：停止运行时并确认无残留进程，安装后用 `mozart.toml` 整栈启动，等待 `pre` 与 rvc 健康。
+6. 默认：不停机，`mozart-ctl restart` 只重启二进制变化的服务；健康检查只等待原本 running 的服务恢复，`pre` 另需控制面就绪。daemon 或增强二进制变化、运行时未运行或 `--full`：停止运行时并确认无残留进程，安装后用 `mozart.toml` 整栈启动，等待 `pre` 与 rvc 健康。
 7. 写 `~/mozart-runtime/deploy.json`。
 
 失败恢复分两段：

@@ -6,6 +6,7 @@
 //! 门控再延迟应答，模拟「命令已生效而应答丢失/超时」（daemon rpc_timeout_ms
 //! 小于该延迟）；缺省 0 不延迟，同 rvc 桩 delay/hang 旋钮性质。
 
+#[allow(dead_code)]
 mod stub_common;
 
 use mozart_core::config::Config;
@@ -17,7 +18,40 @@ use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
-use stub_common::{body, expect_known, fail, ok, parse_args, serve};
+use stub_common::{body, expect_known, fail, ok, serve, StubArgs};
+
+fn parse_pre_args() -> (
+    StubArgs,
+    Option<Option<mozart_core::config::EnhanceConfig>>,
+    Option<mozart_core::config::PreDspConfig>,
+) {
+    let mut args = StubArgs {
+        name: "mozart-pre-stub",
+        socket: PathBuf::new(),
+        config: None,
+        exit_after: None,
+        reply_delay: Duration::ZERO,
+    };
+    let mut effective = None;
+    let mut dsp = None;
+    let mut input = std::env::args().skip(1);
+    while let Some(flag) = input.next() {
+        let value = input.next().expect("missing argument value");
+        match flag.as_str() {
+            "--socket" => args.socket = value.into(),
+            "--config" => args.config = Some(value.into()),
+            "--exit-after-ms" => {
+                args.exit_after = Some(Duration::from_millis(value.parse().unwrap()))
+            }
+            "--delay-ms" => args.reply_delay = Duration::from_millis(value.parse().unwrap()),
+            "--effective-enhance" => effective = Some(serde_json::from_str(&value).unwrap()),
+            "--effective-dsp" => dsp = Some(serde_json::from_str(&value).unwrap()),
+            _ => panic!("unknown argument: {flag}"),
+        }
+    }
+    assert!(!args.socket.as_os_str().is_empty(), "--socket is required");
+    (args, effective, dsp)
+}
 
 struct State {
     route: &'static str,
@@ -28,10 +62,20 @@ struct State {
     mode_asserted: Arc<AtomicBool>,
     startup_id: String,
     file_mode_delay: Duration,
+    dsp: mozart_core::config::PreDspConfig,
 }
 
 fn main() {
-    let args = parse_args("mozart-pre-stub");
+    let (args, effective, dsp) = parse_pre_args();
+    let mut config = Config::load_from(args.config.as_deref()).expect("pre stub config");
+    if let Some(effective) = effective {
+        config
+            .apply_effective_enhance(effective)
+            .expect("effective enhancement");
+    }
+    if let Some(dsp) = dsp {
+        config.pre.dsp = dsp;
+    }
     let file_mode = Arc::new(AtomicBool::new(false));
     let mode_asserted = Arc::new(AtomicBool::new(false));
     let startup_id = format!("stub-{}", std::process::id());
@@ -41,10 +85,6 @@ fn main() {
         .map(Duration::from_millis)
         .unwrap_or(Duration::ZERO);
     if std::env::var("MOZART_PRE_STUB_FLOOD").is_ok_and(|value| value == "1") {
-        let config = Config::load_from(args.config.as_deref()).unwrap_or_else(|err| {
-            eprintln!("mozart-pre-stub: config: {err}");
-            std::process::exit(1);
-        });
         let path = config.rvc_input_socket();
         let gate = file_mode.clone();
         let asserted = mode_asserted.clone();
@@ -57,7 +97,9 @@ fn main() {
         mode_asserted,
         startup_id,
         file_mode_delay,
+        dsp: config.pre.dsp,
     };
+    record_dsp(&state.dsp);
     serve(args, move |msg| handle(msg, &mut state));
 }
 
@@ -95,6 +137,14 @@ fn flood(path: PathBuf, gate: Arc<AtomicBool>, asserted: Arc<AtomicBool>) {
     }
 }
 
+fn record_dsp(dsp: &mozart_core::config::PreDspConfig) {
+    if let Ok(path) = std::env::var("MOZART_PRE_STUB_DSP_STATE_FILE") {
+        let temp = format!("{path}.tmp");
+        std::fs::write(&temp, serde_json::to_vec(dsp).unwrap()).unwrap();
+        std::fs::rename(temp, path).unwrap();
+    }
+}
+
 fn handle(msg: &Message, state: &mut State) -> Vec<u8> {
     let known = [
         ctl::PRE_HELLO,
@@ -103,6 +153,7 @@ fn handle(msg: &Message, state: &mut State) -> Vec<u8> {
         ctl::PRE_GET_STATUS,
         ctl::PRE_SPEECH_STOP,
         ctl::PRE_SET_FILE_MODE,
+        ctl::PRE_SET_DSP,
     ];
     if let Err(reply) = expect_known(msg, &known) {
         return reply;
@@ -127,6 +178,26 @@ fn handle(msg: &Message, state: &mut State) -> Vec<u8> {
                 }
             }
             ok(json!({"route": state.route}))
+        }
+        ctl::PRE_SET_DSP => {
+            if std::env::var("MOZART_PRE_STUB_DSP_REJECT_FILE")
+                .is_ok_and(|path| std::path::Path::new(&path).exists())
+            {
+                return fail(ctl::CODE_INVALID_ARGUMENT, "DSP rejected by stub");
+            }
+            let request: mozart_core::ctl::schema::DspSetRequest =
+                match serde_json::from_value(body.clone()) {
+                    Ok(request) => request,
+                    Err(err) => return fail(ctl::CODE_INVALID_ARGUMENT, &err.to_string()),
+                };
+            state.dsp = mozart_core::config::PreDspConfig {
+                denoise: request.denoise,
+                gate: request.gate,
+                agc: request.agc,
+                limiter: request.limiter,
+            };
+            record_dsp(&state.dsp);
+            ok(serde_json::to_value(&state.dsp).unwrap())
         }
         ctl::PRE_SET_MUTE => {
             let Some(mute) = body.get("mute").and_then(|value| value.as_bool()) else {
@@ -153,6 +224,12 @@ fn handle(msg: &Message, state: &mut State) -> Vec<u8> {
         ctl::PRE_SPEECH_STOP => ok(json!({"stopped": true, "frames_cleared": 0})),
         ctl::PRE_GET_STATUS => ok(json!({
             "state": "ok",
+            "dsp": state.dsp,
+            "enhancement": std::env::var("MOZART_PRE_STUB_ENHANCEMENT_FILE").ok().map(|path| {
+                serde_json::from_slice::<mozart_core::ctl::schema::PreEnhanceStatus>(
+                    &std::fs::read(path).unwrap()
+                ).unwrap()
+            }),
             "route": state.route,
             "mute": state.mute,
             "capture_device": "",

@@ -43,6 +43,38 @@ fn energy_to_db(rms: f32) -> u8 {
     v.clamp(0.0, 255.0) as u8
 }
 
+/// 契约帧分析器：增强与旁路共用能量型 VAD，时间轴原样保留。
+pub struct InputFrameAnalyzer {
+    vad: Vad,
+}
+
+impl Default for InputFrameAnalyzer {
+    fn default() -> Self {
+        Self { vad: Vad::new() }
+    }
+}
+
+impl InputFrameAnalyzer {
+    pub fn reset(&mut self) {
+        *self = Self::default();
+    }
+
+    pub fn analyze(&mut self, frame: &mut InputFrame) {
+        let pcm = frame.pcm;
+        let power: f32 = pcm.iter().map(|sample| sample * sample).sum();
+        let rms = (power / INPUT_SAMPLES as f32).sqrt();
+        let (vad_flag, segment_id) = self.vad.update_activity(audible(rms));
+        frame.meta.energy_db = energy_to_db(rms);
+        frame.meta.vad_flag = vad_flag;
+        frame.meta.segment_id = segment_id;
+        frame.meta.conf = 0;
+    }
+}
+
+fn audible(rms: f32) -> bool {
+    20.0 * (rms + 1e-12).log10() > -60.0
+}
+
 pub struct Dsp {
     denoise: bool,
     hp: Highpass80,
@@ -130,7 +162,10 @@ impl Dsp {
         let trunk_pcm = trunk.pcm;
         self.decimator.process(&trunk_pcm, &mut self.dec);
         for sample in self.dec.iter_mut() {
-            *sample = sample.clamp(-1.0, 1.0);
+            *sample = sample.clamp(
+                -mozart_core::INPUT_PCM_ABS_MAX,
+                mozart_core::INPUT_PCM_ABS_MAX,
+            );
         }
 
         // 能量取降采样并钳位后的契约帧（旧 dsp.c L162-165）。
@@ -146,7 +181,7 @@ impl Dsp {
             trunk_power += sample * sample;
         }
         let trunk_rms = (trunk_power / RAW_SAMPLES as f32).sqrt();
-        let audible = 20.0 * (trunk_rms + 1e-12).log10() > -60.0;
+        let audible = audible(trunk_rms);
 
         let (vad_flag, segment_id) = self.vad.update(conf, audible);
         self.frame_idx = self.frame_idx.wrapping_add(1);

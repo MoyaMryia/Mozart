@@ -41,6 +41,32 @@
 - [x] 换设备不做在线命令，由 daemon 重启 pre 代替。设备枚举归 daemon（SPEC-04），pre 只打开配置的设备、打开失败报错。（`pre/src/main.rs:243,271`）
 - [x] DSP 开关经 `SetDsp` 运行时生效；denoise 重新启用时重置 WOLA 流式状态（噪声估计、频谱队列、增益回到初始，重新攒初始化帧，首块同启动的 64 样本补零），避免陈旧状态伪影；gate/agc/limiter 直接切布尔。（`dsp/src/lib.rs` Dsp::set_switches、`dsp/src/noise_suppressor.rs` NoiseSuppressor::reset）
 
+## UL-UNAS 可选后端
+
+- [x] 新增 `enhance/` C++ 工作进程，以 ONNX Runtime CPU、单线程运行作者预训练权重；禁止随包复制模型，不依赖 PyTorch。
+- [x] 可选 `[enhance]` 配置选定后端；默认不配置，沿用 WOLA。`pre.dsp.denoise` 控制选定后端，UL-UNAS 不与旧 WOLA 叠加。禁用时直接旁路且不调用网络，重新启用或帧不连续时重置会话。
+- [x] 48 kHz 直通保留高通及 gate／AGC／limiter，UL-UNAS 仅处理 FIR 后的共享 16 kHz 输入。普通工作线程通过有界队列调用，采集／播放不等待推理。
+- [x] 增强进程由 daemon 启停、退避重启并轮询状态；控制命令 Hello=0x0701、GetStatus=0x0702，使用既有 JSON 信封。pre 不生成子进程。
+- [x] 音频通过独立 Unix SEQPACKET 会话传输：请求为输入 magic 加 InputFrame；应答为增强 magic、ready 和 InputFrame。首两次 ready=0，此后每请求输出对应两帧前的 320 样本；元数据保留源 frame_idx／pts_ns，不伪造新采集时刻。契约以 core C 头为准。
+- [x] 模型使用 512 点周期 Hann、256 点步进和连续缓存。首部反射，固定积攒两帧后输出；结束排空并保留全部样本。算法积攒 640 个 16 kHz 样本，不当作 ADC／DAC 延迟。真实权重对拍固定排除末尾 512 个采样点（离线参考反射边界、流式结束零排空），其余区间误差 SNR ≥ 60 dB；全部首尾另经恒等模型逐样本重建验证。
+- [x] 重新计算增强后能量与能量型 VAD，不将模型谱增益冒充语音概率；复用 DSP 的滞回。文件接管的 RVC 门控同时检查源帧采集时和发送时状态，ASR 不受影响。
+- [x] 队列溢出、超时、断连、坏应答必须计数并暴露原因；失败不静默回退未增强音频，不重送未知结果。丢帧后重建会话，避免旧缓存跨缺口。
+- [x] 单测覆盖 STFT 恒等、跨 20 ms／16 ms 重打包、首尾、时间戳、切换、重连、背压、文件接管和旧后端回归；板端使用 `~/MozartMryia` 独立源码／运行目录验证真实模型、状态与 RVC／ASR 分发。
+
+### 接入审查修正
+
+- [x] 预设提交保留生效 DSP 开关，不吸收此前下发失败的新基线；严格校验 `PRE_SET_DSP` 成功应答回显四键。
+
+- [x] 接通 daemon 的 `config set pre.dsp.*` 到 `PRE_SET_DSP`；成功才替换生效配置。自动重启通过 `--effective-dsp` 保留上次成功开关，失败的新基线不得混入恢复。（`daemon/tests/dsp.rs`）
+
+- [x] 自动重启使用生效的增强配置，不吸收 TOML 中仍待重启的后端或 socket。
+- [x] 文件接管应答等待 RVC 在途发送归零，使用发送许可与代次隔离，禁止旧帧跨接管恢复回灌。
+- [x] daemon 汇总增强数据面降级；主动关闭不报故障，真实成功帧后清除当前故障，保留丢弃计数。
+- [x] 控制连接按统一空闲时限回收；离线输出拒绝与模型同 inode；仅按生产两帧排空规则验证短文件与尾样本。
+
+
+实现、板端功能证据与整机验收边界见[接入报告](../../reports/ulunas-integration-20261117/RESULTS.md)。
+
 ## 改进点
 
 - [x] 禁用降噪时跳过全部计算。（`dsp/src/lib.rs:88-93`）

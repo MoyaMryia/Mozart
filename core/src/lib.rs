@@ -14,6 +14,7 @@ pub const OUTPUT_SAMPLE_RATE: u32 = 48000;
 pub const FRAME_MS: u32 = 20;
 pub const RAW_SAMPLES: usize = 960;
 pub const INPUT_SAMPLES: usize = 320;
+pub const INPUT_PCM_ABS_MAX: f32 = 1.0;
 pub const OUTPUT_SAMPLES: usize = 960;
 pub const CHANNELS: usize = 1;
 
@@ -67,6 +68,29 @@ impl OutputFrame {
         Self::new(meta, OUTPUT_SAMPLE_RATE, OUTPUT_SAMPLES as u32, pcm)
     }
 }
+
+pub const ENHANCE_PACKET_MAGIC: u32 = 0x534E_5A4D;
+pub const ENHANCE_PRIMING_FRAMES: usize = 2;
+
+#[repr(C, packed)]
+#[derive(Clone, Copy)]
+pub struct EnhanceRequest {
+    pub magic: u32,
+    pub frame: InputFrame,
+}
+
+#[repr(C, packed)]
+#[derive(Clone, Copy)]
+pub struct EnhanceReply {
+    pub magic: u32,
+    pub ready: u32,
+    pub frame: InputFrame,
+}
+
+const _: () = assert!(std::mem::size_of::<EnhanceRequest>() == 1300);
+const _: () = assert!(std::mem::size_of::<EnhanceReply>() == 1304);
+const _: () = assert!(std::mem::offset_of!(EnhanceRequest, frame) == 4);
+const _: () = assert!(std::mem::offset_of!(EnhanceReply, frame) == 8);
 
 /// 48 kHz 原始采集帧（进程内使用，不跨进程边界），对应 frame.h 的 `mozart_raw_frame_t`。
 #[repr(C, packed)]
