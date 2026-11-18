@@ -37,9 +37,9 @@ pub fn run(
     while !stop.load(Relaxed) {
         match socket.recv(Some(RECV_POLL)) {
             Ok(frame) => {
-                ring.push(Inbox::Frame(frame));
                 shared.add_received(1);
                 shared.set_last_packet_unix_ms(unix_ms());
+                ring.push(Inbox::Frame(frame));
                 last_packet = Instant::now();
                 idle_cut_sent = false;
             }
