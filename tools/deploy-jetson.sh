@@ -240,6 +240,7 @@ echo '== 3/5 cmake jetson-release =='
 cmake --preset jetson-release -DFETCHCONTENT_UPDATES_DISCONNECTED=ON
 cmake --build --preset jetson-release --parallel 2
 cp -f build/jetson-release/rvc/mozart-rvc target/debug/
+cp -f build/jetson-release/enhance/mozart-enhance target/debug/
 REMOTE
 
 # 4 安装与重启。
@@ -257,10 +258,24 @@ STATUS_JSON=/tmp/mozart-deploy-status.json
 [ -d "$RUNTIME_DIR" ] || { echo "运行时目录不存在：$RUNTIME_DIR" >&2; exit 1; }
 [ -f "$CFG" ] || { echo "缺配置文件：$CFG" >&2; exit 1; }
 
-for b in ctl daemon pre rvc asr tts bridge; do
+for b in ctl daemon pre enhance rvc asr tts bridge; do
   [ -x "target/debug/mozart-$b" ] || { echo "缺构建产物：target/debug/mozart-$b" >&2; exit 1; }
 done
 [ -x target/debug/examples/rvc_stub ] || { echo '缺构建产物：target/debug/examples/rvc_stub' >&2; exit 1; }
+
+neural_ready() {
+  python3 - "$1" <<'PY'
+import json, sys
+d = json.load(open(sys.argv[1]))
+p = d.get("pre") or {}
+if p.get("denoise_backend") != "ulunas":
+    sys.exit(0)
+n = p.get("enhancement") or {}
+e = d.get("enhance") or {}
+ok = e.get("backend") == "ulunas" and (not n.get("enabled", True) or (n.get("connected", False) and n.get("last_error") is None))
+sys.exit(0 if ok else 1)
+PY
+}
 
 recover() {
   set +e
@@ -300,6 +315,9 @@ if [ "$FULL" = 1 ] || [ "$RUNNING" -eq 0 ]; then
   FULL_RESTART=1
 elif ! cmp -s target/debug/mozart-daemon "$RUNTIME_DIR/bin/mozart-daemon"; then
   FULL_RESTART=1
+elif ! cmp -s target/debug/mozart-enhance "$RUNTIME_DIR/bin/mozart-enhance"; then
+  # 增强与 pre 共享会话状态；更新该程序时重建整栈，不单边接入旧会话。
+  FULL_RESTART=1
 fi
 
 CHANGED=""
@@ -332,13 +350,13 @@ else
       echo '当前无 mozart-ctl，跳过停机（首次部署）'
     fi
     for _ in $(seq 1 30); do
-      pgrep -f 'mozart-(daemon|pre|rvc|asr|tts|bridge)' >/dev/null || break
+      pgrep -f 'mozart-(daemon|pre|enhance|rvc|asr|tts|bridge)' >/dev/null || break
       sleep 0.3
     done
-    if pgrep -f 'mozart-(daemon|pre|rvc|asr|tts|bridge)' >/dev/null; then
+    if pgrep -f 'mozart-(daemon|pre|enhance|rvc|asr|tts|bridge)' >/dev/null; then
       rm -f "$RUNTIME_DIR/.stopped"
       echo '仍有 mozart 进程残留，停止部署：' >&2
-      pgrep -af 'mozart-(daemon|pre|rvc|asr|tts|bridge)' >&2 || true
+      pgrep -af 'mozart-(daemon|pre|enhance|rvc|asr|tts|bridge)' >&2 || true
       exit 1
     fi
   else
@@ -377,7 +395,7 @@ else
     echo '-- 安装二进制（不中断运行，替换后按服务重启生效）--'
   fi
   mkdir -p "$RUNTIME_DIR/bin/examples"
-  for b in ctl daemon pre rvc asr tts bridge; do
+  for b in ctl daemon pre enhance rvc asr tts bridge; do
     install_bin "target/debug/mozart-$b" "$RUNTIME_DIR/bin/mozart-$b" \
       || fail_install "安装失败：mozart-$b"
   done
@@ -389,7 +407,7 @@ else
     "$CTL" --config "$CFG" up || fail_install '运行时启动失败'
     health=0
     for i in $(seq 1 90); do
-      if "$CTL" --config "$CFG" status --json > "$STATUS_JSON" 2>/dev/null; then
+      if "$CTL" --config "$CFG" status --json > "$STATUS_JSON" 2>/dev/null && neural_ready "$STATUS_JSON"; then
         if python3 - "$STATUS_JSON" <<'PY'
 import json, sys
 d = json.load(open(sys.argv[1]))
@@ -433,7 +451,7 @@ PY
       RESTARTED="$CHANGED"
       health=0
       for i in $(seq 1 90); do
-        if "$CTL" --config "$CFG" status --json > "$STATUS_JSON" 2>/dev/null; then
+        if "$CTL" --config "$CFG" status --json > "$STATUS_JSON" 2>/dev/null && neural_ready "$STATUS_JSON"; then
           if python3 - "$STATUS_JSON" $WATCH <<'PY'
 import json, sys
 d = json.load(open(sys.argv[1]))

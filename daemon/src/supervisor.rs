@@ -95,7 +95,17 @@ fn supervise(
         let base = Duration::from_millis(tuning.daemon.restart_backoff_ms);
         let max = Duration::from_millis(tuning.daemon.restart_backoff_max_ms);
         let stable = Duration::from_millis(tuning.daemon.restart_stable_ms);
+        if role == Role::Enhance && config.enhance.is_none() {
+            lock_state(state).process_stopped(role);
+            match backoff_wait(POLL, running, restart_rx) {
+                Backoff::Stopped => break,
+                Backoff::Restart(new) => config = new,
+                Backoff::Elapsed => {}
+            }
+            continue;
+        }
         let bin = match role {
+            Role::Enhance => &config.process.enhance_bin,
             Role::Pre => &config.process.pre_bin,
             Role::Rvc => &config.process.rvc_bin,
             Role::Asr => &config.process.asr_bin,
@@ -104,6 +114,7 @@ fn supervise(
             Role::Llama => &config.process.llama_bin,
         };
         let socket = match role {
+            Role::Enhance => config.enhance_socket(),
             Role::Pre => config.pre_socket(),
             Role::Rvc => config.rvc_socket(),
             Role::Asr => config.asr_socket(),
@@ -114,21 +125,22 @@ fn supervise(
         let log_path = config.log_dir().join(format!("{}.log", role.name()));
 
         lock_state(state).process_starting(role);
-        let mut child = match start_child(role, bin, &socket, &config, config_path, &log_path) {
-            Ok(child) => child,
-            Err(err) => {
-                lock_state(state).process_failed(role, format!("spawn: {err}"));
-                match backoff_wait(backoff, running, restart_rx) {
-                    Backoff::Stopped => break,
-                    Backoff::Restart(new) => {
-                        config = new;
-                        backoff = base;
+        let mut child =
+            match start_child(role, bin, &socket, &config, &shared, config_path, &log_path) {
+                Ok(child) => child,
+                Err(err) => {
+                    lock_state(state).process_failed(role, format!("spawn: {err}"));
+                    match backoff_wait(backoff, running, restart_rx) {
+                        Backoff::Stopped => break,
+                        Backoff::Restart(new) => {
+                            config = new;
+                            backoff = base;
+                        }
+                        Backoff::Elapsed => backoff = next_backoff(backoff, max),
                     }
-                    Backoff::Elapsed => backoff = next_backoff(backoff, max),
+                    continue;
                 }
-                continue;
-            }
-        };
+            };
 
         let pid = child.id();
         let started = Instant::now();
@@ -226,10 +238,14 @@ fn start_child(
     bin: &Path,
     socket: &Path,
     config: &Config,
+    shared: &SharedConfig,
     config_path: Option<&Path>,
     log_path: &Path,
 ) -> io::Result<Child> {
-    let log = OpenOptions::new().create(true).append(true).open(log_path)?;
+    let log = OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(log_path)?;
     let stderr = log.try_clone()?;
     let mut command = Command::new(resolve_bin(bin));
     if role == Role::Llama {
@@ -260,8 +276,27 @@ fn start_child(
             .arg("--host")
             .arg(socket)
             .arg("--jinja");
+    } else if role == Role::Enhance {
+        let enhance = config
+            .enhance
+            .as_ref()
+            .expect("enhance configured before spawn");
+        command
+            .arg("--socket")
+            .arg(socket)
+            .arg("--audio-socket")
+            .arg(config.enhance_audio_socket())
+            .arg("--model")
+            .arg(&enhance.model);
     } else {
         command.arg("--socket").arg(socket);
+        if role == Role::Pre {
+            command
+                .arg("--effective-enhance")
+                .arg(serde_json::to_string(&config.enhance).map_err(io::Error::other)?)
+                .arg("--effective-dsp")
+                .arg(serde_json::to_string(&shared.snapshot().pre.dsp).map_err(io::Error::other)?);
+        }
         // SPEC-04：子进程与 daemon 读同一 TOML，各读自己的配置段；daemon 以内置
         // 默认启动时无文件可传，不传 --config，子进程按同一顺序解析得同一默认值。
         if let Some(config_path) = config_path {

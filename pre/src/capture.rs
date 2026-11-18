@@ -22,6 +22,32 @@ pub fn now_ns() -> u64 {
 /// S16 → f32 归一化除数；设备采集与文件采集源共用。
 pub const S16_NORM: f32 = 32768.0;
 
+/// 在采集边界保存门控与增强 epoch，不让排队跨越接管或开关。
+#[derive(Clone, Copy)]
+pub struct CapturedFrame {
+    pub frame: RawFrame,
+    pub rvc_ai_active: bool,
+    pub file_generation: u64,
+    pub epoch: u64,
+}
+
+impl std::ops::Deref for CapturedFrame {
+    type Target = RawFrame;
+    fn deref(&self) -> &RawFrame {
+        &self.frame
+    }
+}
+
+pub fn enqueue(ring: &Ring<CapturedFrame>, frame: RawFrame, shared: &Shared) {
+    let (rvc_ai_active, file_generation) = shared.file_snapshot();
+    ring.push(CapturedFrame {
+        frame,
+        file_generation,
+        rvc_ai_active,
+        epoch: shared.enhancement_epoch(),
+    });
+}
+
 /// 交错立体声 S16 → 单声道 f32：取 FL（左声道），除以 32768。
 pub fn fl_to_mono(stereo: &[i16], out: &mut [f32]) {
     for (slot, pair) in out.iter_mut().zip(stereo.chunks_exact(2)) {
@@ -33,7 +59,7 @@ pub fn fl_to_mono(stereo: &[i16], out: &mut [f32]) {
 /// 返回 Err 表示致命流错误；主线程据此退出进程，daemon 按退避重启。
 pub fn run(
     pcm: alsa::pcm::PCM,
-    ring: Arc<Ring<RawFrame>>,
+    ring: Arc<Ring<CapturedFrame>>,
     shared: Arc<Shared>,
     stop: &'static AtomicBool,
 ) -> Result<(), String> {
@@ -94,7 +120,7 @@ pub fn run(
             },
             pcm: block,
         };
-        ring.push(frame);
+        enqueue(&ring, frame, &shared);
         frame_idx = frame_idx.wrapping_add(1);
         shared.add_captured(1);
     }

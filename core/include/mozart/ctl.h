@@ -22,6 +22,7 @@ extern "C" {
 #define MOZART_CTL_VERSION         1
 #define MOZART_CTL_HEADER_BYTES    16
 #define MOZART_CTL_MAX_BODY_BYTES  65536
+#define MOZART_CTL_IDLE_TIMEOUT_MS 30000
 
 // ---- 16 字节定长头，全部小端 ---------------------------------------------------
 #pragma pack(push, 1)
@@ -110,6 +111,8 @@ enum {
     // 任务面（tts-jobs.sock，标准信封：响应 type 回显请求号，体 {"status","code","reason","data"}）：
     MOZART_CTL_TTS_JOB_SUBMIT = 0x0610,  // 桥→TTS，体 {"text","utterance_id","voice_params"?}；受理应答 data {"utterance_id"}
     MOZART_CTL_TTS_JOB_REPLY  = 0x0611,  // 受理应答：submitted→ok/Ok、队满→error/Busy、无效→error；type 回显请求号（0x0610/0x0612）
+    MOZART_CTL_ENHANCE_HELLO = 0x0701,
+    MOZART_CTL_ENHANCE_GET_STATUS = 0x0702,
     MOZART_CTL_TTS_JOB_STOP   = 0x0612   // 桥→TTS，体 {}（空）；清队列并中止在途合成，应答 data {"stopped":true}
 };
 

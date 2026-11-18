@@ -30,6 +30,7 @@ extern "C" {
 #define MOZART_INPUT_SAMPLE_RATE   16000
 #define MOZART_INPUT_FRAME_MS      20
 #define MOZART_INPUT_SAMPLES       320
+#define MOZART_INPUT_PCM_ABS_MAX   1.0f // 输入契约为有限且归一化的 PCM
 
 #define MOZART_OUTPUT_SAMPLE_RATE  48000
 #define MOZART_OUTPUT_FRAME_MS     20
@@ -82,6 +83,23 @@ typedef struct {
 #pragma pack(pop)
 MOZART_STATIC_ASSERT(sizeof(mozart_output_frame_t) == 24 + 960 * 4,
                      "mozart_output_frame_t size mismatch");
+
+// ---- 可选增强进程音频会话（Unix SEQPACKET）-----------------------------------
+#define MOZART_ENHANCE_PACKET_MAGIC 0x534E5A4Du // 'MZNS'
+#define MOZART_ENHANCE_PRIMING_FRAMES 2
+#pragma pack(push, 1)
+typedef struct {
+    uint32_t magic; // MOZART_INPUT_PACKET_MAGIC
+    mozart_input_frame_t frame;
+} mozart_enhance_request_t;
+typedef struct {
+    uint32_t magic; // MOZART_ENHANCE_PACKET_MAGIC
+    uint32_t ready; // 0: accumulating; 1: complete source frame
+    mozart_input_frame_t frame;
+} mozart_enhance_reply_t;
+#pragma pack(pop)
+MOZART_STATIC_ASSERT(sizeof(mozart_enhance_request_t) == 1300, "enhance request size");
+MOZART_STATIC_ASSERT(sizeof(mozart_enhance_reply_t) == 1304, "enhance reply size");
 
 // ---- 线包常量 ----------------------------------------------------------------
 #define MOZART_INPUT_PACKET_MAGIC   0x4D5A5254u   // 'MZRT'

@@ -12,8 +12,8 @@ use crate::services::{self, Services};
 use crate::state::{lock_state, State};
 use crate::state_file::{self, StateFile};
 use mozart_core::config::{self, write_rvc_model_baseline, Config, RvcSessionValues};
-use mozart_core::ctl::schema::{PresetApplyData, PresetListData};
 use mozart_core::ctl;
+use mozart_core::ctl::schema::{PresetApplyData, PresetListData};
 use mozart_core::preset::{self, PresetError, PRESET_NAME};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, MutexGuard};
@@ -88,8 +88,10 @@ impl PresetManager {
         let Some(model_dir) = config.rvc_model_dir(model_id) else {
             // 旧配置可能只给 model_id、没有注册表或 models_dir：无法定位预设，
             // 用 live 参数继续，并留可查询降级原因；显式 preset 命令仍报错。
-            lock_state(&self.state)
-                .push_degraded(format!("{}; using live params", unresolvable_reason(model_id)));
+            lock_state(&self.state).push_degraded(format!(
+                "{}; using live params",
+                unresolvable_reason(model_id)
+            ));
             return Ok(PresetResolution::Skip);
         };
         // 模型存在性归推理层（SPEC-10）：目录不存在时跳过载入，让 LoadModel 回
@@ -322,6 +324,9 @@ impl PresetManager {
             .map_err(|err| (ctl::CODE_INTERNAL.to_string(), err.to_string()))?;
         let mut fresh = Config::load_from(Some(path))
             .map_err(|err| (ctl::CODE_INTERNAL.to_string(), err.to_string()))?;
+        fresh.enhance = old.enhance.clone();
+        fresh.pre.dsp = old.pre.dsp.clone();
+        fresh.process.enhance_bin = old.process.enhance_bin.clone();
         fresh.rvc.model_id = live_model_id.to_string();
         let overrides = self
             .state_file
@@ -330,7 +335,12 @@ impl PresetManager {
             .overrides()
             .clone();
         state_file::overlay(&mut fresh, &overrides);
-        services::apply_rvc_session_params_locked(&self.state, &self.services, &old.rvc, &fresh.rvc)?;
+        services::apply_rvc_session_params_locked(
+            &self.state,
+            &self.services,
+            &old.rvc,
+            &fresh.rvc,
+        )?;
         self.config.replace(fresh);
         *applied = Some(model_id.to_string());
         lock_state(&self.state).clear_degraded_prefix(&unresolvable_reason(model_id));
@@ -413,8 +423,8 @@ mod tests {
             eprintln!("跳过：root 下目录权限位不拦写，无法构造基线写回失败");
             return;
         }
-        let dir = std::env::temp_dir()
-            .join(format!("mozart-preset-restore-{}", std::process::id()));
+        let dir =
+            std::env::temp_dir().join(format!("mozart-preset-restore-{}", std::process::id()));
         // 上次运行若在只读期间 panic，目录会留在 0o555，先恢复再删。
         let _ = std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o755));
         let _ = std::fs::remove_dir_all(&dir);
@@ -426,8 +436,7 @@ mod tests {
         let config = SharedConfig::new(Config::default());
         let state = Arc::new(Mutex::new(State::new()));
         let services = Arc::new(Services::new(&config));
-        let state_file =
-            Arc::new(Mutex::new(StateFile::load(dir.join("state.json")).unwrap()));
+        let state_file = Arc::new(Mutex::new(StateFile::load(dir.join("state.json")).unwrap()));
         let presets = PresetManager::new(
             config.clone(),
             state.clone(),

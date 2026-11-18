@@ -113,6 +113,7 @@ var N={
  pre:{x:200,y:60,w:170,h:54,t:'pre',s:'采集·DSP·播放·分发',c:'audio'},
  rvc:{x:450,y:60,w:170,h:54,t:'rvc',s:'C++ 变声推理',c:'audio'},
  spk:{x:880,y:60,w:120,h:54,t:'扬声器',s:'ALSA 播放',c:'audio'},
+ enhance:{x:20,y:190,w:145,h:50,t:'enhance（可选）',s:'C++ · UL-UNAS',c:'audio'},
  asr:{x:200,y:190,w:140,h:50,t:'asr',s:'流式识别+复核',c:'text'},
  bridge:{x:420,y:190,w:150,h:50,t:'bridge',s:'字幕·翻译·播报',c:'text'},
  sub:{x:650,y:190,w:120,h:50,t:'字幕文件',s:'subtitles.jsonl',c:'file'},
@@ -129,6 +130,8 @@ var E={
  pre_rvc:{a:A('pre','r',.3),b:A('rvc','l',.3),c:'audio',lb:'InputFrame 16k · rvc-in'},
  rvc_pre:{a:A('rvc','l',.7),b:A('pre','r',.7),c:'audio',lb:'OutputFrame 32/40/48k · rvc-out'},
  pre_spk:{a:A('pre','t',.5),m:[[285,20],[940,20]],b:A('spk','t',.5),c:'audio',lb:'ALSA 播放（实时/播报）'},
+ pre_enhance:{a:A('pre','l',.7),m:[[180,98],[180,165],[92,165]],b:A('enhance','t',.5),c:'audio',lb:'16k 增强请求'},
+ enhance_pre:{a:A('enhance','r',.5),m:[[184,215],[184,114]],b:A('pre','b',.2),c:'audio',lb:'源时间戳 · 320 样本'},
  pre_asr:{a:A('pre','b',.5),b:A('asr','t',.5),c:'audio',lb:'InputFrame · asr-in'},
  asr_br:{a:A('asr','r',.5),b:A('bridge','l',.5),c:'text',lb:'events · asr-events'},
  br_sub:{a:A('bridge','r',.3),b:A('sub','l',.3),c:'file',lb:'写 jsonl · revision'},
@@ -137,7 +140,8 @@ var E={
  br_tts:{a:A('bridge','r',.7),m:[[610,225],[610,313]],b:A('tts','l',.5),c:'text',lb:'TTS_JOB · tts-jobs'},
  tts_pre:{a:A('tts','r',.5),m:[[830,313],[830,140],[370,140]],b:A('pre','r',.9),c:'audio',lb:'OutputFrame 48k · tts-out（播报）'},
  ctl_da:{a:A('ctl','r',.5),b:A('daemon','l',.5),c:'ctl',lb:'daemon.sock'},
- da_pre:{a:A('daemon','t',.2),m:[[264,400],[120,400],[120,114]],b:A('pre','l',.9),c:'ctl',thin:1},
+ da_pre:{a:A('daemon','t',.2),m:[[264,400],[180,400],[180,114]],b:A('pre','l',.9),c:'ctl',thin:1},
+ da_enhance:{a:A('daemon','l',.5),m:[[92,465]],b:A('enhance','b',.5),c:'ctl',thin:1},
  da_rvc:{a:A('daemon','t',.4),m:[[298,390],[535,390],[535,114]],b:A('rvc','b',.5),c:'ctl',thin:1},
  da_asr:{a:A('daemon','t',.6),m:[[332,410],[270,410],[270,240]],b:A('asr','b',.5),c:'ctl',thin:1},
  da_tts:{a:A('daemon','r',.3),m:[[720,455],[720,336]],b:A('tts','b',.5),c:'ctl',thin:1},
@@ -174,13 +178,14 @@ var D={
  ctl:{bin:'mozart-ctl',desc:'所有整机操作入口。连 daemon 发命令、渲染状态；自身无权威状态。退出码 0/1/2/3/4/5。',pts:[
   ['proto','命令集','v1','<p>经 daemon.sock 转发，<code>--json</code> 稳定输出。</p><span class="pill">up</span><span class="pill">down</span><span class="pill">status</span><span class="pill">route set</span><span class="pill">mute</span><span class="pill">translate on|off</span><span class="pill">speech on|off|stop</span><span class="pill">config get|set|save</span><span class="pill">restart</span><span class="pill">file …</span><span class="pill">model list</span><span class="pill">model use</span><span class="pill">preset save|use|list</span>'],
   ['sock','daemon.sock','connect','<p>SEQPACKET 控制信封（见 daemon proto 层）。request_id 固定 1，超时 rpc_timeout_ms。</p>']]},
- daemon:{bin:'mozart-daemon',desc:'唯一权威。监管 6 子进程、每秒轮询 GetStatus 汇总成派生读模型；不碰音频数据面。',pts:[
+ daemon:{bin:'mozart-daemon',desc:'唯一权威。监管业务子进程与可选增强进程，轮询状态汇总派生读模型；不碰音频数据面。',pts:[
   ['thread','server','控制连接','<p>bind daemon.sock，listen(8)，每连接独立线程，空闲 30s 断开。</p><table class="kv"><tr><td>0x0101</td><td>Hello</td></tr><tr><td>0x0102</td><td>GetStatus</td></tr><tr><td>0x0103/04</td><td>RouteSet / MuteSet</td></tr><tr><td>0x0105</td><td>Shutdown</td></tr><tr><td>0x0106/07/08</td><td>Translate/SpeechSet/Stop → 转发桥</td></tr><tr><td>0x0120</td><td>ModelUse → 断流换模型 + 预设提交</td></tr></table>'],
   ['thread','supervisor ×6','生命周期','<p>退避 500ms 倍增上限 10s，稳定 30s 重置；SIGTERM 2s 后 SIGKILL。llama 启动前清陈旧 socket。</p><table class="kv"><tr><td>mozart 子进程</td><td>--socket --config，各读自己段</td></tr><tr><td>llama-server</td><td>-m gguf -c 2048 -ngl 99 -np 1 -t 2 --host llama.sock --jinja</td></tr></table>'],
   ['thread','services+poller','轮询','<p>ServiceLink 惰性 connect+Hello；每秒 poll 五服务 GetStatus。llama 不轮询，可达性由桥带报。</p>'],
   ['thread','state+arbiter','权威','<p>Processes 6 角色 + 各 Option&lt;Status&gt; + 降级列表。GPU 实时/文件互斥；扬声器分时。mode 派生。</p>'],
   ['thread','model use','断流换模型','<p>0x0120：resolve 读校验目标预设 → StopStream → LoadModel → 提交（同一把 toml 锁内写 model_id 基线 + 五键基线 + applied）→ StartStream 复用 handle 只起一次。全程持 transition 锁，避免 8GB 设备双引擎驻留 OOM，支持跨采样率重建 StreamingRvc。</p><p class="note">失败一律用旧模型 + 旧参数恢复流；起流失败先按 SwitchUndo 整体回退基线、生效配置与 applied。文件任务占 GPU 回 Busy。model_id 只由本命令写回基线，config set 拒绝。</p>'],
   ['proto','控制信封','SEQPACKET','<pre>magic u32 \'MCTL\'=0x4C54434D\nversion u16=1 | type u16 | request_id u32 | body_len u32\nbody JSON ≤64KiB → {status,code,reason,data}</pre><table class="kv"><tr><td>0x01xx</td><td>daemon</td></tr><tr><td>0x02xx</td><td>pre</td></tr><tr><td>0x03xx</td><td>rvc</td></tr><tr><td>0x04xx</td><td>asr</td></tr><tr><td>0x05xx</td><td>bridge</td></tr><tr><td>0x06xx</td><td>tts</td></tr></table>']]},
+ enhance:{bin:'mozart-enhance (C++)',desc:'可选 CPU 增强后端，权重只读引用。pre 普通线程经有界队列调用，不改变 48 kHz 直通。',pts:[['proto','流式增强','16 kHz','<p>周期 Hann 512／256；320 样本重打包，积攒两帧。源 frame_idx 与 pts_ns 保留；重新连接重置状态。禁用不调用网络，错误不静默回退原声。</p>'],['sock','enhance.sock','0x07xx','<p>Hello 0x0701、GetStatus 0x0702。音频另走 enhance-audio.sock 的 SEQPACKET 会话；启动、重启与状态汇总归 daemon。</p>']]},
  pre:{bin:'mozart-pre',desc:'一次采集供所有链路。实时线程不分配不阻塞。AI 支路恒发。',pts:[
   ['thread','capture','ALSA 48k','<p>64 帧周期累积 960 样本 RawFrame；FL 立体声→单声道 f32。</p>'],
   ['thread','DSP','信号链','<p>80Hz 高通→WOLA 降噪→gate/AGC/limiter(默认关)→48k trunk→33 抽头 FIR 3:1 抽取→VAD。pack 出 16k InputFrame。</p>'],

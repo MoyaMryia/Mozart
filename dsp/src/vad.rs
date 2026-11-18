@@ -36,24 +36,27 @@ impl Vad {
     /// `conf` 为本帧 WOLA 置信度，`audible` 为主干 RMS > -60 dB。
     pub fn update(&mut self, conf: f32, audible: bool) -> (u8, u8) {
         let candidate = conf >= CANDIDATE_PROB && audible;
+        self.advance(
+            candidate,
+            conf >= ENTER_PROB && audible,
+            conf < EXIT_PROB || !audible,
+        )
+    }
+
+    /// 能量型活动判据共用同一滞回，不将活动值冒充模型概率。
+    pub fn update_activity(&mut self, active: bool) -> (u8, u8) {
+        self.advance(active, active, !active)
+    }
+
+    fn advance(&mut self, candidate: bool, ready: bool, quiet: bool) -> (u8, u8) {
         if self.in_speech {
-            let quiet = conf < EXIT_PROB || !audible;
-            self.exit_count = if quiet {
-                self.exit_count + 1
-            } else {
-                0
-            };
+            self.exit_count = if quiet { self.exit_count + 1 } else { 0 };
             if self.exit_count >= EXIT_FRAMES {
                 self.in_speech = false;
                 self.exit_count = 0;
             }
         } else {
-            let ready = conf >= ENTER_PROB && audible;
-            self.enter_count = if ready {
-                self.enter_count + 1
-            } else {
-                0
-            };
+            self.enter_count = if ready { self.enter_count + 1 } else { 0 };
             if self.enter_count >= ENTER_FRAMES {
                 self.in_speech = true;
                 self.enter_count = 0;
@@ -121,7 +124,11 @@ mod tests {
             if frame < EXIT_FRAMES - 1 {
                 assert_eq!((vad_flag, segment), (1, 1), "静帧 {frame} 应仍滞回在有声");
             } else {
-                assert_eq!((vad_flag, segment), (0, 0), "第 25 个静帧必须退出并归零分段");
+                assert_eq!(
+                    (vad_flag, segment),
+                    (0, 0),
+                    "第 25 个静帧必须退出并归零分段"
+                );
             }
         }
         // 低置信但候选以下：不重新进入。

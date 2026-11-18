@@ -93,7 +93,10 @@ impl Harness {
         for (key, value) in env {
             text.push_str(&format!("export {key}='{value}'\n"));
         }
-        text.push_str(&format!("exec '{}' \"$@\"\n", example("rvc_stub").display()));
+        text.push_str(&format!(
+            "exec '{}' \"$@\"\n",
+            example("rvc_stub").display()
+        ));
         std::fs::write(&script, text).unwrap();
         let mut perms = std::fs::metadata(&script).unwrap().permissions();
         perms.set_mode(0o755);
@@ -257,7 +260,10 @@ impl Harness {
                 status.rvc.as_ref().is_some_and(|rvc| {
                     rvc.state == "streaming" && rvc.stream_kind.as_deref() == Some("realtime")
                 }) && status.route.active == Route::Rvc
-                    && status.pre.as_ref().is_some_and(|pre| pre.route == Route::Rvc)
+                    && status
+                        .pre
+                        .as_ref()
+                        .is_some_and(|pre| pre.route == Route::Rvc)
             }),
             "实时流未就绪：{:?}",
             self.status()
@@ -318,7 +324,10 @@ fn first_file_job_creates_default_preset_and_uses_canonical_values() {
     assert_eq!(starts[0]["f0_method"], "rmvpe");
 
     let config = std::fs::read_to_string(h.daemon.dir.join("config.toml")).unwrap();
-    assert!(config.contains("pitch_shift = 0"), "载入应写 TOML 基线：{config}");
+    assert!(
+        config.contains("pitch_shift = 0"),
+        "载入应写 TOML 基线：{config}"
+    );
 }
 
 #[test]
@@ -421,8 +430,12 @@ fn corrupt_preset_fails_file_job_and_preset_use_without_baseline_write() {
     h.run_file("b.wav", "model-b");
 
     // 当前已加载 B；损坏 B 的预设后 preset use 报错，且不写基线。
-    let loaded = h.status().rvc.unwrap().model_id.unwrap();
-    assert_eq!(loaded, "model-b");
+    assert!(
+        wait_until(POLL_TIMEOUT, || {
+            h.status().rvc.and_then(|rvc| rvc.model_id).as_deref() == Some("model-b")
+        }),
+        "文件完成后，轮询状态应在期限内反映已加载的 model-b"
+    );
     expect_ok(h.config_set("rvc.pitch_shift", "3"));
     std::fs::write(h.preset_path("model-b"), "not toml").unwrap();
     let reason = expect_error(h.preset_use(), ctl::CODE_INTERNAL);
@@ -482,7 +495,11 @@ fn failed_realtime_model_load_keeps_live_params() {
     let reason = expect_error(reply, ctl::CODE_INVALID_ARGUMENT);
     assert!(reason.contains("model not found"), "{reason}");
 
-    assert_eq!(h.rvc_params(), live_before, "LoadModel 失败不得改 live 参数");
+    assert_eq!(
+        h.rvc_params(),
+        live_before,
+        "LoadModel 失败不得改 live 参数"
+    );
     assert_eq!(
         baseline_before,
         std::fs::read_to_string(h.daemon.dir.join("config.toml")).unwrap(),
@@ -507,7 +524,10 @@ fn missing_model_dir_reports_load_model_error_not_preset_error() {
 
     // 目录不存在：预设层不预检模型存在性，报错归 LoadModel（SPEC-10）。
     let reason = h.run_file_failed("ghost.wav", "ghost-model");
-    assert!(reason.contains("model not found"), "报错须归推理层：{reason}");
+    assert!(
+        reason.contains("model not found"),
+        "报错须归推理层：{reason}"
+    );
     assert!(
         reason.contains(ctl::CODE_INVALID_ARGUMENT),
         "缺失模型应回 InvalidArgument：{reason}"
@@ -609,10 +629,7 @@ fn model_use_loads_target_preset_and_rejects_corrupt_preset() {
         serde_json::from_value(expect_ok(h.preset_list())).unwrap();
     assert_eq!(listed.model_id, "model-b");
     assert!(!listed.dirty);
-    let get_b = expect_ok(h.call(
-        ctl::DAEMON_CONFIG_GET,
-        br#"{"key":"rvc.model_id"}"#,
-    ));
+    let get_b = expect_ok(h.call(ctl::DAEMON_CONFIG_GET, br#"{"key":"rvc.model_id"}"#));
     assert_eq!(get_b["value"], "model-b");
 
     // 损坏预设在切流前拦截，不打断当前 model-b。
@@ -625,10 +642,7 @@ fn model_use_loads_target_preset_and_rejects_corrupt_preset() {
     );
     expect_error(bad_reply, ctl::CODE_INTERNAL);
     assert_eq!(h.rvc_params().pitch_shift, 7);
-    let get_after_bad = expect_ok(h.call(
-        ctl::DAEMON_CONFIG_GET,
-        br#"{"key":"rvc.model_id"}"#,
-    ));
+    let get_after_bad = expect_ok(h.call(ctl::DAEMON_CONFIG_GET, br#"{"key":"rvc.model_id"}"#));
     assert_eq!(get_after_bad["value"], "model-b");
 }
 
@@ -688,7 +702,11 @@ fn model_use_load_failure_restores_old_model_and_old_params() {
 
     h.wait_streaming();
     assert_eq!(h.rvc_params(), live_before, "恢复后生效配置仍是旧参数");
-    assert_eq!(h.config_text(), baseline_before, "五键与 model_id 基线都不得变");
+    assert_eq!(
+        h.config_text(),
+        baseline_before,
+        "五键与 model_id 基线都不得变"
+    );
     assert_eq!(
         std::fs::read_to_string(h.preset_path("model-b")).unwrap(),
         preset_b_before,
@@ -830,7 +848,10 @@ fn model_use_success_commits_baseline_and_starts_one_stream() {
     h.wait_streaming();
     assert_eq!(h.rvc_params().pitch_shift, 7);
     let config = h.config_text();
-    assert!(config.contains("pitch_shift = 7"), "五键基线应已写：{config}");
+    assert!(
+        config.contains("pitch_shift = 7"),
+        "五键基线应已写：{config}"
+    );
     assert!(
         config.contains("model_id = \"model-b\""),
         "model_id 基线应已写：{config}"

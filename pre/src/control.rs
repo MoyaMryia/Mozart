@@ -40,7 +40,11 @@ struct DropLog {
 
 impl DropLog {
     fn new() -> Self {
-        Self { last: [0; 4], last_log: None, frame_size_mismatch_logged: false }
+        Self {
+            last: [0; 4],
+            last_log: None,
+            frame_size_mismatch_logged: false,
+        }
     }
 
     /// `rings` 为（环名, 当前累计）。只在控制线程调用，允许分配与阻塞。
@@ -60,7 +64,9 @@ impl DropLog {
             // 累计计数单调递增，差值即上次日志以来的增量。
             let delta = total - self.last[slot];
             if delta > 0 {
-                eprintln!("mozart-pre: ring {name} dropped +{delta} (total {total}) unix_ms={at_ms}");
+                eprintln!(
+                    "mozart-pre: ring {name} dropped +{delta} (total {total}) unix_ms={at_ms}"
+                );
                 logged = true;
             }
         }
@@ -81,8 +87,7 @@ impl DropLog {
             ("tts output socket", shared.tts_recv_size_mismatch()),
         ] {
             if total > 0 {
-                let message =
-                    format!("{label}: {FRAME_SIZE_MISMATCH_REASON} (packets {total})");
+                let message = format!("{label}: {FRAME_SIZE_MISMATCH_REASON} (packets {total})");
                 shared.set_last_error(&message);
                 eprintln!("mozart-pre: {message}");
                 self.frame_size_mismatch_logged = true;
@@ -96,7 +101,7 @@ impl DropLog {
 pub fn serve(
     listener: Seqpacket,
     shared: Arc<Shared>,
-    capture_ring: Arc<Ring<RawFrame>>,
+    capture_ring: Arc<Ring<crate::capture::CapturedFrame>>,
     trunk: Arc<Ring<RawFrame>>,
     rvc_ring: Arc<Ring<OutputFrame>>,
     tts_ring: Arc<Ring<OutputFrame>>,
@@ -118,14 +123,23 @@ pub fn serve(
                 continue;
             }
         };
-        serve_connection(&conn, &shared, &capture_ring, &trunk, &rvc_ring, &tts_ring, &mut drop_log, stop);
+        serve_connection(
+            &conn,
+            &shared,
+            &capture_ring,
+            &trunk,
+            &rvc_ring,
+            &tts_ring,
+            &mut drop_log,
+            stop,
+        );
     }
 }
 
 fn serve_connection(
     conn: &Seqpacket,
     shared: &Shared,
-    capture_ring: &Ring<RawFrame>,
+    capture_ring: &Ring<crate::capture::CapturedFrame>,
     trunk: &Ring<RawFrame>,
     rvc_ring: &Ring<OutputFrame>,
     tts_ring: &Ring<OutputFrame>,
@@ -154,7 +168,15 @@ fn serve_connection(
         idle = Duration::ZERO;
         let type_ = msg.header.type_;
         let request_id = msg.header.request_id;
-        let reply = dispatch(&msg, shared, capture_ring, trunk, rvc_ring, tts_ring, drop_log);
+        let reply = dispatch(
+            &msg,
+            shared,
+            capture_ring,
+            trunk,
+            rvc_ring,
+            tts_ring,
+            drop_log,
+        );
         if conn.send(type_, request_id, &reply).is_err() {
             return;
         }
@@ -174,7 +196,7 @@ fn parse_body(body: &[u8]) -> Result<Value, Vec<u8>> {
 fn dispatch(
     msg: &Message,
     shared: &Shared,
-    capture_ring: &Ring<RawFrame>,
+    capture_ring: &Ring<crate::capture::CapturedFrame>,
     trunk: &Ring<RawFrame>,
     rvc_ring: &Ring<OutputFrame>,
     tts_ring: &Ring<OutputFrame>,
@@ -212,14 +234,14 @@ fn dispatch(
                     shared.set_file_mode(true);
                     shared.set_mode_asserted(true);
                     let deadline = Instant::now() + FILE_HANDOFF_TIMEOUT;
-                    while !shared.output_released() {
+                    while !shared.sends_idle() || !shared.output_released() {
                         if Instant::now() >= deadline {
                             // 接收线程未在时限内释放（异常态）：回滚门控，
                             // 不留「已暂停但无文件任务」的悬空态；原因经应答可查。
                             shared.set_file_mode(false);
                             return error_body(
                                 ctl::CODE_NOT_READY,
-                                "output socket handoff timed out",
+                                "AI send/output socket handoff timed out",
                             );
                         }
                         std::thread::sleep(FILE_HANDOFF_POLL);
@@ -308,7 +330,7 @@ mod tests {
 
     fn context() -> (
         Arc<Shared>,
-        Arc<Ring<RawFrame>>,
+        Arc<Ring<crate::capture::CapturedFrame>>,
         Arc<Ring<RawFrame>>,
         Arc<Ring<OutputFrame>>,
         Arc<Ring<OutputFrame>>,
@@ -339,14 +361,30 @@ mod tests {
     #[test]
     fn hello_reports_version() {
         let (shared, cap, trunk, rvc, tts, mut log) = context();
-        let reply = dispatch(&message(ctl::PRE_HELLO, b"{}"), &shared, &cap, &trunk, &rvc, &tts, &mut log);
+        let reply = dispatch(
+            &message(ctl::PRE_HELLO, b"{}"),
+            &shared,
+            &cap,
+            &trunk,
+            &rvc,
+            &tts,
+            &mut log,
+        );
         assert_eq!(data(&reply)["version"], VERSION);
     }
 
     #[test]
     fn hello_accepts_empty_body() {
         let (shared, cap, trunk, rvc, tts, mut log) = context();
-        let reply = dispatch(&message(ctl::PRE_HELLO, b""), &shared, &cap, &trunk, &rvc, &tts, &mut log);
+        let reply = dispatch(
+            &message(ctl::PRE_HELLO, b""),
+            &shared,
+            &cap,
+            &trunk,
+            &rvc,
+            &tts,
+            &mut log,
+        );
         assert_eq!(data(&reply)["version"], VERSION);
     }
 
@@ -364,7 +402,15 @@ mod tests {
         );
         assert_eq!(data(&reply)["route"], "rvc");
 
-        let reply = dispatch(&message(ctl::PRE_GET_STATUS, b"{}"), &shared, &cap, &trunk, &rvc, &tts, &mut log);
+        let reply = dispatch(
+            &message(ctl::PRE_GET_STATUS, b"{}"),
+            &shared,
+            &cap,
+            &trunk,
+            &rvc,
+            &tts,
+            &mut log,
+        );
         let status = data(&reply);
         assert_eq!(status["route"], "rvc");
         assert_eq!(status["state"], "running");
@@ -387,11 +433,27 @@ mod tests {
     #[test]
     fn status_records_frame_size_mismatch_once() {
         let (shared, cap, trunk, rvc, tts, mut log) = context();
-        let reply = dispatch(&message(ctl::PRE_GET_STATUS, b"{}"), &shared, &cap, &trunk, &rvc, &tts, &mut log);
+        let reply = dispatch(
+            &message(ctl::PRE_GET_STATUS, b"{}"),
+            &shared,
+            &cap,
+            &trunk,
+            &rvc,
+            &tts,
+            &mut log,
+        );
         assert_eq!(data(&reply)["last_error"], Value::Null);
 
         shared.set_ai_recv_size_mismatch(1);
-        let reply = dispatch(&message(ctl::PRE_GET_STATUS, b"{}"), &shared, &cap, &trunk, &rvc, &tts, &mut log);
+        let reply = dispatch(
+            &message(ctl::PRE_GET_STATUS, b"{}"),
+            &shared,
+            &cap,
+            &trunk,
+            &rvc,
+            &tts,
+            &mut log,
+        );
         let reason = data(&reply)["last_error"].as_str().unwrap().to_string();
         assert!(
             reason.contains(FRAME_SIZE_MISMATCH_REASON),
@@ -400,7 +462,15 @@ mod tests {
         assert!(reason.contains("rvc output socket"), "须点名支路：{reason}");
 
         shared.set_ai_recv_size_mismatch(50);
-        let reply = dispatch(&message(ctl::PRE_GET_STATUS, b"{}"), &shared, &cap, &trunk, &rvc, &tts, &mut log);
+        let reply = dispatch(
+            &message(ctl::PRE_GET_STATUS, b"{}"),
+            &shared,
+            &cap,
+            &trunk,
+            &rvc,
+            &tts,
+            &mut log,
+        );
         assert_eq!(data(&reply)["last_error"], json!(reason), "只记首次");
     }
 
@@ -592,7 +662,12 @@ mod tests {
     #[test]
     fn drop_log_rate_limits_and_merges_deltas() {
         fn rings(capture: u64, trunk: u64, rvc: u64, tts: u64) -> [(&'static str, u64); 4] {
-            [("capture", capture), ("trunk", trunk), ("rvc", rvc), ("tts", tts)]
+            [
+                ("capture", capture),
+                ("trunk", trunk),
+                ("rvc", rvc),
+                ("tts", tts),
+            ]
         }
         let mut log = DropLog::new();
         log.report(rings(0, 0, 0, 0));
@@ -619,12 +694,21 @@ mod tests {
         let (shared, cap, trunk, rvc, tts, mut log) = context();
         // 采集环容量 2，塞 4 帧丢 2。
         for frame_idx in 0..4 {
-            cap.push(RawFrame {
-                meta: mozart_core::FrameMeta {
-                    pts_ns: 0, frame_idx, vad_flag: 1, energy_db: 0, conf: 0, segment_id: 0,
+            crate::capture::enqueue(
+                &cap,
+                RawFrame {
+                    meta: mozart_core::FrameMeta {
+                        pts_ns: 0,
+                        frame_idx,
+                        vad_flag: 1,
+                        energy_db: 0,
+                        conf: 0,
+                        segment_id: 0,
+                    },
+                    pcm: [0.0; mozart_core::RAW_SAMPLES],
                 },
-                pcm: [0.0; mozart_core::RAW_SAMPLES],
-            });
+                &shared,
+            );
         }
         let reply = dispatch(
             &message(ctl::PRE_GET_STATUS, b"{}"),
@@ -684,6 +768,60 @@ mod tests {
 
         stop.store(true, Ordering::Relaxed);
         watcher.join().unwrap();
+    }
+
+    #[test]
+    fn set_file_mode_waits_for_in_flight_send_permit() {
+        let (shared, cap, trunk, rvc, tts, mut log) = context();
+        shared.set_mode_asserted(true);
+        let generation = shared.file_generation();
+        let permit = shared.begin_ai_send(generation).unwrap();
+        shared.set_output_released(true);
+        let (tx, rx) = std::sync::mpsc::channel();
+        let worker = {
+            let shared = shared.clone();
+            std::thread::spawn(move || {
+                let reply = dispatch(
+                    &message(ctl::PRE_SET_FILE_MODE, br#"{"active":true}"#),
+                    &shared,
+                    &cap,
+                    &trunk,
+                    &rvc,
+                    &tts,
+                    &mut log,
+                );
+                tx.send(reply).unwrap();
+            })
+        };
+        let deadline = Instant::now() + FILE_HANDOFF_TIMEOUT;
+        while !shared.file_mode() {
+            assert!(Instant::now() < deadline);
+            std::thread::yield_now();
+        }
+        assert!(matches!(
+            rx.recv_timeout(Duration::from_millis(30)),
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout)
+        ));
+        assert!(!shared.sends_idle());
+        drop(permit);
+        let reply = rx.recv_timeout(FILE_HANDOFF_TIMEOUT).unwrap();
+        assert_eq!(data(&reply)["active"], true);
+        worker.join().unwrap();
+        assert!(shared.sends_idle());
+        shared.set_file_mode(false);
+        assert!(
+            shared.begin_ai_send(generation).is_none(),
+            "旧帧不能跨文件生命周期"
+        );
+        let generation = shared.file_generation();
+        shared.set_file_mode(false);
+        shared.set_mode_asserted(true);
+        assert_eq!(
+            shared.file_generation(),
+            generation,
+            "周期相同断言不推进代次"
+        );
+        assert!(shared.begin_ai_send(generation).is_some());
     }
 
     #[test]
@@ -772,13 +910,23 @@ mod tests {
         // speech stop 清播报环：先塞两帧，停止后环空、应答计 frames_cleared。
         tts.push(OutputFrame::new_48k(
             mozart_core::FrameMeta {
-                pts_ns: 0, frame_idx: 0, vad_flag: 1, energy_db: 0, conf: 0, segment_id: 0,
+                pts_ns: 0,
+                frame_idx: 0,
+                vad_flag: 1,
+                energy_db: 0,
+                conf: 0,
+                segment_id: 0,
             },
             [0.0; mozart_core::OUTPUT_SAMPLES],
         ));
         tts.push(OutputFrame::new_48k(
             mozart_core::FrameMeta {
-                pts_ns: 0, frame_idx: 1, vad_flag: 1, energy_db: 0, conf: 0, segment_id: 0,
+                pts_ns: 0,
+                frame_idx: 1,
+                vad_flag: 1,
+                energy_db: 0,
+                conf: 0,
+                segment_id: 0,
             },
             [0.0; mozart_core::OUTPUT_SAMPLES],
         ));
