@@ -1,6 +1,6 @@
 //! 进程级集成测试：spawn mozart-bridge 二进制，mock ASR 事件面（裸 JSON SEQPACKET）、
 //! mock llama-server（Unix socket HTTP）与 mock TTS 任务面（SEQPACKET 信封），
-//! 验证字幕落盘、启动号校验与重连、开关命令与状态文件恢复、翻译调度与播报投递、
+//! 验证字幕落盘、启动号校验与重连、开关命令（不自写状态文件）、翻译调度与播报投递、
 //! SIGTERM 收尾。
 
 use mozart_core::ctl::schema::Response;
@@ -435,14 +435,14 @@ fn corrections_file_overrides_and_extends_builtin() {
 }
 
 #[test]
-fn switches_persist_across_restart() {
-    let dir = run_dir("persist");
+fn switches_toggle_without_writing_state_file() {
+    let dir = run_dir("switches");
     let mock = MockAsr::bind(&dir.join("asr-events.sock"));
     let mut child = spawn_bridge(&dir, "");
     let control = connect_control(&dir);
     let _conn = mock.accept();
 
-    // 运行时覆盖：translate off、speech off。
+    // 运行时切换：只更新桥内活开关，不自写 bridge-state.json（持久存档归 daemon）。
     call_ok(
         &control,
         ctl::BRIDGE_TRANSLATE_SET,
@@ -453,13 +453,9 @@ fn switches_persist_across_restart() {
     let status = get_status(&control);
     assert_eq!(status["translate_enabled"], false);
     assert_eq!(status["speech_enabled"], false);
-    let state: Value =
-        serde_json::from_str(&std::fs::read_to_string(dir.join("bridge-state.json")).unwrap())
-            .unwrap();
-    assert_eq!(state["translate_enabled"], false);
-    assert_eq!(state["speech_enabled"], false);
+    assert!(!dir.join("bridge-state.json").exists());
 
-    // speech stop：关播报并清队列（Task 4 无投递方，清空数为 0）。
+    // speech stop：关播报并清队列。
     let stop = call_ok(&control, ctl::BRIDGE_SPEECH_STOP, 4, b"{}");
     assert_eq!(stop["speech_enabled"], false);
     assert_eq!(stop["queue_cleared"], 0);
@@ -468,26 +464,13 @@ fn switches_persist_across_restart() {
     assert!(wait_exit(&mut child.0, Duration::from_secs(2)).success());
     drop(control);
 
-    // 重启：TOML 基线仍为 true/true，状态文件覆盖优先。
+    // 单进程独立重启仍回落 TOML 基线；运行时覆盖由 daemon 负责恢复。
     let mut child = spawn_bridge(&dir, "");
     let control = connect_control(&dir);
     let _conn = mock.accept();
     let status = get_status(&control);
-    assert_eq!(status["translate_enabled"], false);
-    assert_eq!(status["speech_enabled"], false);
-
-    // 恢复后再开 translate：覆盖写回状态文件。
-    call_ok(
-        &control,
-        ctl::BRIDGE_TRANSLATE_SET,
-        5,
-        br#"{"enabled":true}"#,
-    );
-    let state: Value =
-        serde_json::from_str(&std::fs::read_to_string(dir.join("bridge-state.json")).unwrap())
-            .unwrap();
-    assert_eq!(state["translate_enabled"], true);
-    assert_eq!(state["speech_enabled"], false);
+    assert_eq!(status["translate_enabled"], true);
+    assert_eq!(status["speech_enabled"], true);
 
     sigterm(&child.0);
     assert!(wait_exit(&mut child.0, Duration::from_secs(2)).success());
@@ -508,7 +491,6 @@ fn toml_baseline_applies_without_state_file() {
     let status = get_status(&control);
     assert_eq!(status["translate_enabled"], false);
     assert_eq!(status["speech_enabled"], false);
-    assert!(!dir.join("bridge-state.json").exists());
 
     // translate off：final 只发布原文，不入待翻译队列。
     conn.send_event(&event("final", "s", 1, "你好"));
@@ -599,16 +581,6 @@ fn asr_absent_degrades_then_recovers() {
 
     sigterm(&child.0);
     assert!(wait_exit(&mut child.0, Duration::from_secs(2)).success());
-    let _ = std::fs::remove_dir_all(&dir);
-}
-
-#[test]
-fn corrupt_state_file_fails_startup() {
-    let dir = run_dir("corrupt");
-    std::fs::write(dir.join("bridge-state.json"), "{not json").unwrap();
-    let mut child = spawn_bridge(&dir, "");
-    let status = wait_exit(&mut child.0, Duration::from_secs(5));
-    assert!(!status.success(), "损坏状态文件应启动失败");
     let _ = std::fs::remove_dir_all(&dir);
 }
 

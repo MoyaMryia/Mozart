@@ -113,15 +113,26 @@ impl FrameWriter {
     }
 }
 
-/// 按 FRAME_MS 节拍发送一帧并计数。首帧立即发送；其后单调时钟节拍：发送耗时
-/// 计入周期，落后时从当前时刻重新起算，不追赶补发。输出线程非实时，睡眠让出 CPU。
+/// 网格步进纯逻辑：在上一目标基础上推进一个 `frame_duration`；若实际时刻已落后
+/// 超过整帧周期，则重置到当前时刻，不追赶补发。
+fn advance_grid(next: Instant, now: Instant, frame_duration: Duration) -> Instant {
+    (next + frame_duration).max(now)
+}
+
+/// 按 FRAME_MS 节拍发送一帧并计数。首帧立即发送并确立网格起点；其后按固定
+/// FRAME_MS 单调网格推进，吸收 send_frame 与 sleep 唤醒抖动，不累加正漂移；
+/// 仅当实际时刻已落后超过整帧周期时才重置网格到当前时刻，不追赶补发。
+/// 输出线程非实时，睡眠让出 CPU。
 fn emit_frame(writer: &mut FrameWriter, frame: &OutputFrame, next: &mut Instant, started: &mut bool) {
     if *started {
         let frame_duration = Duration::from_millis(FRAME_MS as u64);
-        *next = (*next).max(Instant::now()) + frame_duration;
-        std::thread::sleep(next.saturating_duration_since(Instant::now()));
+        let now = Instant::now();
+        *next = advance_grid(*next, now, frame_duration);
+        std::thread::sleep(next.saturating_duration_since(now));
+    } else {
+        *next = Instant::now();
+        *started = true;
     }
-    *started = true;
     writer.send_frame(frame);
     writer.shared.add_frames_out(1);
 }
@@ -401,6 +412,49 @@ mod tests {
         assert_eq!(p2[79], 1999.0);
         assert!(p2[80..].iter().all(|&v| v == 0.0));
         assert_eq!(shared.status().frames_out, 3);
+        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_dir(&dir);
+    }
+
+    /// 节拍网格：帧间存在发送/处理耗时且未超整帧周期时，网格按固定 FRAME_MS
+    /// 推进而不累加正漂移；单帧超期落后时重置网格，不追赶补发。
+    #[test]
+    fn grid_pacing_absorbs_jitter_without_drift() {
+        let frame_duration = Duration::from_millis(FRAME_MS as u64);
+        let origin = Instant::now();
+        let mut next = origin;
+
+        // 帧间处理耗时 2 ms..19 ms（均 < 20 ms 帧周期），不得累加到节拍网格。
+        for k in 1..=5u64 {
+            let now = next + Duration::from_millis((k * 3) % 19 + 1);
+            next = advance_grid(next, now, frame_duration);
+            assert_eq!(
+                next.duration_since(origin),
+                Duration::from_millis(k * FRAME_MS as u64),
+                "帧间耗时不得累加正漂移"
+            );
+        }
+
+        // 单次阻塞超过一个帧周期（35 ms > 20 ms）：网格重置到当前时刻，不追赶补发。
+        let late_now = next + Duration::from_millis(35);
+        next = advance_grid(next, late_now, frame_duration);
+        assert_eq!(
+            next, late_now,
+            "超期后须重置网格到当前时刻，不得保留过期时刻补发"
+        );
+
+        // 也做一次真实 emit_frame 首帧初始化冒烟：首帧立即发送并置 started=true。
+        let dir = socket_dir("grid");
+        let path = dir.join("tts-out.sock");
+        let rx = FrameSocket::<OutputFrame>::bind(&path, OUTPUT_BUFFER_FRAMES).unwrap();
+        let shared = Arc::new(Shared::new());
+        let mut writer = FrameWriter::new(path.clone(), shared.clone());
+        let frame = make_frame(&[0.1; OUTPUT_SAMPLES], 0);
+        let mut started = false;
+        let mut emit_next = Instant::now();
+        emit_frame(&mut writer, &frame, &mut emit_next, &mut started);
+        assert!(started);
+        assert!(rx.recv(Some(Duration::from_secs(1))).is_ok());
         let _ = std::fs::remove_file(&path);
         let _ = std::fs::remove_dir(&dir);
     }

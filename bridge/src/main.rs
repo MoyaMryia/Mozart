@@ -3,7 +3,7 @@
 //! subtitles.jsonl 逐行落盘 + final 入待翻译队列）→ 翻译（预处理 + llama-server
 //! 推理 + 质检 + 译文落盘 + 入待播报队列）→ 播报投递（tts-jobs.sock 发译文）；
 //! 控制线程独立服务 bridge.sock（Hello/GetStatus + 翻译/播报开关）。
-//! 开关以 TOML 为基线，运行时命令覆盖并存档持久目录（字幕同目录）bridge-state.json，重启恢复。
+//! 开关启动取 TOML 基线，运行时覆盖由 daemon 统一存 `state.json` 并在就绪/重启时下发。
 //! 停止：SIGTERM/SIGINT 置停止标志；停收新事件，放弃在途翻译/播报请求，
 //! 丢弃在途队列，字幕存档已逐行 flush，在 daemon 2 s 宽限内退出。
 
@@ -76,18 +76,15 @@ fn run(cli: Cli) -> Result<(), String> {
     let config = Config::load(cli.config.as_deref()).map_err(|err| err.to_string())?;
     install_signal_handlers();
 
-    // 开关：TOML 基线叠加状态文件覆盖；状态文件损坏即致命退出。
-    let baseline = Switches {
+    // 开关：启动取 TOML 基线；运行时覆盖由 daemon 存 state.json 并在就绪/重启时下发。
+    let switches = Switches {
         translate_enabled: config.bridge.translate_enabled,
         speech_enabled: config.bridge.speech_enabled,
     };
-    let state_path = state::state_path_for(&config.bridge.subtitles_path);
-    let switches = state::load_switches(&state_path, baseline)?;
 
     let shared = Arc::new(Shared::new(
         switches,
         config.bridge.subtitles_path.clone(),
-        state_path,
     ));
     // 容量已由配置校验保证 ≥ 1。
     let queues = Arc::new(Queues::new(

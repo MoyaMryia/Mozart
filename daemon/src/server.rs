@@ -5,7 +5,7 @@ use crate::preset::PresetManager;
 use crate::runtime::SharedConfig;
 use crate::services::{self, Services};
 use crate::state::{lock_state, Role, State};
-use crate::state_file::{self, StateFile};
+use crate::state_file::{self, BridgeRestore, StateFile};
 use crate::supervisor::{RestartHandle, Supervisor};
 use mozart_core::config::{
     device_key_kind, ensure_run_dir, get_key, runtime_key_owner, save_overrides, set_key,
@@ -38,6 +38,7 @@ struct Ctx {
     presets: Arc<PresetManager>,
     config: SharedConfig,
     state_file: Arc<Mutex<StateFile>>,
+    bridge_restore: Arc<Mutex<BridgeRestore>>,
     config_path: Option<PathBuf>,
     restarts: Arc<Vec<RestartHandle>>,
     /// TOML 写回串行锁：config set / config save 的读改写不得交错。
@@ -135,7 +136,8 @@ pub fn serve(config: &Config, config_path: Option<&Path>) -> io::Result<()> {
         services.clone(),
         presets.clone(),
         file.clone(),
-        bridge_restore,
+        bridge_restore.clone(),
+        state_file.clone(),
         running.clone(),
     )?;
 
@@ -146,6 +148,7 @@ pub fn serve(config: &Config, config_path: Option<&Path>) -> io::Result<()> {
         presets,
         config: shared,
         state_file,
+        bridge_restore,
         config_path,
         restarts,
         toml_lock,
@@ -177,6 +180,12 @@ fn lock_instance(config: &Config) -> io::Result<File> {
 
 fn lock_state_file(state_file: &Mutex<StateFile>) -> MutexGuard<'_, StateFile> {
     state_file
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
+fn lock_bridge_restore(restore: &Mutex<BridgeRestore>) -> MutexGuard<'_, BridgeRestore> {
+    restore
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner())
 }
@@ -288,33 +297,29 @@ fn handle_request(ctx: &Ctx, msg: &Message) -> (Vec<u8>, bool) {
             Err(reply) => (reply, false),
         },
         ctl::DAEMON_TRANSLATE_SET => match parse_body::<SwitchSetRequest>(&msg.body) {
-            Ok(request) => match services::translate_set(&ctx.services, request.enabled) {
-                Ok(data) => {
-                    record_switch(ctx, "bridge.translate_enabled", request.enabled);
-                    (schema::ok_body(data), false)
-                }
-                Err((code, reason)) => (schema::error_body(&code, &reason), false),
-            },
+            Ok(request) => apply_bridge_switch(
+                ctx,
+                "bridge.translate_enabled",
+                request.enabled,
+                || services::translate_set(&ctx.services, request.enabled),
+            ),
             Err(reply) => (reply, false),
         },
         ctl::DAEMON_SPEECH_SET => match parse_body::<SwitchSetRequest>(&msg.body) {
-            Ok(request) => match services::speech_set(&ctx.services, request.enabled) {
-                Ok(data) => {
-                    record_switch(ctx, "bridge.speech_enabled", request.enabled);
-                    (schema::ok_body(data), false)
-                }
-                Err((code, reason)) => (schema::error_body(&code, &reason), false),
-            },
+            Ok(request) => apply_bridge_switch(
+                ctx,
+                "bridge.speech_enabled",
+                request.enabled,
+                || services::speech_set(&ctx.services, request.enabled),
+            ),
             Err(reply) => (reply, false),
         },
-        ctl::DAEMON_SPEECH_STOP => match services::speech_stop(&ctx.state, &ctx.services) {
-            Ok(data) => {
-                // 桥已关播报（speech_enabled=false）：同步记入状态覆盖。
-                record_switch(ctx, "bridge.speech_enabled", false);
-                (schema::ok_body(data), false)
-            }
-            Err((code, reason)) => (schema::error_body(&code, &reason), false),
-        },
+        ctl::DAEMON_SPEECH_STOP => apply_bridge_switch(
+            ctx,
+            "bridge.speech_enabled",
+            false,
+            || services::speech_stop(&ctx.state, &ctx.services),
+        ),
         ctl::DAEMON_FILE_SUBMIT => match parse_body::<FileSubmitRequest>(&msg.body) {
             Ok(request) => file_reply(ctx.file.submit(request)),
             Err(reply) => (reply, false),
@@ -376,11 +381,28 @@ fn handle_request(ctx: &Ctx, msg: &Message) -> (Vec<u8>, bool) {
     }
 }
 
-/// 字幕开关转发成功后记入运行时状态文件（SPEC-04）。落盘失败只记降级：
-/// 开关已在桥生效（活权威），快照滞后原因 status 可查，不阻断命令。
-fn record_switch(ctx: &Ctx, key: &str, enabled: bool) {
-    if let Err(err) = lock_state_file(&ctx.state_file).set_key(key, json!(enabled)) {
-        lock_state(&ctx.state).push_degraded(format!("state file write {key}: {err}"));
+/// 字幕开关转发与存档在 bridge_restore 锁内串行执行，避免与 Poller 的
+/// 重载/恢复逻辑交错覆写（锁序：bridge_restore → state_file / services.bridge）。
+/// 落盘失败只记降级：开关已在桥生效且内存 overrides 已更新供桥重启恢复，
+/// 快照滞后原因经 status 可查，不阻断命令（仅 daemon 自身重启后会失去未落盘更改）。
+fn apply_bridge_switch<F>(ctx: &Ctx, key: &str, enabled: bool, call: F) -> (Vec<u8>, bool)
+where
+    F: FnOnce() -> Result<serde_json::Value, (String, String)>,
+{
+    let mut restore = lock_bridge_restore(&ctx.bridge_restore);
+    match call() {
+        Ok(data) => {
+            if let Err(err) = lock_state_file(&ctx.state_file).set_key(key, json!(enabled)) {
+                lock_state(&ctx.state).push_degraded(format!("state file write {key}: {err}"));
+            }
+            match key {
+                "bridge.translate_enabled" => restore.translate = None,
+                "bridge.speech_enabled" => restore.speech = None,
+                _ => {}
+            }
+            (schema::ok_body(data), false)
+        }
+        Err((code, reason)) => (schema::error_body(&code, &reason), false),
     }
 }
 
@@ -441,7 +463,7 @@ fn preset_reply<T: serde::Serialize>(result: Result<T, (String, String)>) -> (Ve
 /// config set（SPEC-04）：设备键先对照当前清单校验存在（防呆），再原子写基线，
 /// 回重启提示契约 restart_required + affected，并登记待重启。daemon 运行时键与
 /// rvc 会话参数键写基线后即时应用：daemon/file 键清覆盖并重建生效配置；rvc 会话
-/// 参数按本次设置的键决定是否 StopStream→StartStream，失败保留旧生效配置。其余
+/// 参数按变更键下发 SetParams 或 StopStream→StartStream，失败保留旧生效配置。其余
 /// 键由 core::set_key 分类拒绝。
 fn config_set_reply(ctx: &Ctx, request: &ConfigSetRequest) -> Vec<u8> {
     if let Some(kind) = device_key_kind(&request.key) {
@@ -508,7 +530,7 @@ fn model_use_reply(ctx: &Ctx, model_id: &str) -> Vec<u8> {
 /// 运行时键即时生效（SPEC-04）：清该键状态覆盖，重读 TOML 基线叠加剩余覆盖
 /// 重建生效配置，更新共享句柄与文件队列/存储阈值。服务侧每次操作读最新快照。
 /// rvc 会话键的生效配置只吸收本次写入的键（见 services::merge_session_key），
-/// 再按需重启实时流；编排与替换同处 transition 临界区，失败不替换生效配置
+/// 再按变更键下发 SetParams 或重建实时流；编排与替换同处 transition 临界区，失败不替换生效配置
 /// （TOML 新基线保留，下一次对应键写入或 daemon 重启再尝试）。
 /// 调用方须已持 transition 锁。
 fn apply_runtime_key(ctx: &Ctx, key: &str, old: &Config) -> Result<(), (String, String)> {

@@ -49,3 +49,4 @@
 - [x] 实时原生多采样率（播放端）：播放采样率固定 48 kHz，不按流协商。`BoundaryResampler` 在播放线程入口把模型原生帧重采样到 48 kHz，只取 `valid_samples` 有效段；`sample_rate` 48000 且 `valid_samples` 960 时直通。覆盖 32k/40k/48k 与运行中切率。主条见 SPEC-03。（`pre/src/playback.rs:85-137,198-209`，单测 `:400-478`）
 - [x] `BoundaryResampler` 实时线程约束：栈数组进出，无锁、无阻塞、无分配，播放循环前预创建。采样率变化时以新帧首样本重置插值历史；缺帧与切回 direct 时 reset 清零。（`pre/src/playback.rs:103-136,155,195,205`）
 - [x] 播放设备必须给到 48 kHz：`set_rate_near` 返回值不等于 48000 即报错退出，由 daemon 退避重启。设备不支持 48 kHz 时不在播放侧改率。（`pre/src/alsa_stream.rs:46-51`）
+- [x] 播报分时取帧与切换淡变：`Speaker::Broadcast` 连续发帧期以 4 ms 微抖动等待吸收 TTS 跨进程唤醒抖动，进入 `holdoff` 空窗与实时态立即退回零等待，由 ALSA 写定拍以防抽干硬件缓冲；`Realtime ↔ Broadcast` 切换做 10 ms（`FADE_SAMPLES`）线性淡变；播报期隔离 `Router` 淡变并重置 `BoundaryResampler` 插值历史。（`pre/src/playback.rs`）

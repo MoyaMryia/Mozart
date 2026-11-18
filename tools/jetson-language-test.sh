@@ -46,7 +46,7 @@ export MOZART_STATE_DIR="$SMOKE_DIR/state"
 
 mkdir -p "$SMOKE_DIR"
 rm -rf "$RUN" "$SUB" "$EXCERPT" "$SMOKE_DIR"/rec.raw "$SMOKE_DIR"/st-*.json \
-       "$SMOKE_DIR/state" "$SMOKE_DIR/bridge-state.json"
+       "$SMOKE_DIR/state"
 
 ts() { printf "[%5ss]" "$SECONDS"; }
 ctl() { "$BIN_DIR/mozart-ctl" --config "$CFG" "$@"; }

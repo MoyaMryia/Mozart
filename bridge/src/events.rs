@@ -359,7 +359,7 @@ mod tests {
     /// 有界通道语义：partial 满丢并计数，final 阻塞保留（C2）。
     #[test]
     fn bounded_channel_drops_partial_and_keeps_final() {
-        use crate::state::{Queues, Switches, STATE_FILE_NAME};
+        use crate::state::{Queues, Switches};
         use crate::testutil::temp_dir;
         use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
         use std::os::unix::ffi::OsStrExt;
@@ -400,7 +400,6 @@ mod tests {
         let shared = Arc::new(Shared::new(
             Switches { translate_enabled: false, speech_enabled: false },
             dir.join("subtitles.jsonl"),
-            dir.join(STATE_FILE_NAME),
         ));
         let queues = Queues::new(1, 1);
         let stop = Arc::new(AtomicBool::new(false));

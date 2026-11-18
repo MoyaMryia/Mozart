@@ -411,27 +411,18 @@ pub fn speech_stop(state: &Mutex<State>, services: &Services) -> Result<Value, (
     Ok(response.data)
 }
 
-/// 启动恢复（SPEC-04）：把状态文件的字幕开关覆盖一次性下发到桥。
-/// 成功一项清一项；桥未就绪下一轮重试。活权威在桥，运行时不对账。
-pub fn restore_bridge_switches(services: &Services, pending: &Mutex<BridgeRestore>) {
-    let (translate, speech) = {
-        let guard = pending.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
-        (guard.translate, guard.speech)
-    };
-    if let Some(enabled) = translate {
+/// 启动/重启恢复（SPEC-04）：把状态文件的字幕开关覆盖一次性下发到桥。
+/// 调用方须持 `pending` 锁，避免与并发开关命令交错覆写；成功一项清一项，
+/// 桥未就绪下一轮重试。活权威在桥，运行时不对账。
+pub fn restore_bridge_switches(services: &Services, pending: &mut BridgeRestore) {
+    if let Some(enabled) = pending.translate {
         if translate_set(services, enabled).is_ok() {
-            pending
-                .lock()
-                .unwrap_or_else(|poisoned| poisoned.into_inner())
-                .translate = None;
+            pending.translate = None;
         }
     }
-    if let Some(enabled) = speech {
+    if let Some(enabled) = pending.speech {
         if speech_set(services, enabled).is_ok() {
-            pending
-                .lock()
-                .unwrap_or_else(|poisoned| poisoned.into_inner())
-                .speech = None;
+            pending.speech = None;
         }
     }
 }

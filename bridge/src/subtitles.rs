@@ -705,7 +705,7 @@ mod tests {
 
     #[test]
     fn store_publishes_translation_as_revision() {
-        use crate::state::{Shared, Switches, STATE_FILE_NAME};
+        use crate::state::{Shared, Switches};
 
         let dir = std::env::temp_dir().join(format!(
             "mozart-bridge-store-{}-{:?}",
@@ -716,7 +716,6 @@ mod tests {
         let shared = Shared::new(
             Switches { translate_enabled: true, speech_enabled: true },
             path.clone(),
-            dir.join(STATE_FILE_NAME),
         );
         let store = SubtitleStore::new(JsonlWriter::open(&path).unwrap(), path.clone(), no_corrections());
 
@@ -755,7 +754,7 @@ mod tests {
 
     #[test]
     fn store_publishes_failed_and_skipped_outcomes() {
-        use crate::state::{Shared, Switches, STATE_FILE_NAME};
+        use crate::state::{Shared, Switches};
 
         let dir = std::env::temp_dir().join(format!(
             "mozart-bridge-outcome-{}-{:?}",
@@ -766,7 +765,6 @@ mod tests {
         let shared = Shared::new(
             Switches { translate_enabled: true, speech_enabled: true },
             path.clone(),
-            dir.join(STATE_FILE_NAME),
         );
         let store = SubtitleStore::new(JsonlWriter::open(&path).unwrap(), path.clone(), no_corrections());
         store.apply_event(&event(EventKind::Final, 1, "你好"), &shared).unwrap();

@@ -138,7 +138,7 @@ fn process_job(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::state::{Switches, STATE_FILE_NAME};
+    use crate::state::Switches;
     use crate::subtitles::JsonlWriter;
     use crate::testutil::{http_response, temp_dir, MockLlama};
     use serde_json::Value;
@@ -159,7 +159,6 @@ mod tests {
             let shared = Arc::new(Shared::new(
                 Switches { translate_enabled: true, speech_enabled: true },
                 path.clone(),
-                dir.join(STATE_FILE_NAME),
             ));
             let store = Arc::new(SubtitleStore::new(
                 JsonlWriter::open(&path).unwrap(),
@@ -398,8 +397,7 @@ mod tests {
         fixture.shared.set_switches(Switches {
             translate_enabled: false,
             speech_enabled: true,
-        })
-        .unwrap();
+        });
         fixture.final_record("s:1", "你好");
         fixture.queues.push_translate(TranslateJob {
             utterance_id: "s:1".to_string(),

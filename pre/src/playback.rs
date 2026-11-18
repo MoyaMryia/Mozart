@@ -7,7 +7,7 @@
 //! 直出时后端回包不播、计数）；播报期间同样排空 AI 环计 skipped。
 
 use crate::alsa_stream::{self, Op, StreamError};
-use crate::route::{Mute, Router};
+use crate::route::{Mute, Router, FADE_SAMPLES};
 use crate::state::{Shared, Speaker};
 use mozart_core::ctl::schema::Route;
 use mozart_core::ring::Ring;
@@ -19,6 +19,10 @@ use std::time::{Duration, Instant};
 /// 帧源等待预算：一个 20 ms 帧周期（主干与 AI 接收环共用）；超时补零续流，
 /// 吸收采集与播放两硬件时钟的漂移。
 const FRAME_WAIT: Duration = Duration::from_millis(20);
+
+/// 播报连续发帧期的微抖动等待：仅在刚收到过播报帧、尚未进入 holdoff 空窗时使用，
+/// 既可吸收 TTS 跨进程唤醒抖动，又远低于 ALSA 播放缓冲余量（~20 ms），防止周期性欠载。
+const BROADCAST_JITTER_WAIT: Duration = Duration::from_millis(4);
 
 /// 播报空窗保持时长：TTS 环空后等待后续播报帧的窗口，期间静音实时；
 /// 窗口耗尽恢复实时（SPEC-05 播报投递「播完恢复」）。
@@ -37,6 +41,16 @@ impl SpeakerScheduler {
         Self {
             state: Speaker::Realtime,
             holdoff_until: None,
+        }
+    }
+
+    /// 每轮播放前取 TTS 环的等待预算：仅播报连续发帧期给微抖动等待，
+    /// 实时态与 holdoff 空窗期零等待，由 ALSA 阻塞写独自定拍。
+    fn poll_wait(&self) -> Duration {
+        if self.state == Speaker::Broadcast && self.holdoff_until.is_none() {
+            BROADCAST_JITTER_WAIT
+        } else {
+            Duration::ZERO
         }
     }
 
@@ -136,6 +150,129 @@ impl BoundaryResampler {
     }
 }
 
+/// 实时与播报切换淡变（10 ms = FADE_SAMPLES）：
+/// - Realtime → Broadcast：前 10 ms 从切换当帧的实时采样线性交叉淡化到播报帧；
+/// - Broadcast → Realtime：前 10 ms 从静音（holdoff 尾部）线性淡入到实时帧。
+fn apply_speaker_fade(
+    prev: Speaker,
+    state: Speaker,
+    mono: &mut [f32; RAW_SAMPLES],
+    realtime_tail: &[f32; RAW_SAMPLES],
+) {
+    match (prev, state) {
+        (Speaker::Realtime, Speaker::Broadcast) => {
+            for i in 0..FADE_SAMPLES {
+                let gain = (i + 1) as f32 / FADE_SAMPLES as f32;
+                mono[i] = realtime_tail[i] * (1.0 - gain) + mono[i] * gain;
+            }
+        }
+        (Speaker::Broadcast, Speaker::Realtime) => {
+            for (i, sample) in mono.iter_mut().take(FADE_SAMPLES).enumerate() {
+                let gain = (i + 1) as f32 / FADE_SAMPLES as f32;
+                *sample *= gain;
+            }
+        }
+        _ => {}
+    }
+}
+
+/// 播报帧推进：切换首帧从当前实时路由取样做交叉淡化，随后播报期间只排空
+/// 实时环、重置 RVC 重采样器，并在静音占位缓冲上推进路由状态机（不改播报音量）。
+fn step_broadcast(
+    prev: Speaker,
+    tts_frame: Option<OutputFrame>,
+    trunk: &Ring<RawFrame>,
+    rvc: &Ring<OutputFrame>,
+    shared: &Shared,
+    router: &mut Router,
+    rvc_resampler: &mut BoundaryResampler,
+) -> [f32; RAW_SAMPLES] {
+    let mut realtime_tail = [0f32; RAW_SAMPLES];
+    if prev == Speaker::Realtime {
+        realtime_tail = match router.route() {
+            Route::Direct => {
+                drain_rvc_skipped(rvc, shared);
+                rvc_resampler.reset();
+                trunk
+                    .pop(Some(Duration::ZERO))
+                    .map_or([0f32; RAW_SAMPLES], |frame| frame.pcm)
+            }
+            Route::Rvc => {
+                let _ = trunk.pop(Some(Duration::ZERO));
+                let tail = rvc
+                    .pop(Some(Duration::ZERO))
+                    .map_or([0f32; RAW_SAMPLES], |frame| rvc_resampler.resample_to_48k(&frame));
+                drain_rvc_skipped(rvc, shared);
+                rvc_resampler.reset();
+                tail
+            }
+        };
+        router.apply(&mut realtime_tail);
+    } else {
+        drain_rvc_skipped(rvc, shared);
+        let _ = trunk.pop(Some(Duration::ZERO));
+        rvc_resampler.reset();
+        let mut dummy = [0f32; RAW_SAMPLES];
+        router.apply(&mut dummy);
+    }
+    let mut mono = match tts_frame {
+        Some(frame) => {
+            shared.add_tts_frames_played(1);
+            frame.pcm
+        }
+        // holdoff 空窗：补零续流，等待后续播报帧。
+        None => [0f32; RAW_SAMPLES],
+    };
+    apply_speaker_fade(prev, Speaker::Broadcast, &mut mono, &realtime_tail);
+    mono
+}
+
+/// 实时帧推进：按路由选源并应用路由淡变；刚从播报恢复时跳过等待预算，
+/// 避免与 tts.pop(FRAME_WAIT) 叠加成两帧等待。
+fn step_realtime(
+    prev: Speaker,
+    trunk: &Ring<RawFrame>,
+    rvc: &Ring<OutputFrame>,
+    shared: &Shared,
+    router: &mut Router,
+    rvc_resampler: &mut BoundaryResampler,
+) -> [f32; RAW_SAMPLES] {
+    let wait = if prev == Speaker::Broadcast {
+        Duration::ZERO
+    } else {
+        FRAME_WAIT
+    };
+    let mut mono = match router.route() {
+        Route::Direct => {
+            // packed 字段按值整块搬出，不取引用。
+            let pcm = match trunk.pop(Some(wait)) {
+                Some(frame) => frame.pcm,
+                // 主干欠载：补零续流。属两时钟漂移吸收，不计为丢弃。
+                None => [0f32; RAW_SAMPLES],
+            };
+            // direct 期间后端输出帧不播、排空并计数（旧 skipped_replies）。
+            drain_rvc_skipped(rvc, shared);
+            rvc_resampler.reset();
+            pcm
+        }
+        Route::Rvc => {
+            // rvc 路由不消费主干；逐帧排空防积压。
+            let _ = trunk.pop(Some(Duration::ZERO));
+            // AI 接收环缺帧补零续流（大缓冲与欠载补零归 C++ 侧，SPEC-03）。
+            match rvc.pop(Some(wait)) {
+                Some(frame) => rvc_resampler.resample_to_48k(&frame),
+                None => {
+                    rvc_resampler.reset();
+                    [0f32; RAW_SAMPLES]
+                }
+            }
+        }
+    };
+    router.apply(&mut mono);
+    apply_speaker_fade(prev, Speaker::Realtime, &mut mono, &[0f32; RAW_SAMPLES]);
+    mono
+}
+
 /// 播放线程主体。返回 Err 表示致命流错误；主线程据此退出进程。
 pub fn run(
     pcm: alsa::pcm::PCM,
@@ -160,8 +297,8 @@ pub fn run(
         router.request(shared.route_target());
         mute.request(shared.mute_target());
 
-        // 播报优先：非阻塞取播报帧，推进分时状态（仅在变化时发布原子）。
-        let tts_frame = tts.pop(Some(Duration::ZERO));
+        // 播报优先：仅播报连续发帧期给微抖动等待，holdoff 空窗期与实时态零等待。
+        let tts_frame = tts.pop(Some(speaker.poll_wait()));
         let prev = speaker.state;
         let state = speaker.advance(tts_frame.is_some(), Instant::now());
         if state != prev {
@@ -169,49 +306,21 @@ pub fn run(
         }
 
         let mut mono = match state {
-            Speaker::Broadcast => {
-                // 播报期间实时不播：AI 环排空计 skipped，主干逐帧排空防陈货。
-                drain_rvc_skipped(&rvc, &shared);
-                let _ = trunk.pop(Some(Duration::ZERO));
-                match tts_frame {
-                    Some(frame) => {
-                        shared.add_tts_frames_played(1);
-                        frame.pcm
-                    }
-                    // holdoff 空窗：补零续流，等待后续播报帧。
-                    None => [0f32; RAW_SAMPLES],
-                }
+            Speaker::Broadcast => step_broadcast(
+                prev,
+                tts_frame,
+                &trunk,
+                &rvc,
+                &shared,
+                &mut router,
+                &mut rvc_resampler,
+            ),
+            Speaker::Realtime => {
+                step_realtime(prev, &trunk, &rvc, &shared, &mut router, &mut rvc_resampler)
             }
-            Speaker::Realtime => match router.route() {
-                Route::Direct => {
-                    // packed 字段按值整块搬出，不取引用。
-                    let pcm = match trunk.pop(Some(FRAME_WAIT)) {
-                        Some(frame) => frame.pcm,
-                        // 主干欠载：补零续流。属两时钟漂移吸收，不计为丢弃。
-                        None => [0f32; RAW_SAMPLES],
-                    };
-                    // direct 期间后端输出帧不播、排空并计数（旧 skipped_replies）。
-                    drain_rvc_skipped(&rvc, &shared);
-                    rvc_resampler.reset();
-                    pcm
-                }
-                Route::Rvc => {
-                    // rvc 路由不消费主干；逐帧排空防积压。
-                    let _ = trunk.pop(Some(Duration::ZERO));
-                    // AI 接收环缺帧补零续流（大缓冲与欠载补零归 C++ 侧，SPEC-03）。
-                    match rvc.pop(Some(FRAME_WAIT)) {
-                        Some(frame) => rvc_resampler.resample_to_48k(&frame),
-                        None => {
-                            rvc_resampler.reset();
-                            [0f32; RAW_SAMPLES]
-                        }
-                    }
-                }
-            },
         };
 
-        // 路由淡变 × 静音淡变，逐样本增益相乘。
-        router.apply(&mut mono);
+        // 静音淡变作用于当前最终扬声器输出。
         mute.apply(&mut mono);
         mono_to_s16_stereo(&mono, &mut stereo);
 
@@ -397,6 +506,39 @@ mod tests {
     }
 
     #[test]
+    fn speaker_scheduler_waits_only_during_active_broadcast() {
+        let mut scheduler = SpeakerScheduler::new();
+        let t0 = Instant::now();
+        assert_eq!(scheduler.poll_wait(), Duration::ZERO);
+
+        assert_eq!(scheduler.advance(true, t0), Speaker::Broadcast);
+        assert_eq!(scheduler.poll_wait(), BROADCAST_JITTER_WAIT);
+
+        // 进入 holdoff 空窗后立刻退回零等待，避免空等叠加 ALSA 阻塞写导致 underrun。
+        assert_eq!(
+            scheduler.advance(false, t0 + Duration::from_millis(20)),
+            Speaker::Broadcast
+        );
+        assert_eq!(scheduler.poll_wait(), Duration::ZERO);
+
+        // 恢复发帧后重新开启微抖动等待；holdoff 到期切回 Realtime 后仍为零等待。
+        assert_eq!(
+            scheduler.advance(true, t0 + Duration::from_millis(40)),
+            Speaker::Broadcast
+        );
+        assert_eq!(scheduler.poll_wait(), BROADCAST_JITTER_WAIT);
+        assert_eq!(
+            scheduler.advance(false, t0 + Duration::from_millis(60)),
+            Speaker::Broadcast
+        );
+        assert_eq!(
+            scheduler.advance(false, t0 + Duration::from_millis(260)),
+            Speaker::Realtime
+        );
+        assert_eq!(scheduler.poll_wait(), Duration::ZERO);
+    }
+
+    #[test]
     fn boundary_resampler_handles_40k_and_48k_passthrough() {
         let mut resampler = BoundaryResampler::new();
         let meta = FrameMeta {
@@ -475,5 +617,72 @@ mod tests {
         // valid_samples = 0：输出静音并重置历史。
         let silent = resampler.resample_to_48k(&OutputFrame::new(meta, 32000, 0, pcm32));
         assert!(silent.iter().all(|v| *v == 0.0));
+    }
+
+    #[test]
+    fn speaker_fade_crossfades_into_broadcast_and_fades_back() {
+        // Realtime → Broadcast：前 480 样本从实时尾部线性过渡到播报帧，后 480 保持纯播报。
+        let tail = [1.0f32; RAW_SAMPLES];
+        let mut mono = [-1.0f32; RAW_SAMPLES];
+        apply_speaker_fade(Speaker::Realtime, Speaker::Broadcast, &mut mono, &tail);
+        let expected_first = 1.0 * (1.0 - 1.0 / FADE_SAMPLES as f32) + (-1.0) / FADE_SAMPLES as f32;
+        assert!((mono[0] - expected_first).abs() < 1e-5);
+        assert!((mono[FADE_SAMPLES / 2 - 1]).abs() < 1e-5);
+        assert_eq!(mono[FADE_SAMPLES - 1], -1.0);
+        assert_eq!(mono[RAW_SAMPLES - 1], -1.0);
+
+        // Broadcast → Realtime：前 480 样本从 0 线性淡入到 1，后 480 保持满幅。
+        let mut back = [0.8f32; RAW_SAMPLES];
+        apply_speaker_fade(Speaker::Broadcast, Speaker::Realtime, &mut back, &tail);
+        assert!((back[0] - 0.8 / FADE_SAMPLES as f32).abs() < 1e-6);
+        assert_eq!(back[FADE_SAMPLES - 1], 0.8);
+        assert_eq!(back[RAW_SAMPLES - 1], 0.8);
+    }
+
+    #[test]
+    fn broadcast_isolates_router_fade_and_resets_resampler() {
+        let shared = crate::state::test_shared("cap", "play", "startup");
+        let trunk = Ring::<RawFrame>::new(4);
+        let rvc = Ring::<OutputFrame>::new(4);
+        let mut router = Router::new(Route::Direct);
+        let mut resampler = BoundaryResampler::new();
+        let meta = FrameMeta {
+            pts_ns: 0,
+            frame_idx: 0,
+            vad_flag: 1,
+            energy_db: 0,
+            conf: 0,
+            segment_id: 0,
+        };
+        // 预先让 resampler 处于 40 kHz 历史（last_rate != 0）。
+        let _ = resampler.resample_to_48k(&OutputFrame::new(meta, 40000, 800, [0.9; OUTPUT_SAMPLES]));
+        assert_eq!(resampler.last_rate, 40000);
+
+        // 在播报期切路由（Direct → Rvc）：router 状态机在后台完成切换，
+        // 播报帧不受路由淡变削弱，且 resampler 历史被重置。
+        router.request(Route::Rvc);
+        let out1 = step_broadcast(
+            Speaker::Broadcast,
+            Some(OutputFrame::new_48k(meta, [0.5; OUTPUT_SAMPLES])),
+            &trunk,
+            &rvc,
+            &shared,
+            &mut router,
+            &mut resampler,
+        );
+        assert!(out1.iter().all(|&v| v == 0.5), "播报帧不得被路由淡变衰减");
+        assert_eq!(resampler.last_rate, 0, "播报期须重置 RVC 重采样器历史");
+
+        let out2 = step_broadcast(
+            Speaker::Broadcast,
+            Some(OutputFrame::new_48k(meta, [0.5; OUTPUT_SAMPLES])),
+            &trunk,
+            &rvc,
+            &shared,
+            &mut router,
+            &mut resampler,
+        );
+        assert!(out2.iter().all(|&v| v == 0.5));
+        assert_eq!(router.route(), Route::Rvc, "路由状态机须在后台完成切换");
     }
 }

@@ -192,7 +192,7 @@ var D={
  rvc:{bin:'mozart-rvc (C++)',desc:'C++ 推理，ONNX Runtime/TensorRT。流式 1:1 泵。',pts:[
   ['thread','StreamSession','推理','<p>hubert+rmvpe+generator。几何按模型原生采样率推导（realtime_geometry.hpp）；48k 参考值 window 3840(240ms)/crossfade 2400/past 40000/sola 480/emit 11520，40k 与 32k 输出侧同比缩放。</p>'],
   ['proto','实时旋钮','[rvc.realtime]','<p>crossfade 50ms + sola 10ms 锁为定值 60ms，偏离拒绝（引擎形状按最大 overlap 固定、分析窗未解耦）；startup 400ms（0..15000，20ms 倍数）与 skip_silence true 可调。默认值、上限与整除模数单一来源 tools/model/realtime_chain_params.json；StartStream 入口单点校验，违反回 InvalidArgument。</p><p class="note">解耦分析窗后才放开 overlap，待办见 docs/SPEC/SPEC-03-rvc.md。</p>'],
-  ['sock','rvc.sock','bind 0x03xx','<table class="kv"><tr><td>0x0301</td><td>Hello</td></tr><tr><td>0x0302</td><td>LoadModel</td></tr><tr><td>0x0303/04/05</td><td>Start/Stop/ResetStream</td></tr><tr><td>0x0306</td><td>GetStatus</td></tr></table>'],
+  ['sock','rvc.sock','bind 0x03xx','<table class="kv"><tr><td>0x0301</td><td>Hello</td></tr><tr><td>0x0302</td><td>LoadModel</td></tr><tr><td>0x0303/04/05</td><td>Start/Stop/ResetStream</td></tr><tr><td>0x0306/07</td><td>GetStatus / ListModels</td></tr><tr><td>0x0308</td><td>SetParams（块边界热更）</td></tr></table>'],
   ['sock','rvc-in/out','数据面','<p>rvc-in bind←pre(InputFrame)；rvc-out connect→pre(OutputFrame)。</p>']]},
  asr:{bin:'mozart-asr',desc:'Rust 单进程 sherpa-onnx 库链入。收包/解码/复核/输出四线程+控制。每次启动随机启动号。',pts:[
   ['thread','receiver','收包','<p>bind asr-in，push SPSC 环，不分配不阻塞；1s 空闲切句。</p>'],
@@ -209,7 +209,7 @@ var D={
   ['thread','speech','投递','<p>有界队列队满丢最旧。connect tts-jobs 发 SUBMIT 读回执。off 停新投递；stop 发 JOB_STOP+清队列。</p>'],
   ['sock','bridge.sock','bind 0x05xx','<table class="kv"><tr><td>0x0501</td><td>Hello</td></tr><tr><td>0x0502</td><td>GetStatus(四组)</td></tr><tr><td>0x0503/04/05</td><td>Translate/SpeechSet/Stop</td></tr></table>'],
   ['proto','字幕记录','jsonl','<pre>{seq, utterance_id:"启动号:句号", zh, en,\n final:bool, translation_status:pending|recognizing|\n completed|failed|skipped, revision, received_at, ts,\n asr_engine, online_text, homophone_fixes,\n refinement_status, asr_numeric_audit}</pre>'],
-  ['file','状态持久化','开关','<p>TOML 基线 + 运行时覆盖写 ~/.local/state/mozart/bridge-state.json，重启恢复不回落基线。</p>']]},
+  ['file','状态持久化','开关','<p>TOML 基线 + 运行时覆盖由 daemon 写 ~/.local/state/mozart/state.json，启动与桥重启时恢复，不回落基线。</p>']]},
  llama:{bin:'llama-server (C++)',desc:'第三方翻译推理。系统唯一 HTTP 之处，传输仍 Unix socket。daemon 只管存活。',pts:[
   ['proto','HTTP 接口','llama.sock','<pre>POST /v1/chat/completions\n{model, messages[system,user], max_tokens:128,\n temperature:0,\n chat_template_kwargs:{enable_thinking:false}}\n→ choices[0].message.content + finish_reason</pre><p class="note">Qwen3.5 思考模型必须关 thinking，否则译文为空。</p>'],
   ['proto','模型参数','沿用旧','<p>Qwen3.5-0.8B Q4_K_M。-c 2048 -b 256 -ub 128 --cache-ram 128 -ngl 99 -np 1 -t 2 -tb 2 --host .sock --jinja。板端已确认支持。</p>']]},

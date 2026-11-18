@@ -168,7 +168,7 @@ fn sleep_checked(total: Duration, stop: &AtomicBool) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::state::{Switches, STATE_FILE_NAME};
+    use crate::state::Switches;
     use crate::testutil::{temp_dir, MockTts};
     use std::path::Path;
 
@@ -185,7 +185,6 @@ mod tests {
             let shared = Arc::new(Shared::new(
                 Switches { translate_enabled: true, speech_enabled },
                 dir.join("subtitles.jsonl"),
-                dir.join(STATE_FILE_NAME),
             ));
             Self {
                 dir,

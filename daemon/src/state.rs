@@ -258,6 +258,11 @@ impl State {
         self.bridge = status;
     }
 
+    /// 最近一次监管记录的桥进程 PID（轻量原子/字段读取，避免克隆整份 Status）。
+    pub fn bridge_pid(&self) -> Option<u32> {
+        self.processes.bridge.pid
+    }
+
     pub fn set_hw(&mut self, hw: Option<HardwareStatus>) {
         self.hw = hw;
     }

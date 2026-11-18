@@ -53,8 +53,8 @@
 
 ## 跨模块冲突
 
-1. **播报链路文档残留**：SPEC-03 边界仍写"翻译播报使用同一目标音色"（走变声），SPEC-05 与本文件 2026-11-12 记录已定稿 v1 扬声器分时直播。改文档即可，无代码问题。
-2. **运行时状态归属**（已定）：daemon 统一管运行时状态文件，桥不再自写 `bridge-state.json`，改为经 daemon 写。待实现（daemon 状态文件 + 桥迁移）。
+1. **播报链路文档残留**（已实现）：SPEC-03 边界已指向 SPEC-05 扬声器分时直播，文档与实现一致。
+2. **运行时状态归属**（已实现）：daemon 统一管运行时状态文件 `state.json`，桥不再自写 `bridge-state.json`。
 3. **对外控制面**（已定）：Rust 独立适配器进程，全包静态文件 + REST + SSE + 文件上传下载，作 daemon 控制 socket 客户端。循环等待已破。
 4. **部署布局**（已定）：固定运行位 `~/mozart-runtime/bin` 为唯一部署目录，子进程同目录解析不变。releases 版本目录 + 原子切换为后续增强（SPEC-09 待办），不破坏同目录前提。
 5. **pre 分发消费者**（已定）：配置化，允许多支路，按统一规范声明消费者。待实现。
@@ -156,4 +156,5 @@
 - 2026-11-17：边界变更（用户确认，取代同日 overlap 范围可调部分）：`crossfade_ms + sola_search_ms` 锁为定值 60 ms（50 + 10），入口拒绝偏离，原因是引擎形状按最大 overlap 固定、分析窗尚未与之解耦；`startup_delay_ms` 与 `skip_silence` 仍可调；淡化/SOLA 解耦推迟，待办落 SPEC-03 改进点（SPEC-03、config.md、FUTURE）。
 - 2026-11-17：新增板端套件 `tools/jetson-realtime-mm.sh`（`--realtime-mm`）：跨采样率 `model use`、overlap 定值拒绝、`startup_delay` 可调、失败恢复、40 kHz 文件链与资产隔离；板端实测 48 kHz↔40 kHz 冒烟通过，32 kHz 与延迟/听感仍未验证（SPEC-03、SPEC-11、SETUP）。
 - 2026-11-17：FUTURE 清理：删「淡化与 SOLA 可调」「多预设与 last-used」两行，待办已分别由 SPEC-03、SPEC-11 完整跟踪；听感基准行删模型覆盖表述，文档不记模型数量；SPEC-11 交叉引用同步（FUTURE、SPEC-11）。
+- 2026-11-18：播报链路四项修复：桥移除自写 `bridge-state.json`、统一由 daemon `state.json` 持久化并在桥重启后重下发；修复 TTS 发帧节拍正漂移、句内跨段增益跳变与 pre 播报取帧等待/切换淡变/重采样器重置（SPEC-02、SPEC-04、SPEC-05）。
 - 2026-11-18：实现 FUTURE「在线参数调整（SetParams）」：`core` 新增 `MOZART_CTL_RVC_SET_PARAMS`（`0x0308`），`RVCInferencer` 在块边界取参数快照、`StreamingRvc` 原子更新 `skip_silence` 而不重建推理器或流缓冲；`daemon` 对 `pitch_shift`/`index_rate`/`f0_method`/`realtime.skip_silence` 改走 `SetParams` 无中断生效，`startup_delay_ms` 维持 `StopStream`→`StartStream`（SPEC-03、SPEC-04、SPEC-11、FUTURE、config.md）。

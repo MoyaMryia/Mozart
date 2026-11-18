@@ -1,7 +1,7 @@
 //! 运行时状态文件（SPEC-04）：TOML 基线之上的运行时覆盖快照，daemon 统一管。
 //! JSON 键值对（如 {"bridge.translate_enabled": false}），每次改动原子写
 //! （临时文件 + rename），崩溃也保留。存档快照不是活权威：启动叠加恢复一次，
-//! 运行时不对账。桥不再自写 bridge-state.json 的迁移是另一任务。
+//! 运行时不对账；桥只持有内存活状态，启动与桥重启时由 daemon 恢复一次。
 
 use mozart_core::config::{atomic_write, is_state_key, Config};
 use serde_json::Value;

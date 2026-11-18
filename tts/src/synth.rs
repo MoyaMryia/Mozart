@@ -41,8 +41,14 @@ pub fn duration_cap_s(text_chars: usize) -> f64 {
 
 /// 合成结果安全校验与归一化（沿用旧 clone_worker.py:195-211）：
 /// 空样本、非有限样本（NaN/Inf）、时长超限、peak > 4 一律拒绝（计 failed）；
-/// 否则按 gain = min(1, 0.98 / peak) 原地归一化（peak 为 0 时增益 1）。
-fn sanitize(pcm: &mut [f32], sample_rate: u32, cap_s: f64) -> Result<(), String> {
+/// 否则按句内单调不增增益（`running_gain = min(*running_gain, min(1, 0.98 / peak))`）
+/// 原地缩放，避免前段压低增益后后续段跳回 1.0。
+fn sanitize_segment(
+    pcm: &mut [f32],
+    sample_rate: u32,
+    cap_s: f64,
+    running_gain: &mut f32,
+) -> Result<(), String> {
     if pcm.is_empty() {
         return Err("引擎返回空音频".to_string());
     }
@@ -57,15 +63,23 @@ fn sanitize(pcm: &mut [f32], sample_rate: u32, cap_s: f64) -> Result<(), String>
     if peak > PEAK_LIMIT {
         return Err(format!("引擎幅度峰值 {peak:.2} 超安全范围 {PEAK_LIMIT}，拒绝"));
     }
-    let gain = if peak > 0.0 {
+    let seg_gain = if peak > 0.0 {
         (TARGET_PEAK / peak).min(1.0)
     } else {
         1.0
     };
+    *running_gain = (*running_gain).min(seg_gain);
     for v in pcm.iter_mut() {
-        *v *= gain;
+        *v *= *running_gain;
     }
     Ok(())
+}
+
+/// 单段安全校验与归一化便利入口（供单元测试复用）。
+#[cfg(test)]
+fn sanitize(pcm: &mut [f32], sample_rate: u32, cap_s: f64) -> Result<(), String> {
+    let mut running_gain = 1.0;
+    sanitize_segment(pcm, sample_rate, cap_s, &mut running_gain)
 }
 
 /// 句尾闭引号/括号：标点归一化时允许终标点出现在它们之前（沿用旧实现）。
@@ -256,9 +270,10 @@ pub fn run_with(
         // 流式：synth 线程经生成回调逐段交付，sink 重采样 + 安全校验后送有界通道；
         //  scoped 输出线程独占 writer 按节拍发帧。通道满时 sink 阻塞反压引擎解码。
         let (seg_tx, seg_rx) = mpsc::sync_channel::<Vec<f32>>(SEG_BUFFER);
-        // 时长上限按累计样本核算：sanitize 逐段以「剩余配额」为上限，段时长超剩余
-        // 等价于累计超整句上限。归一化随之逐段进行（流式无法预知整句峰值）。
+        // 时长上限按累计样本核算：sanitize_segment 逐段以「剩余配额」为上限，段时长
+        // 超剩余等价于累计超整句上限。句内增益单调不增，防止跨段音量跳升。
         let mut remaining_s = cap_s;
+        let mut running_gain = 1.0f32;
         let mut total_samples = 0usize;
         let mut stream_err: Option<String> = None;
 
@@ -274,7 +289,12 @@ pub fn run_with(
                         }
                     };
                     let seg_s = pcm.len() as f64 / OUTPUT_SAMPLE_RATE as f64;
-                    if let Err(reason) = sanitize(&mut pcm, OUTPUT_SAMPLE_RATE, remaining_s) {
+                    if let Err(reason) = sanitize_segment(
+                        &mut pcm,
+                        OUTPUT_SAMPLE_RATE,
+                        remaining_s,
+                        &mut running_gain,
+                    ) {
                         stream_err = Some(reason);
                         return false;
                     }
@@ -755,6 +775,46 @@ mod tests {
         let status = shared.status();
         assert_eq!(status.synthesized, 1);
         assert_eq!(status.frames_out, 3);
+        cleanup(&path);
+    }
+
+    /// 流式跨段增益：首段峰值超 0.98 将句内增益压到 0.5 后，次段峰值 0.5
+    /// 须沿用 0.5 增益（输出 0.25），不得跳回 1.0。
+    #[test]
+    fn streaming_keeps_running_gain_monotonic_across_segments() {
+        struct TwoSegEngine;
+        impl Synthesizer for TwoSegEngine {
+            fn sample_rate(&self) -> u32 {
+                OUTPUT_SAMPLE_RATE
+            }
+            fn synthesize(
+                &self,
+                _text: &str,
+                _reference: &[f32],
+                _ref_rate: u32,
+                _abort: &Abort<'_>,
+                sink: &mut dyn FnMut(&[f32]) -> bool,
+            ) -> Result<(), String> {
+                assert!(sink(&vec![1.96f32; mozart_core::OUTPUT_SAMPLES]));
+                assert!(sink(&vec![0.5f32; mozart_core::OUTPUT_SAMPLES]));
+                Ok(())
+            }
+        }
+
+        let (path, mut writer, shared, rx) = writer_fixture("gain");
+        let stop = AtomicBool::new(false);
+        let (tx, jobs_rx) = mpsc::sync_channel(1);
+        tx.send(job("a:1")).unwrap();
+        shared.queue_push();
+        drop(tx);
+        run_with(jobs_rx, &TwoSegEngine, None, &mut writer, &shared, &stop);
+
+        let f0 = rx.recv(Some(Duration::from_secs(2))).unwrap();
+        let f1 = rx.recv(Some(Duration::from_secs(2))).unwrap();
+        let p0 = f0.pcm;
+        let p1 = f1.pcm;
+        assert!((p0[0] - TARGET_PEAK).abs() < 1e-6);
+        assert!((p1[0] - 0.25).abs() < 1e-6, "次段须沿用 0.5 增益：{}", p1[0]);
         cleanup(&path);
     }
 }

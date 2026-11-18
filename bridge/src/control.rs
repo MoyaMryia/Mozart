@@ -1,5 +1,5 @@
 //! 控制面服务端（SPEC-05）：bridge.sock SEQPACKET + core 信封。
-//! Hello/GetStatus 加字幕开关命令；开关改桥内活状态并存档状态文件。
+//! Hello/GetStatus 加字幕开关命令；开关改桥内活状态（持久存档归 daemon）。
 //! 连接逐个服务，断开回到 accept；只读原子计数与队列深度，不碰落盘路径。
 
 use crate::state::{Queues, Shared, Switches, VERSION};
@@ -125,9 +125,7 @@ pub fn dispatch(msg: &Message, shared: &Shared, queues: &Queues, tts_jobs_path: 
                 translate_enabled: shared.translate_enabled(),
                 speech_enabled: false,
             };
-            if let Err(reason) = shared.set_switches(switches) {
-                return error_body(ctl::CODE_INTERNAL, &reason);
-            }
+            shared.set_switches(switches);
             let cleared = queues.clear_speech();
             ok_body(json!({ "speech_enabled": false, "queue_cleared": cleared }))
         }
@@ -136,13 +134,11 @@ pub fn dispatch(msg: &Message, shared: &Shared, queues: &Queues, tts_jobs_path: 
 }
 
 fn set_switches(shared: &Shared, switches: Switches) -> Vec<u8> {
-    match shared.set_switches(switches) {
-        Ok(()) => ok_body(json!({
-            "translate_enabled": switches.translate_enabled,
-            "speech_enabled": switches.speech_enabled,
-        })),
-        Err(reason) => error_body(ctl::CODE_INTERNAL, &reason),
-    }
+    shared.set_switches(switches);
+    ok_body(json!({
+        "translate_enabled": switches.translate_enabled,
+        "speech_enabled": switches.speech_enabled,
+    }))
 }
 
 fn parse_enabled(body: &[u8]) -> Result<bool, String> {
@@ -163,7 +159,7 @@ fn parse_stop(body: &[u8]) -> Result<(), String> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::state::{SpeechJob, STATE_FILE_NAME};
+    use crate::state::SpeechJob;
     use mozart_core::ctl::Header;
     use serde_json::Value;
     use std::path::PathBuf;
@@ -188,7 +184,6 @@ mod tests {
                     speech_enabled: true,
                 },
                 dir.join("subtitles.jsonl"),
-                dir.join(STATE_FILE_NAME),
             );
             Self {
                 dir,
@@ -287,7 +282,7 @@ mod tests {
     }
 
     #[test]
-    fn translate_switch_toggles_and_persists() {
+    fn translate_switch_toggles_live_state() {
         let fixture = Fixture::new("translate");
         let reply = dispatch(
             &message(ctl::BRIDGE_TRANSLATE_SET, br#"{"enabled":false}"#),
@@ -297,15 +292,6 @@ mod tests {
         assert_eq!(data(&reply)["translate_enabled"], false);
         assert!(!fixture.shared.translate_enabled());
         assert!(fixture.shared.speech_enabled());
-        let saved = crate::state::load_switches(
-            &fixture.dir.join(STATE_FILE_NAME),
-            Switches { translate_enabled: true, speech_enabled: true },
-        )
-        .unwrap();
-        assert_eq!(
-            saved,
-            Switches { translate_enabled: false, speech_enabled: true }
-        );
 
         let reply = dispatch(
             &message(ctl::BRIDGE_TRANSLATE_SET, br#"{"enabled":true}"#),
@@ -317,7 +303,7 @@ mod tests {
     }
 
     #[test]
-    fn speech_switch_toggles_and_persists() {
+    fn speech_switch_toggles_live_state() {
         let fixture = Fixture::new("speech");
         let reply = dispatch(
             &message(ctl::BRIDGE_SPEECH_SET, br#"{"enabled":false}"#),
@@ -327,15 +313,6 @@ mod tests {
         assert_eq!(data(&reply)["speech_enabled"], false);
         assert!(!fixture.shared.speech_enabled());
         assert!(fixture.shared.translate_enabled());
-        let saved = crate::state::load_switches(
-            &fixture.dir.join(STATE_FILE_NAME),
-            Switches { translate_enabled: true, speech_enabled: true },
-        )
-        .unwrap();
-        assert_eq!(
-            saved,
-            Switches { translate_enabled: true, speech_enabled: false }
-        );
     }
 
     #[test]
@@ -362,12 +339,6 @@ mod tests {
         }
         assert!(!fixture.shared.speech_enabled());
         assert_eq!(fixture.queues.speech_depth(), 0);
-        let saved = crate::state::load_switches(
-            &fixture.dir.join(STATE_FILE_NAME),
-            Switches { translate_enabled: true, speech_enabled: true },
-        )
-        .unwrap();
-        assert!(!saved.speech_enabled);
     }
 
     #[test]

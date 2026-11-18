@@ -136,6 +136,104 @@ fn restart_restores_switches_from_state_file() {
 }
 
 #[test]
+fn bridge_restart_restores_switches_from_state_file() {
+    let daemon = DaemonProcess::start_with_config(
+        "cfg-bridge-restart",
+        &example("pre_stub"),
+        &example("rvc_stub"),
+        BASELINE,
+    );
+    let conn = daemon.connect();
+    wait_bridge_ready(&conn);
+    assert_eq!(call(&conn, ctl::DAEMON_TRANSLATE_SET, br#"{"enabled":false}"#).status, "ok");
+    assert_eq!(call(&conn, ctl::DAEMON_SPEECH_SET, br#"{"enabled":false}"#).status, "ok");
+    let old_pid = status(&conn).processes.bridge.pid.unwrap();
+
+    // 单服务重启桥进程：新桥进程无状态文件，daemon 检测到 pid 变化后重下发 state.json 覆盖。
+    assert_eq!(
+        call(&conn, ctl::DAEMON_RESTART, br#"{"service":"bridge"}"#).status,
+        "ok"
+    );
+    assert!(
+        wait_until(Duration::from_secs(5), || {
+            let snapshot = status(&conn);
+            let new_pid = snapshot.processes.bridge.pid;
+            new_pid.is_some()
+                && new_pid != Some(old_pid)
+                && snapshot
+                    .bridge
+                    .map(|b| !b.translate_enabled && !b.speech_enabled)
+                    .unwrap_or(false)
+        }),
+        "switch overrides were not restored after bridge restart"
+    );
+}
+
+#[test]
+fn switch_write_failure_records_degraded_and_keeps_in_memory_restore() {
+    use std::os::unix::fs::PermissionsExt;
+
+    struct RestorePermissions(std::path::PathBuf);
+    impl Drop for RestorePermissions {
+        fn drop(&mut self) {
+            let _ = std::fs::set_permissions(&self.0, std::fs::Permissions::from_mode(0o755));
+        }
+    }
+
+    // SAFETY: geteuid 无参数、线程安全。
+    if unsafe { libc::geteuid() } == 0 {
+        eprintln!("跳过：root 下目录权限位不拦写，无法构造 state.json 写盘失败");
+        return;
+    }
+
+    let daemon = DaemonProcess::start_with_config(
+        "cfg-write-fail",
+        &example("pre_stub"),
+        &example("rvc_stub"),
+        BASELINE,
+    );
+    let conn = daemon.connect();
+    wait_bridge_ready(&conn);
+    let old_pid = status(&conn).processes.bridge.pid.unwrap();
+
+    let state_dir = daemon.dir.join("state");
+    std::fs::create_dir_all(&state_dir).unwrap();
+    let _guard = RestorePermissions(state_dir.clone());
+    std::fs::set_permissions(&state_dir, std::fs::Permissions::from_mode(0o555)).unwrap();
+
+    let reply = call(&conn, ctl::DAEMON_TRANSLATE_SET, br#"{"enabled":false}"#);
+    assert_eq!(reply.status, "ok", "写盘失败不得阻断已生效的开关命令: {}", reply.reason);
+    assert!(!state_path(&daemon.dir).exists());
+    assert!(
+        status(&conn)
+            .degraded
+            .iter()
+            .any(|reason| reason.contains("state file write bridge.translate_enabled")),
+        "写盘失败须进入 degraded: {:?}",
+        status(&conn).degraded
+    );
+
+    // 只重启桥进程：daemon 内存 overrides 已更新，仍可把 false 推回新桥。
+    assert_eq!(
+        call(&conn, ctl::DAEMON_RESTART, br#"{"service":"bridge"}"#).status,
+        "ok"
+    );
+    assert!(
+        wait_until(Duration::from_secs(5), || {
+            let snapshot = status(&conn);
+            let new_pid = snapshot.processes.bridge.pid;
+            new_pid.is_some()
+                && new_pid != Some(old_pid)
+                && snapshot
+                    .bridge
+                    .map(|b| !b.translate_enabled && b.speech_enabled)
+                    .unwrap_or(false)
+        }),
+        "bridge restart should restore switch from in-memory overrides even when save failed"
+    );
+}
+
+#[test]
 fn runtime_key_applies_without_restart() {
     let storage = std::env::temp_dir().join(format!("mozart-cfg-runtime-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&storage);

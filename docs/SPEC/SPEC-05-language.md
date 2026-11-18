@@ -34,8 +34,8 @@
 - [x] 字幕编号 utterance_id 用识别启动号:句号，不用桥会话号；识别或桥单独重启都不撞号，落盘队列里的老编号也能对上。
 - [x] 控制面：绑定 `bridge.sock`（run_dir 下），daemon 连接；命令 `Hello` / `GetStatus` 加字幕开关命令，信封见 SPEC-01。配置读 `[bridge]` 段。（命令号 0x05xx）
 - [x] 字幕链路命令（v1）：`translate on|off`、`speech on|off`、`speech stop`，经 daemon 转发到桥执行。`translate off` 桥只发布原文字幕、不调 llama-server；`speech off` 桥停新投递、在途自然播完；`speech stop` 关播报并清空待播报队列（在途丢弃）；三者都不影响字幕落盘。`glossary` 编辑与 `subtitle clear` 缓（数据管理留前端适配器，clear 破坏存档）；识别开关不做，停识别用 daemon 停进程。（`bridge/src/control.rs`、`bridge/src/speech.rs`）
-- [x] 开关持久性（生效语义）：`[bridge]` 的 `translate_enabled` / `speech_enabled` 是 TOML 基线；运行时命令改桥内临时开关，重启恢复、不回落基线。桥是开关的活权威。运行时开关命令（translate/speech）与 `config set` 改 TOML 基线、`config save` 批量提升分开（见 SPEC-04）。（`bridge/src/state.rs`）
-- [ ] 开关持久性（存档归属）：改动记入 daemon 的运行时状态文件（见 SPEC-04）。已定：daemon 统一管，桥不再自写 `bridge-state.json`，改为经 daemon 写状态文件。未实现（daemon 状态文件与桥迁移均待做）。
+- [x] 开关持久性（生效语义）：`[bridge]` 的 `translate_enabled` / `speech_enabled` 是 TOML 基线；经 daemon 转发的运行时命令改桥内临时开关并持久记录，重启恢复、不回落基线（直连 `bridge.sock` 仅改桥内存活状态，不写盘）。桥是开关的活权威。运行时开关命令（translate/speech）与 `config set` 改 TOML 基线、`config save` 批量提升分开（见 SPEC-04）。（`bridge/src/state.rs`）
+- [x] 开关持久性（存档归属）：经 daemon 转发的改动记入 daemon 的运行时状态文件 `state.json`（见 SPEC-04），桥只改内存开关并由 daemon 在启动与桥重启时恢复，不再自写 `bridge-state.json`。（`bridge/src/state.rs`、`daemon/src/poller.rs`）
 - [x] 桥 `GetStatus` 字段分四组：翻译（`translate_enabled`、待翻译队列深度、已翻译/失败/重试/质检拒绝数、llama-server 连接状态、最近成功失败时间与原因）；播报（`speech_enabled`、待播报队列深度、已投递/队满丢弃数、TTS 连接状态、受理计数 submitted/skipped/failed）；字幕（已发布句数、记录表条数、文件路径、最近写入时间）；降级原因列表（可查询，带原因与时间）。（`bridge/src/state.rs`）
 
 - [x] 桥 SIGTERM 收尾：停止收新事件，放弃在途翻译/播报请求，丢弃在途队列后退出；字幕存档逐行 flush 已落盘，不受影响。退出须在 daemon 的 2 s 宽限内完成。（`bridge/tests/process.rs`）
@@ -58,7 +58,7 @@
 ### 播报投递
 
 - [x] 投递队列为有界内存队列，不落盘；队满丢最旧并计数，容量为新增参数、板端实测后定。桥里在途队列（待翻译、待播报）均放内存，落盘的是字幕存档与运行时状态文件（见 SPEC-04）。桥崩溃重启丢失在途播报，不补播旧句；译文存档不受影响（见字幕桥，先于投递写入 subtitles.jsonl）。（`bridge/tests/process.rs:572`）
-- [x] 播报 TTS 为独立 Rust 进程，链 sherpa-onnx 的 TTS 库（C/C++ 接口），不链进桥，以隔离崩溃域、解耦构建；由 daemon 监管，跟随 SPEC-04。桥把合格译文发给 TTS 进程，TTS 用参考音色合成，流式喂给 pre 播放（合成一段播一段，沿用旧低延迟路径），不走变声。播报经变声用同一目标音色见 FUTURE。进程形态、不走变声与流式直播均已落地：生成回调每解码一段 PCM 即经有界通道交输出线程按 20 ms 节拍发帧（`tts/src/synth.rs`、`tts/src/ffi.rs`、`tts/src/output.rs`）。首段音频仍须等整句 LM 阶段完成（PocketTTS v1.13.6：LM 整句批处理、解码逐段回调），解码阶段与播放重叠。
+- [x] 播报 TTS 为独立 Rust 进程，链 sherpa-onnx 的 TTS 库（C/C++ 接口），不链进桥，以隔离崩溃域、解耦构建；由 daemon 监管，跟随 SPEC-04。桥把合格译文发给 TTS 进程，TTS 用参考音色合成，流式喂给 pre 播放（合成一段播一段，沿用旧低延迟路径），不走变声。播报经变声用同一目标音色见 FUTURE。进程形态、不走变声与流式直播均已落地：生成回调每解码一段 PCM 即经有界通道交输出线程按固定单调网格推进 20 ms 节拍发帧（`tts/src/synth.rs`、`tts/src/ffi.rs`、`tts/src/output.rs`），流式合成句内跨段保持单调不增的归一化增益以消除段间音量跳升。首段音频仍须等整句 LM 阶段完成（PocketTTS v1.13.6：LM 整句批处理、解码逐段回调），解码阶段与播放重叠。
 - [x] 播报音频采样率：v1 不走变声，TTS 合成后重采样到播放采样率直接喂 pre 播；经变声输出（FUTURE）时在 TTS 进程内重采样到 16 kHz 契约帧喂 RVC，RVC 输入统一 16 kHz。重采样为纯算术、逐块进行，延迟可忽略；算法沿用旧实现。（v1 路径 24k→48k；16 kHz 分支为 FUTURE 死代码 `tts/src/resample.rs:32-33`）
 - [x] 桥到 TTS 接口走 Unix socket + 自有协议（定长头 + JSON），不用 HTTP：TTS 为自有 Rust 进程，区别于第三方 llama-server。任务通道默认 `tts-jobs.sock`（run_dir 下），TTS 绑定、桥连接。命令号 0x06xx（任务 0x0610/停止 0x0612）。应答已改标准信封：type 回显请求号、体 status/code/reason/data、utterance_id 放 data（见 SPEC-01）。
 - [ ] 桥发参考音色参数：桥只发 text + utterance_id（`bridge/src/speech.rs:119-123`）；`voice_params` 仅校验不生效（`tts/src/jobs.rs:6`），音色走配置 reference_wav。注：按句切换音色取决于 TTS 模型能力（当前 sherpa-onnx 固定参考音频），非纯接线问题；v1 单音色不受影响，通道预留待模型支持时接通。
