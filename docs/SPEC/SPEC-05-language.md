@@ -68,6 +68,8 @@
 ## 改进点
 
 - [x] 复核后再翻译播报：开启复核（`refinement_status = pending`）时，`final` 仅落盘原文字幕不入翻译队列；待 `refined`（`completed` / `failed` / `skipped`）到达后才以最终原文触发单次翻译与 TTS 播报（含终态复核状态校验、空 PCM 防挂起与替换时清理旧纠错字段）。复核未开启（`disabled`）时直接在 `final` 触发一次，消除同一句重复翻译播报两次的问题。（`bridge/src/subtitles.rs`、`asr/src/decoder.rs:216`、`bridge/tests/process.rs`）
+- [ ] 字幕常驻与播报解耦：实时识别与翻译字幕（`subtitles.jsonl`）在所有音频主模式下均持续运行；仅翻译播报模式启用 TTS 语音播报，实时变声与原声直出模式保持只出字幕不播报。
+- [ ] 端到端 STS 选型边界：8 GB Jetson 端侧暂不以本地端到端中译英 STS 替换现有 `ASR + LLM + TTS` 管线（受限于统一内存与流式生态）；后续若引入云端 STS，仅作为翻译播报模式的可选在线后端，本地管线保留为离线默认兜底。
 
 ## 待讨论
 
