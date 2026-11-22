@@ -1,6 +1,6 @@
 # Jetson 开发环境与部署
 
-最后更新：2026-11-16。本文是 Jetson 目录、资产、部署与测试的唯一权威。
+最后更新：2026-11-22。本文是 Jetson 目录、资产、部署与测试的唯一权威。
 连接方式不在仓库记录；部署时用参数或 `MOZART_JETSON` 提供 SSH 目标。
 资产分层与工具链的设计规范见 [SPEC/SPEC-10-env.md](SPEC/SPEC-10-env.md)，TOML 字段见 [config.md](config.md)。
 
@@ -67,7 +67,7 @@
 
 ## 工作流
 
-本机执行，三条命令职责分开：
+本机执行，四条命令职责分开：
 
 ```bash
 # 本机全量即时测试
@@ -78,6 +78,9 @@ MOZART_JETSON=<SSH目标> tools/deploy-jetson.sh
 
 # 部署后测试：设备端单测 + 功能测试，按套件可选
 MOZART_JETSON=<SSH目标> tools/jetson-e2e.sh
+
+# 本机音频桥接：跨平台 SSH 听板端输出 / 双向试听 / 同步录 WAV
+MOZART_JETSON=<SSH目标> uv run tools/jetson-audio.py
 ```
 
 提交前运行 `tools/ci-local.sh --staged`；pre-commit hook 调用同一脚本。
@@ -138,6 +141,29 @@ tools/jetson-e2e.sh <SSH目标> --measure latency
 
 功能套件开始前停止运行时，结束后自动重启。measure 需要 release 构建，部署只产 debug。
 证据目录：`/tmp/mozart-smoke`、`/tmp/mozart-file-test`、`/tmp/mozart-multimodel`、`/tmp/mozart-language-test`；measure 证据在 `~/mozart-t7`。
+
+### 本机音频桥接
+
+`tools/jetson-audio.py` 通过 SSH 在本机与设备之间传输 48 kHz 双声道 16 位 PCM（每帧 20 ms），支持 Linux、Windows 与 macOS。本机侧直连系统默认扬声器与默认麦克风，不创建虚拟麦克风；通过 `uv run` 自动加载 `sounddevice` 依赖。
+
+前置条件：本机到设备已配置 SSH 免密登录，设备上已加载 `snd-aloop`；Linux 主机需已安装系统 PortAudio 共享库（如 `libportaudio2` 或 `portaudio`）。脚本默认使用空闲子设备 `SUBDEV=6`（采集）和 `SUBDEV=7`（播放），避免占用测试套件的 `0~5`；如已在 Loopback 上则直接复用对端，否则通过 `mozart-ctl device use` 临时热切并在退出时还原（[验收边界见 SPEC-09](SPEC/SPEC-09-pipeline.md#验收)）。
+
+```bash
+# 听设备播放输出（默认 play 模式）
+MOZART_JETSON=<SSH目标> uv run tools/jetson-audio.py
+
+# 只把本机默认麦克风送入设备采集
+uv run tools/jetson-audio.py <SSH目标> --mode mic
+
+# 双向全双工试听，并同步保存下行 WAV
+uv run tools/jetson-audio.py <SSH目标> --mode duplex --record out.wav
+
+# 跳过控制面热切，按指定缓冲直连目标 Loopback 子设备
+uv run tools/jetson-audio.py <SSH目标> --no-switch --pb-sub 7 --buffer-ms 80
+
+# 指定隔离运行时目录或配置文件
+uv run tools/jetson-audio.py <SSH目标> --runtime-dir ~/my-runtime --config ~/my-runtime/mozart.toml
+```
 
 ## 资产布局
 

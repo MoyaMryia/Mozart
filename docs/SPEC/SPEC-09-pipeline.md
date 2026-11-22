@@ -5,8 +5,8 @@
 
 ## 目的
 
-把构建、检查、部署、启动、观测和回滚收进本机入口，职责按三条命令分开：
-本机全量测试、部署、部署后测试。
+把构建、检查、部署、启动、观测、回滚和远程音频桥接收进本机入口，职责按命令分开：
+本机全量测试、部署、部署后测试、本机音频桥接。
 
 ## 边界
 
@@ -21,9 +21,17 @@
 | `tools/ci-local.sh all` | 本机全量测试：仓库卫生、文档、C++/CTest、Rust、web | [x] |
 | `tools/deploy-jetson.sh <SSH目标>` | 同步、构建、安装、重启；不跑测试 | [x] |
 | `tools/jetson-e2e.sh <SSH目标> [套件]` | 部署后测试：unit / smoke / file / language / measure | [x] |
+| `tools/jetson-audio.py <SSH目标> [选项]` | 本机↔Jetson 跨平台 SSH 音频桥接（听板端输出、送本机麦、双向全双工、录 WAV） | [x] |
 
 - SSH 目标由参数或 `MOZART_JETSON` 提供，仓库不保存设备地址。
 - 设备端单测归 e2e 的 unit 套件；部署脚本不含测试门。
+
+## 远程音频桥接
+
+- [x] 形态与依赖：单文件跨平台 Python 脚本（`tools/jetson-audio.py`，PEP 723 内联依赖 `sounddevice`），支持 Linux / Windows / macOS 经 `uv run` 或已装 `sounddevice` 的 `python3` 运行；直连系统默认扬声器与默认麦克风（`device=None`），不创建系统虚拟麦克风。配套零外部依赖单元测试 `tools/test_jetson_audio.py`。（`tools/jetson-audio.py`、`tools/test_jetson_audio.py`）
+- [x] 方向与格式：支持 `play`（默认，Jetson 播放 → 本机扬声器）、`mic`（本机麦克风 → Jetson 采集）和 `duplex`（双向全双工）；采用纯 SSH 原始 PCM 管道（`ssh -T -o Compression=no`，远端 `arecord`/`aplay`），两端固定 48 kHz、`S16_LE`、2 声道、20 ms 帧（3840 字节/帧），零重采样。（`tools/jetson-audio.py`）
+- [x] 参数与缓冲：SSH 目标由位置参数或 `MOZART_JETSON` 提供（必填）；支持 `--mode <play|mic|duplex>`、`--record <路径>`（仅 `play`/`duplex` 可用，标准库 `wave` 同步写 48 kHz 立体声 WAV，`mic` 模式传入在入口报参数错）、`--pb-sub` / `--cap-sub`（环境变量 `PB_SUB` / `CAP_SUB`，默认 `7` / `6`，范围 `0..=7`，避开测试套件占用的 `0~5`）、`--no-switch`、`--runtime-dir`（`MOZART_RUNTIME_DIR`，默认 `~/mozart-runtime`）、`--config`（`MOZART_REMOTE_CONFIG`，默认 `<runtime-dir>/mozart.toml`）、`--buffer-ms`（默认 `60`，范围 `20..=500` ms，按 20 ms 帧向上取整；本地有界队列上限 `max(目标帧数 × 2, 6)` 帧，满丢最旧防时钟漂移积压、空补零）。（`tools/jetson-audio.py`、`tools/test_jetson_audio.py`）
+- [x] 板端设备接管与故障处理：默认预检远端 `/proc/asound/Loopback`，查询 `mozart-ctl --config <路径> status --json` 的 `pre.playback_device` / `pre.capture_device`；已在 `Loopback` 且可解析 `DEV`/`SUBDEV` 时直接配对对端（`DEV 0 ↔ 1`）复用，否则经 `mozart-ctl device use` 热切到目标子设备并在退出时自动还原（`duplex` 半切失败立即回滚）；`--no-switch` 跳过控制面直连指定子设备。捕获 `SIGINT`/`SIGTERM`，SSH 断线、板端进程退出或声卡异常时显式报错并以非零码退出，收尾依次停本地音频流、停远端 SSH 子进程、关闭 WAV 文件并逆序还原已切换设备。（`tools/jetson-audio.py`、`tools/test_jetson_audio.py`）
 
 ## 阶段
 
@@ -66,3 +74,4 @@
 - [ ] 一条命令回滚到上一版。
 - [x] 每次部署都能查到提交号、时间和结果（`deploy.json`）。
 - [x] 全过程不需要手工 rsync、ssh 或重启命令。
+- [ ] 一条命令建立本机与 Jetson 的单向或双向实时音频桥接，退出后自动还原板端原设备（Linux 开发机 ↔ Jetson 实机已验证 440 Hz WAV 端到端保真、`play` Loopback 复用、`duplex` 热切采集并还原原设备且无残留进程；Windows / macOS 真机链路未验证——阻塞原因：当前无 Windows / macOS 测试主机；解除条件：在 Windows 与 macOS 主机上各自实测一次 `uv run tools/jetson-audio.py` 正常建链与退出）。
