@@ -69,6 +69,11 @@ check_runtime_scripts() {
     bash -n tools/deploy-jetson.sh tools/web-service.sh
 }
 
+build_adapter_fixtures() {
+    cargo build -p mozart-daemon -p mozart-ctl --bins
+    cargo build -p mozart-core --examples
+}
+
 stage_rust() {
     check_runtime_scripts
     if [ ! -f Cargo.toml ]; then
@@ -76,15 +81,14 @@ stage_rust() {
         return 0
     fi
     cargo check --workspace
-    cargo build -p mozart-core --examples
+    build_adapter_fixtures
     cargo build -p mozart-daemon --example enhance_stub
     cargo test --workspace
 }
 
 stage_adapter() {
     check_runtime_scripts
-    cargo build -p mozart-daemon -p mozart-ctl --bins
-    cargo build -p mozart-core --examples
+    build_adapter_fixtures
     cargo check -p mozart-web-adapter
     cargo test -p mozart-web-adapter
 }

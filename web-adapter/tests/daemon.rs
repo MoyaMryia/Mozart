@@ -8,22 +8,11 @@ use mozart_core::config::WebAdapterConfig;
 use serde_json::{json, Value};
 use std::{
     os::unix::fs::PermissionsExt,
-    path::PathBuf,
+    path::{Path, PathBuf},
     process::Command,
     time::{Duration, Instant},
 };
 use tower::ServiceExt;
-
-fn profile() -> PathBuf {
-    // Integration binaries reside in <profile>/deps, including custom target directories.
-    std::env::current_exe()
-        .unwrap()
-        .parent()
-        .unwrap()
-        .parent()
-        .unwrap()
-        .to_owned()
-}
 
 struct Harness {
     _dir: tempfile::TempDir,
@@ -35,7 +24,11 @@ impl Harness {
     async fn new(model: bool) -> Self {
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path();
-        let bin = profile();
+        // Cargo reports the final binary path. The check script builds the fixtures
+        // into the same profile directory, with protocol stubs under examples/.
+        let bin = Path::new(env!("CARGO_BIN_EXE_mozart-web-adapter"))
+            .parent()
+            .unwrap();
         // The wrapper embeds these paths in single-quoted shell arguments.
         assert!(!root.to_string_lossy().contains('\'') && !bin.to_string_lossy().contains('\''));
         for name in [
@@ -50,7 +43,7 @@ impl Harness {
         ] {
             assert!(
                 bin.join(name).is_file(),
-                "missing {}; build daemon/ctl bins and core examples first",
+                "missing {}; run tools/ci-local.sh adapter to build the integration fixtures",
                 bin.join(name).display()
             );
         }
