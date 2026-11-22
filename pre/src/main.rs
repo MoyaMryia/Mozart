@@ -13,8 +13,8 @@
 //! 释放给 daemon。其余消费者（默认 asr）与主干直出恒跑不受门控。
 //! 发送侧惰性建链，pre 启动不依赖消费者生命周期。
 //! DSP 级开关运行时经 SetDsp 生效：控制线程写目标原子，处理线程逐帧应用。
-//! 停止：SIGTERM/SIGINT 置停止标志，各线程在时限内退出；设备打开失败立即退出，
-//! daemon 按退避重启（SPEC-02：换设备不做在线命令，由重启代替）。
+//! 停止：SIGTERM/SIGINT 置停止标志，各线程在时限内退出；启动阶段设备打开失败立即退出，
+//! 运行中支持经 `PRE_SET_DEVICE` 热替换 ALSA 句柄（失败保留旧设备），物理拔线等致命错误退出由 daemon 退避重启。
 
 mod ai;
 mod alsa_stream;
@@ -27,7 +27,7 @@ mod route;
 mod state;
 
 use alsa::Direction;
-use mozart_core::config::{ensure_run_dir, Config};
+use mozart_core::config::{ensure_run_dir, validate_device_name, Config};
 use mozart_core::dgram::FrameSocket;
 use mozart_core::ring::Ring;
 use mozart_core::thread::{bind_socket as bind_control_socket, guard_panic, spawn_thread};
@@ -87,6 +87,8 @@ struct Args {
     config: Option<PathBuf>,
     effective_enhance: Option<Option<mozart_core::config::EnhanceConfig>>,
     effective_dsp: Option<mozart_core::config::PreDspConfig>,
+    effective_capture_device: Option<String>,
+    effective_playback_device: Option<String>,
 }
 
 fn parse_args() -> Result<Args, String> {
@@ -98,6 +100,8 @@ fn parse_args_from(mut args: impl Iterator<Item = String>) -> Result<Args, Strin
     let mut config = None;
     let mut effective_enhance = None;
     let mut effective_dsp = None;
+    let mut effective_capture_device = None;
+    let mut effective_playback_device = None;
     while let Some(arg) = args.next() {
         match arg.as_str() {
             "--socket" => {
@@ -124,6 +128,22 @@ fn parse_args_from(mut args: impl Iterator<Item = String>) -> Result<Args, Strin
                     limiter: dsp.limiter,
                 });
             }
+            "--effective-capture-device" => {
+                let dev = args
+                    .next()
+                    .ok_or("--effective-capture-device needs a device")?;
+                validate_device_name(&dev, "pre.capture_device")
+                    .map_err(|err| format!("--effective-capture-device: {err}"))?;
+                effective_capture_device = Some(dev);
+            }
+            "--effective-playback-device" => {
+                let dev = args
+                    .next()
+                    .ok_or("--effective-playback-device needs a device")?;
+                validate_device_name(&dev, "pre.playback_device")
+                    .map_err(|err| format!("--effective-playback-device: {err}"))?;
+                effective_playback_device = Some(dev);
+            }
             other => return Err(format!("unknown argument: {other}")),
         }
     }
@@ -132,6 +152,8 @@ fn parse_args_from(mut args: impl Iterator<Item = String>) -> Result<Args, Strin
         config,
         effective_enhance,
         effective_dsp,
+        effective_capture_device,
+        effective_playback_device,
     })
 }
 
@@ -152,6 +174,7 @@ fn process_thread(
 ) -> Result<(), String> {
     // DSP 状态为定长数组，构造后热路径零分配。
     let mut applied = shared.dsp_target();
+    let mut last_capture_epoch = 0u64;
     let nn = shared.enhancement.is_some();
     let mut dsp = mozart_dsp::Dsp::new(
         applied.denoise && !nn,
@@ -172,6 +195,10 @@ fn process_thread(
                     target.limiter,
                 );
                 applied = target;
+            }
+            if captured.capture_epoch != last_capture_epoch {
+                dsp.reset_denoise();
+                last_capture_epoch = captured.capture_epoch;
             }
             let conf = dsp.process_frame(&mut frame);
             let input_frame = dsp.pack_frame(&frame, conf);
@@ -209,7 +236,7 @@ fn stop_on_fatal(stop: &AtomicBool, result: Result<(), String>) -> Result<(), St
 
 /// 依序回收线程。线程返回 Err（致命设备错误、无进展降级）或 panic 时
 /// 置停止标志，让其余线程在时限内退出，主线程得以收尾并失败退出；
-/// daemon 按退避重启（SPEC-02：换设备由重启代替）。逻辑见 core::thread，
+/// daemon 按退避重启。逻辑见 core::thread，
 /// 绑定本进程全局 STOP；设备线程返回 Err 前已自置标志，此处幂等补置兜底。
 fn join_threads(handles: Vec<(&'static str, JoinHandle<Result<(), String>>)>) -> Option<String> {
     mozart_core::thread::join_threads(&STOP, handles)
@@ -253,6 +280,12 @@ fn main() -> ExitCode {
         if let Some(effective) = args.effective_dsp {
             config.pre.dsp = effective;
         }
+        if let Some(capture) = args.effective_capture_device {
+            config.pre.capture_device = capture;
+        }
+        if let Some(playback) = args.effective_playback_device {
+            config.pre.playback_device = playback;
+        }
         Ok(config)
     }) {
         Ok(config) => config,
@@ -289,6 +322,11 @@ fn main() -> ExitCode {
         consumers.clone(),
         state::DspSwitches::from_config(&config.pre.dsp),
     );
+    if config.pre.capture_file.is_some() {
+        shared
+            .capture_switch
+            .lock("cannot switch capture device while capture_file is active");
+    }
     if let Some(enhance) = &config.enhance {
         shared.configure_enhancement(enhance, &config.daemon.run_dir);
     }
@@ -354,7 +392,7 @@ fn main() -> ExitCode {
             return ExitCode::FAILURE;
         }
     };
-    log_stream_setup("playback", &config.pre.playback_device, &playback_pcm);
+    alsa_stream::log_stream_setup("playback", &config.pre.playback_device, &playback_pcm);
     eprintln!(
         "mozart-pre: ai link out={}",
         config.rvc_output_socket().display()
@@ -382,7 +420,7 @@ fn main() -> ExitCode {
                 return ExitCode::FAILURE;
             }
         };
-        log_stream_setup("capture", &config.pre.capture_device, &capture_pcm);
+        alsa_stream::log_stream_setup("capture", &config.pre.capture_device, &capture_pcm);
         let ring = capture_ring.clone();
         let shared = shared.clone();
         match spawn_thread("mozart-capture", move || {
@@ -471,6 +509,7 @@ fn main() -> ExitCode {
     let control_handle = {
         let shared = shared.clone();
         let (capture_ring, trunk, rvc_ring, tts_ring) = control_circles;
+        let device_switch_timeout = control::device_switch_timeout(config.daemon.rpc_timeout_ms);
         match spawn_thread("mozart-control", move || {
             control::serve(
                 listener,
@@ -479,6 +518,7 @@ fn main() -> ExitCode {
                 trunk,
                 rvc_ring,
                 tts_ring,
+                device_switch_timeout,
                 &STOP,
             );
             Ok(())
@@ -512,17 +552,6 @@ fn main() -> ExitCode {
 fn spawn_failure(role: &str, err: std::io::Error) -> ExitCode {
     eprintln!("mozart-pre: spawn {role} thread: {err}");
     ExitCode::FAILURE
-}
-
-fn log_stream_setup(role: &str, device: &str, pcm: &alsa::pcm::PCM) {
-    match pcm.get_params() {
-        Ok((buffer, period)) => {
-            eprintln!(
-                "mozart-pre: {role} device {device} ready (period {period}, buffer {buffer})"
-            );
-        }
-        Err(err) => eprintln!("mozart-pre: {role} device {device} ready (params unknown: {err})"),
-    }
 }
 
 #[cfg(test)]

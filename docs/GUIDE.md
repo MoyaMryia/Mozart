@@ -34,9 +34,11 @@ mozart-ctl down               # 关停
 ```bash
 mozart-ctl device list                              # 列出推荐设备
 mozart-ctl device list --all                        # 列出全部 ALSA 别名
-mozart-ctl config set pre.capture_device "<设备名>"  # 设置麦克风
-mozart-ctl config set pre.playback_device "<设备名>" # 设置扬声器
-mozart-ctl restart pre                              # 重启 pre 生效
+mozart-ctl device use capture "<设备名>"             # 实时临时切换麦克风（不断流、不写配置）
+mozart-ctl device use playback "<设备名>"            # 实时临时切换扬声器（不断流、不写配置）
+mozart-ctl config set pre.capture_device "<设备名>"  # 设置默认麦克风
+mozart-ctl config set pre.playback_device "<设备名>" # 设置默认扬声器
+mozart-ctl restart pre                              # 重启 pre 生效默认配置
 ```
 
 优先选 `plughw:`，不要选 `hw:`。无物理声卡时可用 `snd-aloop`。

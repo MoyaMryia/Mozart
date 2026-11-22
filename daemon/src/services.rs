@@ -132,6 +132,20 @@ impl Services {
         validate_dsp_echo(data.data, dsp)
     }
 
+    /// 调用方持 transition 锁；只在 pre 确认热切换成功后由调用方更新内存生效设备。
+    pub(crate) fn set_device(
+        &self,
+        request: &mozart_core::ctl::schema::DeviceUseRequest,
+    ) -> Result<Value, (String, String)> {
+        let body = serde_json::to_vec(request)
+            .map_err(|err| (ctl::CODE_INTERNAL.to_string(), err.to_string()))?;
+        let data = self
+            .pre()
+            .call_ok(ctl::PRE_SET_DEVICE, &body)
+            .map_err(CallError::into_rejection)?;
+        Ok(data.data)
+    }
+
     // ---- rvc 控制入口：实时路由与文件数据面共用一条链路 ----
     // 文件 worker 在独立线程调用这些入口，不持 transition 锁：GPU 归 File
     // 期间 route_set 只动意图、reconcile 不碰 rvc（见下），两者天然互斥。

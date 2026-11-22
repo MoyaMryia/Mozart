@@ -1276,7 +1276,7 @@ fn expand_tilde(path: &Path, home: Option<&Path>) -> PathBuf {
 }
 
 /// ALSA 设备名不做格式限制；只拦空名与内嵌 NUL（CString 转换会 panic）。
-fn validate_device_name(name: &str, field: &str) -> Result<(), ConfigError> {
+pub fn validate_device_name(name: &str, field: &str) -> Result<(), ConfigError> {
     if name.is_empty() {
         return Err(ConfigError::Invalid(format!("{field} must not be empty")));
     }

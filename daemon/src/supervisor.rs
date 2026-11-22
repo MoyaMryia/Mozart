@@ -291,11 +291,16 @@ fn start_child(
     } else {
         command.arg("--socket").arg(socket);
         if role == Role::Pre {
+            let effective = shared.snapshot();
             command
                 .arg("--effective-enhance")
                 .arg(serde_json::to_string(&config.enhance).map_err(io::Error::other)?)
                 .arg("--effective-dsp")
-                .arg(serde_json::to_string(&shared.snapshot().pre.dsp).map_err(io::Error::other)?);
+                .arg(serde_json::to_string(&effective.pre.dsp).map_err(io::Error::other)?)
+                .arg("--effective-capture-device")
+                .arg(&effective.pre.capture_device)
+                .arg("--effective-playback-device")
+                .arg(&effective.pre.playback_device);
         }
         // SPEC-04：子进程与 daemon 读同一 TOML，各读自己的配置段；daemon 以内置
         // 默认启动时无文件可传，不传 --config，子进程按同一顺序解析得同一默认值。

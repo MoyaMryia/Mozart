@@ -53,7 +53,7 @@
 - [x] 同音字纠错（显式表）：显式纠错表搬成 Rust，有行为测试。（`bridge/src/preprocess.rs:13-26`、`bridge/tests/process.rs:395-427`）
 - [x] 同音字纠错（术语同音索引，拼音匹配、词频过滤）：术语表生成无声调拼音索引，识别文本中与术语同音、写法不同的 2–4 字中文片段换成术语写法；词频不低于 10 的真词不替换。拼音用 pinyin crate 逐字 plain 读音（与 pypinyin 同源，ü 归一化为 v），词频表内嵌 jieba 的 2–4 字高频子集。先显式表、后拼音索引，接入翻译预处理与字幕原文纠错。（`bridge/src/preprocess.rs`、`bridge/data/word_freq.txt`）
 - [x] 同音字纠错与旧实现逐条对拍：对拍夹具入本仓 `tests/fixtures/preprocess/homophones.json`，由旧 `tools/tests/test_homophones.py` 用例经旧 `homophones.correct` 实际运行提取，bridge 逐条断言文本与替换记录一致。（质检对拍旧 `test_translation_checks.py` 另由 `bridge/src/checks.rs` 内联测试覆盖。）
-- [x] 第一版整句 final 才翻译；提前断句（stable_clauses）与可选断句模型推迟到第一版之后，见 FUTURE。
+- [x] 第一版整句才翻译（未开复核在 `final` 触发，开启复核待 `refined` 触发）；提前断句（stable_clauses）与可选断句模型推迟到第一版之后，见 FUTURE。
 
 ### 播报投递
 
@@ -64,6 +64,12 @@
 - [ ] 桥发参考音色参数：桥只发 text + utterance_id（`bridge/src/speech.rs:119-123`）；`voice_params` 仅校验不生效（`tts/src/jobs.rs:6`），音色走配置 reference_wav。注：按句切换音色取决于 TTS 模型能力（当前 sherpa-onnx 固定参考音频），非纯接线问题；v1 单音色不受影响，通道预留待模型支持时接通。
 - [x] TTS 控制面：绑定 `tts.sock`（run_dir 下），daemon 连接；命令 `Hello` / `GetStatus`，信封见 SPEC-01。`GetStatus` 带合成成功/失败数、是否合成中、模型加载状态、任务队列深度、最近错误。配置读 `[tts]` 段，socket 路径相对 run_dir。（`tts/src/control.rs`、`tts/src/state.rs`）
 - [x] 第一版播报原速播放；灵活变速（按时长比例与积压反馈选 1.0–1.5 倍速、保留音高）推迟见 FUTURE。拉伸 DSP 用现成 C 库 libmozart-tempo，控制逻辑与时长模型待启用时搬 Rust。
+
+## 改进点
+
+- [x] 复核后再翻译播报：开启复核（`refinement_status = pending`）时，`final` 仅落盘原文字幕不入翻译队列；待 `refined`（`completed` / `failed` / `skipped`）到达后才以最终原文触发单次翻译与 TTS 播报（含终态复核状态校验、空 PCM 防挂起与替换时清理旧纠错字段）。复核未开启（`disabled`）时直接在 `final` 触发一次，消除同一句重复翻译播报两次的问题。（`bridge/src/subtitles.rs`、`asr/src/decoder.rs:216`、`bridge/tests/process.rs`）
+- [ ] 字幕常驻与播报解耦：实时识别与翻译字幕（`subtitles.jsonl`）在所有音频主模式下均持续运行；仅翻译播报模式启用 TTS 语音播报，实时变声与原声直出模式保持只出字幕不播报。
+- [ ] 端到端 STS 选型边界：8 GB Jetson 端侧暂不以本地端到端中译英 STS 替换现有 `ASR + LLM + TTS` 管线（受限于统一内存与流式生态）；后续若引入云端 STS，仅作为翻译播报模式的可选在线后端，本地管线保留为离线默认兜底。
 
 ## 回归检查
 

@@ -33,3 +33,12 @@ impl SharedConfig {
             .unwrap_or_else(|poisoned| poisoned.into_inner()) = Arc::new(config);
     }
 }
+
+/// 重载 TOML 基线后保留尚未提交/临时生效的 pre 状态，避免被无关运行时写入或预设载入冲掉。
+pub(crate) fn preserve_live_pre_state(fresh: &mut Config, old: &Config) {
+    fresh.enhance = old.enhance.clone();
+    fresh.process.enhance_bin = old.process.enhance_bin.clone();
+    fresh.pre.dsp = old.pre.dsp.clone();
+    fresh.pre.capture_device = old.pre.capture_device.clone();
+    fresh.pre.playback_device = old.pre.playback_device.clone();
+}

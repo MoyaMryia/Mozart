@@ -141,6 +141,43 @@ impl Mute {
     }
 }
 
+/// 播放设备热切换起播淡入：触发后从 0 用 10 ms（FADE_SAMPLES）线性淡入到 1。
+pub struct FadeIn {
+    gain: f32,
+    active: bool,
+}
+
+impl FadeIn {
+    pub fn new() -> Self {
+        Self {
+            gain: 1.0,
+            active: false,
+        }
+    }
+
+    pub fn trigger(&mut self) {
+        self.gain = 0.0;
+        self.active = true;
+    }
+
+    pub fn apply(&mut self, samples: &mut [f32]) {
+        if !self.active {
+            return;
+        }
+        let step = fade_step();
+        for sample in samples {
+            if !self.active {
+                break;
+            }
+            self.gain = (self.gain + step).min(1.0);
+            *sample *= self.gain;
+            if self.gain >= 1.0 {
+                self.active = false;
+            }
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -418,5 +455,20 @@ mod tests {
             assert_eq!(out[i], route_gains[i] * mute_gains[i]);
         }
         assert_eq!(router.route(), Route::Direct);
+    }
+
+    #[test]
+    fn fade_in_ramps_from_zero_over_fade_samples() {
+        let mut fade = FadeIn::new();
+        let mut passthrough = [0.75f32; 8];
+        fade.apply(&mut passthrough);
+        assert_eq!(passthrough, [0.75f32; 8]);
+
+        fade.trigger();
+        let mut frame = [1.0f32; FADE_SAMPLES + 8];
+        fade.apply(&mut frame);
+        assert_close(frame[0], 1.0 / FADE_SAMPLES as f32);
+        assert_close(frame[FADE_SAMPLES - 1], 1.0);
+        assert_eq!(frame[FADE_SAMPLES], 1.0);
     }
 }

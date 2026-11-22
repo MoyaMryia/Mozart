@@ -71,6 +71,7 @@ enum {
     MOZART_CTL_DAEMON_PRESET_USE  = 0x011E,  // data {"model_id","preset","values"}；编排失败回 error
     MOZART_CTL_DAEMON_PRESET_LIST = 0x011F,  // data {"model_id","preset","preset_values","live_values","dirty"}
     MOZART_CTL_DAEMON_MODEL_USE   = 0x0120,  // 体 {"model_id"}，data {"model_id","previous_model_id"}；实时/空闲切换模型
+    MOZART_CTL_DAEMON_DEVICE_USE  = 0x0121,  // 体 {"kind","device"}，data {"kind","device","previous_device"}；临时热切换音频设备（不写回 TOML）
 
     MOZART_CTL_PRE_HELLO      = 0x0201,
     MOZART_CTL_PRE_SET_ROUTE  = 0x0202,
@@ -85,6 +86,9 @@ enum {
     // 运行中切换 DSP 级（SPEC-02）：denoise 重新启用时重置 WOLA 流式状态，
     // gate/agc/limiter 直接切换。应答 data 回显四个开关。
     MOZART_CTL_PRE_SET_DSP = 0x0207,
+    // 体 {"kind":"capture"|"playback","device":string}；运行中热替换采集/播放 ALSA 句柄（SPEC-02）：
+    // 先试打开新设备再关旧句柄，失败保留旧设备；切 capture 清半帧并重置 WOLA，切 playback 首帧 10 ms 淡入。
+    MOZART_CTL_PRE_SET_DEVICE = 0x0208,
 
     MOZART_CTL_RVC_HELLO        = 0x0301,
     MOZART_CTL_RVC_LOAD_MODEL   = 0x0302,

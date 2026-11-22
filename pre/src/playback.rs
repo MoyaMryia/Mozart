@@ -7,8 +7,9 @@
 //! 直出时后端回包不播、计数）；播报期间同样排空 AI 环计 skipped。
 
 use crate::alsa_stream::{self, Op, StreamError};
-use crate::route::{Mute, Router, FADE_SAMPLES};
+use crate::route::{FadeIn, Mute, Router, FADE_SAMPLES};
 use crate::state::{Shared, Speaker};
+use alsa::Direction;
 use mozart_core::ctl::schema::Route;
 use mozart_core::ring::Ring;
 use mozart_core::{OutputFrame, RawFrame, OUTPUT_SAMPLES, RAW_SAMPLES, RAW_SAMPLE_RATE};
@@ -275,24 +276,36 @@ fn step_realtime(
 
 /// 播放线程主体。返回 Err 表示致命流错误；主线程据此退出进程。
 pub fn run(
-    pcm: alsa::pcm::PCM,
+    mut pcm: alsa::pcm::PCM,
     trunk: Arc<Ring<RawFrame>>,
     rvc: Arc<Ring<OutputFrame>>,
     tts: Arc<Ring<OutputFrame>>,
     shared: Arc<Shared>,
     stop: &'static AtomicBool,
 ) -> Result<(), String> {
-    let io = pcm
-        .io_i16()
-        .map_err(|err| format!("playback io_i16: {err}"))?;
     let mut stereo = [0i16; RAW_SAMPLES * 2];
     let mut router = Router::new(Route::Direct);
     let mut mute = Mute::new();
+    let mut fade_in = FadeIn::new();
     let mut speaker = SpeakerScheduler::new();
     let mut rvc_resampler = BoundaryResampler::new();
     let mut underruns = 0u64;
     let mut reported = 0u64;
     loop {
+        if shared.playback_switch.has_pending() {
+            shared.playback_switch.apply_pending(
+                |target| alsa_stream::open_and_verify_io("playback", target, Direction::Playback),
+                |_, new_pcm| {
+                    pcm = new_pcm;
+                    fade_in.trigger();
+                },
+            );
+        }
+        let io = pcm.io_i16().map_err(|err| {
+            let message = format!("playback io_i16: {err}");
+            shared.set_last_error(&message);
+            message
+        })?;
         // 命令目标在帧边界读入状态机；不持任何锁（原子读）。
         router.request(shared.route_target());
         mute.request(shared.mute_target());
@@ -320,7 +333,8 @@ pub fn run(
             }
         };
 
-        // 静音淡变作用于当前最终扬声器输出。
+        // 静音淡变与切设备起播淡入作用于当前最终扬声器输出。
+        fade_in.apply(&mut mono);
         mute.apply(&mut mono);
         mono_to_s16_stereo(&mono, &mut stereo);
 
@@ -331,10 +345,12 @@ pub fn run(
             &mut stereo,
             RAW_SAMPLES,
             stop,
+            shared.playback_switch.pending_flag(),
             &mut underruns,
         ) {
             Ok(()) => shared.add_played(1),
             Err(StreamError::Cancelled) => return Ok(()),
+            Err(StreamError::Reopen) => continue,
             Err(StreamError::NoProgress) => {
                 let message = "playback: no progress for 1 s".to_string();
                 shared.set_last_error(&message);

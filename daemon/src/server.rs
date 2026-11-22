@@ -9,12 +9,12 @@ use crate::state_file::{self, BridgeRestore, StateFile};
 use crate::supervisor::{RestartHandle, Supervisor};
 use mozart_core::config::{
     device_key_kind, ensure_run_dir, get_key, runtime_key_owner, save_overrides, set_key,
-    state_file_path, Config,
+    state_file_path, validate_device_name, Config,
 };
 use mozart_core::ctl::schema::{
-    self, ConfigGetRequest, ConfigSetRequest, DeviceListRequest, FileCancelRequest,
-    FileFetchRequest, FileStatusRequest, FileSubmitRequest, MuteSetRequest, RestartRequest,
-    RouteSetRequest, RvcParams, SwitchSetRequest,
+    self, ConfigGetRequest, ConfigSetRequest, DeviceKind, DeviceListRequest, DeviceUseRequest,
+    FileCancelRequest, FileFetchRequest, FileStatusRequest, FileSubmitRequest, MuteSetRequest,
+    RestartRequest, RouteSetRequest, RvcParams, SwitchSetRequest,
 };
 use mozart_core::ctl::{self, Message, Seqpacket};
 use serde_json::json;
@@ -365,6 +365,10 @@ fn handle_request(ctx: &Ctx, msg: &Message) -> (Vec<u8>, bool) {
             Ok(request) => device::list_reply(request.all, device::list),
             Err(reply) => (reply, false),
         },
+        ctl::DAEMON_DEVICE_USE => match parse_body::<DeviceUseRequest>(&msg.body) {
+            Ok(request) => (device_use_reply(ctx, &request), false),
+            Err(reply) => (reply, false),
+        },
         ctl::DAEMON_CONFIG_SET => match parse_body::<ConfigSetRequest>(&msg.body) {
             Ok(request) => (config_set_reply(ctx, &request), false),
             Err(reply) => (reply, false),
@@ -448,6 +452,18 @@ fn restart_service(ctx: &Ctx, service: &str) -> Vec<u8> {
         );
     }
     let coupled = matches!(role, Role::Pre | Role::Enhance) && config.enhance.is_some();
+    if matches!(role, Role::Pre) || coupled {
+        let mut live = (*active).clone();
+        // 显式 restart pre 清空 device use 临时设备，回到 TOML 基线。
+        live.pre.capture_device = config.pre.capture_device.clone();
+        live.pre.playback_device = config.pre.playback_device.clone();
+        if coupled {
+            ctx.services.refresh_enhance(&config);
+            live.enhance = config.enhance.clone();
+            live.process.enhance_bin = config.process.enhance_bin.clone();
+        }
+        ctx.config.replace(live);
+    }
     let config = Arc::new(config);
     for handle in ctx.restarts.iter().filter(|handle| {
         handle.role() == role || (coupled && matches!(handle.role(), Role::Pre | Role::Enhance))
@@ -456,13 +472,6 @@ fn restart_service(ctx: &Ctx, service: &str) -> Vec<u8> {
             return schema::error_body(ctl::CODE_BUSY, "daemon is shutting down");
         }
         lock_state(&ctx.state).clear_pending_restart(handle.role().name());
-    }
-    if coupled {
-        ctx.services.refresh_enhance(&config);
-        let mut live = (*active).clone();
-        live.enhance = config.enhance.clone();
-        live.process.enhance_bin = config.process.enhance_bin.clone();
-        ctx.config.replace(live);
     }
     schema::ok_body(json!({"service": service, "state": "restarting"}))
 }
@@ -493,6 +502,39 @@ fn preset_reply<T: serde::Serialize>(result: Result<T, (String, String)>) -> (Ve
     }
 }
 
+fn validate_device_exists(device: &str, kind: &str) -> Result<(), (String, String)> {
+    match device::exists(device, kind) {
+        Ok(true) => Ok(()),
+        Ok(false) => Err((
+            ctl::CODE_INVALID_ARGUMENT.to_string(),
+            format!("设备不存在：{device}（{kind}；用 device list 查看可用设备）"),
+        )),
+        Err(err) => Err(err),
+    }
+}
+
+fn device_use_reply(ctx: &Ctx, request: &DeviceUseRequest) -> Vec<u8> {
+    if let Err(err) = validate_device_name(&request.device, request.kind.config_key()) {
+        return schema::error_body(ctl::CODE_INVALID_ARGUMENT, &err.to_string());
+    }
+    if let Err((code, reason)) = validate_device_exists(&request.device, request.kind.as_str()) {
+        return schema::error_body(&code, &reason);
+    }
+    let _transition = ctx.services.transition();
+    match ctx.services.set_device(request) {
+        Ok(data) => {
+            let mut live = (*ctx.config.snapshot()).clone();
+            match request.kind {
+                DeviceKind::Capture => live.pre.capture_device = request.device.clone(),
+                DeviceKind::Playback => live.pre.playback_device = request.device.clone(),
+            }
+            ctx.config.replace(live);
+            schema::ok_body(data)
+        }
+        Err((code, reason)) => schema::error_body(&code, &reason),
+    }
+}
+
 /// config set（SPEC-04）：设备键先对照当前清单校验存在（防呆），再原子写基线，
 /// 回重启提示契约 restart_required + affected，并登记待重启。daemon 运行时键与
 /// rvc 会话参数键写基线后即时应用：daemon/file 键清覆盖并重建生效配置；rvc 会话
@@ -500,18 +542,8 @@ fn preset_reply<T: serde::Serialize>(result: Result<T, (String, String)>) -> (Ve
 /// 键由 core::set_key 分类拒绝。
 fn config_set_reply(ctx: &Ctx, request: &ConfigSetRequest) -> Vec<u8> {
     if let Some(kind) = device_key_kind(&request.key) {
-        match device::exists(&request.value, kind) {
-            Ok(true) => {}
-            Ok(false) => {
-                return schema::error_body(
-                    ctl::CODE_INVALID_ARGUMENT,
-                    &format!(
-                        "设备不存在：{}（{kind}；用 device list 查看可用设备）",
-                        request.value
-                    ),
-                );
-            }
-            Err((code, reason)) => return schema::error_body(&code, &reason),
+        if let Err((code, reason)) = validate_device_exists(&request.value, kind) {
+            return schema::error_body(&code, &reason);
         }
     }
     // 锁顺序 transition → toml：预设载入在持 transition 时也要写 TOML 基线，
@@ -572,11 +604,8 @@ fn apply_runtime_key(ctx: &Ctx, key: &str, old: &Config) -> Result<(), (String, 
         .map_err(|err| (ctl::CODE_INTERNAL.to_string(), err.to_string()))?;
     let overrides = lock_state_file(&ctx.state_file).overrides().clone();
     state_file::overlay(&mut fresh, &overrides);
-    // Restart-only enhancement settings must not leak through an unrelated runtime write.
-    fresh.enhance = old.enhance.clone();
-    fresh.process.enhance_bin = old.process.enhance_bin.clone();
     let requested_dsp = fresh.pre.dsp.clone();
-    fresh.pre.dsp = old.pre.dsp.clone();
+    crate::runtime::preserve_live_pre_state(&mut fresh, old);
     if runtime_key_owner(key) == Some("pre") {
         match key {
             "pre.dsp.denoise" => fresh.pre.dsp.denoise = requested_dsp.denoise,

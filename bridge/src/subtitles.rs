@@ -2,7 +2,8 @@
 //! 记录格式沿用旧实现（subtitle_bridge.py source_caption）：zh/en/final/translation_status/
 //! received_at/ts/seq 加可空审计字段；utterance_id 用启动号:句号。
 //! revision 覆盖语义：创建记 0，每次更新 +1；final 之后不再被 partial/final 覆盖；
-//! refined 只更新 zh 与 refinement_status，不重新触发翻译。
+//! 复核开启（refinement_status = pending）时等 refined 到达后再触发单次翻译与播报；
+//! 复核未开启时则在 final 直接触发一次。
 //! 记录表与写盘由 SubtitleStore 共享给字幕线程与翻译线程：
 //! 译文合格即追加一行 completed 修订，先于播报投递落盘。
 
@@ -29,6 +30,13 @@ const RECORD_CAP: usize = 128;
 
 /// 降级原因：待翻译队列满（后续入队成功时解除）。
 const DEGRADED_TRANSLATE_FULL: &str = "translate queue full";
+
+/// ASR 复核待完成状态；复核终态为 completed / failed / skipped。
+const REFINEMENT_PENDING: &str = "pending";
+
+fn is_terminal_refinement(status: Option<&str>) -> bool {
+    matches!(status, Some("completed" | "failed" | "skipped"))
+}
 
 /// 翻译状态（沿用旧 translation_status 取值）。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -117,6 +125,11 @@ impl RecordTable {
         self.entries.get(key).map(|(record, _)| record)
     }
 
+    /// 只读查看记录，不刷新 LRU 访问序。
+    fn peek(&self, key: &str) -> Option<&SubtitleRecord> {
+        self.entries.get(key).map(|(record, _)| record)
+    }
+
     pub fn get_mut(&mut self, key: &str) -> Option<&mut SubtitleRecord> {
         self.touch(key);
         self.entries.get_mut(key).map(|(record, _)| record)
@@ -188,6 +201,27 @@ fn seq_from_utterance(utterance_id: &str) -> u64 {
         .unwrap_or(0)
 }
 
+/// 对原文执行同音字与术语纠错，返回纠错后文本及仅在命中时附带的审计字段。
+fn apply_source_corrections(
+    raw: &str,
+    corrections: &[(String, String)],
+) -> (String, Option<String>, Option<Value>) {
+    let (zh, fixes) = preprocess::correct_with_terms(
+        raw,
+        &preprocess::builtin_correction_terms(),
+        corrections,
+    );
+    if fixes.is_empty() {
+        (zh, None, None)
+    } else {
+        (
+            zh,
+            Some(raw.to_string()),
+            Some(serde_json::to_value(&fixes).expect("correction fixes are serializable")),
+        )
+    }
+}
+
 /// 合并一条事件进记录表，返回应落盘的记录；None 表示忽略。
 /// 事件字段已在 events::parse 入口校验，此处信任。zh 存纠错后原文。
 pub fn apply(
@@ -212,14 +246,10 @@ pub fn apply(
                 .unwrap_or(&event.text)
                 .trim()
                 .to_string();
-            let (zh, fixes) = preprocess::correct_with_terms(
-                &raw_text,
-                &preprocess::builtin_correction_terms(),
-                corrections,
-            );
+            let (zh, zh_raw, homophone_fixes) = apply_source_corrections(&raw_text, corrections);
             let is_final = event.kind == EventKind::Final;
             let received_at = now_ms as f64 / 1000.0;
-            let mut record = SubtitleRecord {
+            let record = SubtitleRecord {
                 seq: event.seq.unwrap_or_else(|| seq_from_utterance(&event.utterance_id)),
                 utterance_id: event.utterance_id.clone(),
                 zh,
@@ -249,38 +279,27 @@ pub fn apply(
                 asr_polarity_audit: event.asr_polarity_audit.clone(),
                 refinement_status: event.refinement_status.clone(),
                 translation_source_audit: event.translation_source_audit.clone(),
-                homophone_fixes: None,
-                zh_raw: None,
+                homophone_fixes,
+                zh_raw,
                 translation_error: None,
                 translated_at: None,
                 translate_ms: None,
             };
-            if !fixes.is_empty() {
-                record.zh_raw = Some(raw_text);
-                record.homophone_fixes =
-                    Some(serde_json::to_value(&fixes).expect("correction fixes are serializable"));
-            }
             table.insert(event.utterance_id.clone(), record.clone());
             Some(record)
         }
         EventKind::Refined => {
             let record = table.get_mut(&event.utterance_id)?;
-            // 复核文本非空才替换原文（ASR 仅在复核 completed 时携带 refined_text）。
+            // 复核文本非空才替换原文（ASR 仅在复核 completed 时携带 refined_text）；
+            // 替换时同步更新/清理旧纠错审计字段，避免残留上一版的 zh_raw。
             if let Some(refined) = event.refined_text.as_deref() {
                 let trimmed = refined.trim();
                 if !trimmed.is_empty() {
-                    let (zh, fixes) = preprocess::correct_with_terms(
-                        trimmed,
-                        &preprocess::builtin_correction_terms(),
-                        corrections,
-                    );
+                    let (zh, zh_raw, homophone_fixes) =
+                        apply_source_corrections(trimmed, corrections);
                     record.zh = zh;
-                    if !fixes.is_empty() {
-                        record.zh_raw = Some(trimmed.to_string());
-                        record.homophone_fixes = Some(
-                            serde_json::to_value(&fixes).expect("correction fixes are serializable"),
-                        );
-                    }
+                    record.zh_raw = zh_raw;
+                    record.homophone_fixes = homophone_fixes;
                 }
             }
             if let Some(status) = &event.refinement_status {
@@ -334,14 +353,28 @@ impl SubtitleStore {
         }
     }
 
-    /// 合并一条事件并落盘，返回应入待翻译队列的记录；None 表示忽略。
+    /// 合并一条事件并落盘，返回新记录；None 表示忽略（测试便利入口）。
+    #[cfg(test)]
     pub fn apply_event(&self, event: &Event, shared: &Shared) -> Result<Option<SubtitleRecord>, String> {
+        Ok(self.apply_for_dispatch(event, shared)?.map(|(record, _)| record))
+    }
+
+    /// 合并一条事件并落盘，同时判定是否应入待翻译队列（复核开启时等 refined 落地再入队，
+    /// 复核未开启则在 final 入队；每句至多触发一次）。
+    pub fn apply_for_dispatch(
+        &self,
+        event: &Event,
+        shared: &Shared,
+    ) -> Result<Option<(SubtitleRecord, bool)>, String> {
         let now = unix_ms();
         let mut records = self
             .records
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         let created = !records.contains_key(&event.utterance_id);
+        let was_pending_review = records.peek(&event.utterance_id).is_some_and(|record| {
+            record.is_final && record.refinement_status.as_deref() == Some(REFINEMENT_PENDING)
+        });
         let Some(record) = apply(&mut records, event, now, &self.corrections) else {
             return Ok(None);
         };
@@ -351,7 +384,14 @@ impl SubtitleStore {
         }
         shared.set_records_in_memory(records.len() as u32);
         shared.set_last_write_unix_ms(now);
-        Ok(Some(record))
+        let ready_to_translate = match event.kind {
+            EventKind::Partial => false,
+            EventKind::Final => event.refinement_status.as_deref() != Some(REFINEMENT_PENDING),
+            EventKind::Refined => {
+                was_pending_review && is_terminal_refinement(event.refinement_status.as_deref())
+            }
+        };
+        Ok(Some((record, ready_to_translate)))
     }
 
     /// 译文合格：更新记录并追加一行修订（先于播报投递落盘，SPEC-05）。
@@ -469,11 +509,11 @@ fn process(
     queues: &Queues,
     shared: &Shared,
 ) -> Result<(), String> {
-    let Some(record) = store.apply_event(&event, shared)? else {
+    let Some((record, ready_to_translate)) = store.apply_for_dispatch(&event, shared)? else {
         return Ok(());
     };
-    // final 入待翻译队列；translate off 只发布原文，不入队。
-    if record.is_final && shared.translate_enabled() {
+    // 复核开启时等 refined 再入待翻译队列；复核关闭时在 final 入队；translate off 只发布原文。
+    if ready_to_translate && shared.translate_enabled() {
         let job = TranslateJob {
             utterance_id: record.utterance_id.clone(),
             text: record.zh.clone(),
@@ -815,5 +855,137 @@ mod tests {
         }
         assert_eq!(table.len(), 150);
         assert!(table.contains_key("a1b2c3d4:1"));
+    }
+
+    #[test]
+    fn dispatch_waits_for_refined_when_pending_and_fires_once() {
+        use crate::state::{Shared, Switches};
+
+        let dir = std::env::temp_dir().join(format!(
+            "mozart-bridge-dispatch-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let path = dir.join("subtitles.jsonl");
+        let shared = Shared::new(
+            Switches { translate_enabled: true, speech_enabled: true },
+            path.clone(),
+        );
+        let store = SubtitleStore::new(JsonlWriter::open(&path).unwrap(), path.clone(), no_corrections());
+
+        let final_pending = parse(
+            &serde_json::to_vec(&json!({
+                "type": "final",
+                "startup_id": "a1b2c3d4",
+                "utterance_id": "a1b2c3d4:1",
+                "seq": 1,
+                "text": "初版错字",
+                "refinement_status": "pending",
+            }))
+            .unwrap(),
+        )
+        .unwrap()
+        .unwrap();
+        let (_, ready) = store.apply_for_dispatch(&final_pending, &shared).unwrap().unwrap();
+        assert!(!ready, "开启复核时 final 不得直接入翻译队列");
+
+        let (rec, ready) = store
+            .apply_for_dispatch(&refined_event(1, Some("复核正文")), &shared)
+            .unwrap()
+            .unwrap();
+        assert!(ready, "refined 到达后应触发一次翻译");
+        assert_eq!(rec.zh, "复核正文");
+
+        // 重复 refined 不得再触发第二次。
+        let (_, ready_again) = store
+            .apply_for_dispatch(&refined_event(1, Some("重复复核")), &shared)
+            .unwrap()
+            .unwrap();
+        assert!(!ready_again, "同一句不得触发第二次翻译");
+
+        // 复核跳过/失败（无 refined_text）也应兜底用原文触发一次。
+        let final_pending_2 = parse(
+            &serde_json::to_vec(&json!({
+                "type": "final",
+                "startup_id": "a1b2c3d4",
+                "utterance_id": "a1b2c3d4:2",
+                "seq": 2,
+                "text": "兜底原文",
+                "refinement_status": "pending",
+            }))
+            .unwrap(),
+        )
+        .unwrap()
+        .unwrap();
+        assert!(!store.apply_for_dispatch(&final_pending_2, &shared).unwrap().unwrap().1);
+        let refined_skipped = parse(
+            &serde_json::to_vec(&json!({
+                "type": "refined",
+                "startup_id": "a1b2c3d4",
+                "utterance_id": "a1b2c3d4:2",
+                "seq": 2,
+                "text": "兜底原文",
+                "refinement_status": "skipped",
+            }))
+            .unwrap(),
+        )
+        .unwrap()
+        .unwrap();
+        let (rec2, ready2) = store.apply_for_dispatch(&refined_skipped, &shared).unwrap().unwrap();
+        assert!(ready2);
+        assert_eq!(rec2.zh, "兜底原文");
+
+        // 复核关闭（disabled）则在 final 立即触发，且后续 stray refined 不重复触发。
+        let final_disabled = parse(
+            &serde_json::to_vec(&json!({
+                "type": "final",
+                "startup_id": "a1b2c3d4",
+                "utterance_id": "a1b2c3d4:3",
+                "seq": 3,
+                "text": "直接翻译",
+                "refinement_status": "disabled",
+            }))
+            .unwrap(),
+        )
+        .unwrap()
+        .unwrap();
+        assert!(store.apply_for_dispatch(&final_disabled, &shared).unwrap().unwrap().1);
+        assert!(!store.apply_for_dispatch(&refined_event(3, Some("晚到复核")), &shared).unwrap().unwrap().1);
+
+        // 非终态 refined（如缺状态）不提前触发，终态 refined 到来后才触发。
+        let final_pending_4 = parse(
+            &serde_json::to_vec(&json!({
+                "type": "final",
+                "startup_id": "a1b2c3d4",
+                "utterance_id": "a1b2c3d4:4",
+                "seq": 4,
+                "text": "等待终态",
+                "refinement_status": "pending",
+            }))
+            .unwrap(),
+        )
+        .unwrap()
+        .unwrap();
+        assert!(!store.apply_for_dispatch(&final_pending_4, &shared).unwrap().unwrap().1);
+        let non_terminal_refined = event(EventKind::Refined, 4, "等待终态");
+        assert!(!store.apply_for_dispatch(&non_terminal_refined, &shared).unwrap().unwrap().1);
+        assert!(store.apply_for_dispatch(&refined_event(4, Some("终态完成")), &shared).unwrap().unwrap().1);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn refined_clears_stale_homophone_fixes_from_final() {
+        let mut table = RecordTable::new();
+        let corrections = preprocess::builtin_corrections();
+        let final_rec = apply(&mut table, &event(EventKind::Final, 1, "我以经说了"), 100, &corrections).unwrap();
+        assert_eq!(final_rec.zh, "我已经说了");
+        assert_eq!(final_rec.zh_raw.as_deref(), Some("我以经说了"));
+        assert!(final_rec.homophone_fixes.is_some());
+
+        let refined_rec = apply(&mut table, &refined_event(1, Some("我已经说完了。")), 200, &corrections).unwrap();
+        assert_eq!(refined_rec.zh, "我已经说完了。");
+        assert!(refined_rec.zh_raw.is_none(), "复核未命中纠错时不得残留旧 zh_raw");
+        assert!(refined_rec.homophone_fixes.is_none(), "复核未命中纠错时不得残留旧 homophone_fixes");
     }
 }

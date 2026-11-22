@@ -2,10 +2,180 @@
 //! `last_error` 用互斥锁保护，只在降级事件写入，不跨任何 I/O 持有。
 
 use mozart_core::config::{PreConsumerConfig, PreDspConfig};
+use mozart_core::ctl;
 use mozart_core::ctl::schema::{PreStatus, Route};
 use std::collections::BTreeMap;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicU8, AtomicUsize, Ordering};
-use std::sync::Mutex;
+use std::sync::{mpsc, Mutex};
+use std::time::{Duration, Instant};
+
+const SWITCH_POLL: Duration = Duration::from_millis(20);
+
+struct SwitchRequest {
+    target: String,
+    reply: mpsc::Sender<Result<String, String>>,
+}
+
+struct DeviceSwitchInner {
+    current: String,
+    locked_reason: Option<String>,
+    request: Option<SwitchRequest>,
+}
+
+/// 音频设备热切换槽（采集/播放各持一槽）：
+/// 音频线程稳态热路径只读 `pending` 原子，不加锁；只有收到切换命令时才短暂拿锁取目标，
+/// 并在锁外执行 ALSA open，避免阻塞 GetStatus 与其他命令。
+pub struct DeviceSwitchSlot {
+    pending: AtomicBool,
+    request_lock: Mutex<()>,
+    inner: Mutex<DeviceSwitchInner>,
+}
+
+impl DeviceSwitchSlot {
+    pub fn new(initial: String) -> Self {
+        Self {
+            pending: AtomicBool::new(false),
+            request_lock: Mutex::new(()),
+            inner: Mutex::new(DeviceSwitchInner {
+                current: initial,
+                locked_reason: None,
+                request: None,
+            }),
+        }
+    }
+
+    pub fn lock(&self, reason: &str) {
+        self.inner
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .locked_reason = Some(reason.to_string());
+    }
+
+    pub fn current(&self) -> String {
+        self.inner
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .current
+            .clone()
+    }
+
+    pub fn pending_flag(&self) -> &AtomicBool {
+        &self.pending
+    }
+
+    pub fn has_pending(&self) -> bool {
+        self.pending.load(Ordering::Acquire)
+    }
+
+    /// 控制线程发起热切换并等待音频线程在循环边界完成；返回旧设备名或拒绝原因。
+    pub fn request_switch(
+        &self,
+        target: &str,
+        timeout: Duration,
+        stop: &AtomicBool,
+    ) -> Result<String, (String, String)> {
+        let _guard = self
+            .request_lock
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if stop.load(Ordering::Relaxed) {
+            return Err((ctl::CODE_BUSY.to_string(), "pre is shutting down".to_string()));
+        }
+        let rx = {
+            let mut inner = self
+                .inner
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            if let Some(reason) = &inner.locked_reason {
+                return Err((ctl::CODE_INVALID_ARGUMENT.to_string(), reason.clone()));
+            }
+            if inner.current == target {
+                return Ok(inner.current.clone());
+            }
+            let (tx, rx) = mpsc::channel();
+            inner.request = Some(SwitchRequest {
+                target: target.to_string(),
+                reply: tx,
+            });
+            self.pending.store(true, Ordering::Release);
+            rx
+        };
+        let deadline = Instant::now() + timeout;
+        loop {
+            if stop.load(Ordering::Relaxed) {
+                self.clear_pending();
+                return Err((ctl::CODE_BUSY.to_string(), "pre is shutting down".to_string()));
+            }
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            if remaining.is_zero() {
+                self.clear_pending();
+                return Err((
+                    ctl::CODE_NOT_READY.to_string(),
+                    "audio device switch timed out".to_string(),
+                ));
+            }
+            match rx.recv_timeout(remaining.min(SWITCH_POLL)) {
+                Ok(Ok(previous)) => return Ok(previous),
+                Ok(Err(message)) => {
+                    return Err((ctl::CODE_INVALID_ARGUMENT.to_string(), message));
+                }
+                Err(mpsc::RecvTimeoutError::Timeout) => continue,
+                Err(mpsc::RecvTimeoutError::Disconnected) => {
+                    self.clear_pending();
+                    return Err((
+                        ctl::CODE_NOT_READY.to_string(),
+                        "audio thread stopped during device switch".to_string(),
+                    ));
+                }
+            }
+        }
+    }
+
+    fn clear_pending(&self) {
+        let mut inner = self
+            .inner
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        inner.request = None;
+        self.pending.store(false, Ordering::Release);
+    }
+
+    /// 音频线程在循环边界调用：取走待切目标，锁外打开新设备；成功才替换当前设备与句柄。
+    pub fn apply_pending<S>(
+        &self,
+        opener: impl FnOnce(&str) -> Result<S, String>,
+        on_success: impl FnOnce(&str, S),
+    ) {
+        let req = {
+            let mut inner = self
+                .inner
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            let req = inner.request.take();
+            self.pending.store(false, Ordering::Release);
+            req
+        };
+        let Some(req) = req else {
+            return;
+        };
+        match opener(&req.target) {
+            Ok(stream) => {
+                let prev = {
+                    let mut inner = self
+                        .inner
+                        .lock()
+                        .unwrap_or_else(|poisoned| poisoned.into_inner());
+                    std::mem::replace(&mut inner.current, req.target.clone())
+                };
+                on_success(&req.target, stream);
+                let _ = req.reply.send(Ok(prev));
+            }
+            Err(err) => {
+                let _ = req.reply.send(Err(err));
+            }
+        }
+    }
+}
 
 /// 版本号，Hello 与 GetStatus 一致上报。
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");
@@ -153,6 +323,8 @@ pub struct Shared {
     consumers: Vec<Consumer>,
     /// DSP 级开关目标：控制线程（SetDsp）写，处理线程逐帧读、变化时应用。
     dsp_target: AtomicU64,
+    /// 采集设备切换代次：采集热切换成功后递增，触发处理线程重置 WOLA 与增强会话。
+    capture_epoch: AtomicU64,
     pub enhancement: Option<std::sync::Arc<crate::enhancement::Enhancement>>,
     /// AI 输出帧坏包丢弃，接收线程发布绝对值。
     ai_recv_dropped: AtomicU64,
@@ -169,8 +341,8 @@ pub struct Shared {
     /// 播报帧播放累计，播放线程累加。
     tts_frames_played: AtomicU64,
     last_error: Mutex<Option<String>>,
-    capture_device: String,
-    playback_device: String,
+    pub capture_switch: DeviceSwitchSlot,
+    pub playback_switch: DeviceSwitchSlot,
     /// 进程启动号：每次启动随机生成，GetStatus 上报供 daemon 识别重启。
     startup_id: String,
 }
@@ -201,6 +373,7 @@ impl Shared {
             frames_played: AtomicU64::new(0),
             consumers: consumers.into_iter().map(Consumer::from_config).collect(),
             dsp_target: AtomicU64::new(dsp.code().into()),
+            capture_epoch: AtomicU64::new(0),
             enhancement: None,
             ai_recv_dropped: AtomicU64::new(0),
             tts_recv_dropped: AtomicU64::new(0),
@@ -210,8 +383,8 @@ impl Shared {
             speaker_state: AtomicU8::new(speaker_code(Speaker::Realtime)),
             tts_frames_played: AtomicU64::new(0),
             last_error: Mutex::new(None),
-            capture_device,
-            playback_device,
+            capture_switch: DeviceSwitchSlot::new(capture_device),
+            playback_switch: DeviceSwitchSlot::new(playback_device),
             startup_id,
         }
     }
@@ -345,7 +518,15 @@ impl Shared {
     }
 
     pub fn enhancement_epoch(&self) -> u64 {
-        self.dsp_snapshot().1
+        self.dsp_snapshot().1.wrapping_add(self.capture_epoch())
+    }
+
+    pub fn capture_epoch(&self) -> u64 {
+        self.capture_epoch.load(Ordering::Acquire)
+    }
+
+    pub fn bump_capture_epoch(&self) -> u64 {
+        self.capture_epoch.fetch_add(1, Ordering::AcqRel) + 1
     }
 
     pub fn configure_enhancement(
@@ -455,8 +636,8 @@ impl Shared {
             // 路由与静音上报命令目标；淡变在 20 ms 内完成，属执行细节。
             route: self.route_target(),
             mute: self.mute_target(),
-            capture_device: self.capture_device.clone(),
-            playback_device: self.playback_device.clone(),
+            capture_device: self.capture_switch.current(),
+            playback_device: self.playback_switch.current(),
             frames_captured: self.frames_captured.load(Ordering::Relaxed),
             frames_played: self.frames_played.load(Ordering::Relaxed),
             frames_dropped: queue.dropped,
@@ -719,5 +900,67 @@ mod tests {
         };
         shared.set_dsp_target(target);
         assert_eq!(shared.dsp_target(), target);
+    }
+
+    #[test]
+    fn device_switch_slot_succeeds_rejects_failure_and_respects_lock() {
+        let stop = AtomicBool::new(false);
+        let slot = std::sync::Arc::new(DeviceSwitchSlot::new("dev-a".to_string()));
+
+        // 同设备切换幂等返回，不触发 pending。
+        assert_eq!(
+            slot.request_switch("dev-a", Duration::from_millis(100), &stop)
+                .unwrap(),
+            "dev-a"
+        );
+        assert!(!slot.has_pending());
+
+        // 打开失败：保留旧设备，返回 InvalidArgument。
+        let worker_slot = slot.clone();
+        let handle = std::thread::spawn(move || {
+            while !worker_slot.has_pending() {
+                std::thread::sleep(Duration::from_millis(1));
+            }
+            worker_slot.apply_pending::<()>(
+                |target| Err(format!("open {target} failed")),
+                |_, _| unreachable!(),
+            );
+        });
+        let err = slot
+            .request_switch("dev-bad", Duration::from_secs(1), &stop)
+            .unwrap_err();
+        assert_eq!(err.0, ctl::CODE_INVALID_ARGUMENT);
+        assert!(err.1.contains("open dev-bad failed"));
+        assert_eq!(slot.current(), "dev-a");
+        handle.join().unwrap();
+
+        // 打开成功：更新 current 并返回旧设备。
+        let worker_slot = slot.clone();
+        let handle = std::thread::spawn(move || {
+            while !worker_slot.has_pending() {
+                std::thread::sleep(Duration::from_millis(1));
+            }
+            worker_slot.apply_pending(
+                |target| Ok(format!("handle:{target}")),
+                |target, stream| {
+                    assert_eq!(target, "dev-b");
+                    assert_eq!(stream, "handle:dev-b");
+                },
+            );
+        });
+        let prev = slot
+            .request_switch("dev-b", Duration::from_secs(1), &stop)
+            .unwrap();
+        assert_eq!(prev, "dev-a");
+        assert_eq!(slot.current(), "dev-b");
+        handle.join().unwrap();
+
+        // 锁定时（capture_file 模式）直接拒绝，even if same target。
+        slot.lock("capture_file active");
+        let locked = slot
+            .request_switch("dev-b", Duration::from_millis(50), &stop)
+            .unwrap_err();
+        assert_eq!(locked.0, ctl::CODE_INVALID_ARGUMENT);
+        assert!(locked.1.contains("capture_file"));
     }
 }

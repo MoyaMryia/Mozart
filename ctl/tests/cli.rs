@@ -1111,6 +1111,63 @@ fn config_get_rejects_malformed_pending_field() {
 }
 
 #[test]
+fn device_use_sends_kind_device_and_renders_output() {
+    let env = CtlEnv::new("device-use");
+    let stub = StubDaemon::start(
+        &env.socket(),
+        vec![
+            (
+                ctl::DAEMON_DEVICE_USE,
+                ok_body(json!({
+                    "kind": "capture",
+                    "device": "plughw:CARD=MIC,DEV=0",
+                    "previous_device": "default"
+                })),
+            ),
+            (
+                ctl::DAEMON_DEVICE_USE,
+                ok_body(json!({
+                    "kind": "playback",
+                    "device": "plughw:CARD=APE,DEV=0",
+                    "previous_device": "default"
+                })),
+            ),
+        ],
+    );
+    let json_out = env.run(&["device", "use", "capture", "plughw:CARD=MIC,DEV=0", "--json"]);
+    assert_success(&json_out);
+    assert_eq!(
+        stdout_json(&json_out),
+        json!({
+            "kind": "capture",
+            "device": "plughw:CARD=MIC,DEV=0",
+            "previous_device": "default"
+        })
+    );
+    let human_out = env.run(&["device", "use", "playback", "plughw:CARD=APE,DEV=0"]);
+    assert_success(&human_out);
+    assert!(
+        String::from_utf8_lossy(&human_out.stdout)
+            .contains("playback device switched: default -> plughw:CARD=APE,DEV=0")
+    );
+    let requests = stub.requests();
+    assert_eq!(
+        requests[0],
+        (
+            ctl::DAEMON_DEVICE_USE,
+            json!({"kind": "capture", "device": "plughw:CARD=MIC,DEV=0"})
+        )
+    );
+    assert_eq!(
+        requests[1],
+        (
+            ctl::DAEMON_DEVICE_USE,
+            json!({"kind": "playback", "device": "plughw:CARD=APE,DEV=0"})
+        )
+    );
+}
+
+#[test]
 fn device_list_empty_renders_no_devices() {
     let env = CtlEnv::new("device-empty");
     let _stub = StubDaemon::start(

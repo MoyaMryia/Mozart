@@ -38,7 +38,7 @@
 - [x] 控制面（daemon → pre）：Unix SEQPACKET 定长头 + JSON。命令 `Hello`（版本握手）、`SetRoute{route}`（切 direct/rvc）、`SetMute{mute}`（静音开关）、`SetFileMode{active}`（文件接管开关：暂停/恢复 rvc AI 发送并交接 output_socket 绑定，asr 不受影响）、`SetDsp{denoise,gate,agc,limiter}`（运行中切换 DSP 级）、`GetStatus`。路由与静音由 pre 执行淡变，策略归 daemon。（`pre/src/control.rs`）
 - [x] `SetDsp{denoise,gate,agc,limiter}`（运行中切换 DSP 级）：命令号 0x0207（`core/include/mozart/ctl.h`、`core/src/ctl.rs`），请求体 schema::DspSetRequest 四键必需、拒未知键；pre 校验后写目标原子，处理线程逐帧应用，应答回显四个开关。（`pre/src/control.rs` dispatch、`pre/src/main.rs` process_thread）
 - [x] 状态：`GetStatus` 返回运行状态、路由、静音、文件接管状态（file_mode）、采集/播放设备名、采集/播放/丢弃帧计数、队列深度、各消费者丢弃计数、最近错误、版本。daemon 每秒轮询，pre 不主动推；旧 `pre-status.json` 废弃。（`pre/src/state.rs`）
-- [x] 换设备不做在线命令，由 daemon 重启 pre 代替。设备枚举归 daemon（SPEC-04），pre 只打开配置的设备、打开失败报错。（`pre/src/main.rs:243,271`）
+- [x] 修改持久基线（`config set`）仍由 daemon 重启 pre 生效；运行时临时换设备走 `PRE_SET_DEVICE`（`0x0208`）。设备枚举归 daemon（SPEC-04），pre 只打开指定设备、打开失败保留旧设备或启动报错。（`pre/src/main.rs`、`pre/src/control.rs`）
 - [x] DSP 开关经 `SetDsp` 运行时生效；denoise 重新启用时重置 WOLA 流式状态（噪声估计、频谱队列、增益回到初始，重新攒初始化帧，首块同启动的 64 样本补零），避免陈旧状态伪影；gate/agc/limiter 直接切布尔。（`dsp/src/lib.rs` Dsp::set_switches、`dsp/src/noise_suppressor.rs` NoiseSuppressor::reset）
 
 ## UL-UNAS 可选后端
@@ -76,3 +76,6 @@
 - [x] `BoundaryResampler` 实时线程约束：栈数组进出，无锁、无阻塞、无分配，播放循环前预创建。采样率变化时以新帧首样本重置插值历史；缺帧与切回 direct 时 reset 清零。（`pre/src/playback.rs:103-136,155,195,205`）
 - [x] 播放设备必须给到 48 kHz：`set_rate_near` 返回值不等于 48000 即报错退出，由 daemon 退避重启。设备不支持 48 kHz 时不在播放侧改率。（`pre/src/alsa_stream.rs:46-51`）
 - [x] 播报分时取帧与切换淡变：`Speaker::Broadcast` 连续发帧期以 4 ms 微抖动等待吸收 TTS 跨进程唤醒抖动，进入 `holdoff` 空窗与实时态立即退回零等待，由 ALSA 写定拍以防抽干硬件缓冲；`Realtime ↔ Broadcast` 切换做 10 ms（`FADE_SAMPLES`）线性淡变；播报期隔离 `Router` 淡变并重置 `BoundaryResampler` 插值历史。（`pre/src/playback.rs`）
+- [x] 音频设备热切换（`PRE_SET_DEVICE` `0x0208`）：采集与播放线程在循环边界支持热替换 ALSA PCM 句柄，先试打开新设备再关旧句柄，失败保留旧设备继续运行并回错；切 `capture` 时清空半帧采集缓冲、触发处理线程重置 WOLA 降噪状态（UL-UNAS 同步随 `capture_epoch` 重置）并拒绝 `capture_file` 模式；切 `playback` 时首帧执行 10 ms 线性淡入消杂音；支持 `--effective-capture-device` / `--effective-playback-device` 供崩溃自愈沿用临时设备；物理拔线仍按 `Fatal` 退出。（`pre/src/state.rs`、`pre/src/control.rs`、`pre/src/capture.rs`、`pre/src/playback.rs`、`pre/tests/set_device.rs`；板端通过 `snd-aloop` 跨子设备通音及 USB 麦打开验证，真实扬声器切口主观听感未验证——阻塞原因：无物理扬声器实听环境，解除条件：接物理扬声器热切 `playback` 并人工试听切口有无爆音）
+- [ ] 扬声器主模式门控：仅在翻译播报模式下激活 TTS 播报输出，播报空窗保持扬声器静音、不再自动切回实时原声或变声；实时变声与原声直出模式下仅输出对应实时支路，不插播 TTS。
+- [ ] 实时播放缓冲余量与欠载平滑（衔接 SPEC-03 实时衔接步骤 2）：当前播放 ALSA 硬件缓冲为 `max(period × 4, period + 960) = 1024` 样本（`21.3 ms`），仅比单帧 `960` 样本（`20 ms`）多 `64` 样本（`1.33 ms`）；当 RVC 接收环等待或调度微抖动时极易触发硬件 `EPIPE` underrun（实测 30 s 出现 6 次），且 `rvc.pop` 超时直接写入 20 ms 全零并重置重采样器会产生方波缺口咔嗒声。优化：适度增大播放侧 ALSA 硬件缓冲周期余量（避免单帧写完仅剩 1.33 ms），并在 RVC 接收环短时欠载时对上一帧末尾做短淡出归零，恢复来帧时短淡入。验收：单测覆盖欠载过渡无单样本满幅阶跃；板端 30 s 实时变声 `pre.log` 播放 underrun 计数为 0。
