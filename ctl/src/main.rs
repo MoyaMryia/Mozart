@@ -1,10 +1,10 @@
 use clap::{Parser, Subcommand, ValueEnum};
 use mozart_core::config::{ensure_run_dir, Config, RvcSessionValues};
 use mozart_core::ctl::schema::{
-    Activity, ConfigGetRequest, ConfigSetRequest, DeviceEntry, DeviceListRequest, FileCancelRequest,
-    FileFetchRequest, FileJob, FileJobState, FileProgress, FileStatusRequest, FileSubmitRequest,
-    ModelEntry, PresetApplyData, PresetListData, ProcessState, Response, RestartRequest, Route,
-    Status,
+    Activity, ConfigGetRequest, ConfigSetRequest, DeviceEntry, DeviceKind, DeviceListRequest,
+    DeviceUseRequest, FileCancelRequest, FileFetchRequest, FileJob, FileJobState, FileProgress,
+    FileStatusRequest, FileSubmitRequest, ModelEntry, PresetApplyData, PresetListData,
+    ProcessState, Response, RestartRequest, Route, Status,
 };
 use mozart_core::ctl::{self, Seqpacket};
 use serde_json::{json, Value};
@@ -192,6 +192,12 @@ enum ServiceArg {
     Llama,
 }
 
+#[derive(Clone, Copy, ValueEnum)]
+enum DeviceKindArg {
+    Capture,
+    Playback,
+}
+
 #[derive(Subcommand)]
 enum DeviceAction {
     /// 列出采集/播放设备（ALSA 名、人读标签、方向）
@@ -199,6 +205,13 @@ enum DeviceAction {
         /// 列出完整 ALSA 别名清单；缺省只列配置首选（plughw 与 default）
         #[arg(long)]
         all: bool,
+    },
+    /// 实时临时热切换采集或播放设备（不写回 mozart.toml）
+    Use {
+        /// 设备方向：capture 或 playback
+        kind: DeviceKindArg,
+        /// 目标 ALSA 设备名（用 device list 查看）
+        device: String,
     },
 }
 
@@ -281,6 +294,7 @@ fn run(cli: Cli) -> Result<(), CliError> {
         Action::Restart { service } => restart(&config, service, cli.json),
         Action::Device { action } => match action {
             DeviceAction::List { all } => device_list(&config, cli.json, all),
+            DeviceAction::Use { kind, device } => device_use(&config, cli.json, kind, &device),
         },
         Action::Config { action } => match action {
             ConfigAction::Set { key, value } => config_set(&config, &key, &value, cli.json),
@@ -728,6 +742,38 @@ fn device_list(config: &Config, json_output: bool, all: bool) -> Result<(), CliE
     for device in &devices {
         println!("{:<24} {:<9} {}", device.id, device.kind, device.label);
     }
+    Ok(())
+}
+
+fn device_use(
+    config: &Config,
+    json_output: bool,
+    kind: DeviceKindArg,
+    device: &str,
+) -> Result<(), CliError> {
+    let kind = match kind {
+        DeviceKindArg::Capture => DeviceKind::Capture,
+        DeviceKindArg::Playback => DeviceKind::Playback,
+    };
+    let body = body_json(&DeviceUseRequest {
+        kind,
+        device: device.to_string(),
+    })?;
+    let data = call_with_timeout(
+        config,
+        ctl::DAEMON_DEVICE_USE,
+        &body,
+        config_set_timeout_ms(config),
+    )?;
+    if json_output {
+        println!("{data}");
+        return Ok(());
+    }
+    let previous = data
+        .get("previous_device")
+        .and_then(|v| v.as_str())
+        .unwrap_or("-");
+    println!("{} device switched: {previous} -> {device}", kind.as_str());
     Ok(())
 }
 
@@ -1619,5 +1665,33 @@ mod tests {
         assert!(parse(&["preset"]).is_err());
         assert!(parse(&["preset", "bogus"]).is_err());
         assert!(parse(&["preset", "use", "default"]).is_err());
+    }
+
+    #[test]
+    fn device_use_parses_kind_and_device() {
+        let cli = parse(&["device", "use", "capture", "plughw:CARD=MIC,DEV=0"]).unwrap();
+        assert!(matches!(
+            cli.command,
+            Action::Device {
+                action: DeviceAction::Use {
+                    kind: DeviceKindArg::Capture,
+                    device,
+                }
+            } if device == "plughw:CARD=MIC,DEV=0"
+        ));
+        let cli = parse(&["--json", "device", "use", "playback", "default"]).unwrap();
+        assert!(cli.json);
+        assert!(matches!(
+            cli.command,
+            Action::Device {
+                action: DeviceAction::Use {
+                    kind: DeviceKindArg::Playback,
+                    device,
+                }
+            } if device == "default"
+        ));
+        assert!(parse(&["device", "use"]).is_err());
+        assert!(parse(&["device", "use", "duplex", "default"]).is_err());
+        assert!(parse(&["device", "use", "capture"]).is_err());
     }
 }

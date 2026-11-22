@@ -19,10 +19,11 @@ const RETRY: Duration = Duration::from_millis(2);
 /// 无进展上限（旧 MOZART_PCM_NO_PROGRESS_NS = 1 s）。
 const NO_PROGRESS: Duration = Duration::from_secs(1);
 
-/// 流错误：`Cancelled` 与 `NoProgress` 由调用方按停止/降级处理。
+/// 流错误：`Cancelled`、`Reopen` 与 `NoProgress` 由调用方按停止/切设备/降级处理。
 #[derive(Debug)]
 pub enum StreamError {
     Cancelled,
+    Reopen,
     NoProgress,
     Fatal(String),
 }
@@ -70,6 +71,24 @@ pub fn open(device: &str, dir: Direction) -> Result<PCM, String> {
     Ok(pcm)
 }
 
+pub fn log_stream_setup(role: &str, device: &str, pcm: &PCM) {
+    match pcm.get_params() {
+        Ok((buffer, period)) => {
+            eprintln!(
+                "mozart-pre: {role} device {device} ready (period {period}, buffer {buffer})"
+            );
+        }
+        Err(err) => eprintln!("mozart-pre: {role} device {device} ready (params unknown: {err})"),
+    }
+}
+
+pub fn open_and_verify_io(role: &str, device: &str, dir: Direction) -> Result<PCM, String> {
+    let pcm = open(device, dir)?;
+    pcm.io_i16().map_err(|err| format!("{role} io_i16: {err}"))?;
+    log_stream_setup(role, device, &pcm);
+    Ok(pcm)
+}
+
 /// 传输方向。
 #[derive(Clone, Copy)]
 pub enum Op {
@@ -86,6 +105,7 @@ pub fn transfer(
     buf: &mut [i16],
     frames: usize,
     stop: &AtomicBool,
+    reopen: &AtomicBool,
     xruns: &mut u64,
 ) -> Result<(), StreamError> {
     let mut deadline = Instant::now() + NO_PROGRESS;
@@ -94,6 +114,9 @@ pub fn transfer(
     while done < frames {
         if stop.load(Ordering::Relaxed) {
             return Err(StreamError::Cancelled);
+        }
+        if reopen.load(Ordering::Acquire) {
+            return Err(StreamError::Reopen);
         }
         if Instant::now() >= deadline {
             return Err(StreamError::NoProgress);

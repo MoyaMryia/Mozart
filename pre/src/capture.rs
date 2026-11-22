@@ -3,6 +3,7 @@
 
 use crate::alsa_stream::{self, Op, StreamError, PERIOD_FRAMES};
 use crate::state::Shared;
+use alsa::Direction;
 use mozart_core::ring::Ring;
 use mozart_core::{FrameMeta, RawFrame, RAW_SAMPLES};
 use std::sync::atomic::AtomicBool;
@@ -29,6 +30,7 @@ pub struct CapturedFrame {
     pub rvc_ai_active: bool,
     pub file_generation: u64,
     pub epoch: u64,
+    pub capture_epoch: u64,
 }
 
 impl std::ops::Deref for CapturedFrame {
@@ -45,6 +47,7 @@ pub fn enqueue(ring: &Ring<CapturedFrame>, frame: RawFrame, shared: &Shared) {
         file_generation,
         rvc_ai_active,
         epoch: shared.enhancement_epoch(),
+        capture_epoch: shared.capture_epoch(),
     });
 }
 
@@ -58,14 +61,11 @@ pub fn fl_to_mono(stereo: &[i16], out: &mut [f32]) {
 /// 采集线程主体：攒满 960 样本即组装 RawFrame 入队。
 /// 返回 Err 表示致命流错误；主线程据此退出进程，daemon 按退避重启。
 pub fn run(
-    pcm: alsa::pcm::PCM,
+    mut pcm: alsa::pcm::PCM,
     ring: Arc<Ring<CapturedFrame>>,
     shared: Arc<Shared>,
     stop: &'static AtomicBool,
 ) -> Result<(), String> {
-    let io = pcm
-        .io_i16()
-        .map_err(|err| format!("capture io_i16: {err}"))?;
     let mut stereo = [0i16; PERIOD_FRAMES * 2];
     let mut block = [0f32; RAW_SAMPLES];
     let mut filled = 0usize;
@@ -73,6 +73,21 @@ pub fn run(
     let mut overruns = 0u64;
     let mut reported = 0u64;
     loop {
+        if shared.capture_switch.has_pending() {
+            shared.capture_switch.apply_pending(
+                |target| alsa_stream::open_and_verify_io("capture", target, Direction::Capture),
+                |_, new_pcm| {
+                    pcm = new_pcm;
+                    filled = 0;
+                    shared.bump_capture_epoch();
+                },
+            );
+        }
+        let io = pcm.io_i16().map_err(|err| {
+            let message = format!("capture io_i16: {err}");
+            shared.set_last_error(&message);
+            message
+        })?;
         match alsa_stream::transfer(
             &pcm,
             &io,
@@ -80,10 +95,15 @@ pub fn run(
             &mut stereo,
             PERIOD_FRAMES,
             stop,
+            shared.capture_switch.pending_flag(),
             &mut overruns,
         ) {
             Ok(()) => {}
             Err(StreamError::Cancelled) => return Ok(()),
+            Err(StreamError::Reopen) => {
+                filled = 0;
+                continue;
+            }
             Err(StreamError::NoProgress) => {
                 let message = "capture: no progress for 1 s".to_string();
                 shared.set_last_error(&message);

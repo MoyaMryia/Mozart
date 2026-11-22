@@ -20,11 +20,14 @@ use std::sync::Arc;
 use std::time::Duration;
 use stub_common::{body, expect_known, fail, ok, serve, StubArgs};
 
-fn parse_pre_args() -> (
-    StubArgs,
-    Option<Option<mozart_core::config::EnhanceConfig>>,
-    Option<mozart_core::config::PreDspConfig>,
-) {
+struct PreOverrides {
+    enhance: Option<Option<mozart_core::config::EnhanceConfig>>,
+    dsp: Option<mozart_core::config::PreDspConfig>,
+    capture_device: Option<String>,
+    playback_device: Option<String>,
+}
+
+fn parse_pre_args() -> (StubArgs, PreOverrides) {
     let mut args = StubArgs {
         name: "mozart-pre-stub",
         socket: PathBuf::new(),
@@ -32,8 +35,12 @@ fn parse_pre_args() -> (
         exit_after: None,
         reply_delay: Duration::ZERO,
     };
-    let mut effective = None;
-    let mut dsp = None;
+    let mut overrides = PreOverrides {
+        enhance: None,
+        dsp: None,
+        capture_device: None,
+        playback_device: None,
+    };
     let mut input = std::env::args().skip(1);
     while let Some(flag) = input.next() {
         let value = input.next().expect("missing argument value");
@@ -44,13 +51,15 @@ fn parse_pre_args() -> (
                 args.exit_after = Some(Duration::from_millis(value.parse().unwrap()))
             }
             "--delay-ms" => args.reply_delay = Duration::from_millis(value.parse().unwrap()),
-            "--effective-enhance" => effective = Some(serde_json::from_str(&value).unwrap()),
-            "--effective-dsp" => dsp = Some(serde_json::from_str(&value).unwrap()),
+            "--effective-enhance" => overrides.enhance = Some(serde_json::from_str(&value).unwrap()),
+            "--effective-dsp" => overrides.dsp = Some(serde_json::from_str(&value).unwrap()),
+            "--effective-capture-device" => overrides.capture_device = Some(value),
+            "--effective-playback-device" => overrides.playback_device = Some(value),
             _ => panic!("unknown argument: {flag}"),
         }
     }
     assert!(!args.socket.as_os_str().is_empty(), "--socket is required");
-    (args, effective, dsp)
+    (args, overrides)
 }
 
 struct State {
@@ -63,18 +72,26 @@ struct State {
     startup_id: String,
     file_mode_delay: Duration,
     dsp: mozart_core::config::PreDspConfig,
+    capture_device: String,
+    playback_device: String,
 }
 
 fn main() {
-    let (args, effective, dsp) = parse_pre_args();
+    let (args, overrides) = parse_pre_args();
     let mut config = Config::load_from(args.config.as_deref()).expect("pre stub config");
-    if let Some(effective) = effective {
+    if let Some(effective) = overrides.enhance {
         config
             .apply_effective_enhance(effective)
             .expect("effective enhancement");
     }
-    if let Some(dsp) = dsp {
+    if let Some(dsp) = overrides.dsp {
         config.pre.dsp = dsp;
+    }
+    if let Some(capture) = overrides.capture_device {
+        config.pre.capture_device = capture;
+    }
+    if let Some(playback) = overrides.playback_device {
+        config.pre.playback_device = playback;
     }
     let file_mode = Arc::new(AtomicBool::new(false));
     let mode_asserted = Arc::new(AtomicBool::new(false));
@@ -98,6 +115,8 @@ fn main() {
         startup_id,
         file_mode_delay,
         dsp: config.pre.dsp,
+        capture_device: config.pre.capture_device,
+        playback_device: config.pre.playback_device,
     };
     record_dsp(&state.dsp);
     serve(args, move |msg| handle(msg, &mut state));
@@ -154,6 +173,7 @@ fn handle(msg: &Message, state: &mut State) -> Vec<u8> {
         ctl::PRE_SPEECH_STOP,
         ctl::PRE_SET_FILE_MODE,
         ctl::PRE_SET_DSP,
+        ctl::PRE_SET_DEVICE,
     ];
     if let Err(reply) = expect_known(msg, &known) {
         return reply;
@@ -199,6 +219,28 @@ fn handle(msg: &Message, state: &mut State) -> Vec<u8> {
             record_dsp(&state.dsp);
             ok(serde_json::to_value(&state.dsp).unwrap())
         }
+        ctl::PRE_SET_DEVICE => {
+            if std::env::var("MOZART_PRE_STUB_DEVICE_REJECT_FILE")
+                .is_ok_and(|path| std::path::Path::new(&path).exists())
+            {
+                return fail(ctl::CODE_INVALID_ARGUMENT, "device rejected by stub");
+            }
+            let request: mozart_core::ctl::schema::DeviceUseRequest =
+                match serde_json::from_value(body.clone()) {
+                    Ok(request) => request,
+                    Err(err) => return fail(ctl::CODE_INVALID_ARGUMENT, &err.to_string()),
+                };
+            let target = match request.kind {
+                mozart_core::ctl::schema::DeviceKind::Capture => &mut state.capture_device,
+                mozart_core::ctl::schema::DeviceKind::Playback => &mut state.playback_device,
+            };
+            let previous = std::mem::replace(target, request.device.clone());
+            ok(json!({
+                "kind": request.kind.as_str(),
+                "device": request.device,
+                "previous_device": previous,
+            }))
+        }
         ctl::PRE_SET_MUTE => {
             let Some(mute) = body.get("mute").and_then(|value| value.as_bool()) else {
                 return fail(ctl::CODE_INVALID_ARGUMENT, "mute must be a boolean");
@@ -232,8 +274,8 @@ fn handle(msg: &Message, state: &mut State) -> Vec<u8> {
             }),
             "route": state.route,
             "mute": state.mute,
-            "capture_device": "",
-            "playback_device": "",
+            "capture_device": state.capture_device,
+            "playback_device": state.playback_device,
             "frames_captured": 0,
             "frames_played": 0,
             "frames_dropped": 0,

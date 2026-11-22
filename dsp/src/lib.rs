@@ -124,6 +124,13 @@ impl Dsp {
         self.limiter.set_enabled(limiter);
     }
 
+    /// 采集源热切换时重置 WOLA 降噪状态（重新学习新设备底噪）；禁用时无操作。
+    pub fn reset_denoise(&mut self) {
+        if self.denoise {
+            self.ns.reset();
+        }
+    }
+
     /// 就地处理一帧主干（960 样本），返回本帧语音置信度（0..1）。
     /// 置信度语义同旧实现：自上次查询以来的功率加权平均，查询即清零；禁用
     /// 降噪时恒 0。VAD 与 16 kHz 打包经 `pack_frame` 按帧消费该值。

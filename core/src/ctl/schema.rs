@@ -579,6 +579,38 @@ pub struct DeviceListRequest {
     pub all: bool,
 }
 
+/// 音频设备方向（DAEMON_DEVICE_USE / PRE_SET_DEVICE 共用）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum DeviceKind {
+    Capture,
+    Playback,
+}
+
+impl DeviceKind {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Capture => "capture",
+            Self::Playback => "playback",
+        }
+    }
+
+    pub fn config_key(self) -> &'static str {
+        match self {
+            Self::Capture => "pre.capture_device",
+            Self::Playback => "pre.playback_device",
+        }
+    }
+}
+
+/// DAEMON_DEVICE_USE / PRE_SET_DEVICE 请求体：临时热切换音频设备。
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct DeviceUseRequest {
+    pub kind: DeviceKind,
+    pub device: String,
+}
+
 /// DAEMON_CONFIG_SET 请求体（SPEC-04）：改单个键的持久基线。
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -886,6 +918,31 @@ mod tests {
         ] {
             assert!(
                 serde_json::from_str::<DspSetRequest>(bad).is_err(),
+                "应拒绝：{bad}"
+            );
+        }
+    }
+
+    #[test]
+    fn device_use_request_parses_kind_and_rejects_extras() {
+        let cap: DeviceUseRequest =
+            serde_json::from_str(r#"{"kind":"capture","device":"plughw:CARD=MIC,DEV=0"}"#)
+                .unwrap();
+        assert_eq!(cap.kind, DeviceKind::Capture);
+        assert_eq!(cap.device, "plughw:CARD=MIC,DEV=0");
+        let pb: DeviceUseRequest =
+            serde_json::from_str(r#"{"kind":"playback","device":"default"}"#).unwrap();
+        assert_eq!(pb.kind, DeviceKind::Playback);
+        assert_eq!(pb.device, "default");
+        for bad in [
+            "{}",
+            r#"{"kind":"duplex","device":"default"}"#,
+            r#"{"kind":"capture"}"#,
+            r#"{"kind":"capture","device":"default","x":1}"#,
+            "not json",
+        ] {
+            assert!(
+                serde_json::from_str::<DeviceUseRequest>(bad).is_err(),
                 "应拒绝：{bad}"
             );
         }

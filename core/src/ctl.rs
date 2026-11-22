@@ -69,6 +69,9 @@ pub const DAEMON_PRESET_USE: u16 = 0x011E;
 pub const DAEMON_PRESET_LIST: u16 = 0x011F;
 /// 体：schema::ModelUseRequest {"model_id"}；data {"model_id","previous_model_id"}。
 pub const DAEMON_MODEL_USE: u16 = 0x0120;
+/// 体：schema::DeviceUseRequest {"kind","device"}；
+/// data {"kind","device","previous_device"}；临时热切换音频设备（不写回 TOML）。
+pub const DAEMON_DEVICE_USE: u16 = 0x0121;
 
 pub const PRE_HELLO: u16 = 0x0201;
 pub const PRE_SET_ROUTE: u16 = 0x0202;
@@ -84,6 +87,9 @@ pub const PRE_SET_FILE_MODE: u16 = 0x0206;
 /// 运行中切换 DSP 级（SPEC-02）。denoise 重新启用时重置 WOLA 流式状态，
 /// gate/agc/limiter 直接切换；应答 data 回显四个开关。
 pub const PRE_SET_DSP: u16 = 0x0207;
+/// 体：schema::DeviceUseRequest {"kind","device"}；
+/// 运行中热替换采集/播放 ALSA 句柄，data 回 {"kind","device","previous_device"}。
+pub const PRE_SET_DEVICE: u16 = 0x0208;
 
 pub const RVC_HELLO: u16 = 0x0301;
 pub const RVC_LOAD_MODEL: u16 = 0x0302;
@@ -633,10 +639,12 @@ mod tests {
         assert_eq!(DAEMON_PRESET_USE, 0x011E);
         assert_eq!(DAEMON_PRESET_LIST, 0x011F);
         assert_eq!(DAEMON_MODEL_USE, 0x0120);
+        assert_eq!(DAEMON_DEVICE_USE, 0x0121);
         assert_eq!(RVC_LIST_MODELS, 0x0307);
         assert_eq!(RVC_SET_PARAMS, 0x0308);
         assert_eq!(PRE_SET_FILE_MODE, 0x0206);
         assert_eq!(PRE_SET_DSP, 0x0207);
+        assert_eq!(PRE_SET_DEVICE, 0x0208);
         assert_eq!(ENHANCE_HELLO, 0x0701);
         assert_eq!(ENHANCE_GET_STATUS, 0x0702);
     }
@@ -668,6 +676,7 @@ mod tests {
         ("DAEMON_PRESET_USE", DAEMON_PRESET_USE),
         ("DAEMON_PRESET_LIST", DAEMON_PRESET_LIST),
         ("DAEMON_MODEL_USE", DAEMON_MODEL_USE),
+        ("DAEMON_DEVICE_USE", DAEMON_DEVICE_USE),
         ("PRE_HELLO", PRE_HELLO),
         ("PRE_SET_ROUTE", PRE_SET_ROUTE),
         ("PRE_SET_MUTE", PRE_SET_MUTE),
@@ -675,6 +684,7 @@ mod tests {
         ("PRE_SPEECH_STOP", PRE_SPEECH_STOP),
         ("PRE_SET_FILE_MODE", PRE_SET_FILE_MODE),
         ("PRE_SET_DSP", PRE_SET_DSP),
+        ("PRE_SET_DEVICE", PRE_SET_DEVICE),
         ("RVC_HELLO", RVC_HELLO),
         ("RVC_LOAD_MODEL", RVC_LOAD_MODEL),
         ("RVC_START_STREAM", RVC_START_STREAM),

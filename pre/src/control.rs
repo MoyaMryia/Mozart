@@ -5,8 +5,10 @@
 //! 控制线程）。连接逐个服务：daemon 持单连接每秒轮询，断开后回到 accept。
 
 use crate::state::{DspSwitches, QueueReadout, Shared, VERSION};
+use mozart_core::config::validate_device_name;
 use mozart_core::ctl::schema::{
-    error_body, ok_body, DspSetRequest, FileModeSetRequest, MuteSetRequest, RouteSetRequest,
+    error_body, ok_body, DeviceUseRequest, DspSetRequest, FileModeSetRequest, MuteSetRequest,
+    RouteSetRequest,
 };
 use mozart_core::ctl::{self, Message, Seqpacket, ACCEPT_POLL, IDLE_TIMEOUT, RECV_POLL};
 use mozart_core::dgram::FRAME_SIZE_MISMATCH_REASON;
@@ -23,6 +25,9 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 const FILE_HANDOFF_TIMEOUT: Duration = Duration::from_secs(1);
 /// 握手等待的轮询步长。
 const FILE_HANDOFF_POLL: Duration = Duration::from_millis(5);
+/// 音频设备热切换超时预留：比 daemon rpc_timeout_ms 留出余量，确保 pre 先返回错误，避免对端先超时产生状态分叉。
+const DEVICE_SWITCH_TIMEOUT_MARGIN_MS: u64 = 200;
+const DEVICE_SWITCH_TIMEOUT_FLOOR_MS: u64 = 200;
 /// 环丢帧日志的最小间隔（SPEC-01 限频）：窗口内的增量并入下一条。
 const DROP_LOG_INTERVAL: Duration = Duration::from_secs(1);
 
@@ -98,6 +103,7 @@ impl DropLog {
 }
 
 /// 服务循环：绑定与监听由调用方完成；收到停止标志后返回。
+#[allow(clippy::too_many_arguments)]
 pub fn serve(
     listener: Seqpacket,
     shared: Arc<Shared>,
@@ -105,6 +111,7 @@ pub fn serve(
     trunk: Arc<Ring<RawFrame>>,
     rvc_ring: Arc<Ring<OutputFrame>>,
     tts_ring: Arc<Ring<OutputFrame>>,
+    device_switch_timeout: Duration,
     stop: &'static AtomicBool,
 ) {
     let mut drop_log = DropLog::new();
@@ -131,11 +138,21 @@ pub fn serve(
             &rvc_ring,
             &tts_ring,
             &mut drop_log,
+            device_switch_timeout,
             stop,
         );
     }
 }
 
+pub fn device_switch_timeout(rpc_timeout_ms: u64) -> Duration {
+    Duration::from_millis(
+        rpc_timeout_ms
+            .saturating_sub(DEVICE_SWITCH_TIMEOUT_MARGIN_MS)
+            .max(DEVICE_SWITCH_TIMEOUT_FLOOR_MS),
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
 fn serve_connection(
     conn: &Seqpacket,
     shared: &Shared,
@@ -144,6 +161,7 @@ fn serve_connection(
     rvc_ring: &Ring<OutputFrame>,
     tts_ring: &Ring<OutputFrame>,
     drop_log: &mut DropLog,
+    device_switch_timeout: Duration,
     stop: &AtomicBool,
 ) {
     let mut idle = Duration::ZERO;
@@ -168,7 +186,7 @@ fn serve_connection(
         idle = Duration::ZERO;
         let type_ = msg.header.type_;
         let request_id = msg.header.request_id;
-        let reply = dispatch(
+        let reply = dispatch_with_stop(
             &msg,
             shared,
             capture_ring,
@@ -176,6 +194,8 @@ fn serve_connection(
             rvc_ring,
             tts_ring,
             drop_log,
+            device_switch_timeout,
+            stop,
         );
         if conn.send(type_, request_id, &reply).is_err() {
             return;
@@ -192,7 +212,7 @@ fn parse_body(body: &[u8]) -> Result<Value, Vec<u8>> {
         .map_err(|err| error_body(ctl::CODE_INVALID_ARGUMENT, &err.to_string()))
 }
 
-/// 命令分发。请求体是外部输入，在此校验一次；内部执行信任已校验的值。
+#[cfg(test)]
 fn dispatch(
     msg: &Message,
     shared: &Shared,
@@ -201,6 +221,33 @@ fn dispatch(
     rvc_ring: &Ring<OutputFrame>,
     tts_ring: &Ring<OutputFrame>,
     drop_log: &mut DropLog,
+) -> Vec<u8> {
+    let stop = AtomicBool::new(false);
+    dispatch_with_stop(
+        msg,
+        shared,
+        capture_ring,
+        trunk,
+        rvc_ring,
+        tts_ring,
+        drop_log,
+        Duration::from_secs(1),
+        &stop,
+    )
+}
+
+/// 命令分发。请求体是外部输入，在此校验一次；内部执行信任已校验的值。
+#[allow(clippy::too_many_arguments)]
+fn dispatch_with_stop(
+    msg: &Message,
+    shared: &Shared,
+    capture_ring: &Ring<crate::capture::CapturedFrame>,
+    trunk: &Ring<RawFrame>,
+    rvc_ring: &Ring<OutputFrame>,
+    tts_ring: &Ring<OutputFrame>,
+    drop_log: &mut DropLog,
+    device_switch_timeout: Duration,
+    stop: &AtomicBool,
 ) -> Vec<u8> {
     let body = match parse_body(&msg.body) {
         Ok(body) => body,
@@ -276,6 +323,27 @@ fn dispatch(
                     "agc": switches.agc,
                     "limiter": switches.limiter,
                 }))
+            }
+            Err(err) => error_body(ctl::CODE_INVALID_ARGUMENT, &err.to_string()),
+        },
+        ctl::PRE_SET_DEVICE => match serde_json::from_value::<DeviceUseRequest>(body) {
+            Ok(request) => {
+                if let Err(err) = validate_device_name(&request.device, request.kind.config_key())
+                {
+                    return error_body(ctl::CODE_INVALID_ARGUMENT, &err.to_string());
+                }
+                let slot = match request.kind {
+                    mozart_core::ctl::schema::DeviceKind::Capture => &shared.capture_switch,
+                    mozart_core::ctl::schema::DeviceKind::Playback => &shared.playback_switch,
+                };
+                match slot.request_switch(&request.device, device_switch_timeout, stop) {
+                    Ok(previous) => ok_body(json!({
+                        "kind": request.kind.as_str(),
+                        "device": request.device,
+                        "previous_device": previous,
+                    })),
+                    Err((code, reason)) => error_body(&code, &reason),
+                }
             }
             Err(err) => error_body(ctl::CODE_INVALID_ARGUMENT, &err.to_string()),
         },
@@ -883,7 +951,7 @@ mod tests {
             let trunk = trunk.clone();
             let rvc = rvc.clone();
             let tts = tts.clone();
-            move || serve(listener, shared, cap, trunk, rvc, tts, stop)
+            move || serve(listener, shared, cap, trunk, rvc, tts, Duration::from_secs(1), stop)
         });
 
         let conn = Seqpacket::connect(&path).unwrap();
@@ -966,5 +1034,70 @@ mod tests {
 
         std::fs::remove_file(&path).unwrap();
         let _ = std::fs::remove_dir(&dir);
+    }
+
+    #[test]
+    fn set_device_validates_input_and_switches_active_device() {
+        let (shared, cap, trunk, rvc, tts, mut log) = context();
+        // 空设备名与未知字段在入口被拒绝。
+        for bad in [
+            br#"{"kind":"capture","device":""}"#.as_slice(),
+            br#"{"kind":"duplex","device":"default"}"#,
+            br#"{"kind":"capture","device":"a\u0000b"}"#,
+            br#"{"kind":"capture","device":"x","extra":1}"#,
+        ] {
+            let reply = dispatch(
+                &message(ctl::PRE_SET_DEVICE, bad),
+                &shared,
+                &cap,
+                &trunk,
+                &rvc,
+                &tts,
+                &mut log,
+            );
+            assert_eq!(error_code(&reply), ctl::CODE_INVALID_ARGUMENT);
+        }
+
+        // 模拟播放线程响应切换请求。
+        let worker_shared = shared.clone();
+        let worker = std::thread::spawn(move || {
+            while !worker_shared.playback_switch.has_pending() {
+                std::thread::sleep(Duration::from_millis(1));
+            }
+            worker_shared
+                .playback_switch
+                .apply_pending(|_| Ok(()), |_, _| {});
+        });
+        let reply = dispatch(
+            &message(
+                ctl::PRE_SET_DEVICE,
+                br#"{"kind":"playback","device":"plughw:CARD=Loopback,DEV=0,SUBDEV=5"}"#,
+            ),
+            &shared,
+            &cap,
+            &trunk,
+            &rvc,
+            &tts,
+            &mut log,
+        );
+        let body = data(&reply);
+        assert_eq!(body["kind"], "playback");
+        assert_eq!(body["device"], "plughw:CARD=Loopback,DEV=0,SUBDEV=5");
+        assert_eq!(body["previous_device"], "play-dev");
+        worker.join().unwrap();
+
+        let status_reply = dispatch(
+            &message(ctl::PRE_GET_STATUS, b"{}"),
+            &shared,
+            &cap,
+            &trunk,
+            &rvc,
+            &tts,
+            &mut log,
+        );
+        assert_eq!(
+            data(&status_reply)["playback_device"],
+            "plughw:CARD=Loopback,DEV=0,SUBDEV=5"
+        );
     }
 }

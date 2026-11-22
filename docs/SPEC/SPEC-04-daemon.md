@@ -56,7 +56,7 @@
 - [x] 文件任务状态与进度：字段 `job_id` / `name` / `model_id` / `state` / `progress` / `error`，state 六态（queued / processing / cancelling / completed / failed / cancelled），completed 附结果可取标记（fetch 提示）；不带模式枚举（mode 派生）。进度 = 粗阶段（解码/喂入/推理/发布）+ 推理段用 rvc `GetStatus` 块/窗计数细化（daemon 每秒轮询已有）；依赖 rvc 文件模式给出有意义块计数，缺则退回粗阶段。CLI `file status <job_id>` 查单个、`file list` 看队列。
 - [x] 文件转换入口（v1）：CLI `file submit <path>` 提交本地路径；daemon 复制文件到受管存储目录后入队，队列只引用副本，原文件变动不影响排队任务。入口校验：扩展名白名单 `.wav` / `.mp3` / `.m4a` / `.aac` / `.flac` / `.ogg`，100 MiB 大小预检；300 s 时长上限在解码后检查。HTTP 上传归 web 适配器，流式写盘后经同一入队契约提交。（`daemon/src/file/decode.rs:46,75-80`）
 - [x] 监控归 daemon，不独立进程：进程存活与崩溃重启；每秒轮询各服务 `GetStatus` 汇总业务指标与降级原因；收集子进程日志。（`daemon/src/poller.rs`、`daemon/src/supervisor.rs`）
-- [x] 音频设备识别归 daemon（硬件发现，与 hwmon 一类）：用 ALSA API（`snd_device_name_hint`）枚举采集/播放设备，不 shell `arecord`/`aplay`；按需查询不缓存（USB 插拔）；返回设备 id（ALSA 名，配置用）+ 人读标签。CLI `device list` 缺省只列配置首选（`plughw:` 与 `default`），`--all` 返回完整 ALSA 别名清单。配置/切换设备时对照当前清单校验存在。pre 只打开配置的设备（使用）、不做枚举；换设备仍由 daemon 重启 pre，热切换见 [FUTURE.md](../FUTURE.md)。（`daemon/src/device.rs:14-82`、`ctl/src/main.rs:636-654`）
+- [x] 音频设备识别归 daemon（硬件发现，与 hwmon 一类）：用 ALSA API（`snd_device_name_hint`）枚举采集/播放设备，不 shell `arecord`/`aplay`；按需查询不缓存（USB 插拔）；返回设备 id（ALSA 名，配置用）+ 人读标签。CLI `device list` 缺省只列配置首选（`plughw:` 与 `default`），`--all` 返回完整 ALSA 别名清单。配置/切换设备时对照当前清单校验存在。pre 只打开配置的设备（使用）、不做枚举；持久配置 `config set` 仍由 daemon 重启 pre，运行时临时热切换见下方 `device use`。（`daemon/src/device.rs:14-82`、`ctl/src/main.rs`）
 - [x] 语言服务（识别、桥、TTS）各绑控制 socket，daemon 连接并每秒轮询，接法与 pre/rvc 一致。llama-server 不说控制协议：daemon 只管其进程存活与重启，业务可达性由桥的 `GetStatus` 带报。（`daemon/src/services.rs`）
 - [x] 监管退避：崩溃后从 500 ms 起倍增，上限 10 s；连续稳定运行 30 s 后重置。子进程日志追加到 `run_dir/logs/<name>.log`，daemon 退出前先停止子进程。（`daemon/src/supervisor.rs:87-175`）
 - [x] 路由执行顺序：切到 rvc 先 `LoadModel` / `StartStream` 再让 pre `SetRoute(rvc)`，失败回滚停流；切回 direct 先 pre `SetRoute(direct)` 再 `StopStream` 并释放 GPU。轮询对账按同一顺序：rvc 方向先确保实时流在跑再切 pre 路由，流未就绪（rvc 缺席或起流失败）本轮不切、下一轮重试；direct 方向先切路由再停流，文件 GPU 门控不变。（`daemon/src/services.rs`；次序回归 `daemon/tests/linkage.rs`）
@@ -73,6 +73,7 @@
 - [ ] （文档）职责行 `HTTP/SSE` 为残留措辞，v1 daemon 不起 HTTP，待删。
 - [x] 实时换模型命令与编排：`model use <id>`（0x0120）落地 [docs/config.md](../config.md)「运行时换模型走控制命令」的设计意图。编排定为断流切换（StopStream→LoadModel→预设提交→StartStream），失败用旧模型旧参数恢复并回报原因；`[rvc].model_id` 由本命令写回基线，`config set` 继续拒绝。命令契约、次序与回退见本文件「已确认」三条。推理侧状态语义见 SPEC-03。板端切换延迟、接缝与帧守恒未验证，见 SPEC-03 板端条目。（`ctl/src/main.rs:278,645-664`、`daemon/src/server.rs:340-341,490-506`）
 - [x] 实时原生多采样率（控制面）：不做播放采样率协商，播放固定 48 kHz、边界重采样归 pre（SPEC-02）；跨采样率换模型走 `model use` 断流切换，几何随 `StartStream` 重建。主条见 SPEC-03，板端断流代价与多采样率验收见 SPEC-03 板端条目。
+- [x] 音频设备实时热切换命令 `device use <capture|playback> <设备名>`（`DAEMON_DEVICE_USE` `0x0121`）：体 `{"kind","device"}`，data `{"kind","device","previous_device"}`。入口按设备清单校验存在性与方向匹配，再经 `PRE_SET_DEVICE`（`0x0208`）下发 pre 实时生效；不写回 `mozart.toml`、不进 `state.json`，`config set pre.capture_device/playback_device` 维持 S 类。daemon 内存保留当前临时生效设备，pre 意外崩溃自愈重启时通过 `--effective-capture-device` / `--effective-playback-device` 沿用；显式 `restart pre` 或 `down`/`up` 清空临时覆盖、恢复 `mozart.toml` 基线。（`daemon/src/server.rs`、`daemon/src/supervisor.rs`、`daemon/src/runtime.rs`、`ctl/src/main.rs`、`daemon/tests/device_use.rs`）
 
 ## 待讨论
 
