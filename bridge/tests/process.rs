@@ -978,3 +978,118 @@ fn sigterm_during_stalled_llama_exits_within_grace() {
     llama_server.join().unwrap();
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+#[test]
+fn review_pending_waits_for_refined_and_broadcasts_once() {
+    let dir = run_dir("review-once");
+    let asr = MockAsr::bind(&dir.join("asr-events.sock"));
+    let llama = MockLlama::bind(&dir.join("llama.sock"));
+    let (requests, llama_server) = llama.spawn(vec![llama_ok("Reviewed.")]);
+    let tts = MockTts::bind(&dir.join("tts-jobs.sock"));
+    let (jobs, tts_server) = tts.spawn(vec!["submitted"]);
+    let mut child = spawn_bridge(&dir, "");
+    let control = connect_control(&dir);
+    let conn = asr.accept();
+
+    let mut pending_final = event("final", "a1b2c3d4", 1, "初版错字");
+    pending_final["refinement_status"] = json!("pending");
+    conn.send_event(&pending_final);
+    wait_until("pending final 仅落盘原文字幕", Duration::from_secs(5), || {
+        read_lines(&dir).len() == 1
+    });
+    // 复核未完成前不得入翻译与播报队列。
+    std::thread::sleep(Duration::from_millis(120));
+    assert!(requests.lock().unwrap().is_empty());
+    assert!(jobs.lock().unwrap().is_empty());
+
+    conn.send_event(&refined_event("a1b2c3d4", 1, "初版错字", "复核正文"));
+    wait_until("复核后单次翻译与播报完成", Duration::from_secs(5), || {
+        get_status(&control)["speech_submitted"] == 1
+    });
+
+    let status = get_status(&control);
+    assert_eq!(status["subtitles_published"], 1);
+    assert_eq!(status["translated"], 1);
+    assert_eq!(status["speech_delivered"], 1);
+    assert_eq!(status["speech_submitted"], 1);
+
+    let requests = requests.lock().unwrap();
+    assert_eq!(requests.len(), 1);
+    let text = String::from_utf8(requests[0].clone()).unwrap();
+    let (_, body) = text.split_once("\r\n\r\n").unwrap();
+    let value: Value = serde_json::from_str(body).unwrap();
+    assert_eq!(value["messages"][1]["content"], "复核正文");
+
+    let jobs = jobs.lock().unwrap();
+    assert_eq!(jobs.len(), 1);
+    assert_eq!(jobs[0]["text"], "Reviewed.");
+
+    let lines = read_lines(&dir);
+    assert_eq!(lines.len(), 3);
+    assert_eq!(lines[0]["zh"], "初版错字");
+    assert_eq!(lines[0]["translation_status"], "pending");
+    assert_eq!(lines[1]["zh"], "复核正文");
+    assert_eq!(lines[1]["refinement_status"], "completed");
+    assert_eq!(lines[2]["zh"], "复核正文");
+    assert_eq!(lines[2]["en"], "Reviewed.");
+    assert_eq!(lines[2]["translation_status"], "completed");
+
+    sigterm(&child.0);
+    assert!(wait_exit(&mut child.0, Duration::from_secs(2)).success());
+    llama_server.join().unwrap();
+    tts_server.join().unwrap();
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn review_skipped_falls_back_to_online_final_once() {
+    let dir = run_dir("review-skip");
+    let asr = MockAsr::bind(&dir.join("asr-events.sock"));
+    let llama = MockLlama::bind(&dir.join("llama.sock"));
+    let (requests, llama_server) = llama.spawn(vec![llama_ok("Fallback.")]);
+    let tts = MockTts::bind(&dir.join("tts-jobs.sock"));
+    let (jobs, tts_server) = tts.spawn(vec!["submitted"]);
+    let mut child = spawn_bridge(&dir, "");
+    let control = connect_control(&dir);
+    let conn = asr.accept();
+
+    let mut pending_final = event("final", "a1b2c3d4", 1, "在线文本");
+    pending_final["refinement_status"] = json!("pending");
+    conn.send_event(&pending_final);
+    wait_until("pending final 落盘", Duration::from_secs(5), || {
+        read_lines(&dir).len() == 1
+    });
+
+    let mut skipped_refined = event("refined", "a1b2c3d4", 1, "在线文本");
+    skipped_refined["refinement_status"] = json!("skipped");
+    conn.send_event(&skipped_refined);
+    wait_until("复核 skipped 后兜底翻译播报完成", Duration::from_secs(5), || {
+        get_status(&control)["speech_submitted"] == 1
+    });
+
+    let status = get_status(&control);
+    assert_eq!(status["translated"], 1);
+    assert_eq!(status["speech_delivered"], 1);
+    let requests = requests.lock().unwrap();
+    assert_eq!(requests.len(), 1);
+    let text = String::from_utf8(requests[0].clone()).unwrap();
+    let (_, body) = text.split_once("\r\n\r\n").unwrap();
+    let value: Value = serde_json::from_str(body).unwrap();
+    assert_eq!(value["messages"][1]["content"], "在线文本");
+    let jobs = jobs.lock().unwrap();
+    assert_eq!(jobs.len(), 1);
+    assert_eq!(jobs[0]["text"], "Fallback.");
+
+    let lines = read_lines(&dir);
+    assert_eq!(lines.len(), 3);
+    assert_eq!(lines[1]["refinement_status"], "skipped");
+    assert_eq!(lines[2]["zh"], "在线文本");
+    assert_eq!(lines[2]["en"], "Fallback.");
+    assert_eq!(lines[2]["translation_status"], "completed");
+
+    sigterm(&child.0);
+    assert!(wait_exit(&mut child.0, Duration::from_secs(2)).success());
+    llama_server.join().unwrap();
+    tts_server.join().unwrap();
+    let _ = std::fs::remove_dir_all(&dir);
+}

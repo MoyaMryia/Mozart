@@ -213,23 +213,20 @@ impl Decoder {
         }
         self.finals += 1;
         self.shared.add_final(1);
-        let review_enabled = self.review.is_some();
+        let review_tx = self.review.as_ref().filter(|_| !pcm.is_empty());
         let event = Event::final_utterance(
             &self.shared.startup_id,
             self.finals,
             delta,
             start_pts,
             Some(end_pts),
-            review_enabled,
+            review_tx.is_some(),
         );
         deliver(&self.events, event.clone(), &self.shared);
 
-        let Some(tx) = self.review.as_ref() else {
+        let Some(tx) = review_tx else {
             return;
         };
-        if pcm.is_empty() {
-            return;
-        }
         let job = ReviewJob {
             final_event: event,
             pcm,

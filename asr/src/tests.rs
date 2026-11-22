@@ -386,6 +386,28 @@ fn sigterm_flush_feeds_silence_and_cuts_final() {
     assert_eq!(shared.status(0).state, "idle");
 }
 
+#[test]
+fn decoder_empty_pcm_finish_marks_review_disabled() {
+    let (fake, _state) = FakeOnline::new(1);
+    let (review_tx, review_rx) = mpsc::sync_channel::<ReviewJob>(2);
+    let (tx, rx) = mpsc::sync_channel(crate::event::EVENT_QUEUE_CAPACITY);
+    let shared = Arc::new(Shared::new("teststart".to_string()));
+    let mut dec = Decoder::new(fake, Some(review_tx), tx, shared);
+
+    // 首帧 endpoint 切句并消耗掉所有句音频；随后喂静音收尾若再切出残余文本（空 PCM），
+    // 不得发出 refinement_status = pending 的挂起事件。
+    dec.feed(frame(0)).unwrap();
+    dec.finish_utterance();
+
+    let events = events_now(&rx);
+    let finals: Vec<&Event> = events.iter().filter(|e| e.kind == FINAL).collect();
+    assert_eq!(finals.len(), 2);
+    assert_eq!(finals[0].refinement_status.as_deref(), Some("pending"));
+    assert_eq!(finals[1].refinement_status.as_deref(), Some("disabled"));
+    assert_eq!(review_rx.try_recv().unwrap().final_event.seq, 1);
+    assert!(review_rx.try_recv().is_err());
+}
+
 // ---------------------------------------------------------------------------
 // 复核线程
 // ---------------------------------------------------------------------------
