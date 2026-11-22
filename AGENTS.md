@@ -62,7 +62,8 @@ Mozart 是面向 NVIDIA Jetson Orin Nano Super 8 GB 的本地语音处理系统�
 | `enhance/` | pre 的可选 C++ 增强工作进程；daemon 监管 | CMake `mozart-enhance` |
 | `daemon/` | 控制进程：生命周期、控制命令、模式/路由策略 | Cargo `mozart-daemon` |
 | `rvc/` | C++ 推理进程：StreamSession、旧 rvc-backend | CMake `mozart-rvc` |
-| `web/` | TypeScript 前端（后续） | npm |
+| `web/` | Vue/TypeScript 控制台，使用 HTTP/SSE 适配器接口 | npm |
+| `web-adapter/` | 独立 HTTP/SSE 适配器，连接 daemon 控制面 | Cargo `mozart-web-adapter` |
 | `tests/` | 跨组件 C++ 测试与小型夹具 | CTest |
 | `cmake/` | CMake 模块 | — |
 | `tools/` | 构建、检查、部署脚本 | — |
@@ -83,6 +84,7 @@ Mozart 是面向 NVIDIA Jetson Orin Nano Super 8 GB 的本地语音处理系统�
 `docs/architecture/` 存放自包含 HTML 架构图：`mozart-new-architecture.html` 为总体架构，`rvc-module.html` 与 `rvc-realtime-module.html` 描述推理模块，`rvc-realtime-assets.html` 描述实时推理模块、资产来源与参数边界。
 
 完成架构性更改后，比对代码、架构图、`docs/SPEC/` 与 `docs/ARCHITECTURE-HIGHLIGHTS.md`，确认是否需要同步更新。
+对外控制面（HTTP/SSE）的 v1 首批接口已实现；命令面欠账及验收见 [SPEC-06](docs/SPEC/SPEC-06-web.md)。
 
 ## 语言与写作
 

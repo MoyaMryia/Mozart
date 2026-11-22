@@ -105,7 +105,9 @@ impl JobContext {
 }
 
 fn lock_queue(queue: &Mutex<FileQueue>) -> MutexGuard<'_, FileQueue> {
-    queue.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
+    queue
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
 }
 
 pub struct FileCoordinator {
@@ -167,8 +169,10 @@ impl FileCoordinator {
     /// denoise/时长上限/ffmpeg 等键由 worker 每任务读配置快照，无需在此处理。
     pub fn apply_file_config(&self, config: &Config) {
         lock_queue(&self.queue).set_capacity(config.file.queue_capacity);
-        self.storage
-            .set_limits(config.file.max_upload_bytes, config.file.storage_limit_bytes);
+        self.storage.set_limits(
+            config.file.max_upload_bytes,
+            config.file.storage_limit_bytes,
+        );
     }
 
     /// poller 每 tick 驱动一次仲裁。
@@ -325,9 +329,9 @@ impl FileCoordinator {
     }
 
     pub fn status(&self, job_id: &str) -> Result<Value, (String, String)> {
-        let job = lock_queue(&self.queue).status(job_id).ok_or_else(|| {
-            QueueError::UnknownJob(job_id.to_string()).into_rejection()
-        })?;
+        let job = lock_queue(&self.queue)
+            .status(job_id)
+            .ok_or_else(|| QueueError::UnknownJob(job_id.to_string()).into_rejection())?;
         serde_json::to_value(job).map_err(|err| (ctl::CODE_INTERNAL.to_string(), err.to_string()))
     }
 
@@ -353,14 +357,20 @@ impl FileCoordinator {
         let path = self.storage.result_path(&job.job_id);
         // result_ready 是发布时标记，驱逐删文件不改它：以盘上实际存在为准。
         if !path.is_file() {
+            eprintln!("result file missing: {}", path.display());
             return Err((
                 ctl::CODE_NOT_READY.to_string(),
-                format!("result not available: result file missing: {}", path.display()),
+                "result not available: result file missing".to_string(),
             ));
         }
         // storage_dir 可配相对路径：canonicalize 收敛为绝对路径供同机 CLI 复制。
-        let output_path = fs::canonicalize(&path)
-            .map_err(|err| (ctl::CODE_INTERNAL.to_string(), err.to_string()))?;
+        let output_path = fs::canonicalize(&path).map_err(|err| {
+            eprintln!("canonicalize result {}: {err}", path.display());
+            (
+                ctl::CODE_INTERNAL.to_string(),
+                "result not available".to_string(),
+            )
+        })?;
         let stem = Path::new(&job.name)
             .file_stem()
             .map(|stem| stem.to_string_lossy().into_owned())
@@ -378,16 +388,12 @@ impl FileCoordinator {
     fn resolve_model(&self, requested: Option<String>) -> Result<String, (String, String)> {
         match requested {
             Some(model_id) => Ok(model_id),
-            None => self
-                .services
-                .rvc_status()?
-                .model_id
-                .ok_or_else(|| {
-                    (
-                        ctl::CODE_NOT_READY.to_string(),
-                        "no model loaded; submit with model_id".to_string(),
-                    )
-                }),
+            None => self.services.rvc_status()?.model_id.ok_or_else(|| {
+                (
+                    ctl::CODE_NOT_READY.to_string(),
+                    "no model loaded; submit with model_id".to_string(),
+                )
+            }),
         }
     }
 
@@ -555,10 +561,8 @@ pub(crate) mod testutil {
 
     pub fn temp_dir(tag: &str) -> PathBuf {
         let seq = SEQ.fetch_add(1, Ordering::Relaxed);
-        let dir = std::env::temp_dir().join(format!(
-            "mozart-file-{}-{tag}-{seq}",
-            std::process::id()
-        ));
+        let dir =
+            std::env::temp_dir().join(format!("mozart-file-{}-{tag}-{seq}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         dir
     }
@@ -641,9 +645,7 @@ mod tests {
         services: &Arc<Services>,
         dir: &Path,
     ) -> Arc<PresetManager> {
-        let state_file = Arc::new(Mutex::new(
-            StateFile::load(dir.join("state.json")).unwrap(),
-        ));
+        let state_file = Arc::new(Mutex::new(StateFile::load(dir.join("state.json")).unwrap()));
         Arc::new(PresetManager::new(
             config.clone(),
             state.clone(),
@@ -656,7 +658,14 @@ mod tests {
 
     /// rvc socket 不存在：任何误发的 RPC 都会以 NotReady 失败，
     /// 以此证明 File 占用期间的路由分流不碰实时链路。
-    fn setup(tag: &str) -> (Arc<FileCoordinator>, mpsc::Receiver<String>, mpsc::Sender<Outcome>, PathBuf) {
+    fn setup(
+        tag: &str,
+    ) -> (
+        Arc<FileCoordinator>,
+        mpsc::Receiver<String>,
+        mpsc::Sender<Outcome>,
+        PathBuf,
+    ) {
         let dir = temp_dir(tag);
         let mut config = Config::default();
         config.file.storage_dir = dir.clone();
@@ -714,7 +723,10 @@ mod tests {
             job_id,
             "GPU 空闲应自动启动排队任务"
         );
-        assert_eq!(lock_state(&coordinator.state).gpu_owner(), Some(Activity::File));
+        assert_eq!(
+            lock_state(&coordinator.state).gpu_owner(),
+            Some(Activity::File)
+        );
         assert_eq!(
             lock_queue(&coordinator.queue).state_of(&job_id),
             Some(FileJobState::Processing)
@@ -746,8 +758,14 @@ mod tests {
             Route::Direct,
         )
         .unwrap();
-        assert_eq!(lock_state(&coordinator.state).route_desired(), Route::Direct);
-        assert_eq!(lock_state(&coordinator.state).gpu_owner(), Some(Activity::File));
+        assert_eq!(
+            lock_state(&coordinator.state).route_desired(),
+            Route::Direct
+        );
+        assert_eq!(
+            lock_state(&coordinator.state).gpu_owner(),
+            Some(Activity::File)
+        );
 
         // 再挂 rvc，任务结束后由 tick 应用。
         services::route_set(
@@ -775,7 +793,10 @@ mod tests {
         let status = lock_state(&coordinator.state).status();
         assert_eq!(status.route.desired, Route::Rvc);
         assert!(
-            status.degraded.iter().any(|reason| reason.contains("route apply")),
+            status
+                .degraded
+                .iter()
+                .any(|reason| reason.contains("route apply")),
             "应用失败必须留下可查询原因：{:?}",
             status.degraded
         );
@@ -912,6 +933,7 @@ mod tests {
         let (code, reason) = coordinator.fetch(fetch_request(&job_id)).unwrap_err();
         assert_eq!(code, ctl::CODE_NOT_READY);
         assert!(reason.contains("missing"), "{reason}");
+        assert!(!reason.contains(dir.to_str().unwrap()), "{reason}");
 
         // 发布未成功（result_ready=false）：同样不可取。
         let other = enqueue(&coordinator, "b.wav");
@@ -1097,8 +1119,14 @@ mod tests {
             FileCoordinator::new(config, state, services, presets, running, worker).unwrap(),
         );
 
-        // 预置一个已完成任务的旧文件，确保驱逐必然触发并删到它。
-        let old = dir.join("job_0000000000000.output.wav");
+        // 在队列快照中登记终态任务，再预置其旧文件供驱逐。
+        let old_id = "job_0000000000000";
+        {
+            let mut queue = lock_queue(&coordinator.queue);
+            queue.submit(old_id.to_string(), "old.wav".to_string(), "demo".to_string()).unwrap();
+            queue.cancel(&coordinator.storage, old_id).unwrap();
+        }
+        let old = dir.join(format!("{old_id}.output.wav"));
         fs::write(&old, vec![0u8; 200]).unwrap();
 
         // 任务 A 进入 processing，worker 阻塞等放行。
@@ -1129,7 +1157,9 @@ mod tests {
         };
 
         // 放行 worker → finish 起跑。修复后它应阻塞在 submit_lock 上，A 保持 processing。
-        release_tx.send(Outcome::Failed("done".to_string())).unwrap();
+        release_tx
+            .send(Outcome::Failed("done".to_string()))
+            .unwrap();
         let settled_early = wait_until(Duration::from_millis(300), || {
             lock_queue(&coordinator.queue).state_of(&job_a) != Some(FileJobState::Processing)
         });
@@ -1156,7 +1186,10 @@ mod tests {
             coordinator.storage.source_path(&job_b).is_some(),
             "新排队任务的源副本必须在驱逐后存活"
         );
-        assert!(!old.exists(), "驱逐应已删除最旧的已完成文件（证明驱逐确实运行）");
+        assert!(
+            !old.exists(),
+            "驱逐应已删除最旧的已完成文件（证明驱逐确实运行）"
+        );
         drop(coordinator);
         fs::remove_dir_all(&dir).unwrap();
         fs::remove_dir_all(&src_dir).unwrap();

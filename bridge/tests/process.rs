@@ -820,8 +820,9 @@ fn translation_retries_then_succeeds() {
     let conn = asr.accept();
 
     conn.send_event(&event("final", "s", 1, "你好"));
-    wait_until("重试后翻译成功", Duration::from_secs(5), || {
-        get_status(&control)["translated"] == 1
+    wait_until("重试后翻译和播报提交成功", Duration::from_secs(5), || {
+        let status = get_status(&control);
+        status["translated"] == 1 && status["speech_submitted"] == 1
     });
     let status = get_status(&control);
     assert_eq!(status["translate_retried"], 2);

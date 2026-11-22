@@ -26,7 +26,7 @@
 | 3 | [SPEC-03-rvc.md](SPEC-03-rvc.md) | rvc-backend：推理核心与调度 | 讨论中 |
 | 4 | [SPEC-04-daemon.md](SPEC-04-daemon.md) | state、api、monitor：入口与控制面 | 讨论中 |
 | 5 | [SPEC-05-language.md](SPEC-05-language.md) | tools：识别、字幕、翻译、翻译播报、投递、变速 | 讨论中 |
-| 6 | [SPEC-06-web.md](SPEC-06-web.md) | frontend | 后续 |
+| 6 | [SPEC-06-web.md](SPEC-06-web.md) | frontend、HTTP/SSE 适配器 | 首批接口与部署入口已实现，板端局部联调通过，完整验收保留 |
 | 7 | [SPEC-07-device.md](SPEC-07-device.md) | usb-audio、usb-gadget | 待定 |
 | 8 | [SPEC-08-verification.md](SPEC-08-verification.md) | rvc-golden、reports | 讨论中 |
 | 9 | [SPEC-09-pipeline.md](SPEC-09-pipeline.md) | 开发与部署流水线 | 讨论中 |
@@ -76,6 +76,8 @@
 - 2026-11-22：确认并登记 FUTURE「音频设备热切换」：新增控制命令 `device use <capture|playback> <设备名>`（daemon `0x0121` / pre `0x0208`），只做临时实时切换、不写 `mozart.toml` 或 `state.json`；`config set pre.capture_device/playback_device` 保持 S 类。daemon 内存保留生效设备供 `pre` 崩溃自愈恢复，显式 `restart pre` 或 `down`/`up` 回到基线。`pre` 先开新再关旧、失败保留旧设备，切 `capture` 重置 WOLA 状态并拒绝 `capture_file` 模式，切 `playback` 首帧 10 ms 淡入，不做物理拔线自动自愈（SPEC-02、SPEC-04、FUTURE）。
 - 2026-11-17：用户确认接入 UL-UNAS。新增 `enhance/` C++ 推理工作进程，归 SPEC-02；daemon 统一管理生命周期，pre 通过有界队列在普通线程调用。增强 RVC／ASR 共用的 16 kHz 支路，不降低 48 kHz 直通带宽。初版为可选后端，旧 WOLA 默认不变。隔离开发目录为 `~/MozartMryia`，只读引用既有模型，不复制模型或覆盖正式部署。
 - [x] 完成 UL-UNAS 跨模块接入：帧协议、配置、daemon 监管、pre 分发、构建检查和隔离板端测试；对应模块验收见 SPEC-02，整机验收范围见[接入报告](../../reports/ulunas-integration-20261117/RESULTS.md)。
+- 2026-11-17：实现首批独立 HTTP/SSE 适配器；完整命令面及产品验收见 SPEC-06、SPEC-08。
+- 2026-11-16：定义 v1 HTTP/SSE 适配器契约，创建 Vue 控制台。
 
 - 2026-11-10：建立模块化规格。
 - 2026-11-10：确认方向、采集边界、队列语义、RVC 进程形态；规格内容按模块归位。

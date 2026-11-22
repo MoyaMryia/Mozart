@@ -65,6 +65,28 @@ pub struct DaemonInfo {
     pub uptime_s: u64,
 }
 
+/// Optional additions to GetStatus, absent when read from an older daemon.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct StatusExtensions {
+    #[serde(default)]
+    pub daemon: DaemonStatusExtensions,
+    #[serde(default)]
+    pub file_limits: Option<FileLimits>,
+    #[serde(default)]
+    pub api_capabilities: Vec<String>,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct DaemonStatusExtensions {
+    #[serde(default)]
+    pub poll_interval_ms: Option<u64>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct FileLimits {
+    pub max_upload_bytes: u64,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RouteState {
     pub desired: Route,
@@ -654,6 +676,17 @@ pub struct PresetListData {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn status_extensions_accept_old_and_new_responses() {
+        let old: super::StatusExtensions = serde_json::from_str(r#"{"daemon":{"pid":1}}"#).unwrap();
+        assert!(old.daemon.poll_interval_ms.is_none());
+        assert!(old.file_limits.is_none());
+        assert!(old.api_capabilities.is_empty());
+        let new: super::StatusExtensions = serde_json::from_str(r#"{"daemon":{"poll_interval_ms":123},"file_limits":{"max_upload_bytes":456},"api_capabilities":["file_fetch_safe_errors_v1"]}"#).unwrap();
+        assert_eq!(new.daemon.poll_interval_ms, Some(123));
+        assert_eq!(new.file_limits.unwrap().max_upload_bytes, 456);
+        assert_eq!(new.api_capabilities, ["file_fetch_safe_errors_v1"]);
+    }
     use super::*;
 
     /// 序列化 → 反序列化 → 再序列化稳定，且与默认值一致。

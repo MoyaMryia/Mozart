@@ -282,9 +282,7 @@ fn run(cli: Cli) -> Result<(), CliError> {
             route_set(&config, route, cli.json)
         }
         Action::Mute { state } => mute(&config, state == "on", cli.json),
-        Action::Translate { state } => {
-            translate(&config, matches!(state, OnOff::On), cli.json)
-        }
+        Action::Translate { state } => translate(&config, matches!(state, OnOff::On), cli.json),
         Action::Speech { action } => speech(&config, action, cli.json),
         Action::File { action } => file_command(&config, action, cli.json),
         Action::Model { action } => match action {
@@ -492,13 +490,8 @@ fn speech(config: &Config, action: SpeechAction, json_output: bool) -> Result<()
         SpeechAction::Stop => (ctl::DAEMON_SPEECH_STOP, "{}".to_string(), "speech: stopped"),
     };
     let conn = connect(config)?;
-    let response = request(
-        &conn,
-        type_,
-        body.as_bytes(),
-        config.daemon.rpc_timeout_ms,
-    )
-    .map_err(classify_io)?;
+    let response = request(&conn, type_, body.as_bytes(), config.daemon.rpc_timeout_ms)
+        .map_err(classify_io)?;
     let data = expect_ok(response)?;
     if json_output {
         println!("{data}");
@@ -786,7 +779,7 @@ fn config_set(config: &Config, key: &str, value: &str, json_output: bool) -> Res
         config,
         ctl::DAEMON_CONFIG_SET,
         &body,
-        config_set_timeout_ms(config),
+        ctl::request_timeout_ms(config.daemon.rpc_timeout_ms, ctl::DAEMON_CONFIG_SET),
     )?;
     if json_output {
         println!("{data}");
@@ -794,7 +787,10 @@ fn config_set(config: &Config, key: &str, value: &str, json_output: bool) -> Res
     }
     println!("{key} = {value}");
     let restart_required = data["restart_required"].as_bool().ok_or_else(|| {
-        CliError::new(EXIT_ERROR, "invalid config set payload: missing restart_required")
+        CliError::new(
+            EXIT_ERROR,
+            "invalid config set payload: missing restart_required",
+        )
     })?;
     if restart_required {
         let affected = data["affected"].as_array().ok_or_else(|| {
@@ -833,7 +829,10 @@ fn config_get(config: &Config, key: Option<&str>, json_output: bool) -> Result<(
             .iter()
             .map(|item| {
                 item.as_str().map(str::to_string).ok_or_else(|| {
-                    CliError::new(EXIT_ERROR, "invalid config get payload: pending_restart_keys 元素须为字符串")
+                    CliError::new(
+                        EXIT_ERROR,
+                        "invalid config get payload: pending_restart_keys 元素须为字符串",
+                    )
                 })
             })
             .collect::<Result<_, _>>()?,
@@ -879,7 +878,7 @@ fn preset_command(
 ) -> Result<(), CliError> {
     // 三个命令都在 daemon 侧抢 transition 锁并查一次 rvc 状态，poller 持锁
     // 对账会拖长应答：短超时会在服务端已完成写入时报超时。预算同 config set。
-    let timeout_ms = config_set_timeout_ms(config);
+    let timeout_ms = ctl::config_set_timeout_ms(config.daemon.rpc_timeout_ms);
     match action {
         PresetAction::Save => {
             let data = call_with_timeout(config, ctl::DAEMON_PRESET_SAVE, b"{}", timeout_ms)?;
@@ -916,9 +915,8 @@ fn print_preset_apply(data: &Value, action: &str, json_output: bool) -> Result<(
         println!("{data}");
         return Ok(());
     }
-    let apply: PresetApplyData = serde_json::from_value(data.clone()).map_err(|err| {
-        CliError::new(EXIT_ERROR, format!("invalid preset payload: {err}"))
-    })?;
+    let apply: PresetApplyData = serde_json::from_value(data.clone())
+        .map_err(|err| CliError::new(EXIT_ERROR, format!("invalid preset payload: {err}")))?;
     println!(
         "preset {}: {} (model {})",
         action, apply.preset, apply.model_id
@@ -1091,7 +1089,12 @@ fn same_file(a: &Path, b: &Path) -> io::Result<bool> {
 
 fn probe(config: &Config) -> io::Result<Response> {
     let conn = Seqpacket::connect_timeout(&config.daemon_socket(), rpc_timeout(config))?;
-    request(&conn, ctl::DAEMON_HELLO, b"{}", config.daemon.rpc_timeout_ms)
+    request(
+        &conn,
+        ctl::DAEMON_HELLO,
+        b"{}",
+        config.daemon.rpc_timeout_ms,
+    )
 }
 
 fn spawn_daemon(config: &Config, config_path: Option<&Path>) -> Result<Child, CliError> {
@@ -1123,12 +1126,9 @@ fn spawn_daemon(config: &Config, config_path: Option<&Path>) -> Result<Child, Cl
             Ok(())
         });
     }
-    command.spawn().map_err(|err| {
-        CliError::new(
-            EXIT_ERROR,
-            format!("spawn {}: {err}", bin.display()),
-        )
-    })
+    command
+        .spawn()
+        .map_err(|err| CliError::new(EXIT_ERROR, format!("spawn {}: {err}", bin.display())))
 }
 
 fn daemon_binary() -> PathBuf {
@@ -1410,15 +1410,21 @@ mod tests {
     fn speech_parses_on_off_stop() {
         assert!(matches!(
             parse(&["speech", "on"]).unwrap().command,
-            Action::Speech { action: SpeechAction::On }
+            Action::Speech {
+                action: SpeechAction::On
+            }
         ));
         assert!(matches!(
             parse(&["speech", "off"]).unwrap().command,
-            Action::Speech { action: SpeechAction::Off }
+            Action::Speech {
+                action: SpeechAction::Off
+            }
         ));
         assert!(matches!(
             parse(&["speech", "stop"]).unwrap().command,
-            Action::Speech { action: SpeechAction::Stop }
+            Action::Speech {
+                action: SpeechAction::Stop
+            }
         ));
         assert!(parse(&["speech", "bogus"]).is_err());
         assert!(parse(&["speech"]).is_err());
@@ -1428,10 +1434,18 @@ mod tests {
     fn global_flags_parse_with_language_commands() {
         let cli = parse(&["--json", "translate", "on"]).unwrap();
         assert!(cli.json);
-        assert!(matches!(cli.command, Action::Translate { state: OnOff::On }));
+        assert!(matches!(
+            cli.command,
+            Action::Translate { state: OnOff::On }
+        ));
         let cli = parse(&["speech", "stop", "--json"]).unwrap();
         assert!(cli.json);
-        assert!(matches!(cli.command, Action::Speech { action: SpeechAction::Stop }));
+        assert!(matches!(
+            cli.command,
+            Action::Speech {
+                action: SpeechAction::Stop
+            }
+        ));
     }
 
     #[test]
@@ -1461,15 +1475,21 @@ mod tests {
     fn file_queue_and_job_commands_parse() {
         assert!(matches!(
             parse(&["file", "pause"]).unwrap().command,
-            Action::File { action: FileAction::Pause }
+            Action::File {
+                action: FileAction::Pause
+            }
         ));
         assert!(matches!(
             parse(&["file", "resume"]).unwrap().command,
-            Action::File { action: FileAction::Resume }
+            Action::File {
+                action: FileAction::Resume
+            }
         ));
         assert!(matches!(
             parse(&["file", "list"]).unwrap().command,
-            Action::File { action: FileAction::List }
+            Action::File {
+                action: FileAction::List
+            }
         ));
         match parse(&["file", "cancel", "job_1"]).unwrap().command {
             Action::File {
@@ -1506,7 +1526,9 @@ mod tests {
         let cli = parse(&["file", "fetch", "job_1"]).unwrap();
         assert!(matches!(
             cli.command,
-            Action::File { action: FileAction::Fetch { output: None, .. } }
+            Action::File {
+                action: FileAction::Fetch { output: None, .. }
+            }
         ));
         assert!(parse(&["file", "fetch"]).is_err());
         assert!(parse(&["file", "fetch", "job_1", "-o"]).is_err());
@@ -1518,11 +1540,15 @@ mod tests {
         assert!(cli.json);
         assert!(matches!(
             cli.command,
-            Action::Model { action: ModelAction::List { available: false } }
+            Action::Model {
+                action: ModelAction::List { available: false }
+            }
         ));
         assert!(matches!(
             parse(&["model", "list", "--available"]).unwrap().command,
-            Action::Model { action: ModelAction::List { available: true } }
+            Action::Model {
+                action: ModelAction::List { available: true }
+            }
         ));
         let cli = parse(&["--json", "file", "list"]).unwrap();
         assert!(cli.json);
@@ -1538,27 +1564,39 @@ mod tests {
         ));
         assert!(matches!(
             parse(&["restart", "pre"]).unwrap().command,
-            Action::Restart { service: ServiceArg::Pre }
+            Action::Restart {
+                service: ServiceArg::Pre
+            }
         ));
         assert!(matches!(
             parse(&["restart", "rvc"]).unwrap().command,
-            Action::Restart { service: ServiceArg::Rvc }
+            Action::Restart {
+                service: ServiceArg::Rvc
+            }
         ));
         assert!(matches!(
             parse(&["restart", "asr"]).unwrap().command,
-            Action::Restart { service: ServiceArg::Asr }
+            Action::Restart {
+                service: ServiceArg::Asr
+            }
         ));
         assert!(matches!(
             parse(&["restart", "tts"]).unwrap().command,
-            Action::Restart { service: ServiceArg::Tts }
+            Action::Restart {
+                service: ServiceArg::Tts
+            }
         ));
         assert!(matches!(
             parse(&["restart", "bridge"]).unwrap().command,
-            Action::Restart { service: ServiceArg::Bridge }
+            Action::Restart {
+                service: ServiceArg::Bridge
+            }
         ));
         assert!(matches!(
             parse(&["restart", "llama"]).unwrap().command,
-            Action::Restart { service: ServiceArg::Llama }
+            Action::Restart {
+                service: ServiceArg::Llama
+            }
         ));
         assert!(parse(&["restart", "bogus"]).is_err());
         assert!(parse(&["restart"]).is_err());
@@ -1572,12 +1610,16 @@ mod tests {
         assert!(cli.json);
         assert!(matches!(
             cli.command,
-            Action::Device { action: DeviceAction::List { all: false } }
+            Action::Device {
+                action: DeviceAction::List { all: false }
+            }
         ));
         let cli = parse(&["device", "list", "--all"]).unwrap();
         assert!(matches!(
             cli.command,
-            Action::Device { action: DeviceAction::List { all: true } }
+            Action::Device {
+                action: DeviceAction::List { all: true }
+            }
         ));
         assert!(parse(&["device"]).is_err());
         assert!(parse(&["device", "bogus"]).is_err());
@@ -1587,7 +1629,11 @@ mod tests {
     fn config_set_timeout_covers_serial_rpcs() {
         let mut config = Config::default();
         config.daemon.rpc_timeout_ms = 1000;
-        assert_eq!(config_set_timeout_ms(&config), 15_000, "低于下限时取 15 s");
+        assert_eq!(
+            ctl::config_set_timeout_ms(config.daemon.rpc_timeout_ms),
+            15_000,
+            "低于下限时取 15 s"
+        );
         config.daemon.rpc_timeout_ms = 3000;
         assert_eq!(config_set_timeout_ms(&config), 21_000, "7 倍 RPC 超时覆盖串行调用");
     }
@@ -1607,11 +1653,15 @@ mod tests {
         let cli = parse(&["config", "get"]).unwrap();
         assert!(matches!(
             cli.command,
-            Action::Config { action: ConfigAction::Get { key: None } }
+            Action::Config {
+                action: ConfigAction::Get { key: None }
+            }
         ));
         assert!(matches!(
             parse(&["config", "save"]).unwrap().command,
-            Action::Config { action: ConfigAction::Save }
+            Action::Config {
+                action: ConfigAction::Save
+            }
         ));
         assert!(parse(&["config"]).is_err());
         assert!(parse(&["config", "set", "onlykey"]).is_err());

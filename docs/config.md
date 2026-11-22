@@ -221,6 +221,28 @@ path = "<资产根>/models/asr/<模型id>"
 
 文件数据面复用 `[rvc].input_socket` / `[rvc].output_socket`（SPEC-03 状态门控交接），`[file]` 不再有独立 socket 键。
 
+### [web]
+
+core 接受此段；适配器与 daemon 读取同一 TOML。
+适配器采用已有的配置文件选择顺序，HTTP 请求不能改变配置来源。
+
+| 键 | 类型 | 默认 | 范围 | 类别 |
+| --- | --- | --- | --- | --- |
+| listen | socket address | 0.0.0.0:80 | 有效 IP 与端口 | S |
+| static_dir | path | web/dist | 前端静态资源目录 | S |
+| upload_dir | path | ~/.local/state/mozart/web-uploads | 适配器私有临时目录，权限 0700 | S |
+| allowed_origins | array<string> | ["http://localhost", "http://127.0.0.1", "http://[::1]"] | 无路径的 HTTP origin，不含通配符 | S |
+| max_concurrent_uploads | int | 2 | ≥1 | S |
+| upload_timeout_ms | int | 120000 | >0，接收一次 multipart 正文的总时限 | S |
+| sse_heartbeat_ms | int | 15000 | >0 | S |
+| sse_buffer_bytes | int | 1048576 | >0，每客户端待发送事件的编码字节总量 | S |
+
+这些 S 类键通过重启适配器生效，不加入当前 `restart <service>` 的业务服务列表。
+相对路径按 TOML 所在目录解析；使用内置默认且无配置文件时按工作目录解析，支持开头的 `~`。
+部署时向 `allowed_origins` 加入设备热点和局域网的实际访问地址。
+文件字节限额只引用 daemon 的生效 `file.max_upload_bytes`，不在 web 段另设限额。
+上传、SSE 与访问边界见 [SPEC-06](SPEC/SPEC-06-web.md)。
+
 ## 特殊机制说明
 
 - **RVC 会话参数**（f0_method / pitch_shift / index_rate / rms_mix_rate / protect）：`config set rvc.<会话参数>` 与 `preset use` 写 TOML 持久基线。实时流在跑时，`pitch_shift` / `index_rate` / `f0_method` 与 `[rvc.realtime].skip_silence` 变化由 daemon 下发 `SetParams`（`0x0308`）在下一推理块边界无中断生效，失败时保留在跑旧参、生效配置保留旧值、TOML 保留新基线；`startup_delay_ms` 决定启动缓冲，变化仍走 `StopStream`→`StartStream`（失败用旧参恢复）。仅改 `protect` / `rms_mix_rate` 或参数值未变化只更新 TOML 基线与生效配置，不下发 `rvc` 命令。direct/空闲只更新生效配置。文件任务不中断：当前任务用旧参、下一任务用新参。`status.rvc_params` 表示当前生效配置；存在待生效基线或 rvc 不可达时，可能不等于正在跑的流参数。`protect` / `rms_mix_rate` 在实时链路不应用，仍只对文件链路生效；实时补应用见 [FUTURE.md](FUTURE.md)。编排细节见 [SPEC-04](SPEC/SPEC-04-daemon.md)。

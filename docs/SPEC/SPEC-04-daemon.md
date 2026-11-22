@@ -13,12 +13,12 @@
 - [x] daemon 是 C++ 控制消息的唯一发送方；音频进程不参与 C++ 控制面。
 - [x] daemon 决定模式与路由策略；音频进程只执行切换、淡变和静音，不在热路径上做决策。
 - [x] v1 的 daemon 不含 HTTP/SSE；对外接口推迟到语言与前端模块。
-- [x] 控制面形式：daemon 单一权威 + Unix 控制 socket + CLI 瘦客户端（`mozart-ctl`）。CLI 只把命令翻译成控制消息，决策全在 daemon；程序集成直连 socket 用同一协议。网页接口以后作为独立 HTTP 适配器客户端接入，daemon 自身不起 HTTP；后续硬件控制复用同一协议与权威。
+- [x] 控制面形式：daemon 单一权威 + Unix 控制 socket + CLI 瘦客户端（`mozart-ctl`）。CLI 只把命令翻译成控制消息，决策全在 daemon；程序集成直连 socket 用同一协议。网页接口作为独立 HTTP 适配器客户端接入，daemon 自身不起 HTTP；后续硬件控制复用同一协议与权威。
 - [x] 以 CLI 为统一启动入口，拉起 daemon 与各服务，便于 pipeline 封装。
 - [x] CLI 设计范式（参考 clig.dev 与 git plumbing/porcelain）：名词-动词语法 `mozart-ctl <对象> <动作>`，加整机聚合动词（up/down/status）。CLI 零决策，只解析、组消息、发 socket、格式化回复。（`ctl/src/main.rs:36-197`）
 - [x] 输出契约：stdout 放数据、stderr 放日志与错误；`--json` 的 schema 是稳定机器契约，人读输出可变；退出码分类（成功 / 连接失败 / 参数错 / 拒绝 / 超时）。（`ctl/src/main.rs:18-21`，退出码 0/1/2/3/4/5）
 - [x] 标志用全名，常用才给短名；非终端不出颜色与动画（认 `NO_COLOR`）；改状态要告知，危险操作确认或 `--force`，命令幂等。
-- [x] 实现：clap + serde_json；`mozart-ctl` 独立 crate，与 daemon 共用 core 的协议定义。网页适配器、硬件控制以后经同一 CLI 与 socket 协议接入。
+- [x] 实现：clap + serde_json；`mozart-ctl` 独立 crate，与 daemon 共用 core 的协议定义。网页适配器经控制 socket 接入，生命周期操作调用可信 CLI；硬件控制后续复用协议。
 - [x] 启动方式：CLI 直接 spawn 控制 daemon；daemon 拉起并监管 pre、rvc 等服务进程。不依赖 systemd，systemd 部署留到流水线阶段再议。daemon spawn 子进程时传 `--socket`（控制面）与 `--config`（同一 TOML），子进程各读自己的配置段。（`daemon/src/supervisor.rs`）
 - [x] `--config` 传的是 daemon 自己解析出的 TOML 路径；内置默认启动（无配置文件）时不传，子进程按同一解析顺序得到同一默认值。（`daemon/src/supervisor.rs:260-269`）
 - [x] 部署布局：所有运行时二进制安装到 `~/mozart-runtime/bin`，daemon 按自身可执行文件同目录解析 pre/rvc（`process.*_bin` 为裸名时）；rvc 的 CMake 产物复制到同一目录，或用 `MOZART_RVC_BIN` 指绝对路径。目录规范见 [SETUP.md](../SETUP.md)。（`core/src/config.rs:504`）
@@ -60,13 +60,46 @@
 - [x] 语言服务（识别、桥、TTS）各绑控制 socket，daemon 连接并每秒轮询，接法与 pre/rvc 一致。llama-server 不说控制协议：daemon 只管其进程存活与重启，业务可达性由桥的 `GetStatus` 带报。（`daemon/src/services.rs`）
 - [x] 监管退避：崩溃后从 500 ms 起倍增，上限 10 s；连续稳定运行 30 s 后重置。子进程日志追加到 `run_dir/logs/<name>.log`，daemon 退出前先停止子进程。（`daemon/src/supervisor.rs:87-175`）
 - [x] 路由执行顺序：切到 rvc 先 `LoadModel` / `StartStream` 再让 pre `SetRoute(rvc)`，失败回滚停流；切回 direct 先 pre `SetRoute(direct)` 再 `StopStream` 并释放 GPU。轮询对账按同一顺序：rvc 方向先确保实时流在跑再切 pre 路由，流未就绪（rvc 缺席或起流失败）本轮不切、下一轮重试；direct 方向先切路由再停流，文件 GPU 门控不变。（`daemon/src/services.rs`；次序回归 `daemon/tests/linkage.rs`）
-- [x] 主机硬件指标（CPU/内存/GPU/可用性）由 daemon 读 `/proc`、`/sys` 采集（移植旧 `SystemMonitor`），并入 status。监控出口经 CLI `status`/`logs`，以后 HTTP 适配器推网页；历史时序、告警、面板推迟。（`daemon/src/hwmon.rs`）
+- [x] 主机硬件指标（CPU/内存/GPU/可用性）由 daemon 读 `/proc`、`/sys` 采集（移植旧 `SystemMonitor`），并入 status。监控出口经 CLI `status`/`logs`，HTTP 适配器推网页；历史时序、告警、面板推迟。（`daemon/src/hwmon.rs`）
 - [x] RPC 超时（`rpc_timeout_ms`）覆盖 connect、send、recv 全程；控制通道任何一步不得无限阻塞，卡死的子进程不得拖住控制面。
 - [x] 子进程设 `PDEATHSIG` 后校验父进程仍存活（ppid 未变为 1），daemon 崩溃瞬间不留孤儿。（`daemon/src/supervisor.rs:275-286`）
 - [x] 关停幂等：关停进行中再次收到 `Shutdown` 仍应答 ok；其余命令返回 `Busy`，原因为 "daemon is shutting down"。
 - [x] daemon 捕获 SIGTERM/SIGINT，走与 `Shutdown` 相同的优雅关停（停子进程、退出），幂等。运行时状态每次改动已落盘，关停无需额外写盘。
 
+## 本机程序集成
+
+本机程序连接配置的 `daemon.run_dir` / `daemon.socket`，默认文件名为 `daemon.sock`。
+传输和信封见 [SPEC-01](SPEC-01-core.md)；命令号的单一来源为
+`core/include/mozart/ctl.h`，JSON schema 为 `core/src/ctl/schema.rs`。
+Rust 调用方复用 `mozart-core::ctl`，其他语言按同一小端信封编码。
+这是 Unix `SOCK_SEQPACKET` 接口，不是 HTTP，也不是无头 JSON 字节流。
+响应回显请求的命令号与 `request_id`；调用方必须校验关联关系。
+
+外部客户端统一经过 daemon，不直连业务子进程控制面。
+HTTP 方法、路径、上传下载和 SSE 契约归 [SPEC-06](SPEC-06-web.md)，不在 daemon 内实现第二套网络入口。
+CLI 的 `--json` 输出通常为响应的 `data`，不是完整 socket 响应信封。
+`up` / `down` 是 CLI 的生命周期组合操作，不对应新的控制命令号。
+
+### 程序集成待实现补充
+
+- [x] `GetStatus.data` 增加 `file_limits: {"max_upload_bytes": <整数>}`。
+  从 daemon 当前生效配置取得，不从磁盘 TOML 单独重读；配置即时更新后下次查询应反映新值。
+  旧响应缺少此字段时，HTTP 上传返回 `Unsupported`，不得使用默认常量替代。
+  此字段只供传输入口提前限流；最终准入仍由文件队列入口按当时生效限制裁定。
+- [x] `GetStatus.data.daemon` 增加生效 `poll_interval_ms`，供状态 SSE 共享轮询使用。
+  旧响应缺少此字段时，状态 SSE 返回 `Unsupported`，普通 `/status` 查询仍可透传。
+- [x] `FileFetch` 结果缺失时，错误 `reason` 使用 job_id 和失败原因，不包含受管文件绝对路径。
+  路径只记 daemon 日志；成功响应的 `output_path` 仍供同机适配器打开，不作为 HTTP JSON 发布。
+  完成此修改后，`GetStatus.data.api_capabilities` 数组才可声明 `file_fetch_safe_errors_v1`。
+  字段缺失按空能力列表处理；适配器仅在同一 daemon 连接上确认该能力后开放下载。
+- [x] 将 CLI 普通请求、配置写入和启动停止的截止时间计算提取为共用逻辑，供适配器复用。
+  保持现有 CLI 预算，不因增加 HTTP 层缩短控制请求时间。
+- [ ] glossary 编辑和 subtitle clear 的提供方命令另行补齐；实时模型选择已有 `ModelUse`，Web 映射已接入。
+  在提供方契约确定前，适配器不得直接向 RVC 发 `LoadModel` 或自行截断字幕文件。
+
 ## 改进点
+
+- [x] 文件驱逐仅删除队列已知任务的受管产物，保留其他文件与符号链接，报告访问错误。
 
 - [x] 模式名与状态字段统一。
 - [x] 端口集中配置。（`core/src/config.rs`）
@@ -78,4 +111,4 @@
 
 ## 待讨论
 
-- HTTP/SSE 适配器见前端模块。（与 SPEC-06 互相等待，见 SPEC.md 跨模块冲突）
+- HTTP/SSE 接口契约已归 [SPEC-06](SPEC-06-web.md)，实现按该规格推进，不再互相等待。
