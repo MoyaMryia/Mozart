@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # 本地与 CI 共用的检查命令。依赖安装留在 workflow 中。
-#   tools/ci-local.sh <repo|lint|native|rust|web>     运行一个阶段
+#   tools/ci-local.sh <repo|lint|native|rust|adapter|web> 运行一个阶段
 #   tools/ci-local.sh --staged                        提交前检查，pre-commit hook 调用
 #   tools/ci-local.sh all                             依次运行全部阶段
 set -euo pipefail
@@ -10,7 +10,7 @@ MAX_TRACKED_BYTES=$((5 * 1024 * 1024))
 
 # 阶段名与触发路径（扩展正则，匹配暂存文件路径）。
 NATIVE_PATHS='^(core|pre|enhance|rvc|daemon|api|tests)/|^CMakeLists\.txt$|^CMakePresets\.json$|^cmake/'
-RUST_PATHS='^(core|dsp|pre|daemon|ctl|asr|tts|bridge)/|^Cargo\.toml$|^Cargo\.lock$'
+RUST_PATHS='^(core|dsp|pre|daemon|ctl|asr|tts|bridge|web-adapter)/|^Cargo\.toml$|^Cargo\.lock$|^tools/(ci-local|deploy-jetson|web-service)\.sh$'
 WEB_PATHS='^web/'
 
 skip() { echo "跳过 $1：$2" >&2; }
@@ -65,7 +65,12 @@ stage_native() {
     fi
 }
 
+check_runtime_scripts() {
+    bash -n tools/deploy-jetson.sh tools/web-service.sh
+}
+
 stage_rust() {
+    check_runtime_scripts
     if [ ! -f Cargo.toml ]; then
         skip rust "没有 Cargo.toml"
         return 0
@@ -76,6 +81,14 @@ stage_rust() {
     cargo test --workspace
 }
 
+stage_adapter() {
+    check_runtime_scripts
+    cargo build -p mozart-daemon -p mozart-ctl --bins
+    cargo build -p mozart-core --examples
+    cargo check -p mozart-web-adapter
+    cargo test -p mozart-web-adapter
+}
+
 stage_web() {
     if [ ! -f web/package.json ]; then
         skip web "web/package.json 不存在"
@@ -83,6 +96,12 @@ stage_web() {
     fi
     npm --prefix web test
     npm --prefix web run build
+    if [ "${MOZART_WEB_BROWSER:-0}" = 1 ]; then
+        npm --prefix web run test:browser
+    fi
+    if [ -n "${MOZART_WEB_LIVE_URL:-}" ]; then
+        npm --prefix web run test:live
+    fi
 }
 
 # 测试读取工作区。检查范围内的工作区必须与暂存区一致，结果才对应将要提交的内容。
@@ -102,6 +121,7 @@ run_stage() {
         lint) stage_lint ;;
         native) stage_native ;;
         rust) stage_rust ;;
+        adapter) stage_adapter ;;
         web) stage_web ;;
         *) echo "未知阶段：$1" >&2; exit 2 ;;
     esac

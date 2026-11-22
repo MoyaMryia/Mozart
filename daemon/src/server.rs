@@ -261,16 +261,23 @@ fn handle_request(ctx: &Ctx, msg: &Message) -> (Vec<u8>, bool) {
         ctl::DAEMON_GET_STATUS => {
             let mut status = lock_state(&ctx.state).status();
             // 当前生效配置里的会话参数：config set 失败回退后仍显示旧值。
-            let rvc = ctx.config.snapshot().rvc.clone();
+            let effective = ctx.config.snapshot();
+            let rvc = &effective.rvc;
             status.rvc_params = Some(RvcParams {
                 pitch_shift: rvc.pitch_shift,
                 index_rate: rvc.index_rate,
                 rms_mix_rate: rvc.rms_mix_rate,
                 protect: rvc.protect,
-                f0_method: rvc.f0_method,
+                f0_method: rvc.f0_method.clone(),
             });
             match serde_json::to_value(status) {
-                Ok(status) => (schema::ok_body(status), false),
+                Ok(mut status) => {
+                    status["daemon"]["poll_interval_ms"] = json!(effective.daemon.poll_interval_ms);
+                    status["file_limits"] =
+                        json!({"max_upload_bytes": effective.file.max_upload_bytes});
+                    status["api_capabilities"] = json!(["file_fetch_safe_errors_v1"]);
+                    (schema::ok_body(status), false)
+                }
                 Err(err) => (
                     schema::error_body(ctl::CODE_INTERNAL, &err.to_string()),
                     false,

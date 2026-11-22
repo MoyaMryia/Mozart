@@ -155,23 +155,36 @@ impl Storage {
         }
     }
 
-    /// 每任务后驱逐：目录总大小超上限时按文件名时间戳从旧到新删至 80%。
-    /// 未完成任务（queued/processing/cancelling）的全部文件受保护；
-    /// queue.json 永不驱逐。单文件删除失败跳过（可能已被并发删除），
-    /// 留待下一轮，不阻断队列。
+    /// 每任务后驱逐队列已知任务的受管文件，超上限时按名称从旧到新删至 80%。
+    /// 未完成任务受保护；访问错误向调用方报告。
     pub fn evict(&self, unfinished_ids: &[String]) -> io::Result<()> {
+        #[derive(serde::Deserialize)]
+        struct Snapshot { jobs: Vec<SnapshotJob> }
+        #[derive(serde::Deserialize)]
+        struct SnapshotJob { job_id: String }
+        let snapshot: Snapshot = match fs::read(self.dir.join(QUEUE_FILE)) {
+            Ok(data) => serde_json::from_slice(&data).map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?,
+            Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(()),
+            Err(e) => return Err(e),
+        };
         let mut entries: Vec<(String, u64)> = Vec::new();
         let mut total: u64 = 0;
         for entry in fs::read_dir(&self.dir)? {
             let entry = entry?;
-            let meta = match entry.metadata() {
-                Ok(meta) if meta.is_file() => meta,
-                _ => continue,
-            };
             let name = entry.file_name().to_string_lossy().into_owned();
-            if name == QUEUE_FILE {
-                continue;
-            }
+            let managed = snapshot.jobs.iter().any(|job| {
+                name.strip_prefix(&format!("{}.", job.job_id)).is_some_and(|suffix| {
+                    matches!(suffix, "output.wav" | "decoded.f32" | "output.f32" | "output.wav.part")
+                        || suffix.strip_prefix("input.").is_some_and(|ext| SOURCE_EXTENSIONS.contains(&ext))
+                })
+            });
+            if !managed { continue; }
+            let meta = match fs::symlink_metadata(entry.path()) {
+                Ok(meta) if meta.file_type().is_file() => meta,
+                Ok(_) => continue,
+                Err(e) if e.kind() == io::ErrorKind::NotFound => continue,
+                Err(e) => return Err(e),
+            };
             total += meta.len();
             entries.push((name, meta.len()));
         }
@@ -191,8 +204,10 @@ impl Storage {
             {
                 continue;
             }
-            if fs::remove_file(self.dir.join(&name)).is_ok() {
-                total -= size;
+            match fs::remove_file(self.dir.join(&name)) {
+                Ok(()) => total -= size,
+                Err(e) if e.kind() == io::ErrorKind::NotFound => total -= size,
+                Err(e) => return Err(e),
             }
         }
         Ok(())
@@ -297,7 +312,10 @@ mod tests {
         write(&dir.join("job_4000.input.wav"), 100);
         write(&dir.join("job_4000.decoded.f32"), 100);
         // queue.json 是元数据，不计入缓存总大小，也永不驱逐。
-        write(&dir.join(QUEUE_FILE), 100);
+        fs::write(dir.join(QUEUE_FILE), r#"{"jobs":[{"job_id":"job_1000"},{"job_id":"job_2000"},{"job_id":"job_3000"},{"job_id":"job_4000"}]}"#).unwrap();
+        write(&dir.join("job_0000.output.wav"), 5000);
+        write(&dir.join("job_1000.notes"), 5000);
+        std::os::unix::fs::symlink(dir.join("job_1000.notes"), dir.join("job_2000.input.wav")).unwrap();
         // 总 1300 > 1000，目标 800：删两个最旧（各 400）后 500 达标。
         store.evict(&["job_4000".to_string()]).unwrap();
         assert!(!dir.join("job_1000.output.wav").exists());
@@ -307,6 +325,9 @@ mod tests {
         assert!(dir.join("job_4000.input.wav").exists());
         assert!(dir.join("job_4000.decoded.f32").exists());
         assert!(dir.join(QUEUE_FILE).exists());
+        assert!(dir.join("job_0000.output.wav").exists());
+        assert!(dir.join("job_1000.notes").exists());
+        assert!(fs::symlink_metadata(dir.join("job_2000.input.wav")).unwrap().file_type().is_symlink());
 
         // 未超上限不动。
         let before = fs::read_dir(&dir).unwrap().count();
@@ -316,10 +337,22 @@ mod tests {
     }
 
     #[test]
+    fn evict_reports_invalid_snapshot_without_deleting() {
+        let dir = temp_dir("evict-invalid");
+        let store = storage(&dir, 1);
+        write(&dir.join("job_1000.output.wav"), 400);
+        fs::write(dir.join(QUEUE_FILE), b"invalid").unwrap();
+        assert_eq!(store.evict(&[]).unwrap_err().kind(), io::ErrorKind::InvalidData);
+        assert!(dir.join("job_1000.output.wav").exists());
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
     fn evict_keeps_all_when_protected_covers_everything() {
         let dir = temp_dir("evict-protected");
         let store = storage(&dir, 100);
         write(&dir.join("job_1000.output.wav"), 400);
+        fs::write(dir.join(QUEUE_FILE), r#"{"jobs":[{"job_id":"job_1000"}]}"#).unwrap();
         store.evict(&["job_1000".to_string()]).unwrap();
         assert!(dir.join("job_1000.output.wav").exists());
         fs::remove_dir_all(&dir).unwrap();

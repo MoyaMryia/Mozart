@@ -70,6 +70,20 @@ pub const DAEMON_PRESET_LIST: u16 = 0x011F;
 /// 体：schema::ModelUseRequest {"model_id"}；data {"model_id","previous_model_id"}。
 pub const DAEMON_MODEL_USE: u16 = 0x0120;
 
+/// Budget for operations involving up to six serial RPCs.
+pub fn config_set_timeout_ms(rpc_timeout_ms: u64) -> u64 {
+    rpc_timeout_ms.saturating_mul(6).max(15_000)
+}
+
+pub fn request_timeout_ms(rpc_timeout_ms: u64, command: u16) -> u64 {
+    match command {
+        DAEMON_CONFIG_SET | DAEMON_PRESET_SAVE | DAEMON_PRESET_USE | DAEMON_PRESET_LIST => {
+            config_set_timeout_ms(rpc_timeout_ms)
+        }
+        _ => rpc_timeout_ms,
+    }
+}
+
 pub const PRE_HELLO: u16 = 0x0201;
 pub const PRE_SET_ROUTE: u16 = 0x0202;
 pub const PRE_SET_MUTE: u16 = 0x0203;
@@ -238,6 +252,12 @@ pub struct Message {
 #[derive(Debug)]
 pub struct Seqpacket {
     fd: OwnedFd,
+}
+
+impl AsRawFd for Seqpacket {
+    fn as_raw_fd(&self) -> std::os::fd::RawFd {
+        self.fd.as_raw_fd()
+    }
 }
 
 impl Seqpacket {
@@ -563,6 +583,21 @@ fn protocol_io(err: ProtocolError) -> io::Error {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn request_budgets_cover_long_commands() {
+        use super::*;
+        for command in [
+            DAEMON_CONFIG_SET,
+            DAEMON_PRESET_SAVE,
+            DAEMON_PRESET_USE,
+            DAEMON_PRESET_LIST,
+        ] {
+            assert_eq!(request_timeout_ms(1000, command), 15_000);
+            assert_eq!(request_timeout_ms(3000, command), 18_000);
+            assert_eq!(request_timeout_ms(u64::MAX, command), u64::MAX);
+        }
+        assert_eq!(request_timeout_ms(1000, DAEMON_GET_STATUS), 1000);
+    }
     use super::*;
 
     fn socketpair() -> (Seqpacket, Seqpacket) {

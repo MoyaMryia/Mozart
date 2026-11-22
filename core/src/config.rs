@@ -4,6 +4,7 @@ use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::fmt;
 use std::io;
+use std::net::SocketAddr;
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 
@@ -11,6 +12,7 @@ use std::path::{Path, PathBuf};
 #[serde(default, deny_unknown_fields)]
 pub struct Config {
     pub daemon: DaemonConfig,
+    pub web: WebConfig,
     pub process: ProcessConfig,
     pub pre: PreConfig,
     pub enhance: Option<EnhanceConfig>,
@@ -42,6 +44,132 @@ pub struct DaemonConfig {
     pub restart_backoff_ms: u64,
     pub restart_backoff_max_ms: u64,
     pub restart_stable_ms: u64,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct WebConfig {
+    pub listen: SocketAddr,
+    pub static_dir: PathBuf,
+    pub upload_dir: PathBuf,
+    pub allowed_origins: Vec<String>,
+    pub max_concurrent_uploads: usize,
+    pub upload_timeout_ms: u64,
+    pub sse_heartbeat_ms: u64,
+    pub sse_buffer_bytes: usize,
+}
+
+impl Default for WebConfig {
+    fn default() -> Self {
+        Self {
+            listen: "0.0.0.0:80".parse().unwrap(),
+            static_dir: "web/dist".into(),
+            upload_dir: "~/.local/state/mozart/web-uploads".into(),
+            allowed_origins: ["http://localhost", "http://127.0.0.1", "http://[::1]"]
+                .into_iter()
+                .map(String::from)
+                .collect(),
+            max_concurrent_uploads: 2,
+            upload_timeout_ms: 120_000,
+            sse_heartbeat_ms: 15_000,
+            sse_buffer_bytes: 1_048_576,
+        }
+    }
+}
+
+impl WebConfig {
+    fn prepare(&mut self, path: Option<&Path>, home: Option<&Path>) -> Result<(), ConfigError> {
+        let base = match path
+            .and_then(Path::parent)
+            .filter(|p| !p.as_os_str().is_empty())
+        {
+            Some(base) if base.is_absolute() => base.to_path_buf(),
+            Some(base) => std::env::current_dir()
+                .map_err(|e| ConfigError::Invalid(format!("current directory: {e}")))?
+                .join(base),
+            None => std::env::current_dir()
+                .map_err(|e| ConfigError::Invalid(format!("current directory: {e}")))?,
+        };
+        self.static_dir = base.join(expand_tilde(&self.static_dir, home));
+        self.upload_dir = base.join(expand_tilde(&self.upload_dir, home));
+        Ok(())
+    }
+
+    fn validate(&self) -> Result<(), ConfigError> {
+        for (name, zero) in [
+            ("max_concurrent_uploads", self.max_concurrent_uploads == 0),
+            ("upload_timeout_ms", self.upload_timeout_ms == 0),
+            ("sse_heartbeat_ms", self.sse_heartbeat_ms == 0),
+            ("sse_buffer_bytes", self.sse_buffer_bytes == 0),
+        ] {
+            if zero {
+                return Err(ConfigError::Invalid(format!(
+                    "web.{name} must be greater than zero"
+                )));
+            }
+        }
+        Ok(())
+    }
+}
+
+/// Thin client configuration: unrelated module tables are intentionally ignored.
+#[derive(Debug, Clone)]
+pub struct WebAdapterConfig {
+    pub daemon: DaemonConfig,
+    pub web: WebConfig,
+    pub subtitles_path: PathBuf,
+}
+
+#[derive(Default, Deserialize)]
+#[serde(default)]
+struct AdapterDocument {
+    daemon: DaemonConfig,
+    web: WebConfig,
+    bridge: AdapterBridge,
+}
+
+#[derive(Deserialize)]
+#[serde(default)]
+struct AdapterBridge {
+    subtitles_path: PathBuf,
+}
+impl Default for AdapterBridge {
+    fn default() -> Self {
+        Self {
+            subtitles_path: BridgeConfig::default().subtitles_path,
+        }
+    }
+}
+
+impl WebAdapterConfig {
+    pub fn load_from(path: Option<&Path>) -> Result<Self, ConfigError> {
+        let mut doc: AdapterDocument = match path {
+            Some(path) => {
+                let text = std::fs::read_to_string(path).map_err(|source| ConfigError::Read {
+                    path: path.to_path_buf(),
+                    source,
+                })?;
+                toml::from_str(&text).map_err(|source| ConfigError::Parse {
+                    path: path.to_path_buf(),
+                    source,
+                })?
+            }
+            None => AdapterDocument::default(),
+        };
+        doc.daemon.apply_env()?;
+        doc.daemon.validate()?;
+        let home = std::env::var_os("HOME").map(PathBuf::from);
+        doc.web.prepare(path, home.as_deref())?;
+        doc.web.validate()?;
+        Ok(Self {
+            daemon: doc.daemon,
+            web: doc.web,
+            subtitles_path: expand_tilde(&doc.bridge.subtitles_path, home.as_deref()),
+        })
+    }
+    pub fn daemon_socket(&self) -> PathBuf {
+        self.daemon.run_dir.join(&self.daemon.socket)
+    }
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -477,6 +605,7 @@ impl Default for Config {
     fn default() -> Self {
         Self {
             daemon: DaemonConfig::default(),
+            web: WebConfig::default(),
             process: ProcessConfig::default(),
             pre: PreConfig::default(),
             enhance: None,
@@ -502,6 +631,40 @@ impl Default for DaemonConfig {
             restart_backoff_max_ms: 10_000,
             restart_stable_ms: 30_000,
         }
+    }
+}
+
+impl DaemonConfig {
+    fn apply_env(&mut self) -> Result<(), ConfigError> {
+        if let Some(dir) = std::env::var_os("MOZART_RUN_DIR") {
+            self.run_dir = dir.into();
+        }
+        if let Ok(value) = std::env::var("MOZART_POLL_INTERVAL_MS") {
+            self.poll_interval_ms = value.parse().map_err(|_| {
+                ConfigError::Invalid("MOZART_POLL_INTERVAL_MS must be an integer".into())
+            })?;
+        }
+        Ok(())
+    }
+    fn validate(&self) -> Result<(), ConfigError> {
+        for (name, value) in [
+            ("poll_interval_ms", self.poll_interval_ms),
+            ("rpc_timeout_ms", self.rpc_timeout_ms),
+            ("start_timeout_ms", self.start_timeout_ms),
+            ("restart_stable_ms", self.restart_stable_ms),
+        ] {
+            if value == 0 {
+                return Err(ConfigError::Invalid(format!(
+                    "daemon.{name} must be greater than zero"
+                )));
+            }
+        }
+        if self.restart_backoff_ms == 0 || self.restart_backoff_max_ms < self.restart_backoff_ms {
+            return Err(ConfigError::Invalid(
+                "daemon.restart_backoff_max_ms must be at least restart_backoff_ms".into(),
+            ));
+        }
+        validate_socket_name(&self.socket, "daemon.socket")
     }
 }
 
@@ -578,6 +741,7 @@ impl Config {
             config.bridge.corrections_path = Some(expand_tilde(path, home.as_deref()));
         }
         config.file.storage_dir = expand_tilde(&config.file.storage_dir, home.as_deref());
+        config.web.prepare(path, home.as_deref())?;
         config.validate()?;
         if let Some(enhance) = &mut config.enhance {
             if enhance.model.is_relative() {
@@ -689,9 +853,7 @@ impl Config {
     }
 
     fn apply_env(&mut self) -> Result<(), ConfigError> {
-        if let Some(dir) = std::env::var_os("MOZART_RUN_DIR") {
-            self.daemon.run_dir = PathBuf::from(dir);
-        }
+        self.daemon.apply_env()?;
         if let Some(bin) = std::env::var_os("MOZART_ENHANCE_BIN") {
             self.process.enhance_bin = PathBuf::from(bin);
         }
@@ -713,47 +875,12 @@ impl Config {
         if let Some(bin) = std::env::var_os("MOZART_LLAMA_BIN") {
             self.process.llama_bin = PathBuf::from(bin);
         }
-        if let Ok(value) = std::env::var("MOZART_POLL_INTERVAL_MS") {
-            self.daemon.poll_interval_ms = value.parse().map_err(|_| {
-                ConfigError::Invalid("MOZART_POLL_INTERVAL_MS must be an integer".to_string())
-            })?;
-        }
         Ok(())
     }
 
     fn validate(&self) -> Result<(), ConfigError> {
-        let interval = self.daemon.poll_interval_ms;
-        let rpc = self.daemon.rpc_timeout_ms;
-        let start = self.daemon.start_timeout_ms;
-        let backoff = self.daemon.restart_backoff_ms;
-        let backoff_max = self.daemon.restart_backoff_max_ms;
-        let stable = self.daemon.restart_stable_ms;
-        if interval == 0 {
-            return Err(ConfigError::Invalid(
-                "daemon.poll_interval_ms must be greater than zero".to_string(),
-            ));
-        }
-        if rpc == 0 {
-            return Err(ConfigError::Invalid(
-                "daemon.rpc_timeout_ms must be greater than zero".to_string(),
-            ));
-        }
-        if start == 0 {
-            return Err(ConfigError::Invalid(
-                "daemon.start_timeout_ms must be greater than zero".to_string(),
-            ));
-        }
-        if backoff == 0 || backoff_max < backoff {
-            return Err(ConfigError::Invalid(
-                "daemon.restart_backoff_max_ms must be at least restart_backoff_ms".to_string(),
-            ));
-        }
-        if stable == 0 {
-            return Err(ConfigError::Invalid(
-                "daemon.restart_stable_ms must be greater than zero".to_string(),
-            ));
-        }
-        validate_socket_name(&self.daemon.socket, "daemon.socket")?;
+        self.daemon.validate()?;
+        self.web.validate()?;
         validate_socket_name(&self.pre.socket, "pre.socket")?;
         validate_device_name(&self.pre.capture_device, "pre.capture_device")?;
         validate_device_name(&self.pre.playback_device, "pre.playback_device")?;
@@ -1621,6 +1748,30 @@ mod tests {
             assert!(set_key(Some(&path), key, value).is_err());
             assert_eq!(std::fs::read_to_string(&path).unwrap(), baseline);
         }
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn web_adapter_ignores_other_modules_and_validates_consumed_fields() {
+        let dir = temp_config_dir("web");
+        let path = dir.join("mozart.toml");
+        std::fs::write(&path, "[web]\nstatic_dir = 'assets'\n[bridge]\nsubtitles_path = 'subs.jsonl'\nfuture = 123\n[rvc.realtime]\nfuture = [1, 2]\n").unwrap();
+        let config = WebAdapterConfig::load_from(Some(&path)).unwrap();
+        assert_eq!(config.web.static_dir, dir.join("assets"));
+        assert_eq!(config.subtitles_path, PathBuf::from("subs.jsonl"));
+        assert!(Config::load_from(Some(&path)).is_err());
+        for key in [
+            "max_concurrent_uploads",
+            "upload_timeout_ms",
+            "sse_heartbeat_ms",
+            "sse_buffer_bytes",
+        ] {
+            std::fs::write(&path, format!("[web]\n{key} = 0\n")).unwrap();
+            assert!(WebAdapterConfig::load_from(Some(&path)).is_err());
+            assert!(Config::load_from(Some(&path)).is_err());
+        }
+        std::fs::write(&path, "[daemon]\nsocket = '../bad'\n").unwrap();
+        assert!(WebAdapterConfig::load_from(Some(&path)).is_err());
         let _ = std::fs::remove_dir_all(dir);
     }
 

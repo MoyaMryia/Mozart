@@ -65,6 +65,10 @@
 - [x] TTS 控制面：绑定 `tts.sock`（run_dir 下），daemon 连接；命令 `Hello` / `GetStatus`，信封见 SPEC-01。`GetStatus` 带合成成功/失败数、是否合成中、模型加载状态、任务队列深度、最近错误。配置读 `[tts]` 段，socket 路径相对 run_dir。（`tts/src/control.rs`、`tts/src/state.rs`）
 - [x] 第一版播报原速播放；灵活变速（按时长比例与积压反馈选 1.0–1.5 倍速、保留音高）推迟见 FUTURE。拉伸 DSP 用现成 C 库 libmozart-tempo，控制逻辑与时长模型待启用时搬 Rust。
 
+## 回归检查
+
+- [x] 重试翻译的进程测试在原 5 s 预算内同时等待翻译和异步播报提交，保留全部状态断言，消除提前观察计数的竞态。
+
 ## 待讨论
 
 - 无。glossary 编辑与 subtitle clear 留前端模块（见 SPEC-06）。
