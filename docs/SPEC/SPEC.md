@@ -70,6 +70,7 @@
 
 ## 变更记录
 
+- 2026-11-22：登记实时变声衔接自然度分步优化与延迟拆解待办：将实时变声的停顿/开口咔嗒声、偶发断音、持续说话字间轻微颤动与字头吐字失真拆为 4 步可独立验收待办，并补充实时延迟构成拆解与分阶段降延迟待办；从 `FUTURE.md` 迁出 `protect 与 rms_mix_rate 实时对齐` 入正式待办跟踪（SPEC-02、SPEC-03、FUTURE）。
 - 2026-11-22：确认并登记本机↔Jetson 跨平台 SSH 音频桥接工具（`tools/jetson-audio.py`）：单文件 Python（PEP 723 + `sounddevice`）直连本机系统默认扬声器与默认麦克风，不建系统虚拟麦克风；纯 SSH 原始 PCM 管道（48 kHz / `S16_LE` / 2 ch / 20 ms），支持 `play`/`mic`/`duplex`、同步 WAV 录制、有界缓冲防漂移、板端 `Loopback` 复用或 `device use` 智能热切与退出还原、故障显式报错退出（SPEC-09）。
 - 2026-11-22：确认「复核后再翻译播报」与「三主模式互斥 + 常驻字幕」边界：开启复核时等 `refined` 后仅触发单次翻译与播报；音频主输出收敛为实时变声（默认启动）/翻译播报（说话间隙静音并停释 RVC）/原声直出三主模式，识别与翻译字幕常驻；明确 8 GB 端侧保留本地语言管线、云端 STS 仅作翻译模式可选在线后端（SPEC-02、SPEC-04、SPEC-05）。
 - 2026-11-22：确认并登记 FUTURE「音频设备热切换」：新增控制命令 `device use <capture|playback> <设备名>`（daemon `0x0121` / pre `0x0208`），只做临时实时切换、不写 `mozart.toml` 或 `state.json`；`config set pre.capture_device/playback_device` 保持 S 类。daemon 内存保留生效设备供 `pre` 崩溃自愈恢复，显式 `restart pre` 或 `down`/`up` 回到基线。`pre` 先开新再关旧、失败保留旧设备，切 `capture` 重置 WOLA 状态并拒绝 `capture_file` 模式，切 `playback` 首帧 10 ms 淡入，不做物理拔线自动自愈（SPEC-02、SPEC-04、FUTURE）。
