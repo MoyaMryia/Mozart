@@ -4,9 +4,27 @@ use crate::preset::PresetManager;
 use crate::services::{self, Services};
 use crate::state::{lock_state, State};
 use crate::state_file::{BridgeRestore, StateFile};
-use mozart_core::config::Config;
+use mozart_core::config::{Config, StartupMode};
 use mozart_core::ctl::schema::{OutputMode, OutputModeStatus, OutputPhase, PlayoutPolicy, Route};
 use std::sync::{Mutex, TryLockError};
+
+pub fn initialize(state: &mut State, config: &Config) {
+    let requested = match config.daemon.startup_mode {
+        StartupMode::Manual => return,
+        StartupMode::Rvc if !config.rvc.model_id.is_empty() => OutputMode::Rvc,
+        StartupMode::Rvc | StartupMode::Direct => OutputMode::Direct,
+        StartupMode::Broadcast => OutputMode::Broadcast,
+    };
+    state.playout_policy = PlayoutPolicy::Silent;
+    // A fresh supervised bridge has no prior admission. Direct and RVC can
+    // start without waiting for bridge or TTS; the pre gate rejects TTS.
+    let phase = if requested == OutputMode::Broadcast {
+        OutputPhase::ClosingSpeech
+    } else {
+        OutputPhase::Routing
+    };
+    set_intent(state, requested, phase);
+}
 
 /// Called under the transition lock. A newer request withdraws an uncommitted route intent.
 pub fn request(state: &mut State, mode: OutputMode) -> OutputModeStatus {
@@ -15,11 +33,15 @@ pub fn request(state: &mut State, mode: OutputMode) -> OutputModeStatus {
             return current.clone();
         }
     }
+    set_intent(state, mode, OutputPhase::ClosingSpeech)
+}
+
+fn set_intent(state: &mut State, mode: OutputMode, phase: OutputPhase) -> OutputModeStatus {
     state.set_route_desired(state.route_active());
     let next = OutputModeStatus {
         requested: mode,
         applied: None,
-        phase: OutputPhase::ClosingSpeech,
+        phase,
         last_error: None,
     };
     state.output_mode = Some(next.clone());
@@ -145,6 +167,27 @@ pub fn observe_pre_playout(state: &mut State, pre: &mozart_core::ctl::schema::Pr
             mode.phase = OutputPhase::ClosingSpeech;
             mode.applied = None;
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn startup_defaults_to_rvc_if_a_model_is_configured() {
+        let mut config = Config::default();
+        let mut state = State::new();
+        initialize(&mut state, &config);
+        assert_eq!(state.output_mode.unwrap().requested, OutputMode::Direct);
+
+        config.rvc.model_id = "demo".into();
+        let mut state = State::new();
+        initialize(&mut state, &config);
+        let mode = state.output_mode.unwrap();
+        assert_eq!(mode.requested, OutputMode::Rvc);
+        assert_eq!(mode.phase, OutputPhase::Routing);
+        assert_eq!(state.playout_policy, PlayoutPolicy::Silent);
     }
 }
 

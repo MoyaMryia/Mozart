@@ -112,6 +112,7 @@ impl DaemonProcess {
             .env("MOZART_BRIDGE_BIN", bridge_bin)
             .env("MOZART_LLAMA_BIN", llama_bin)
             .env("MOZART_POLL_INTERVAL_MS", "100")
+            .env("MOZART_STARTUP_MODE", "manual")
             .stdout(Stdio::null())
             .stderr(Stdio::inherit())
             .spawn()
@@ -154,6 +155,7 @@ impl DaemonProcess {
             .env("MOZART_BRIDGE_BIN", example("bridge_stub"))
             .env("MOZART_LLAMA_BIN", example("llama_stub"))
             .env("MOZART_POLL_INTERVAL_MS", "100")
+            .env("MOZART_STARTUP_MODE", "manual")
             .stdout(Stdio::null())
             .stderr(Stdio::inherit());
         for (key, value) in extra_env {

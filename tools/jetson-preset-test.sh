@@ -100,6 +100,7 @@ ASSET_PRESETS_BEFORE_B=$(find "$SRC_MODEL_B" -maxdepth 1 -name presets -print)
 
 cat > "$CFG" <<EOF
 [daemon]
+startup_mode = "manual"
 run_dir = "$RUN"
 rpc_timeout_ms = 5000
 start_timeout_ms = 60000

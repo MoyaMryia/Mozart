@@ -54,6 +54,8 @@ mozart-ctl mute off           # 取消静音
 mozart-ctl model use <模型id>  # 换模型（实时或空闲）
 ```
 
+启动时有已配置的变声模型则默认进入实时变声，没有模型则默认直出。可在 `[daemon]` 中设置 `startup_mode`。
+
 模式命令返回受理结果。用 `mozart-ctl status --json` 查看 `output_mode.applied`；三种模式都保留识别和翻译字幕。手动执行 `route set` 或 `speech` 会退出托管模式。
 
 `model use` 短暂断流：停流 → 载入新模型 → 载入该模型的 `presets/default.toml` → 重新起流。

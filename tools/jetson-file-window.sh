@@ -101,6 +101,7 @@ for m in $MODEL_IDS; do
 done
 cat > "$CFG" <<EOF
 [daemon]
+startup_mode = "manual"
 run_dir = "$RUN"
 rpc_timeout_ms = 5000
 start_timeout_ms = 60000

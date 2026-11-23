@@ -62,13 +62,19 @@ pub fn serve(config: &Config, config_path: Option<&Path>) -> io::Result<()> {
     let state_file = StateFile::load(state_file_path())?;
     let mut effective = config.clone();
     state_file::overlay(&mut effective, state_file.overrides());
-    let bridge_restore = Arc::new(Mutex::new(state_file.bridge_restore()));
+    let mut initial_state = State::new();
+    crate::mode::initialize(&mut initial_state, &effective);
+    let mut restore = state_file.bridge_restore();
+    if initial_state.output_mode.is_some() {
+        restore.speech = None;
+    }
+    let bridge_restore = Arc::new(Mutex::new(restore));
     let state_file = Arc::new(Mutex::new(state_file));
     let shared = SharedConfig::new(effective);
 
     // 子进程与 daemon 读同一 TOML：解析出的路径随 spawn 传递（--config）。
     let config_path = config_path.map(|path| path.to_path_buf());
-    let state = Arc::new(Mutex::new(State::new()));
+    let state = Arc::new(Mutex::new(initial_state));
     let services = Arc::new(Services::new(&shared));
     let running = Arc::new(AtomicBool::new(true));
     // 预设载入与 config set/save 共用 TOML 串行锁与 transition 锁。

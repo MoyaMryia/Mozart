@@ -92,6 +92,7 @@ ffmpeg -y -v error -ss "$SS_S" -t "$T_S" -i "$SAMPLE_M4A" -ar 48000 -ac 2 "$EXCE
 # ---- 配置 ----
 cat > "$CFG" <<EOF
 [daemon]
+startup_mode = "manual"
 run_dir = "$RUN"
 rpc_timeout_ms = 2000
 start_timeout_ms = 30000

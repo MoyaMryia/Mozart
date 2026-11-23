@@ -90,6 +90,25 @@ fn output_modes_switch_speech_and_route_without_restarting_asr() {
 }
 
 #[test]
+fn startup_enters_realtime_mode_without_a_user_command() {
+    use mozart_core::ctl::schema::{OutputMode, PlayoutPolicy, Route};
+    let storage = std::env::temp_dir().join(format!("mozart-startup-file-{}", std::process::id()));
+    let daemon = DaemonProcess::start_file(
+        "startup-output-mode", &storage, "", true, &[("MOZART_STARTUP_MODE", "rvc".to_string())],
+    );
+    let conn = daemon.connect();
+    assert!(wait_until(Duration::from_secs(5), || {
+        let view = status(&conn);
+        view.route.active == Route::Rvc
+            && view.output_mode.is_some_and(|mode| mode.applied == Some(OutputMode::Rvc))
+            && view.pre.is_some_and(|pre| pre.playout_policy == PlayoutPolicy::RealtimeOnly)
+            && view.bridge.is_some_and(|bridge| !bridge.speech_enabled && bridge.translate_enabled)
+    }));
+    drop(daemon);
+    std::fs::remove_dir_all(storage).unwrap();
+}
+
+#[test]
 fn missing_tts_fence_is_not_success_and_blocks_reopening() {
     let daemon = DaemonProcess::start_full(
         "lang-fence-without-tts", &example("pre_stub"), &example("rvc_stub"),
