@@ -18,23 +18,23 @@ pub struct Shared {
     queue_depth: AtomicU64,
     frames_out: AtomicU64,
     output_dropped: AtomicU64,
-    /// 任务代际：TTS_JOB_STOP 推进；在途合成与帧投递据此中止（见 Abort）。
-    job_epoch: AtomicU64,
+    /// TTS_JOB_STOP 安装的单调截止令牌。旧任务与在途合成据此中止。
+    cutoff: AtomicU64,
+    output_gate: Mutex<()>,
     last_error: Mutex<Option<String>>,
 }
 
-/// 在途合成的中止判定：进程停止（SIGTERM）或任务代际推进（TTS_JOB_STOP）。
-/// 创建时捕获任务代际；合成与帧投递期间代际变化即视为中止。
+/// 在途合成的中止判定：进程停止，或任务令牌早于当前播报截止令牌。
 /// 真实 FFI 的生成进度回调跨 C 边界持有它（栈对象，生成调用期间存活）。
 pub struct Abort<'a> {
     stop: &'a AtomicBool,
-    epoch: &'a AtomicU64,
-    start: u64,
+    cutoff: &'a AtomicU64,
+    pub issued_ns: u64,
 }
 
 impl Abort<'_> {
     pub fn aborted(&self) -> bool {
-        self.stop.load(Relaxed) || self.epoch.load(Relaxed) != self.start
+        self.stop.load(Relaxed) || self.issued_ns < self.cutoff.load(Relaxed)
     }
 }
 
@@ -50,7 +50,8 @@ impl Shared {
             queue_depth: AtomicU64::new(0),
             frames_out: AtomicU64::new(0),
             output_dropped: AtomicU64::new(0),
-            job_epoch: AtomicU64::new(0),
+            cutoff: AtomicU64::new(0),
+            output_gate: Mutex::new(()),
             last_error: Mutex::new(None),
         }
     }
@@ -67,22 +68,34 @@ impl Shared {
     pub fn add_stopped(&self, count: u64) {
         self.stopped.fetch_add(count, Relaxed);
     }
-    /// 当前任务代际。合成线程在取任务后捕获，作为中止判定基准。
-    pub fn job_epoch(&self) -> u64 {
-        self.job_epoch.load(Relaxed)
+    pub fn cutoff(&self) -> u64 {
+        self.cutoff.load(std::sync::atomic::Ordering::SeqCst)
     }
-    /// TTS_JOB_STOP：推进任务代际，在途合成与帧投递据此中止；
-    /// 在队任务由合成线程在下一轮循环清空（队列接收端归合成线程独占）。
-    pub fn stop_jobs(&self) {
-        self.job_epoch.fetch_add(1, Relaxed);
+
+    fn output_gate(&self) -> std::sync::MutexGuard<'_, ()> {
+        self.output_gate.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
     }
-    /// 捕获当前代际的中止判定（进程停止标志 + 任务代际）。
-    pub fn abort<'a>(&'a self, stop: &'a AtomicBool) -> Abort<'a> {
-        Abort {
-            stop,
-            epoch: &self.job_epoch,
-            start: self.job_epoch.load(Relaxed),
+
+    /// 重放旧截止值不影响新任务。确认前等待当前非阻塞发送离开门控。
+    pub fn install_fence(&self, cutoff: u64) -> u64 {
+        let _gate = self.output_gate();
+        self.cutoff.fetch_max(cutoff, std::sync::atomic::Ordering::SeqCst).max(cutoff)
+    }
+
+    pub fn send_if_current(&self, abort: &Abort<'_>, send: impl FnOnce()) {
+        let _gate = self.output_gate();
+        if !abort.aborted() {
+            send();
         }
+    }
+    #[cfg(test)]
+    pub fn stop_jobs(&self) { self.install_fence(mozart_core::speech::monotonic_ns()); }
+    #[cfg(test)]
+    pub fn abort<'a>(&'a self, stop: &'a AtomicBool) -> Abort<'a> {
+        self.abort_job(stop, mozart_core::speech::monotonic_ns())
+    }
+    pub fn abort_job<'a>(&'a self, stop: &'a AtomicBool, issued_ns: u64) -> Abort<'a> {
+        Abort { stop, cutoff: &self.cutoff, issued_ns }
     }
     pub fn set_synthesizing(&self, active: bool) {
         self.synthesizing.store(active, Relaxed);

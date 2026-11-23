@@ -44,6 +44,31 @@ pub enum Route {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
+pub enum OutputMode {
+    Direct,
+    Rvc,
+    Broadcast,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum OutputPhase {
+    ClosingSpeech,
+    Routing,
+    OpeningSpeech,
+    Applied,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct OutputModeStatus {
+    pub requested: OutputMode,
+    pub applied: Option<OutputMode>,
+    pub phase: OutputPhase,
+    pub last_error: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
 pub enum Activity {
     Realtime,
     File,
@@ -277,6 +302,8 @@ pub struct Status {
     pub enhance: Option<EnhanceStatus>,
     pub daemon: DaemonInfo,
     pub route: RouteState,
+    #[serde(default)]
+    pub output_mode: Option<OutputModeStatus>,
     pub mute: bool,
     pub arbiter: ArbiterState,
     pub processes: Processes,
@@ -461,6 +488,12 @@ impl Default for BridgeStatus {
 #[serde(deny_unknown_fields)]
 pub struct RouteSetRequest {
     pub route: Route,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct OutputModeSetRequest {
+    pub mode: OutputMode,
 }
 
 #[derive(Debug, Deserialize)]

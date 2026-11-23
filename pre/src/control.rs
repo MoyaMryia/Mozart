@@ -110,7 +110,7 @@ pub fn serve(
     capture_ring: Arc<Ring<crate::capture::CapturedFrame>>,
     trunk: Arc<Ring<RawFrame>>,
     rvc_ring: Arc<Ring<OutputFrame>>,
-    tts_ring: Arc<Ring<OutputFrame>>,
+    tts_ring: Arc<Ring<mozart_core::SpeechFrame>>,
     device_switch_timeout: Duration,
     stop: &'static AtomicBool,
 ) {
@@ -159,7 +159,7 @@ fn serve_connection(
     capture_ring: &Ring<crate::capture::CapturedFrame>,
     trunk: &Ring<RawFrame>,
     rvc_ring: &Ring<OutputFrame>,
-    tts_ring: &Ring<OutputFrame>,
+    tts_ring: &Ring<mozart_core::SpeechFrame>,
     drop_log: &mut DropLog,
     device_switch_timeout: Duration,
     stop: &AtomicBool,
@@ -219,7 +219,7 @@ fn dispatch(
     capture_ring: &Ring<crate::capture::CapturedFrame>,
     trunk: &Ring<RawFrame>,
     rvc_ring: &Ring<OutputFrame>,
-    tts_ring: &Ring<OutputFrame>,
+    tts_ring: &Ring<mozart_core::SpeechFrame>,
     drop_log: &mut DropLog,
 ) -> Vec<u8> {
     let stop = AtomicBool::new(false);
@@ -244,7 +244,7 @@ fn dispatch_with_stop(
     capture_ring: &Ring<crate::capture::CapturedFrame>,
     trunk: &Ring<RawFrame>,
     rvc_ring: &Ring<OutputFrame>,
-    tts_ring: &Ring<OutputFrame>,
+    tts_ring: &Ring<mozart_core::SpeechFrame>,
     drop_log: &mut DropLog,
     device_switch_timeout: Duration,
     stop: &AtomicBool,
@@ -328,8 +328,7 @@ fn dispatch_with_stop(
         },
         ctl::PRE_SET_DEVICE => match serde_json::from_value::<DeviceUseRequest>(body) {
             Ok(request) => {
-                if let Err(err) = validate_device_name(&request.device, request.kind.config_key())
-                {
+                if let Err(err) = validate_device_name(&request.device, request.kind.config_key()) {
                     return error_body(ctl::CODE_INVALID_ARGUMENT, &err.to_string());
                 }
                 let slot = match request.kind {
@@ -348,7 +347,35 @@ fn dispatch_with_stop(
             Err(err) => error_body(ctl::CODE_INVALID_ARGUMENT, &err.to_string()),
         },
         ctl::PRE_SPEECH_STOP => {
-            // speech stop 经 daemon 转发：清播报环，丢弃已送达未播的播报帧。
+            if body.get("cutoff_ns").is_some() {
+                let fence: mozart_core::speech::StopFence = match serde_json::from_value(body) {
+                    Ok(fence) => fence,
+                    Err(err) => return error_body(ctl::CODE_INVALID_ARGUMENT, &err.to_string()),
+                };
+                if !mozart_core::speech::valid_timestamp(fence.cutoff_ns) {
+                    return error_body(ctl::CODE_INVALID_ARGUMENT, "invalid speech cutoff");
+                }
+                let cutoff = shared
+                    .speech_cutoff
+                    .fetch_max(fence.cutoff_ns, Ordering::SeqCst)
+                    .max(fence.cutoff_ns);
+                let request = shared.speech_request.fetch_add(1, Ordering::SeqCst) + 1;
+                let deadline = Instant::now() + Duration::from_secs(1);
+                while shared.speech_ack.load(Ordering::SeqCst) < request {
+                    if Instant::now() >= deadline {
+                        return error_body(
+                            ctl::CODE_NOT_READY,
+                            "speech stop playback acknowledgement timed out",
+                        );
+                    }
+                    std::thread::sleep(Duration::from_millis(1));
+                }
+                return ok_body(json!({"stopped": true, "cutoff_ns": cutoff}));
+            }
+            if body != json!({}) {
+                return error_body(ctl::CODE_INVALID_ARGUMENT, "invalid speech stop body");
+            }
+            // 旧式命令只清播报环，丢弃已送达未播的播报帧。
             // 播放线程下一帧见环空，holdoff 后恢复实时；计数经应答可查。
             let mut frames_cleared = 0u64;
             while tts_ring.pop(Some(Duration::ZERO)).is_some() {
@@ -401,7 +428,7 @@ mod tests {
         Arc<Ring<crate::capture::CapturedFrame>>,
         Arc<Ring<RawFrame>>,
         Arc<Ring<OutputFrame>>,
-        Arc<Ring<OutputFrame>>,
+        Arc<Ring<mozart_core::SpeechFrame>>,
         DropLog,
     ) {
         (
@@ -951,7 +978,18 @@ mod tests {
             let trunk = trunk.clone();
             let rvc = rvc.clone();
             let tts = tts.clone();
-            move || serve(listener, shared, cap, trunk, rvc, tts, Duration::from_secs(1), stop)
+            move || {
+                serve(
+                    listener,
+                    shared,
+                    cap,
+                    trunk,
+                    rvc,
+                    tts,
+                    Duration::from_secs(1),
+                    stop,
+                )
+            }
         });
 
         let conn = Seqpacket::connect(&path).unwrap();
@@ -976,28 +1014,34 @@ mod tests {
         assert_eq!(data(&reply.body)["route"], "rvc");
 
         // speech stop 清播报环：先塞两帧，停止后环空、应答计 frames_cleared。
-        tts.push(OutputFrame::new_48k(
-            mozart_core::FrameMeta {
-                pts_ns: 0,
-                frame_idx: 0,
-                vad_flag: 1,
-                energy_db: 0,
-                conf: 0,
-                segment_id: 0,
-            },
-            [0.0; mozart_core::OUTPUT_SAMPLES],
-        ));
-        tts.push(OutputFrame::new_48k(
-            mozart_core::FrameMeta {
-                pts_ns: 0,
-                frame_idx: 1,
-                vad_flag: 1,
-                energy_db: 0,
-                conf: 0,
-                segment_id: 0,
-            },
-            [0.0; mozart_core::OUTPUT_SAMPLES],
-        ));
+        tts.push(mozart_core::SpeechFrame {
+            issued_ns: 1,
+            frame: OutputFrame::new_48k(
+                mozart_core::FrameMeta {
+                    pts_ns: 0,
+                    frame_idx: 0,
+                    vad_flag: 1,
+                    energy_db: 0,
+                    conf: 0,
+                    segment_id: 0,
+                },
+                [0.0; mozart_core::OUTPUT_SAMPLES],
+            ),
+        });
+        tts.push(mozart_core::SpeechFrame {
+            issued_ns: 1,
+            frame: OutputFrame::new_48k(
+                mozart_core::FrameMeta {
+                    pts_ns: 0,
+                    frame_idx: 1,
+                    vad_flag: 1,
+                    energy_db: 0,
+                    conf: 0,
+                    segment_id: 0,
+                },
+                [0.0; mozart_core::OUTPUT_SAMPLES],
+            ),
+        });
         conn.send(ctl::PRE_SPEECH_STOP, 4, b"{}").unwrap();
         let reply = conn.recv(Some(Duration::from_secs(2))).unwrap();
         let stopped = data(&reply.body);

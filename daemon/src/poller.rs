@@ -48,13 +48,22 @@ impl Poller {
                             .unwrap_or_else(|poisoned| poisoned.into_inner());
                         if bridge_pid.is_some() && bridge_pid != last_bridge_pid {
                             last_bridge_pid = bridge_pid;
-                            *restore = state_file
+                            let saved = state_file
                                 .lock()
                                 .unwrap_or_else(|poisoned| poisoned.into_inner())
                                 .bridge_restore();
+                            restore.translate = saved.translate;
+                            let managed = crate::mode::bridge_restarted(&mut lock_state(&state));
+                            // Supervised bridge always boots with admission closed.
+                            restore.speech = Some(if managed { false } else { saved.speech.unwrap_or(config.bridge.speech_enabled) });
+                        }
+                        if restore.speech_stop.is_some() && lock_state(&state).output_mode.is_none() {
+                            // advance_speech_stop publishes any remaining failure to status.
+                            let _ = services::advance_speech_stop(&state, &services, &state_file, &mut restore);
                         }
                         services::restore_bridge_switches(&services, &mut restore);
                     }
+                    crate::mode::tick(&state, &services, &config, &presets, &state_file, &bridge_restore);
                     file.tick();
                     let hw = monitor.sample();
                     lock_state(&state).set_hw(Some(hw));

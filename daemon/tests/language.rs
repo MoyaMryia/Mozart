@@ -24,6 +24,79 @@ fn wait_language_ready(conn: &Seqpacket) {
 }
 
 #[test]
+fn output_modes_switch_speech_and_route_without_restarting_asr() {
+    use mozart_core::ctl::schema::{OutputMode, OutputPhase, Route};
+    let daemon = DaemonProcess::start("lang-output-mode", &example("pre_stub"), &example("rvc_stub"));
+    let conn = daemon.connect();
+    wait_language_ready(&conn);
+    let startup = status(&conn).asr.unwrap().startup_id;
+    let pid = status(&conn).processes.asr.pid;
+    for (name, requested, route, speaking) in [
+        ("broadcast", OutputMode::Broadcast, Route::Direct, true),
+        ("rvc", OutputMode::Rvc, Route::Rvc, false),
+        ("direct", OutputMode::Direct, Route::Direct, false),
+        ("broadcast", OutputMode::Broadcast, Route::Direct, true),
+    ] {
+        let body = serde_json::json!({"mode": name}).to_string();
+        let accepted = call(&conn, ctl::DAEMON_OUTPUT_MODE_SET, body.as_bytes());
+        assert_eq!(accepted.status, "ok", "{}", accepted.reason);
+        assert_eq!(accepted.data["requested"], name);
+        assert_eq!(accepted.data["phase"], "closing_speech");
+        assert!(accepted.data["applied"].is_null());
+        assert!(wait_until(Duration::from_secs(5), || {
+            let view = status(&conn);
+            view.output_mode.is_some_and(|m| m.phase == OutputPhase::Applied && m.applied == Some(requested))
+                && view.route.active == route
+                && view.bridge.is_some_and(|b| b.speech_enabled == speaking && b.translate_enabled)
+                && view.pre.is_some_and(|p| p.route == route)
+        }), "mode did not apply: {:?}", status(&conn).output_mode);
+        let current = status(&conn);
+        assert_eq!(current.processes.asr.pid, pid);
+        assert_eq!(current.asr.unwrap().startup_id, startup);
+    }
+    let invalid = call(&conn, ctl::DAEMON_OUTPUT_MODE_SET, br#"{"mode":"unknown"}"#);
+    assert_eq!(invalid.code, ctl::CODE_INVALID_ARGUMENT);
+    assert_eq!(status(&conn).output_mode.unwrap().applied, Some(OutputMode::Broadcast));
+    let bridge_pid = status(&conn).processes.bridge.pid.unwrap();
+    // SAFETY: this PID belongs to the supervised child started by this test.
+    assert_eq!(unsafe { libc::kill(bridge_pid as i32, libc::SIGKILL) }, 0);
+    assert!(wait_until(Duration::from_secs(5), || {
+        let view = status(&conn);
+        view.processes.bridge.pid.is_some_and(|current| current != bridge_pid)
+            && view.output_mode.is_some_and(|m| m.applied == Some(OutputMode::Broadcast))
+            && view.bridge.is_some_and(|b| b.speech_enabled)
+    }));
+    assert_eq!(status(&conn).asr.unwrap().startup_id, startup);
+}
+
+#[test]
+fn missing_tts_fence_is_not_success_and_blocks_reopening() {
+    let daemon = DaemonProcess::start_full(
+        "lang-fence-without-tts", &example("pre_stub"), &example("rvc_stub"),
+        &example("asr_stub"), std::path::Path::new("/bin/false"),
+        &example("bridge_stub"), &example("llama_stub"),
+        "[daemon]\nrpc_timeout_ms = 300\n[rvc]\nmodel_id = \"demo\"\n",
+    );
+    let conn = daemon.connect();
+    assert!(wait_until(Duration::from_secs(5), || {
+        let view = status(&conn);
+        view.pre.is_some() && view.bridge.as_ref().is_some_and(|b| b.speech_enabled) && view.asr.is_some()
+    }));
+    let asr_before = status(&conn).processes.asr.pid;
+    let stop = call(&conn, ctl::DAEMON_SPEECH_STOP, b"{}");
+    assert_eq!(stop.status, "error");
+    assert!(stop.reason.contains("speech stop fence: tts"), "{}", stop.reason);
+    let reopen = call(&conn, ctl::DAEMON_SPEECH_SET, br#"{"enabled":true}"#);
+    assert_eq!(reopen.status, "error");
+    assert!(wait_until(Duration::from_secs(5), || {
+        let view = status(&conn);
+        view.bridge.is_some_and(|b| !b.speech_enabled && b.translate_enabled)
+            && view.degraded.iter().any(|reason| reason.starts_with("speech stop fence: tts"))
+    }));
+    assert_eq!(status(&conn).processes.asr.pid, asr_before);
+}
+
+#[test]
 fn supervises_and_aggregates_language_children() {
     let daemon = DaemonProcess::start("lang-supervise", &example("pre_stub"), &example("rvc_stub"));
     let conn = daemon.connect();
@@ -76,6 +149,7 @@ fn forwards_translate_and_speech_to_bridge() {
     let stop = call(&conn, ctl::DAEMON_SPEECH_STOP, b"{}");
     assert_eq!(stop.status, "ok");
     assert_eq!(stop.data["speech_enabled"], false);
+    assert!(stop.data["cutoff_ns"].as_u64().is_some());
     assert!(
         wait_until(Duration::from_secs(5), || {
             status(&conn).bridge.map(|b| !b.speech_enabled).unwrap_or(false)

@@ -102,7 +102,8 @@ RPC 截止时间复用 CLI 的普通请求、配置写入及启动停止预算�
 | `POST /system/up` | `{}` | 固定参数调用 `mozart-ctl up --json`；`{"state":"running"}` 或 `already-running` |
 | `POST /system/down` | `{}` | 固定参数调用 `mozart-ctl down --json`；`{"state":"stopped"}` 或 `not-running` |
 | `GET /status` | 无 | `DAEMON_GET_STATUS`，整机快照 |
-| `PUT /route` | `{"route":"direct"}` 或 `{"route":"rvc"}` | `DAEMON_ROUTE_SET` |
+| `PUT /route` | `{"route":"direct"}` 或 `{"route":"rvc"}` | `DAEMON_ROUTE_SET`；退出托管输出模式 |
+| `PUT /mode` | `{"mode":"direct"}`、`{"mode":"rvc"}` 或 `{"mode":"broadcast"}` | `DAEMON_OUTPUT_MODE_SET`；应答表示受理，按 `GET /status` 的 `output_mode` 查询转换 |
 | `PUT /mute` | `{"mute":true}` | `DAEMON_MUTE_SET` |
 | `PUT /translate` | `{"enabled":true}` | `DAEMON_TRANSLATE_SET` |
 | `PUT /speech` | `{"enabled":true}` | `DAEMON_SPEECH_SET` |

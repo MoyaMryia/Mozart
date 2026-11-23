@@ -337,7 +337,7 @@ fn main() -> ExitCode {
     ));
     let trunk = Arc::new(Ring::<RawFrame>::new(TRUNK_QUEUE_FRAMES));
     let rvc_ring = Arc::new(Ring::<OutputFrame>::new(ai::RVC_QUEUE_FRAMES));
-    let tts_ring = Arc::new(Ring::<OutputFrame>::new(ai::TTS_QUEUE_FRAMES));
+    let tts_ring = Arc::new(Ring::<mozart_core::SpeechFrame>::new(ai::TTS_QUEUE_FRAMES));
 
     let listener = match bind_control_socket(&args.socket) {
         Ok(listener) => listener,
@@ -371,17 +371,19 @@ fn main() -> ExitCode {
 
     // 播报支路输出侧：pre 绑定 tts_output_socket 收 TTS 播报帧（SPEC-05 方向
     // 约定：pre 绑定、TTS 连接）。绑定失败立即退出：部署路径属配置错误。
-    let tts_out_socket =
-        match FrameSocket::<OutputFrame>::bind(&config.tts_output_socket(), ai::TTS_QUEUE_FRAMES) {
-            Ok(socket) => socket,
-            Err(err) => {
-                eprintln!(
-                    "mozart-pre: bind {}: {err}",
-                    config.tts_output_socket().display()
-                );
-                return ExitCode::FAILURE;
-            }
-        };
+    let tts_out_socket = match FrameSocket::<mozart_core::SpeechFrame>::bind(
+        &config.tts_output_socket(),
+        ai::TTS_QUEUE_FRAMES,
+    ) {
+        Ok(socket) => socket,
+        Err(err) => {
+            eprintln!(
+                "mozart-pre: bind {}: {err}",
+                config.tts_output_socket().display()
+            );
+            return ExitCode::FAILURE;
+        }
+    };
 
     // 播放设备先就绪，后拉线程；采集源二选一：测试文件（SPEC-02 文件采集源）
     // 或 ALSA 设备。文件契约在采集线程启动时入口校验，失败走致命错误传播。

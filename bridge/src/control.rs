@@ -20,11 +20,6 @@ struct EnabledRequest {
     enabled: bool,
 }
 
-/// speech stop 请求体：空对象（兼容空 body）。
-#[derive(Debug, Deserialize)]
-#[serde(deny_unknown_fields)]
-struct StopRequest {}
-
 /// 服务循环：绑定与监听由调用方完成；停止标志置位后返回。
 pub fn serve(
     listener: Seqpacket,
@@ -115,19 +110,18 @@ pub fn dispatch(msg: &Message, shared: &Shared, queues: &Queues, tts_jobs_path: 
             Err(reason) => error_body(ctl::CODE_INVALID_ARGUMENT, &reason),
         },
         ctl::BRIDGE_SPEECH_STOP => {
-            if let Err(reason) = parse_stop(&msg.body) {
-                return error_body(ctl::CODE_INVALID_ARGUMENT, &reason);
-            }
-            // 先向 TTS 下发停止（中止在途合成），再关开关、清桥队列。
-            // TTS 缺席只记降级，不阻断桥侧停止。
-            crate::speech::send_stop(tts_jobs_path, shared);
-            let switches = Switches {
-                translate_enabled: shared.translate_enabled(),
-                speech_enabled: false,
+            let fenced = match parse_stop(&msg.body) {
+                Ok(value) => value,
+                Err(reason) => return error_body(ctl::CODE_INVALID_ARGUMENT, &reason),
             };
-            shared.set_switches(switches);
+            let cutoff = shared.stop_speech();
             let cleared = queues.clear_speech();
-            ok_body(json!({ "speech_enabled": false, "queue_cleared": cleared }))
+            if !fenced {
+                crate::speech::send_stop(tts_jobs_path, shared, cutoff);
+            }
+            ok_body(
+                json!({ "speech_enabled": false, "queue_cleared": cleared, "cutoff_ns": cutoff }),
+            )
         }
         _ => error_body(ctl::CODE_UNKNOWN_COMMAND, "unknown command"),
     }
@@ -147,13 +141,19 @@ fn parse_enabled(body: &[u8]) -> Result<bool, String> {
     Ok(request.enabled)
 }
 
-fn parse_stop(body: &[u8]) -> Result<(), String> {
+fn parse_stop(body: &[u8]) -> Result<bool, String> {
     if body.is_empty() {
-        return Ok(());
+        return Ok(false);
     }
-    serde_json::from_slice::<StopRequest>(body)
-        .map(|_| ())
-        .map_err(|err| format!("invalid stop body: {err}"))
+    let request: serde_json::Map<String, serde_json::Value> =
+        serde_json::from_slice(body).map_err(|err| format!("invalid stop body: {err}"))?;
+    if request.is_empty() {
+        Ok(false)
+    } else if request.len() == 1 && request.get("fenced") == Some(&serde_json::Value::Bool(true)) {
+        Ok(true)
+    } else {
+        Err("invalid stop body: expected {} or {\"fenced\":true}".into())
+    }
 }
 
 #[cfg(test)]
@@ -225,7 +225,12 @@ mod tests {
     #[test]
     fn hello_reports_version() {
         let fixture = Fixture::new("hello");
-        let reply = dispatch(&message(ctl::BRIDGE_HELLO, b""), &fixture.shared, &fixture.queues, &fixture.tts_path());
+        let reply = dispatch(
+            &message(ctl::BRIDGE_HELLO, b""),
+            &fixture.shared,
+            &fixture.queues,
+            &fixture.tts_path(),
+        );
         assert_eq!(data(&reply)["version"], VERSION);
     }
 
@@ -235,16 +240,16 @@ mod tests {
         fixture.shared.add_published();
         fixture.shared.set_records_in_memory(1);
         fixture.shared.set_last_write_unix_ms(123);
-        fixture
-            .queues
-            .push_translate(crate::state::TranslateJob {
-                utterance_id: "s:1".to_string(),
-                text: "你好".to_string(),
-            });
+        fixture.queues.push_translate(crate::state::TranslateJob {
+            utterance_id: "s:1".to_string(),
+            text: "你好".to_string(),
+            speech_generation: None,
+        });
         let reply = dispatch(
             &message(ctl::BRIDGE_GET_STATUS, b""),
             &fixture.shared,
-            &fixture.queues, &fixture.tts_path(),
+            &fixture.queues,
+            &fixture.tts_path(),
         );
         let status = data(&reply);
         assert_eq!(status["translate_enabled"], true);
@@ -271,7 +276,8 @@ mod tests {
         let reply = dispatch(
             &message(ctl::BRIDGE_GET_STATUS, b""),
             &fixture.shared,
-            &fixture.queues, &fixture.tts_path(),
+            &fixture.queues,
+            &fixture.tts_path(),
         );
         let status = data(&reply);
         assert_eq!(status["translated"], 1);
@@ -287,7 +293,8 @@ mod tests {
         let reply = dispatch(
             &message(ctl::BRIDGE_TRANSLATE_SET, br#"{"enabled":false}"#),
             &fixture.shared,
-            &fixture.queues, &fixture.tts_path(),
+            &fixture.queues,
+            &fixture.tts_path(),
         );
         assert_eq!(data(&reply)["translate_enabled"], false);
         assert!(!fixture.shared.translate_enabled());
@@ -296,7 +303,8 @@ mod tests {
         let reply = dispatch(
             &message(ctl::BRIDGE_TRANSLATE_SET, br#"{"enabled":true}"#),
             &fixture.shared,
-            &fixture.queues, &fixture.tts_path(),
+            &fixture.queues,
+            &fixture.tts_path(),
         );
         assert_eq!(data(&reply)["translate_enabled"], true);
         assert!(fixture.shared.translate_enabled());
@@ -308,7 +316,8 @@ mod tests {
         let reply = dispatch(
             &message(ctl::BRIDGE_SPEECH_SET, br#"{"enabled":false}"#),
             &fixture.shared,
-            &fixture.queues, &fixture.tts_path(),
+            &fixture.queues,
+            &fixture.tts_path(),
         );
         assert_eq!(data(&reply)["speech_enabled"], false);
         assert!(!fixture.shared.speech_enabled());
@@ -321,17 +330,20 @@ mod tests {
         fixture.queues.push_speech(SpeechJob {
             utterance_id: "s:1".to_string(),
             text: "hello".to_string(),
+            generation: crate::state::SpeechGeneration::FIRST,
         });
         fixture.queues.push_speech(SpeechJob {
             utterance_id: "s:2".to_string(),
             text: "world".to_string(),
+            generation: crate::state::SpeechGeneration::FIRST,
         });
         // 空 body 与 {} 都接受。
         for body in [b"".as_slice(), b"{}"] {
             let reply = dispatch(
                 &message(ctl::BRIDGE_SPEECH_STOP, body),
                 &fixture.shared,
-                &fixture.queues, &fixture.tts_path(),
+                &fixture.queues,
+                &fixture.tts_path(),
             );
             let result = data(&reply);
             assert_eq!(result["speech_enabled"], false);
@@ -352,7 +364,12 @@ mod tests {
                 br#"{"enabled":true,"x":1}"#,
                 b"not json",
             ] {
-                let reply = dispatch(&message(type_, body), &fixture.shared, &fixture.queues, &fixture.tts_path());
+                let reply = dispatch(
+                    &message(type_, body),
+                    &fixture.shared,
+                    &fixture.queues,
+                    &fixture.tts_path(),
+                );
                 assert_eq!(error_code(&reply), ctl::CODE_INVALID_ARGUMENT);
             }
         }
@@ -360,7 +377,8 @@ mod tests {
             let reply = dispatch(
                 &message(ctl::BRIDGE_SPEECH_STOP, body),
                 &fixture.shared,
-                &fixture.queues, &fixture.tts_path(),
+                &fixture.queues,
+                &fixture.tts_path(),
             );
             assert_eq!(error_code(&reply), ctl::CODE_INVALID_ARGUMENT);
         }
@@ -372,8 +390,27 @@ mod tests {
     #[test]
     fn unknown_command_is_rejected() {
         let fixture = Fixture::new("unknown");
-        let reply = dispatch(&message(ctl::ASR_HELLO, b""), &fixture.shared, &fixture.queues, &fixture.tts_path());
+        let reply = dispatch(
+            &message(ctl::ASR_HELLO, b""),
+            &fixture.shared,
+            &fixture.queues,
+            &fixture.tts_path(),
+        );
         assert_eq!(error_code(&reply), ctl::CODE_UNKNOWN_COMMAND);
+    }
+
+    #[test]
+    fn fenced_stop_returns_cutoff_and_reopen_advances_token() {
+        let fixture = Fixture::new("fenced-stop");
+        let before = fixture.shared.speech_generation().unwrap().issued_ns();
+        let reply = dispatch(&message(ctl::BRIDGE_SPEECH_STOP, br#"{"fenced":true}"#),
+            &fixture.shared, &fixture.queues, &fixture.tts_path());
+        let result = data(&reply);
+        let cutoff = result["cutoff_ns"].as_u64().unwrap();
+        assert!(cutoff >= before);
+        assert_eq!(result["speech_enabled"], false);
+        fixture.shared.set_switches(Switches { translate_enabled: true, speech_enabled: true });
+        assert!(fixture.shared.speech_generation().unwrap().issued_ns() > cutoff);
     }
 
     #[test]
@@ -404,6 +441,7 @@ mod tests {
         fixture.queues.push_speech(SpeechJob {
             utterance_id: "s:1".to_string(),
             text: "hello".to_string(),
+            generation: crate::state::SpeechGeneration::FIRST,
         });
         // TTS 缺席：停止下发失败只记降级，桥侧仍关开关并清队列。
         let reply = dispatch(

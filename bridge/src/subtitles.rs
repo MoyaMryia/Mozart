@@ -9,20 +9,25 @@
 
 use crate::events::{Event, EventKind};
 use crate::preprocess;
-use crate::state::{unix_ms, Queues, Shared, TranslateJob};
+use crate::state::{unix_ms, Queues, Shared, SpeechGeneration, TranslateJob};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::collections::HashMap;
 use std::fs::{self, File, OpenOptions};
-use std::io::{self, Write};
+use std::io::{self, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering::Relaxed};
 use std::sync::mpsc::{Receiver, RecvTimeoutError};
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 /// 记录表轮询步长：让停止标志在宽限期内生效。
 const RECV_POLL: Duration = Duration::from_millis(100);
+const REFINEMENT_DEADLINE: Duration = Duration::from_secs(30);
+const RECOVERY_TAIL_BYTES: u64 = 1024 * 1024;
+const REVIEW_TIMEOUT: &str = "refinement timeout";
+const REVIEW_INTERRUPTED: &str = "refinement interrupted by bridge restart";
+const DEGRADED_RECOVERY: &str = "subtitle recovery skipped invalid journal records";
 
 /// 内存记录表上限（旧 latest 128）；超限按最久未用淘汰，在途句受保护。
 /// 旧 refined 64 是独立的复核等待表，新架构复核直接并入记录表，不另设。
@@ -68,6 +73,10 @@ pub struct SubtitleRecord {
     pub is_final: bool,
     pub revision: u64,
     pub translation_status: TranslationStatus,
+    #[serde(skip)]
+    speech_generation: Option<SpeechGeneration>,
+    #[serde(skip)]
+    review_deadline: Option<Instant>,
     #[serde(skip_serializing_if = "Option::is_none", default)]
     pub source_audio: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none", default)]
@@ -84,6 +93,8 @@ pub struct SubtitleRecord {
     pub asr_polarity_audit: Option<Value>,
     #[serde(skip_serializing_if = "Option::is_none", default)]
     pub refinement_status: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub refinement_error: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none", default)]
     pub translation_source_audit: Option<Value>,
     #[serde(skip_serializing_if = "Option::is_none", default)]
@@ -206,11 +217,8 @@ fn apply_source_corrections(
     raw: &str,
     corrections: &[(String, String)],
 ) -> (String, Option<String>, Option<Value>) {
-    let (zh, fixes) = preprocess::correct_with_terms(
-        raw,
-        &preprocess::builtin_correction_terms(),
-        corrections,
-    );
+    let (zh, fixes) =
+        preprocess::correct_with_terms(raw, &preprocess::builtin_correction_terms(), corrections);
     if fixes.is_empty() {
         (zh, None, None)
     } else {
@@ -229,6 +237,7 @@ pub fn apply(
     event: &Event,
     now_ms: u64,
     corrections: &[(String, String)],
+    speech_generation: Option<SpeechGeneration>,
 ) -> Option<SubtitleRecord> {
     match event.kind {
         EventKind::Partial | EventKind::Final => {
@@ -270,6 +279,9 @@ pub fn apply(
                 } else {
                     TranslationStatus::Recognizing
                 },
+                speech_generation: if is_final { speech_generation } else { None },
+                review_deadline: (is_final && event.refinement_status.as_deref() == Some(REFINEMENT_PENDING))
+                    .then(|| Instant::now() + REFINEMENT_DEADLINE),
                 source_audio: event.source_audio.clone(),
                 source_audio_sha256: event.source_audio_sha256.clone(),
                 source_audio_seconds: event.source_audio_seconds,
@@ -278,6 +290,7 @@ pub fn apply(
                 asr_numeric_audit: event.asr_numeric_audit.clone(),
                 asr_polarity_audit: event.asr_polarity_audit.clone(),
                 refinement_status: event.refinement_status.clone(),
+                refinement_error: None,
                 translation_source_audit: event.translation_source_audit.clone(),
                 homophone_fixes,
                 zh_raw,
@@ -290,6 +303,9 @@ pub fn apply(
         }
         EventKind::Refined => {
             let record = table.get_mut(&event.utterance_id)?;
+            if sealed_refinement(record) {
+                return None;
+            }
             // 复核文本非空才替换原文（ASR 仅在复核 completed 时携带 refined_text）；
             // 替换时同步更新/清理旧纠错审计字段，避免残留上一版的 zh_raw。
             if let Some(refined) = event.refined_text.as_deref() {
@@ -304,11 +320,26 @@ pub fn apply(
             }
             if let Some(status) = &event.refinement_status {
                 record.refinement_status = Some(status.clone());
+                if is_terminal_refinement(Some(status.as_str())) {
+                    record.review_deadline = None;
+                }
             }
             record.revision += 1;
             Some(record.clone())
         }
     }
+}
+
+fn sealed_refinement(record: &SubtitleRecord) -> bool {
+    matches!(record.refinement_error.as_deref(), Some(REVIEW_TIMEOUT | REVIEW_INTERRUPTED))
+}
+
+fn seal_refinement(record: &mut SubtitleRecord, reason: &str) {
+    record.refinement_status = Some("skipped".into());
+    record.refinement_error = Some(reason.to_owned());
+    record.speech_generation = None;
+    record.review_deadline = None;
+    record.revision += 1;
 }
 
 /// JSONL 追加写：逐行 flush，进程存活期间保持打开。
@@ -322,8 +353,65 @@ impl JsonlWriter {
         if let Some(parent) = path.parent() {
             fs::create_dir_all(parent)?;
         }
-        let file = OpenOptions::new().create(true).append(true).open(path)?;
+        let file = OpenOptions::new().read(true).create(true).append(true).open(path)?;
         Ok(Self { file })
+    }
+
+    /// Read at most the documented tail. A torn final line belongs to this writer;
+    /// remove the incomplete suffix so the next valid append starts on a new line.
+    fn recent_records(&mut self) -> io::Result<(Vec<SubtitleRecord>, bool)> {
+        let len = self.file.metadata()?.len();
+        let start = len.saturating_sub(RECOVERY_TAIL_BYTES);
+        self.file.seek(SeekFrom::Start(start))?;
+        let mut tail = Vec::new();
+        (&mut self.file).take(len - start).read_to_end(&mut tail)?;
+        let mut damaged = false;
+        if !tail.is_empty() && !tail.ends_with(b"\n") {
+            let safe_len = match tail.iter().rposition(|&byte| byte == b'\n') {
+                Some(last) => last + 1,
+                None if start == 0 => 0,
+                None => return Err(io::Error::other("subtitle recovery cannot locate a complete line within the tail")),
+            };
+            self.file.set_len(start + safe_len as u64)?;
+            tail.truncate(safe_len);
+            damaged = true;
+        }
+        if start > 0 {
+            // Locate the first complete line; only skip the initial line if the
+            // preceding byte proves that the window begins inside a line.
+            self.file.seek(SeekFrom::Start(start - 1))?;
+            let mut previous = [0];
+            self.file.read_exact(&mut previous)?;
+            if previous[0] != b'\n' {
+                let through = tail.iter().position(|&byte| byte == b'\n').map_or(tail.len(), |i| i + 1);
+                tail.drain(..through);
+            }
+            eprintln!("mozart-bridge: subtitle recovery inspected only the last {RECOVERY_TAIL_BYTES} bytes");
+        }
+        let mut latest = HashMap::<String, (usize, SubtitleRecord)>::new();
+        let lines = tail.split(|&byte| byte == b'\n').filter(|line| !line.is_empty());
+        for (position, line) in lines.enumerate() {
+            let record: SubtitleRecord = match serde_json::from_slice(line) {
+                Ok(record) => record,
+                Err(_) => {
+                    // The unreadable line may be the newest revision of any
+                    // previously seen sentence. Only trust records after it.
+                    damaged = true;
+                    latest.clear();
+                    continue;
+                }
+            };
+            if record.is_final && latest.get(&record.utterance_id).is_none_or(|(_, old)| record.revision >= old.revision) {
+                latest.insert(record.utterance_id.clone(), (position, record));
+            }
+        }
+        let mut recent: Vec<_> = latest.into_values().collect();
+        recent.sort_unstable_by_key(|(position, _)| *position);
+        if recent.len() > RECORD_CAP {
+            eprintln!("mozart-bridge: subtitle recovery retained only the latest {RECORD_CAP} final utterances");
+            recent.drain(..recent.len() - RECORD_CAP);
+        }
+        Ok((recent.into_iter().map(|(_, record)| record).collect(), damaged))
     }
 
     pub fn write(&mut self, record: &SubtitleRecord) -> io::Result<()> {
@@ -355,8 +443,14 @@ impl SubtitleStore {
 
     /// 合并一条事件并落盘，返回新记录；None 表示忽略（测试便利入口）。
     #[cfg(test)]
-    pub fn apply_event(&self, event: &Event, shared: &Shared) -> Result<Option<SubtitleRecord>, String> {
-        Ok(self.apply_for_dispatch(event, shared)?.map(|(record, _)| record))
+    pub fn apply_event(
+        &self,
+        event: &Event,
+        shared: &Shared,
+    ) -> Result<Option<SubtitleRecord>, String> {
+        Ok(self
+            .apply_for_dispatch(event, shared)?
+            .map(|(record, _)| record))
     }
 
     /// 合并一条事件并落盘，同时判定是否应入待翻译队列（复核开启时等 refined 落地再入队，
@@ -375,7 +469,13 @@ impl SubtitleStore {
         let was_pending_review = records.peek(&event.utterance_id).is_some_and(|record| {
             record.is_final && record.refinement_status.as_deref() == Some(REFINEMENT_PENDING)
         });
-        let Some(record) = apply(&mut records, event, now, &self.corrections) else {
+        let Some(record) = apply(
+            &mut records,
+            event,
+            now,
+            &self.corrections,
+            shared.speech_generation(),
+        ) else {
             return Ok(None);
         };
         self.write_locked(&record)?;
@@ -392,6 +492,44 @@ impl SubtitleStore {
             }
         };
         Ok(Some((record, ready_to_translate)))
+    }
+
+    fn recover(&self, shared: &Shared) -> Result<Vec<SubtitleRecord>, String> {
+        let (recent, damaged) = self.writer.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
+            .recent_records().map_err(|error| format!("恢复字幕 {}：{error}", self.path.display()))?;
+        if damaged {
+            shared.degrade(DEGRADED_RECOVERY);
+            eprintln!("mozart-bridge: {DEGRADED_RECOVERY}");
+        }
+        let mut records = self.records.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        let mut fallback = Vec::new();
+        for mut record in recent {
+            if record.refinement_status.as_deref() == Some(REFINEMENT_PENDING) {
+                seal_refinement(&mut record, REVIEW_INTERRUPTED);
+                self.write_locked(&record)?;
+                shared.set_last_write_unix_ms(unix_ms());
+            }
+            if record.translation_status == TranslationStatus::Pending && sealed_refinement(&record) {
+                fallback.push(record.clone());
+            }
+            records.insert(record.utterance_id.clone(), record);
+        }
+        shared.set_records_in_memory(records.len() as u32);
+        Ok(fallback)
+    }
+
+    fn expire_refinements(&self, now: Instant, shared: &Shared) -> Result<Vec<SubtitleRecord>, String> {
+        let mut records = self.records.lock().unwrap_or_else(|p| p.into_inner());
+        let mut expired = Vec::new();
+        for (record, _) in records.entries.values_mut() {
+            if record.review_deadline.is_some_and(|deadline| now >= deadline) {
+                seal_refinement(record, REVIEW_TIMEOUT);
+                self.write_locked(record)?;
+                expired.push(record.clone());
+            }
+        }
+        if !expired.is_empty() { shared.set_last_write_unix_ms(unix_ms()); }
+        Ok(expired)
     }
 
     /// 译文合格：更新记录并追加一行修订（先于播报投递落盘，SPEC-05）。
@@ -440,7 +578,12 @@ impl SubtitleStore {
         reason: &str,
         shared: &Shared,
     ) -> Result<(), String> {
-        self.publish_outcome(utterance_id, TranslationStatus::Skipped, Some(reason), shared)
+        self.publish_outcome(
+            utterance_id,
+            TranslationStatus::Skipped,
+            Some(reason),
+            shared,
+        )
     }
 
     fn publish_outcome(
@@ -488,7 +631,18 @@ pub fn run(
     shared: Arc<Shared>,
     stop: &'static AtomicBool,
 ) -> Result<(), String> {
+    for record in store.recover(&shared)? {
+        dispatch_fallback(record, &store, &queues, &shared)?;
+    }
+    let mut next_expiry = Instant::now();
     while !stop.load(Relaxed) {
+        let now = Instant::now();
+        if now >= next_expiry {
+            for record in store.expire_refinements(now, &shared)? {
+                dispatch_fallback(record, &store, &queues, &shared)?;
+            }
+            next_expiry = now + RECV_POLL;
+        }
         let event = match rx.recv_timeout(RECV_POLL) {
             Ok(event) => event,
             Err(RecvTimeoutError::Timeout) => continue,
@@ -496,11 +650,22 @@ pub fn run(
             Err(RecvTimeoutError::Disconnected) => break,
         };
         process(event, &store, &queues, &shared)?;
-        while let Ok(event) = rx.try_recv() {
-            process(event, &store, &queues, &shared)?;
-        }
     }
     Ok(())
+}
+
+fn dispatch_fallback(record: SubtitleRecord, store: &SubtitleStore, queues: &Queues, shared: &Shared) -> Result<(), String> {
+    if !shared.translate_enabled() {
+        return store.publish_translation_skipped(&record.utterance_id, "translation disabled", shared);
+    }
+    let job = TranslateJob { utterance_id: record.utterance_id, text: record.zh, speech_generation: None };
+    if queues.push_translate(job.clone()) {
+        shared.resolve(DEGRADED_TRANSLATE_FULL);
+        Ok(())
+    } else {
+        shared.degrade(DEGRADED_TRANSLATE_FULL);
+        store.publish_translation_skipped(&job.utterance_id, DEGRADED_TRANSLATE_FULL, shared)
+    }
 }
 
 fn process(
@@ -517,6 +682,7 @@ fn process(
         let job = TranslateJob {
             utterance_id: record.utterance_id.clone(),
             text: record.zh.clone(),
+            speech_generation: record.speech_generation,
         };
         if !queues.push_translate(job) {
             shared.degrade(DEGRADED_TRANSLATE_FULL);
@@ -530,6 +696,15 @@ fn process(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn apply(
+        table: &mut RecordTable,
+        event: &Event,
+        now_ms: u64,
+        corrections: &[(String, String)],
+    ) -> Option<SubtitleRecord> {
+        super::apply(table, event, now_ms, corrections, None)
+    }
     use crate::events::{parse, EventKind};
     use serde_json::{json, Value};
 
@@ -569,10 +744,120 @@ mod tests {
         Vec::new()
     }
 
+    fn pending_final(seq: u64) -> Event {
+        let mut event = event(EventKind::Final, seq, "在线原文");
+        event.refinement_status = Some(REFINEMENT_PENDING.to_owned());
+        event
+    }
+
+    #[test]
+    fn lost_refinement_expires_once_and_falls_back_to_text_only() {
+        let dir = crate::testutil::temp_dir("review-timeout");
+        let path = dir.join("subtitles.jsonl");
+        let shared = Shared::new(crate::state::Switches { translate_enabled: true, speech_enabled: true }, path.clone());
+        let store = SubtitleStore::new(JsonlWriter::open(&path).unwrap(), path.clone(), no_corrections());
+        let (record, ready) = store.apply_for_dispatch(&pending_final(1), &shared).unwrap().unwrap();
+        assert!(!ready);
+        assert!(record.speech_generation.is_some());
+        let expiry = record.review_deadline.unwrap();
+        assert!(store.expire_refinements(expiry - Duration::from_millis(1), &shared).unwrap().is_empty());
+        let mut expired = store.expire_refinements(expiry, &shared).unwrap();
+        assert_eq!(expired.len(), 1);
+        let fallback = expired.pop().unwrap();
+        assert_eq!(fallback.refinement_status.as_deref(), Some("skipped"));
+        assert_eq!(fallback.refinement_error.as_deref(), Some(REVIEW_TIMEOUT));
+        assert_eq!(fallback.revision, record.revision + 1);
+        let queues = Queues::new(2, 2);
+        dispatch_fallback(fallback, &store, &queues, &shared).unwrap();
+        let job = queues.recv_translate(Duration::ZERO).unwrap();
+        assert_eq!(job.text, "在线原文");
+        assert!(job.speech_generation.is_none());
+        assert!(store.apply_for_dispatch(&refined_event(1, Some("迟到复核")), &shared).unwrap().is_none());
+        assert!(store.expire_refinements(expiry, &shared).unwrap().is_empty());
+        assert_eq!(fs::read_to_string(path).unwrap().lines().count(), 2);
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn restart_recovers_latest_pending_revision_and_never_replays_completed() {
+        let dir = crate::testutil::temp_dir("review-restart");
+        let path = dir.join("subtitles.jsonl");
+        let shared = Shared::new(crate::state::Switches { translate_enabled: true, speech_enabled: true }, path.clone());
+        {
+            let store = SubtitleStore::new(JsonlWriter::open(&path).unwrap(), path.clone(), no_corrections());
+            store.apply_for_dispatch(&pending_final(1), &shared).unwrap();
+            store.apply_for_dispatch(&pending_final(2), &shared).unwrap();
+            store.apply_for_dispatch(&refined_event(2, Some("已有复核")), &shared).unwrap();
+            store.publish_translation("a1b2c3d4:2", "Finished.", 1, &shared).unwrap();
+        }
+        OpenOptions::new().append(true).open(&path).unwrap().write_all(b"{\"torn").unwrap();
+        let store = SubtitleStore::new(JsonlWriter::open(&path).unwrap(), path.clone(), no_corrections());
+        let recovered = store.recover(&shared).unwrap();
+        assert_eq!(recovered.len(), 1);
+        assert_eq!(recovered[0].utterance_id, "a1b2c3d4:1");
+        assert_eq!(recovered[0].refinement_error.as_deref(), Some(REVIEW_INTERRUPTED));
+        assert!(recovered[0].speech_generation.is_none());
+        assert!(store.apply_for_dispatch(&pending_final(2), &shared).unwrap().is_none());
+        assert!(store.apply_for_dispatch(&refined_event(1, Some("迟到复核")), &shared).unwrap().is_none());
+        let text = fs::read_to_string(&path).unwrap();
+        assert_eq!(text.lines().count(), 5);
+        assert!(text.lines().all(|line| serde_json::from_str::<Value>(line).is_ok()));
+        drop(store);
+        // If a restart happens after the skipped revision but before translation, retry text only.
+        let store = SubtitleStore::new(JsonlWriter::open(&path).unwrap(), path, no_corrections());
+        let replay = store.recover(&shared).unwrap();
+        assert_eq!(replay.len(), 1);
+        assert_eq!(replay[0].revision, recovered[0].revision);
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn unreadable_complete_line_cannot_replay_older_pending_records() {
+        let dir = crate::testutil::temp_dir("review-corrupt-line");
+        let path = dir.join("subtitles.jsonl");
+        let mut writer = JsonlWriter::open(&path).unwrap();
+        let mut table = RecordTable::new();
+        let old = apply(&mut table, &pending_final(1), 1, &no_corrections()).unwrap();
+        writer.write(&old).unwrap();
+        writer.file.write_all(b"{corrupt completed revision}\n").unwrap();
+        let fresh = apply(&mut table, &pending_final(2), 2, &no_corrections()).unwrap();
+        writer.write(&fresh).unwrap();
+        let (records, damaged) = writer.recent_records().unwrap();
+        assert!(damaged);
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0].utterance_id, fresh.utterance_id);
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn recovery_starts_at_a_complete_line_in_the_bounded_tail() {
+        let dir = crate::testutil::temp_dir("review-tail-bound");
+        let path = dir.join("subtitles.jsonl");
+        let mut writer = JsonlWriter::open(&path).unwrap();
+        let mut table = RecordTable::new();
+        let old = apply(&mut table, &pending_final(1), 1, &no_corrections()).unwrap();
+        let recent = apply(&mut table, &pending_final(2), 2, &no_corrections()).unwrap();
+        writer.write(&old).unwrap();
+        writer.file.write_all(&vec![b' '; RECOVERY_TAIL_BYTES as usize]).unwrap();
+        writer.file.write_all(b"\n").unwrap();
+        writer.write(&recent).unwrap();
+        let (recovered, damaged) = writer.recent_records().unwrap();
+        assert_eq!(recovered.len(), 1);
+        assert_eq!(recovered[0].utterance_id, recent.utterance_id);
+        assert!(!damaged, "the truncated prefix is not a parsed record");
+        fs::remove_dir_all(dir).unwrap();
+    }
+
     #[test]
     fn partial_final_refined_merge_with_revisions() {
         let mut table = RecordTable::new();
-        let first = apply(&mut table, &event(EventKind::Partial, 1, "你"), 100, &no_corrections()).unwrap();
+        let first = apply(
+            &mut table,
+            &event(EventKind::Partial, 1, "你"),
+            100,
+            &no_corrections(),
+        )
+        .unwrap();
         assert_eq!(first.revision, 0);
         assert!(!first.is_final);
         assert_eq!(first.translation_status, TranslationStatus::Recognizing);
@@ -580,16 +865,34 @@ mod tests {
         assert_eq!(first.zh, "你");
         assert_eq!(first.en, "");
 
-        let second = apply(&mut table, &event(EventKind::Partial, 1, "你好"), 200, &no_corrections()).unwrap();
+        let second = apply(
+            &mut table,
+            &event(EventKind::Partial, 1, "你好"),
+            200,
+            &no_corrections(),
+        )
+        .unwrap();
         assert_eq!(second.revision, 1);
         assert_eq!(second.zh, "你好");
 
-        let third = apply(&mut table, &event(EventKind::Final, 1, "你好"), 300, &no_corrections()).unwrap();
+        let third = apply(
+            &mut table,
+            &event(EventKind::Final, 1, "你好"),
+            300,
+            &no_corrections(),
+        )
+        .unwrap();
         assert_eq!(third.revision, 2);
         assert!(third.is_final);
         assert_eq!(third.translation_status, TranslationStatus::Pending);
 
-        let fourth = apply(&mut table, &refined_event(1, Some("你好。")), 400, &no_corrections()).unwrap();
+        let fourth = apply(
+            &mut table,
+            &refined_event(1, Some("你好。")),
+            400,
+            &no_corrections(),
+        )
+        .unwrap();
         assert_eq!(fourth.revision, 3);
         assert_eq!(fourth.zh, "你好。");
         assert!(fourth.is_final);
@@ -601,9 +904,30 @@ mod tests {
     #[test]
     fn final_is_sticky_against_late_partial_and_final() {
         let mut table = RecordTable::new();
-        apply(&mut table, &event(EventKind::Final, 1, "你好"), 100, &no_corrections());
-        assert_eq!(apply(&mut table, &event(EventKind::Partial, 1, "晚到"), 200, &no_corrections()), None);
-        assert_eq!(apply(&mut table, &event(EventKind::Final, 1, "重写"), 300, &no_corrections()), None);
+        apply(
+            &mut table,
+            &event(EventKind::Final, 1, "你好"),
+            100,
+            &no_corrections(),
+        );
+        assert_eq!(
+            apply(
+                &mut table,
+                &event(EventKind::Partial, 1, "晚到"),
+                200,
+                &no_corrections()
+            ),
+            None
+        );
+        assert_eq!(
+            apply(
+                &mut table,
+                &event(EventKind::Final, 1, "重写"),
+                300,
+                &no_corrections()
+            ),
+            None
+        );
         assert_eq!(table["a1b2c3d4:1"].zh, "你好");
         assert_eq!(table["a1b2c3d4:1"].revision, 0);
     }
@@ -619,7 +943,13 @@ mod tests {
     #[test]
     fn final_without_partial_creates_record() {
         let mut table = RecordTable::new();
-        let record = apply(&mut table, &event(EventKind::Final, 7, "整句"), 100, &no_corrections()).unwrap();
+        let record = apply(
+            &mut table,
+            &event(EventKind::Final, 7, "整句"),
+            100,
+            &no_corrections(),
+        )
+        .unwrap();
         assert_eq!(record.revision, 0);
         assert!(record.is_final);
         assert_eq!(record.seq, 7);
@@ -635,13 +965,24 @@ mod tests {
     #[test]
     fn refined_without_text_keeps_original_and_bumps_revision() {
         let mut table = RecordTable::new();
-        apply(&mut table, &event(EventKind::Final, 1, "你好"), 100, &no_corrections());
+        apply(
+            &mut table,
+            &event(EventKind::Final, 1, "你好"),
+            100,
+            &no_corrections(),
+        );
         // 复核 failed/skipped：ASR 不携带 refined_text。
         let record = apply(&mut table, &refined_event(1, None), 200, &no_corrections()).unwrap();
         assert_eq!(record.zh, "你好");
         assert_eq!(record.revision, 1);
         // 空白复核文本同样不替换。
-        let record = apply(&mut table, &refined_event(1, Some("  ")), 300, &no_corrections()).unwrap();
+        let record = apply(
+            &mut table,
+            &refined_event(1, Some("  ")),
+            300,
+            &no_corrections(),
+        )
+        .unwrap();
         assert_eq!(record.zh, "你好");
         assert_eq!(record.revision, 2);
     }
@@ -649,8 +990,19 @@ mod tests {
     #[test]
     fn distinct_utterances_keep_separate_revisions() {
         let mut table = RecordTable::new();
-        apply(&mut table, &event(EventKind::Partial, 1, "甲"), 100, &no_corrections());
-        let second = apply(&mut table, &event(EventKind::Partial, 2, "乙"), 200, &no_corrections()).unwrap();
+        apply(
+            &mut table,
+            &event(EventKind::Partial, 1, "甲"),
+            100,
+            &no_corrections(),
+        );
+        let second = apply(
+            &mut table,
+            &event(EventKind::Partial, 2, "乙"),
+            200,
+            &no_corrections(),
+        )
+        .unwrap();
         assert_eq!(second.revision, 0);
         assert_eq!(table.len(), 2);
     }
@@ -659,7 +1011,13 @@ mod tests {
     fn correction_applies_to_zh_and_records_fixes() {
         let mut table = RecordTable::new();
         let corrections = preprocess::builtin_corrections();
-        let record = apply(&mut table, &event(EventKind::Final, 1, "我以经说了"), 100, &corrections).unwrap();
+        let record = apply(
+            &mut table,
+            &event(EventKind::Final, 1, "我以经说了"),
+            100,
+            &corrections,
+        )
+        .unwrap();
         assert_eq!(record.zh, "我已经说了");
         assert_eq!(record.zh_raw.as_deref(), Some("我以经说了"));
         let fixes = record.homophone_fixes.unwrap();
@@ -727,7 +1085,13 @@ mod tests {
         let path = dir.join("nested/subtitles.jsonl");
         let mut writer = JsonlWriter::open(&path).unwrap();
         let mut table = RecordTable::new();
-        let record = apply(&mut table, &event(EventKind::Partial, 1, "你好"), 1, &no_corrections()).unwrap();
+        let record = apply(
+            &mut table,
+            &event(EventKind::Partial, 1, "你好"),
+            1,
+            &no_corrections(),
+        )
+        .unwrap();
         writer.write(&record).unwrap();
         // 不关闭文件即可读到已 flush 的行。
         let content = std::fs::read_to_string(&path).unwrap();
@@ -754,10 +1118,17 @@ mod tests {
         ));
         let path = dir.join("subtitles.jsonl");
         let shared = Shared::new(
-            Switches { translate_enabled: true, speech_enabled: true },
+            Switches {
+                translate_enabled: true,
+                speech_enabled: true,
+            },
             path.clone(),
         );
-        let store = SubtitleStore::new(JsonlWriter::open(&path).unwrap(), path.clone(), no_corrections());
+        let store = SubtitleStore::new(
+            JsonlWriter::open(&path).unwrap(),
+            path.clone(),
+            no_corrections(),
+        );
 
         let record = store
             .apply_event(&event(EventKind::Final, 1, "你好"), &shared)
@@ -803,14 +1174,29 @@ mod tests {
         ));
         let path = dir.join("subtitles.jsonl");
         let shared = Shared::new(
-            Switches { translate_enabled: true, speech_enabled: true },
+            Switches {
+                translate_enabled: true,
+                speech_enabled: true,
+            },
             path.clone(),
         );
-        let store = SubtitleStore::new(JsonlWriter::open(&path).unwrap(), path.clone(), no_corrections());
-        store.apply_event(&event(EventKind::Final, 1, "你好"), &shared).unwrap();
-        store.publish_translation_failed("a1b2c3d4:1", "Translation rejected: x", &shared).unwrap();
-        store.apply_event(&event(EventKind::Final, 2, "世界"), &shared).unwrap();
-        store.publish_translation_skipped("a1b2c3d4:2", "translate off", &shared).unwrap();
+        let store = SubtitleStore::new(
+            JsonlWriter::open(&path).unwrap(),
+            path.clone(),
+            no_corrections(),
+        );
+        store
+            .apply_event(&event(EventKind::Final, 1, "你好"), &shared)
+            .unwrap();
+        store
+            .publish_translation_failed("a1b2c3d4:1", "Translation rejected: x", &shared)
+            .unwrap();
+        store
+            .apply_event(&event(EventKind::Final, 2, "世界"), &shared)
+            .unwrap();
+        store
+            .publish_translation_skipped("a1b2c3d4:2", "translate off", &shared)
+            .unwrap();
 
         let lines: Vec<Value> = std::fs::read_to_string(&path)
             .unwrap()
@@ -830,10 +1216,20 @@ mod tests {
     fn lru_caps_table_and_protects_in_flight() {
         let mut table = RecordTable::new();
         // 一条在途句（pending）先入表。
-        apply(&mut table, &event(EventKind::Final, 0, "在途"), 1, &no_corrections());
+        apply(
+            &mut table,
+            &event(EventKind::Final, 0, "在途"),
+            1,
+            &no_corrections(),
+        );
         // 灌入超过上限的已完成句（可淘汰）。
         for seq in 1..=200u64 {
-            apply(&mut table, &event(EventKind::Final, seq, "句"), seq, &no_corrections());
+            apply(
+                &mut table,
+                &event(EventKind::Final, seq, "句"),
+                seq,
+                &no_corrections(),
+            );
             table
                 .get_mut(&format!("a1b2c3d4:{seq}"))
                 .unwrap()
@@ -851,7 +1247,12 @@ mod tests {
         let mut table = RecordTable::new();
         // 全是在途句（pending）：不淘汰，可短暂超界。
         for seq in 1..=150u64 {
-            apply(&mut table, &event(EventKind::Final, seq, "句"), seq, &no_corrections());
+            apply(
+                &mut table,
+                &event(EventKind::Final, seq, "句"),
+                seq,
+                &no_corrections(),
+            );
         }
         assert_eq!(table.len(), 150);
         assert!(table.contains_key("a1b2c3d4:1"));
@@ -868,10 +1269,17 @@ mod tests {
         ));
         let path = dir.join("subtitles.jsonl");
         let shared = Shared::new(
-            Switches { translate_enabled: true, speech_enabled: true },
+            Switches {
+                translate_enabled: true,
+                speech_enabled: true,
+            },
             path.clone(),
         );
-        let store = SubtitleStore::new(JsonlWriter::open(&path).unwrap(), path.clone(), no_corrections());
+        let store = SubtitleStore::new(
+            JsonlWriter::open(&path).unwrap(),
+            path.clone(),
+            no_corrections(),
+        );
 
         let final_pending = parse(
             &serde_json::to_vec(&json!({
@@ -978,12 +1386,24 @@ mod tests {
     fn refined_clears_stale_homophone_fixes_from_final() {
         let mut table = RecordTable::new();
         let corrections = preprocess::builtin_corrections();
-        let final_rec = apply(&mut table, &event(EventKind::Final, 1, "我以经说了"), 100, &corrections).unwrap();
+        let final_rec = apply(
+            &mut table,
+            &event(EventKind::Final, 1, "我以经说了"),
+            100,
+            &corrections,
+        )
+        .unwrap();
         assert_eq!(final_rec.zh, "我已经说了");
         assert_eq!(final_rec.zh_raw.as_deref(), Some("我以经说了"));
         assert!(final_rec.homophone_fixes.is_some());
 
-        let refined_rec = apply(&mut table, &refined_event(1, Some("我已经说完了。")), 200, &corrections).unwrap();
+        let refined_rec = apply(
+            &mut table,
+            &refined_event(1, Some("我已经说完了。")),
+            200,
+            &corrections,
+        )
+        .unwrap();
         assert_eq!(refined_rec.zh, "我已经说完了。");
         assert!(refined_rec.zh_raw.is_none(), "复核未命中纠错时不得残留旧 zh_raw");
         assert!(refined_rec.homophone_fixes.is_none(), "复核未命中纠错时不得残留旧 homophone_fixes");

@@ -101,9 +101,20 @@ typedef struct {
 MOZART_STATIC_ASSERT(sizeof(mozart_enhance_request_t) == 1300, "enhance request size");
 MOZART_STATIC_ASSERT(sizeof(mozart_enhance_reply_t) == 1304, "enhance reply size");
 
+// ---- 播报线包：专用魔数 + 播报准入令牌 + OutputFrame 内容（均小端） --------
+#pragma pack(push, 1)
+typedef struct {
+    uint32_t magic;      // MOZART_SPEECH_PACKET_MAGIC
+    uint64_t issued_ns;  // 桥签发的同机 CLOCK_MONOTONIC 令牌，整句不变
+    mozart_output_frame_t frame;
+} mozart_speech_packet_t;
+#pragma pack(pop)
+MOZART_STATIC_ASSERT(sizeof(mozart_speech_packet_t) == 3876, "speech packet size");
+
 // ---- 线包常量 ----------------------------------------------------------------
 #define MOZART_INPUT_PACKET_MAGIC   0x4D5A5254u   // 'MZRT'
 #define MOZART_OUTPUT_PACKET_MAGIC  0x54525A4Du   // 'TRZM'
+#define MOZART_SPEECH_PACKET_MAGIC  0x50535A4Du   // 'MZSP'
 #define MOZART_PACKET_HEADER_SIZE   20            // 4B magic + 16B meta
 // 输入线包: 20 + 320*4 = 1300 字节
 // 输出线包: 20 + 8 + 960*4 = 3868 字节

@@ -1,5 +1,5 @@
 //! 进程级集成测试：spawn mozart-pre（ALSA null 设备，无真实声学），TTS 桩经
-//! tts-out.sock 喂 OutputFrame，验证扬声器分时接线：播报期 GetStatus 为
+//! tts-out.sock 喂 SpeechFrame，验证扬声器分时接线：播报期 GetStatus 为
 //! broadcast 且播报帧计数增长，停喂后 holdoff 200 ms 恢复 realtime。
 //! 路由选源与 holdoff 的逐分支时序由 playback 单元测试钉住；本用例验证
 //! socket → 接收环 → 播放线程 → 状态上报的端到端接线。
@@ -10,7 +10,7 @@ use common::*;
 
 use mozart_core::ctl::Seqpacket;
 use mozart_core::dgram::FrameSocket;
-use mozart_core::{FrameMeta, OutputFrame, OUTPUT_SAMPLES};
+use mozart_core::{FrameMeta, OutputFrame, SpeechFrame, OUTPUT_SAMPLES};
 use std::io::Read;
 use std::process::Command;
 use std::sync::atomic::{AtomicBool, Ordering::Relaxed};
@@ -54,14 +54,15 @@ fn broadcast_priority_and_holdoff_recovery() {
 
     // TTS 桩：连接 pre 绑定的 tts-out.sock，paced 喂帧（每 5 ms 一帧，
     // 远小于 200 ms holdoff，播报期状态持续 broadcast）。
-    let tx = FrameSocket::<OutputFrame>::connect(&dir.join("tts-out.sock"), 8).unwrap();
+    let tx = FrameSocket::<SpeechFrame>::connect(&dir.join("tts-out.sock"), 8).unwrap();
     let stop = Arc::new(AtomicBool::new(false));
     let sender = {
         let stop = stop.clone();
         std::thread::spawn(move || {
             let mut idx = 0u32;
+            let issued_ns = mozart_core::speech::monotonic_ns();
             while !stop.load(Relaxed) {
-                let _ = tx.send(&tts_frame(idx));
+                let _ = tx.send(&SpeechFrame { issued_ns, frame: tts_frame(idx) });
                 idx = idx.wrapping_add(1);
                 std::thread::sleep(Duration::from_millis(5));
             }
@@ -89,6 +90,39 @@ fn broadcast_priority_and_holdoff_recovery() {
     sigterm(&child.0);
     let status = wait_exit(&mut child.0, Duration::from_secs(2));
     assert!(status.success(), "退出状态：{status}");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn confirmed_speech_stop_rejects_delayed_old_frames_and_accepts_new() {
+    let dir = run_dir("speech-fence");
+    let mut child = spawn_pre(&dir, &null_device_config(&dir));
+    wait_sockets(&dir);
+    let control = Seqpacket::connect(&dir.join("pre.sock")).unwrap();
+    let tx = FrameSocket::<SpeechFrame>::connect(&dir.join("tts-out.sock"), 8).unwrap();
+    let old = SpeechFrame { issued_ns: mozart_core::speech::monotonic_ns(), frame: tts_frame(0) };
+    tx.send(&old).unwrap();
+    wait_until("首个旧代帧已播", Duration::from_secs(3), || get_status(&control)["tts_frames_played"] == 1);
+    let cutoff_ns = mozart_core::speech::monotonic_ns();
+    let body = serde_json::to_vec(&mozart_core::speech::StopFence { cutoff_ns }).unwrap();
+    control.send(mozart_core::ctl::PRE_SPEECH_STOP, 80, &body).unwrap();
+    let msg = control.recv(Some(Duration::from_secs(2))).unwrap();
+    let reply: mozart_core::ctl::schema::Response = serde_json::from_slice(&msg.body).unwrap();
+    assert_eq!(reply.status, "ok", "{}", reply.reason);
+    assert_eq!(reply.data["cutoff_ns"], cutoff_ns);
+    assert_eq!(reply.data["stopped"], true);
+
+    for _ in 0..4 {
+        tx.send(&old).unwrap();
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    assert_eq!(get_status(&control)["tts_frames_played"], 1, "旧帧不得经过播放边界");
+    let fresh = SpeechFrame { issued_ns: mozart_core::speech::monotonic_ns(), frame: tts_frame(1) };
+    tx.send(&fresh).unwrap();
+    wait_until("只接纳新的播报帧", Duration::from_secs(3), || get_status(&control)["tts_frames_played"] == 2);
+    assert_eq!(get_status(&control)["tts_frames_played"], 2);
+    sigterm(&child.0);
+    assert!(wait_exit(&mut child.0, Duration::from_secs(2)).success());
     let _ = std::fs::remove_dir_all(&dir);
 }
 

@@ -67,8 +67,12 @@
 
 ## 改进点
 
+- [x] 在字幕桥为播报许可引入代次。桥首次处理句末 `final` 时绑定播报资格；等待复核、翻译、投递或重连时不重新获得资格。关停后重新开启不得从桥投递旧代任务，旧句仍更新文字字幕。专项回归覆盖待复核、翻译在途和投递重连（`bridge/tests/process.rs`、`bridge/src/translate.rs`、`bridge/src/speech.rs`）。
+- [x] 将播报代次扩展到 TTS 任务、音频输出和 pre 准入。使用同机单调时钟令牌 `issued_ns` 标识桥播报代次；停止建立 `cutoff_ns`，小于截止令牌的任务与帧不得通过，即使延迟到达。严格停止应答等待 TTS 安装截止值及 pre 播放线程处理帧边界。已提交给 ALSA 的尾音自然播完，不以应答宣称声学静音。TTS 和 pre 使用 `frame.h` 的同版播报线包，不能混用旧 `OutputFrame` 发送端。实测与范围见[本机联调报告](../../reports/speech-fence-20261123/RESULTS.md)。
+
 - [x] 复核后再翻译播报：开启复核（`refinement_status = pending`）时，`final` 仅落盘原文字幕不入翻译队列；待 `refined`（`completed` / `failed` / `skipped`）到达后才以最终原文触发单次翻译与 TTS 播报（含终态复核状态校验、空 PCM 防挂起与替换时清理旧纠错字段）。复核未开启（`disabled`）时直接在 `final` 触发一次，消除同一句重复翻译播报两次的问题。（`bridge/src/subtitles.rs`、`asr/src/decoder.rs:216`、`bridge/tests/process.rs`）
-- [ ] 字幕常驻与播报解耦：实时识别与翻译字幕（`subtitles.jsonl`）在所有音频主模式下均持续运行；仅翻译播报模式启用 TTS 语音播报，实时变声与原声直出模式保持只出字幕不播报。
+- [x] 复核丢失后有界收敛：等待到 30 s 单调时限后标记复核跳过，用在线原文继续文字翻译且不补播。桥重启从存档尾部最多 1 MiB、128 条最近 final 按最高修订恢复；仍未决的复核立即标记中断，已完成不重放，迟到复核不覆盖结果。超出读取范围记日志；无法翻译时标明原因。
+- [x] 字幕常驻与播报解耦：由 `SetOutputMode` 切换时不关闭识别和翻译字幕；仅 `broadcast` 模式启用 TTS。用户单独关闭翻译是独立设置，不由模式切换改写。`broadcast` 在无播报帧时沿用直通路由。验收见[模式往返报告](../../reports/speech-fence-20261123/RESULTS.md)。
 - [ ] 端到端 STS 选型边界：8 GB Jetson 端侧暂不以本地端到端中译英 STS 替换现有 `ASR + LLM + TTS` 管线（受限于统一内存与流式生态）；后续若引入云端 STS，仅作为翻译播报模式的可选在线后端，本地管线保留为离线默认兜底。
 
 ## 回归检查

@@ -13,7 +13,7 @@ use alsa::Direction;
 use mozart_core::ctl::schema::Route;
 use mozart_core::ring::Ring;
 use mozart_core::{OutputFrame, RawFrame, OUTPUT_SAMPLES, RAW_SAMPLES, RAW_SAMPLE_RATE};
-use std::sync::atomic::AtomicBool;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -202,7 +202,9 @@ fn step_broadcast(
                 let _ = trunk.pop(Some(Duration::ZERO));
                 let tail = rvc
                     .pop(Some(Duration::ZERO))
-                    .map_or([0f32; RAW_SAMPLES], |frame| rvc_resampler.resample_to_48k(&frame));
+                    .map_or([0f32; RAW_SAMPLES], |frame| {
+                        rvc_resampler.resample_to_48k(&frame)
+                    });
                 drain_rvc_skipped(rvc, shared);
                 rvc_resampler.reset();
                 tail
@@ -229,6 +231,10 @@ fn step_broadcast(
 }
 
 /// 实时帧推进：按路由选源并应用路由淡变；刚从播报恢复时跳过等待预算，
+fn select_speech(tagged: mozart_core::SpeechFrame, cutoff: u64) -> Option<OutputFrame> {
+    (tagged.issued_ns >= cutoff).then_some(tagged.frame)
+}
+
 /// 避免与 tts.pop(FRAME_WAIT) 叠加成两帧等待。
 fn step_realtime(
     prev: Speaker,
@@ -279,7 +285,7 @@ pub fn run(
     mut pcm: alsa::pcm::PCM,
     trunk: Arc<Ring<RawFrame>>,
     rvc: Arc<Ring<OutputFrame>>,
-    tts: Arc<Ring<OutputFrame>>,
+    tts: Arc<Ring<mozart_core::SpeechFrame>>,
     shared: Arc<Shared>,
     stop: &'static AtomicBool,
 ) -> Result<(), String> {
@@ -292,6 +298,10 @@ pub fn run(
     let mut underruns = 0u64;
     let mut reported = 0u64;
     loop {
+        // This boundary follows the previous ALSA write. Acknowledgement here
+        // precedes selection using the installed cutoff.
+        let request = shared.speech_request.load(Ordering::SeqCst);
+        shared.speech_ack.store(request, Ordering::SeqCst);
         if shared.playback_switch.has_pending() {
             shared.playback_switch.apply_pending(
                 |target| alsa_stream::open_and_verify_io("playback", target, Direction::Playback),
@@ -311,7 +321,9 @@ pub fn run(
         mute.request(shared.mute_target());
 
         // 播报优先：仅播报连续发帧期给微抖动等待，holdoff 空窗期与实时态零等待。
-        let tts_frame = tts.pop(Some(speaker.poll_wait()));
+        let tts_frame = tts
+            .pop(Some(speaker.poll_wait()))
+            .and_then(|tagged| select_speech(tagged, shared.speech_cutoff.load(Ordering::SeqCst)));
         let prev = speaker.state;
         let state = speaker.advance(tts_frame.is_some(), Instant::now());
         if state != prev {
@@ -372,6 +384,38 @@ pub fn run(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn speech_fence_rejects_delayed_old_frame_and_accepts_new() {
+        let frame = || {
+            mozart_core::OutputFrame::new_48k(
+                mozart_core::FrameMeta {
+                    pts_ns: 0,
+                    frame_idx: 0,
+                    vad_flag: 0,
+                    energy_db: 0,
+                    conf: 0,
+                    segment_id: 0,
+                },
+                [0.0; mozart_core::OUTPUT_SAMPLES],
+            )
+        };
+        assert!(super::select_speech(
+            mozart_core::SpeechFrame {
+                issued_ns: 9,
+                frame: frame()
+            },
+            10
+        )
+        .is_none());
+        assert!(super::select_speech(
+            mozart_core::SpeechFrame {
+                issued_ns: 10,
+                frame: frame()
+            },
+            10
+        )
+        .is_some());
+    }
     use super::*;
     use mozart_core::FrameMeta;
 
@@ -671,7 +715,8 @@ mod tests {
             segment_id: 0,
         };
         // 预先让 resampler 处于 40 kHz 历史（last_rate != 0）。
-        let _ = resampler.resample_to_48k(&OutputFrame::new(meta, 40000, 800, [0.9; OUTPUT_SAMPLES]));
+        let _ =
+            resampler.resample_to_48k(&OutputFrame::new(meta, 40000, 800, [0.9; OUTPUT_SAMPLES]));
         assert_eq!(resampler.last_rate, 40000);
 
         // 在播报期切路由（Direct → Rvc）：router 状态机在后台完成切换，

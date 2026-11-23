@@ -263,7 +263,8 @@ fn handle(msg: &Message, state: &mut State) -> Vec<u8> {
             }
             ok(json!({"active": active}))
         }
-        ctl::PRE_SPEECH_STOP => ok(json!({"stopped": true, "frames_cleared": 0})),
+        ctl::PRE_SPEECH_STOP => ok(json!({"stopped": true, "frames_cleared": 0,
+            "cutoff_ns": body.get("cutoff_ns")})),
         ctl::PRE_GET_STATUS => ok(json!({
             "state": "ok",
             "dsp": state.dsp,

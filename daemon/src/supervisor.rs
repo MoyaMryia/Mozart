@@ -311,6 +311,9 @@ fn start_child(
     for (key, value) in &config.process.env {
         command.env(key, value);
     }
+    if role == Role::Bridge {
+        command.env(mozart_core::speech::SUPERVISED_BRIDGE_BOOT_ENV, "1");
+    }
     command
         .stdin(Stdio::null())
         .stdout(Stdio::from(log))

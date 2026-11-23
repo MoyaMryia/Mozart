@@ -65,6 +65,7 @@ fn serve_connection(conn: &Seqpacket, shared: &Shared, stop: &AtomicBool) {
 pub fn dispatch(msg: &Message, shared: &Shared) -> Vec<u8> {
     match msg.header.type_ {
         ctl::TTS_HELLO => ok_body(json!({"version": VERSION})),
+        ctl::TTS_JOB_STOP => crate::jobs::stop_reply(&msg.body, shared),
         ctl::TTS_GET_STATUS => match serde_json::to_value(shared.status()) {
             Ok(value) => ok_body(value),
             Err(err) => error_body(ctl::CODE_INTERNAL, &err.to_string()),

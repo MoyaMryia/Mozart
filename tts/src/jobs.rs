@@ -25,6 +25,7 @@ const MAX_CONNECTIONS: usize = 8;
 /// 一条合成任务（voice_params 校验后丢弃，v1 用配置音色）。
 #[derive(Debug, Clone, PartialEq)]
 pub struct Job {
+    pub issued_ns: u64,
     pub text: String,
     pub utterance_id: String,
 }
@@ -33,6 +34,7 @@ pub struct Job {
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct JobRequest {
+    pub issued_ns: Option<u64>,
     pub text: String,
     pub utterance_id: String,
     #[serde(default)]
@@ -67,7 +69,13 @@ pub fn parse_request(body: &[u8]) -> Result<Job, String> {
             return Err("voice_params must be an object".to_string());
         }
     }
+    let issued_ns = match request.issued_ns {
+        Some(value) if mozart_core::speech::valid_timestamp(value) => value,
+        Some(_) => return Err("issued_ns must be a valid monotonic timestamp".into()),
+        None => mozart_core::speech::monotonic_ns(),
+    };
     Ok(Job {
+        issued_ns,
         text: request.text,
         utterance_id: request.utterance_id,
     })
@@ -141,21 +149,26 @@ fn serve_connection(conn: &Seqpacket, tasks: &SyncSender<Job>, shared: &Shared, 
     }
 }
 
-/// 命令分发：TTS_JOB_SUBMIT 入队（受理结果决定应答）；TTS_JOB_STOP 推进任务代际
-/// （在途合成中止、在队任务由 synth 线程清空），应答 data {"stopped":true}。
+/// 任务面与控制面共用停止入口。旧任务逐件丢弃，不清除新代队列。
 pub fn dispatch(msg: &Message, tasks: &SyncSender<Job>, shared: &Shared) -> Vec<u8> {
     match msg.header.type_ {
         ctl::TTS_JOB_SUBMIT => dispatch_submit(msg, tasks, shared),
-        ctl::TTS_JOB_STOP => {
-            // 入口校验一次：停止体为空或 {}。
-            if !msg.body.is_empty() && msg.body != b"{}" {
-                return error_body(ctl::CODE_INVALID_ARGUMENT, "invalid stop body");
-            }
-            shared.stop_jobs();
-            ok_body(json!({ "stopped": true }))
-        }
+        ctl::TTS_JOB_STOP => stop_reply(&msg.body, shared),
         _ => error_body(ctl::CODE_UNKNOWN_COMMAND, "unknown command"),
     }
+}
+
+pub(crate) fn stop_reply(body: &[u8], shared: &Shared) -> Vec<u8> {
+    let cutoff = if body.is_empty() || body == b"{}" {
+        mozart_core::speech::monotonic_ns()
+    } else {
+        match serde_json::from_slice::<mozart_core::speech::StopFence>(body) {
+            Ok(fence) if mozart_core::speech::valid_timestamp(fence.cutoff_ns) => fence.cutoff_ns,
+            _ => return error_body(ctl::CODE_INVALID_ARGUMENT, "invalid stop body"),
+        }
+    };
+    let cutoff = shared.install_fence(cutoff);
+    ok_body(json!({ "stopped": true, "cutoff_ns": cutoff }))
 }
 
 /// TTS_JOB_SUBMIT：入队结果决定受理应答（标准信封，utterance_id 放 data）。
@@ -165,6 +178,10 @@ fn dispatch_submit(msg: &Message, tasks: &SyncSender<Job>, shared: &Shared) -> V
         Err(reason) => return submit_error(ctl::CODE_INVALID_ARGUMENT, &reason, ""),
     };
     let utterance_id = job.utterance_id.clone();
+    if job.issued_ns < shared.cutoff() {
+        shared.add_stopped(1);
+        return submit_error(ctl::CODE_NOT_READY, "speech generation revoked", &utterance_id);
+    }
     shared.queue_push();
     match tasks.try_send(job) {
         Ok(()) => ok_body(json!({ "utterance_id": utterance_id })),
@@ -323,16 +340,42 @@ mod tests {
     }
 
     #[test]
-    fn dispatch_stop_bumps_epoch_and_replies_stopped() {
+    fn dispatch_stop_installs_cutoff_and_replies_stopped() {
         let (tx, _rx) = mpsc::sync_channel::<Job>(1);
         let shared = Shared::new();
-        assert_eq!(shared.job_epoch(), 0);
+        assert_eq!(shared.cutoff(), 0);
         for body in [&b""[..], &b"{}"[..]] {
+            let before = mozart_core::speech::monotonic_ns();
             let reply = reply_of(&dispatch(&stop(body), &tx, &shared));
             assert_eq!(reply.status, "ok");
             assert_eq!(reply.data["stopped"], true);
+            assert_eq!(reply.data["cutoff_ns"], shared.cutoff());
+            assert!(shared.cutoff() >= before);
         }
-        assert_eq!(shared.job_epoch(), 2, "每次停止推进一代");
+    }
+
+    #[test]
+    fn typed_stop_rejects_late_old_job_and_does_not_revoke_new_job() {
+        let (tx, rx) = mpsc::sync_channel::<Job>(2);
+        let shared = Shared::new();
+        let cutoff = mozart_core::speech::monotonic_ns();
+        let stop_body = json!({"cutoff_ns": cutoff});
+        assert_eq!(reply_of(&dispatch(&stop(stop_body.to_string().as_bytes()), &tx, &shared)).status, "ok");
+        let old_body = json!({"text":"old", "utterance_id":"s:1", "issued_ns":cutoff - 1});
+        let old = reply_of(&dispatch(&submit(old_body.to_string().as_bytes()), &tx, &shared));
+        assert_eq!(old.code, ctl::CODE_NOT_READY);
+        assert_eq!(shared.status().queue_depth, 0);
+        assert!(rx.try_recv().is_err());
+
+        let issued_ns = mozart_core::speech::monotonic_ns();
+        let new_body = json!({"text":"new", "utterance_id":"s:2", "issued_ns":issued_ns});
+        let new = reply_of(&dispatch(&submit(new_body.to_string().as_bytes()), &tx, &shared));
+        assert_eq!(new.status, "ok");
+        let replay = reply_of(&dispatch(&stop(stop_body.to_string().as_bytes()), &tx, &shared));
+        assert_eq!(replay.data["cutoff_ns"], cutoff);
+        let job = rx.try_recv().unwrap();
+        assert_eq!(job.utterance_id, "s:2");
+        assert!(!shared.abort_job(&AtomicBool::new(false), job.issued_ns).aborted());
     }
 
     #[test]
@@ -343,7 +386,7 @@ mod tests {
         assert_eq!(reply.status, "error");
         assert_eq!(reply.code, ctl::CODE_INVALID_ARGUMENT);
         assert_eq!(reply.reason, "invalid stop body");
-        assert_eq!(shared.job_epoch(), 0, "坏体不得推进代际");
+        assert_eq!(shared.cutoff(), 0, "坏体不得推进代际");
     }
 
     #[test]
@@ -373,7 +416,8 @@ mod tests {
         let body: Value = serde_json::from_slice(&reply.body).unwrap();
         assert_eq!(body["status"], "ok");
         assert_eq!(body["data"]["stopped"], true);
-        assert_eq!(shared.job_epoch(), 1);
+        assert_ne!(shared.cutoff(), 0);
+        assert_eq!(body["data"]["cutoff_ns"], shared.cutoff());
 
         stop.store(true, Relaxed);
         server.join().unwrap();

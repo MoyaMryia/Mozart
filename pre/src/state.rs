@@ -79,7 +79,10 @@ impl DeviceSwitchSlot {
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         if stop.load(Ordering::Relaxed) {
-            return Err((ctl::CODE_BUSY.to_string(), "pre is shutting down".to_string()));
+            return Err((
+                ctl::CODE_BUSY.to_string(),
+                "pre is shutting down".to_string(),
+            ));
         }
         let rx = {
             let mut inner = self
@@ -104,7 +107,10 @@ impl DeviceSwitchSlot {
         loop {
             if stop.load(Ordering::Relaxed) {
                 self.clear_pending();
-                return Err((ctl::CODE_BUSY.to_string(), "pre is shutting down".to_string()));
+                return Err((
+                    ctl::CODE_BUSY.to_string(),
+                    "pre is shutting down".to_string(),
+                ));
             }
             let remaining = deadline.saturating_duration_since(Instant::now());
             if remaining.is_zero() {
@@ -303,6 +309,9 @@ impl DspSwitches {
 }
 
 pub struct Shared {
+    pub speech_cutoff: AtomicU64,
+    pub speech_request: AtomicU64,
+    pub speech_ack: AtomicU64,
     route_target: AtomicU8,
     mute_target: AtomicBool,
     /// 文件接管状态（SPEC-03 状态门控交接）：控制线程写，处理线程与
@@ -364,6 +373,9 @@ impl Shared {
         dsp: DspSwitches,
     ) -> Self {
         Self {
+            speech_cutoff: AtomicU64::new(0),
+            speech_request: AtomicU64::new(0),
+            speech_ack: AtomicU64::new(0),
             route_target: AtomicU8::new(route_code(Route::Direct)),
             mute_target: AtomicBool::new(false),
             file_gate: AtomicU64::new(0),

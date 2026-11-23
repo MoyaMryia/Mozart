@@ -52,7 +52,7 @@ pub fn pack_utterance(pcm: &[f32]) -> Vec<OutputFrame> {
 pub struct FrameWriter {
     /// pre `tts_output_socket` 路径；连接失败可恢复，路径固定。
     path: PathBuf,
-    socket: Option<FrameSocket<OutputFrame>>,
+    socket: Option<FrameSocket<mozart_core::SpeechFrame>>,
     shared: Arc<Shared>,
     /// 未建链期（pre 未绑定）与通道弃用后的发送丢弃合计；建链后的过载丢弃
     /// 由 FrameSocket 内部计数，发布时两者相加。
@@ -80,7 +80,7 @@ impl FrameWriter {
     }
 
     /// 恒定发送一帧。对端不在、过载、通道坏：丢弃计数继续，不阻塞不重试。
-    fn send_frame(&mut self, frame: &OutputFrame) {
+    fn send_frame(&mut self, frame: &mozart_core::SpeechFrame) {
         if self.socket.is_none() {
             match FrameSocket::connect(&self.path, OUTPUT_BUFFER_FRAMES) {
                 Ok(socket) => self.socket = Some(socket),
@@ -123,7 +123,7 @@ fn advance_grid(next: Instant, now: Instant, frame_duration: Duration) -> Instan
 /// FRAME_MS 单调网格推进，吸收 send_frame 与 sleep 唤醒抖动，不累加正漂移；
 /// 仅当实际时刻已落后超过整帧周期时才重置网格到当前时刻，不追赶补发。
 /// 输出线程非实时，睡眠让出 CPU。
-fn emit_frame(writer: &mut FrameWriter, frame: &OutputFrame, next: &mut Instant, started: &mut bool) {
+fn emit_frame(writer: &mut FrameWriter, frame: &OutputFrame, next: &mut Instant, started: &mut bool, abort: &Abort<'_>) {
     if *started {
         let frame_duration = Duration::from_millis(FRAME_MS as u64);
         let now = Instant::now();
@@ -133,8 +133,11 @@ fn emit_frame(writer: &mut FrameWriter, frame: &OutputFrame, next: &mut Instant,
         *next = Instant::now();
         *started = true;
     }
-    writer.send_frame(frame);
-    writer.shared.add_frames_out(1);
+    let shared = writer.shared.clone();
+    shared.send_if_current(abort, || {
+        writer.send_frame(&mozart_core::SpeechFrame { issued_ns: abort.issued_ns, frame: *frame });
+        shared.add_frames_out(1);
+    });
 }
 
 /// 流式输出（SPEC-05 合成一段播一段）：从通道收 synth 线程逐段交付的 48 kHz PCM，
@@ -158,14 +161,14 @@ pub fn write_stream(rx: Receiver<Vec<f32>>, writer: &mut FrameWriter, abort: &Ab
             }
             let frame = make_frame(&pending[..OUTPUT_SAMPLES], frame_idx);
             pending.drain(..OUTPUT_SAMPLES);
-            emit_frame(writer, &frame, &mut next, &mut started);
+            emit_frame(writer, &frame, &mut next, &mut started, abort);
             frame_idx += 1;
         }
     }
     // 句末不足一帧补零（与 pack_utterance 一致）。
     if !pending.is_empty() && !abort.aborted() {
         let frame = make_frame(&pending, frame_idx);
-        emit_frame(writer, &frame, &mut next, &mut started);
+        emit_frame(writer, &frame, &mut next, &mut started, abort);
     }
 }
 
@@ -239,10 +242,10 @@ mod tests {
         assert_eq!(status.output_dropped, 5, "pre 未绑定：5 帧全部丢弃计数");
 
         // pre 绑定后下一句自动接通并送达。
-        let rx = FrameSocket::<OutputFrame>::bind(&path, OUTPUT_BUFFER_FRAMES).unwrap();
+        let rx = FrameSocket::<mozart_core::SpeechFrame>::bind(&path, OUTPUT_BUFFER_FRAMES).unwrap();
         writer.write_utterance(&vec![0.25f32; 960], &abort);
         let got = rx.recv(Some(Duration::from_secs(1))).unwrap();
-        let FrameMeta { frame_idx, .. } = got.meta;
+        let FrameMeta { frame_idx, .. } = got.frame.meta;
         assert_eq!(frame_idx, 0);
         let status = shared.status();
         assert_eq!(status.frames_out, 6);
@@ -256,7 +259,7 @@ mod tests {
     fn frames_arrive_at_bound_receiver() {
         let dir = socket_dir("arrive");
         let path = dir.join("tts-out.sock");
-        let rx = FrameSocket::<OutputFrame>::bind(&path, OUTPUT_BUFFER_FRAMES).unwrap();
+        let rx = FrameSocket::<mozart_core::SpeechFrame>::bind(&path, OUTPUT_BUFFER_FRAMES).unwrap();
         let shared = Arc::new(Shared::new());
         let mut writer = FrameWriter::new(path.clone(), shared.clone());
         let stop = no_stop();
@@ -265,10 +268,10 @@ mod tests {
         writer.write_utterance(&pcm, &abort);
         for idx in 0..2u32 {
             let got = rx.recv(Some(Duration::from_secs(1))).unwrap();
-            let FrameMeta { frame_idx, pts_ns, .. } = got.meta;
+            let FrameMeta { frame_idx, pts_ns, .. } = got.frame.meta;
             assert_eq!(frame_idx, idx);
             assert_eq!(pts_ns, idx as u64 * 20_000_000);
-            let chunk = got.pcm;
+            let chunk = got.frame.pcm;
             assert_eq!(&chunk[..], &pcm[idx as usize * 960..(idx as usize + 1) * 960]);
         }
         let status = shared.status();
@@ -288,18 +291,18 @@ mod tests {
         let stop = no_stop();
         let abort = shared.abort(&stop);
 
-        let rx1 = FrameSocket::<OutputFrame>::bind(&path, OUTPUT_BUFFER_FRAMES).unwrap();
+        let rx1 = FrameSocket::<mozart_core::SpeechFrame>::bind(&path, OUTPUT_BUFFER_FRAMES).unwrap();
         writer.write_utterance(&vec![0.25f32; 960], &abort);
-        let FrameMeta { frame_idx, .. } = rx1.recv(None).unwrap().meta;
+        let FrameMeta { frame_idx, .. } = rx1.recv(None).unwrap().frame.meta;
         assert_eq!(frame_idx, 0);
         drop(rx1); // socket 文件留在原地。
         writer.write_utterance(&vec![0.25f32; 960], &abort); // 丢弃 + 重连失败。
         assert_eq!(shared.status().output_dropped, 1, "重启窗口的发送必须计入丢弃");
 
-        let rx2 = FrameSocket::<OutputFrame>::bind(&path, OUTPUT_BUFFER_FRAMES).unwrap();
+        let rx2 = FrameSocket::<mozart_core::SpeechFrame>::bind(&path, OUTPUT_BUFFER_FRAMES).unwrap();
         writer.write_utterance(&vec![0.25f32; 960], &abort); // 仍走失败分支：丢弃 + 重连成功。
         writer.write_utterance(&vec![0.25f32; 960], &abort); // 通道已恢复：送达。
-        let FrameMeta { frame_idx, .. } = rx2.recv(Some(Duration::from_secs(1))).unwrap().meta;
+        let FrameMeta { frame_idx, .. } = rx2.recv(Some(Duration::from_secs(1))).unwrap().frame.meta;
         assert_eq!(frame_idx, 0);
         assert_eq!(shared.status().output_dropped, 2, "重启窗口丢弃 1 + 重绑首帧丢弃 1");
         let _ = std::fs::remove_file(&path);
@@ -312,7 +315,7 @@ mod tests {
     fn paced_delivery_fits_receiver_buffer() {
         let dir = socket_dir("paced");
         let path = dir.join("tts-out.sock");
-        let rx = FrameSocket::<OutputFrame>::bind(&path, OUTPUT_BUFFER_FRAMES).unwrap();
+        let rx = FrameSocket::<mozart_core::SpeechFrame>::bind(&path, OUTPUT_BUFFER_FRAMES).unwrap();
         let shared = Arc::new(Shared::new());
         let mut writer = FrameWriter::new(path.clone(), shared.clone());
         let stop = no_stop();
@@ -321,7 +324,7 @@ mod tests {
             for idx in 0..12u32 {
                 let frame = rx.recv(Some(Duration::from_secs(2))).unwrap();
                 // packed 字段经解构按值读取，不能取引用。
-                let FrameMeta { frame_idx, .. } = frame.meta;
+                let FrameMeta { frame_idx, .. } = frame.frame.meta;
                 assert_eq!(frame_idx, idx);
             }
         });
@@ -347,7 +350,7 @@ mod tests {
     fn stop_interrupts_remaining_frames() {
         let dir = socket_dir("stop");
         let path = dir.join("tts-out.sock");
-        let rx = FrameSocket::<OutputFrame>::bind(&path, OUTPUT_BUFFER_FRAMES).unwrap();
+        let rx = FrameSocket::<mozart_core::SpeechFrame>::bind(&path, OUTPUT_BUFFER_FRAMES).unwrap();
         let shared = Arc::new(Shared::new());
         let mut writer = FrameWriter::new(path.clone(), shared.clone());
         let stop = Arc::new(AtomicBool::new(false));
@@ -357,7 +360,7 @@ mod tests {
             for idx in 0..2u32 {
                 let frame = rx.recv(Some(Duration::from_secs(2))).unwrap();
                 // packed 字段经解构按值读取，不能取引用。
-                let FrameMeta { frame_idx, .. } = frame.meta;
+                let FrameMeta { frame_idx, .. } = frame.frame.meta;
                 assert_eq!(frame_idx, idx);
             }
             stop_rx.store(true, Relaxed);
@@ -376,7 +379,7 @@ mod tests {
     fn stream_buffers_partial_frames_across_segments() {
         let dir = socket_dir("streampartial");
         let path = dir.join("tts-out.sock");
-        let rx = FrameSocket::<OutputFrame>::bind(&path, OUTPUT_BUFFER_FRAMES).unwrap();
+        let rx = FrameSocket::<mozart_core::SpeechFrame>::bind(&path, OUTPUT_BUFFER_FRAMES).unwrap();
         let shared = Arc::new(Shared::new());
         let mut writer = FrameWriter::new(path.clone(), shared.clone());
         let stop = no_stop();
@@ -395,11 +398,11 @@ mod tests {
         let f1 = rx.recv(Some(Duration::from_secs(1))).unwrap();
         let f2 = rx.recv(Some(Duration::from_secs(1))).unwrap();
         // packed 字段经按值拷贝/解构读取，不能取引用。
-        let FrameMeta { frame_idx: idx0, .. } = f0.meta;
-        let FrameMeta { frame_idx: idx1, .. } = f1.meta;
-        let FrameMeta { frame_idx: idx2, .. } = f2.meta;
-        let p1 = f1.pcm;
-        let p2 = f2.pcm;
+        let FrameMeta { frame_idx: idx0, .. } = f0.frame.meta;
+        let FrameMeta { frame_idx: idx1, .. } = f1.frame.meta;
+        let FrameMeta { frame_idx: idx2, .. } = f2.frame.meta;
+        let p1 = f1.frame.pcm;
+        let p2 = f2.frame.pcm;
         assert_eq!(idx0, 0);
         assert_eq!(idx1, 1);
         assert_eq!(idx2, 2);
@@ -446,13 +449,15 @@ mod tests {
         // 也做一次真实 emit_frame 首帧初始化冒烟：首帧立即发送并置 started=true。
         let dir = socket_dir("grid");
         let path = dir.join("tts-out.sock");
-        let rx = FrameSocket::<OutputFrame>::bind(&path, OUTPUT_BUFFER_FRAMES).unwrap();
+        let rx = FrameSocket::<mozart_core::SpeechFrame>::bind(&path, OUTPUT_BUFFER_FRAMES).unwrap();
         let shared = Arc::new(Shared::new());
         let mut writer = FrameWriter::new(path.clone(), shared.clone());
         let frame = make_frame(&[0.1; OUTPUT_SAMPLES], 0);
         let mut started = false;
         let mut emit_next = Instant::now();
-        emit_frame(&mut writer, &frame, &mut emit_next, &mut started);
+        let stop = no_stop();
+        let abort = shared.abort(&stop);
+        emit_frame(&mut writer, &frame, &mut emit_next, &mut started, &abort);
         assert!(started);
         assert!(rx.recv(Some(Duration::from_secs(1))).is_ok());
         let _ = std::fs::remove_file(&path);

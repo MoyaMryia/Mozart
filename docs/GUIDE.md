@@ -46,12 +46,15 @@ mozart-ctl restart pre                              # 重启 pre 生效默认配
 ## 四、实时变声
 
 ```bash
-mozart-ctl route set rvc      # 切到变声
-mozart-ctl route set direct   # 切回直出
+mozart-ctl mode rvc           # 切到变声
+mozart-ctl mode direct        # 切回直出
+mozart-ctl mode broadcast     # 开启翻译播报模式
 mozart-ctl mute on            # 静音
 mozart-ctl mute off           # 取消静音
 mozart-ctl model use <模型id>  # 换模型（实时或空闲）
 ```
+
+模式命令返回受理结果。用 `mozart-ctl status --json` 查看 `output_mode.applied`；三种模式都保留识别和翻译字幕。手动执行 `route set` 或 `speech` 会退出托管模式。
 
 `model use` 短暂断流：停流 → 载入新模型 → 载入该模型的 `presets/default.toml` → 重新起流。
 它把模型选择写回配置基线，重启后沿用；`config set rvc.model_id` 被拒绝。

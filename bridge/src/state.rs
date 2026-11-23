@@ -5,10 +5,11 @@
 //! 待翻译队满拒收由字幕线程记降级；SIGTERM 退出时丢弃。
 
 use mozart_core::ctl::schema::BridgeStatus;
+use std::collections::VecDeque;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering::Relaxed};
-use std::sync::mpsc::{self, Receiver, RecvTimeoutError, SyncSender, TrySendError};
-use std::sync::Mutex;
+use std::sync::mpsc::{self, Receiver, RecvTimeoutError, SyncSender};
+use std::sync::{Condvar, Mutex, MutexGuard};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 /// 版本号，Hello 与 GetStatus 一致上报。
@@ -112,10 +113,34 @@ impl SpeechStats {
     }
 }
 
+/// 在 final 时绑定的单调时钟许可。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SpeechGeneration(u64);
+
+impl SpeechGeneration {
+    pub fn issued_ns(self) -> u64 {
+        self.0
+    }
+}
+
+struct SpeechGate {
+    active: Option<SpeechGeneration>,
+    cutoff: u64,
+}
+
+impl SpeechGate {
+    fn revoke(&mut self) -> u64 {
+        let after_active = self.active.take().map_or(1, |token| token.0 + 1);
+        self.cutoff = mozart_core::speech::monotonic_ns().max(self.cutoff).max(after_active);
+        self.cutoff
+    }
+}
+
 pub struct Shared {
     pub subtitles_path: PathBuf,
     translate_enabled: AtomicBool,
-    speech_enabled: AtomicBool,
+    // 开关与一次非阻塞发送在同一把锁下串行。
+    speech_generation: Mutex<SpeechGate>,
     subtitles_published: AtomicU64,
     records_in_memory: AtomicU32,
     events_dropped: AtomicU64,
@@ -132,7 +157,12 @@ impl Shared {
         Self {
             subtitles_path,
             translate_enabled: AtomicBool::new(switches.translate_enabled),
-            speech_enabled: AtomicBool::new(switches.speech_enabled),
+            speech_generation: Mutex::new(SpeechGate {
+                active: switches
+                    .speech_enabled
+                    .then(|| SpeechGeneration(mozart_core::speech::monotonic_ns().max(1))),
+                cutoff: 0,
+            }),
             subtitles_published: AtomicU64::new(0),
             records_in_memory: AtomicU32::new(0),
             events_dropped: AtomicU64::new(0),
@@ -149,7 +179,27 @@ impl Shared {
         self.translate_enabled.load(Relaxed)
     }
     pub fn speech_enabled(&self) -> bool {
-        self.speech_enabled.load(Relaxed)
+        self.speech_generation().is_some()
+    }
+
+    fn speech_gate(&self) -> MutexGuard<'_, SpeechGate> {
+        self.speech_generation
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
+    pub fn speech_generation(&self) -> Option<SpeechGeneration> {
+        self.speech_gate().active
+    }
+
+    /// `send` 必须非阻塞。应答在释放门控之后等待。
+    pub fn send_current_speech<T>(
+        &self,
+        generation: SpeechGeneration,
+        send: impl FnOnce() -> T,
+    ) -> Option<T> {
+        let gate = self.speech_gate();
+        (gate.active == Some(generation)).then(send)
     }
 
     pub fn translate_stats(&self) -> &TranslateStats {
@@ -159,11 +209,24 @@ impl Shared {
         &self.speech_stats
     }
 
-    /// 运行时开关更新：仅改桥内活权威原子；持久存档归 daemon `state.json`（SPEC-04）。
+    /// 运行时开关只改桥内活状态；持久存档归 daemon `state.json`（SPEC-04）。
     pub fn set_switches(&self, switches: Switches) {
         self.translate_enabled
             .store(switches.translate_enabled, Relaxed);
-        self.speech_enabled.store(switches.speech_enabled, Relaxed);
+        let mut gate = self.speech_gate();
+        if switches.speech_enabled && gate.active.is_none() {
+            gate.active = Some(SpeechGeneration(
+                mozart_core::speech::monotonic_ns()
+                    .max(gate.cutoff.checked_add(1).expect("speech cutoff overflow")),
+            ));
+        } else if !switches.speech_enabled && gate.active.is_some() {
+            gate.revoke();
+        }
+    }
+
+    pub fn stop_speech(&self) -> u64 {
+        let mut gate = self.speech_gate();
+        gate.revoke()
     }
 
     /// 已发布句数按 utterance_id 计，不按 JSONL 行数（沿用旧实现）。
@@ -267,6 +330,7 @@ impl Shared {
 pub struct TranslateJob {
     pub utterance_id: String,
     pub text: String,
+    pub speech_generation: Option<SpeechGeneration>,
 }
 
 /// 待播报句：合格译文，投递线程消费。
@@ -274,19 +338,24 @@ pub struct TranslateJob {
 pub struct SpeechJob {
     pub utterance_id: String,
     pub text: String,
+    pub generation: SpeechGeneration,
+}
+
+#[cfg(test)]
+impl SpeechGeneration {
+    pub const FIRST: Self = Self(1);
 }
 
 /// 有界内存队列（SPEC-05）：容量来自配置。
 /// 待翻译队满拒收，由字幕线程记录降级；待播报队满丢最旧并计数（播报投递条款）。
-/// 接收端放锁里：工作线程取件与 speech stop 清空共用；
-/// 深度用原子计数（入队 +1、取件 -1），控制线程只读，不跨阻塞持有锁。
+/// 播报取件在条件变量上等待，不占用停止命令所需的队列锁。
 pub struct Queues {
     translate_tx: SyncSender<TranslateJob>,
     translate_rx: Mutex<Receiver<TranslateJob>>,
     translate_depth: AtomicU32,
-    speech_tx: SyncSender<SpeechJob>,
-    speech_rx: Mutex<Receiver<SpeechJob>>,
-    speech_depth: AtomicU32,
+    speech: Mutex<VecDeque<SpeechJob>>,
+    speech_ready: Condvar,
+    speech_capacity: usize,
     speech_dropped: AtomicU64,
 }
 
@@ -294,14 +363,13 @@ impl Queues {
     /// 容量已由配置校验保证 ≥ 1。
     pub fn new(translate_capacity: usize, speech_capacity: usize) -> Self {
         let (translate_tx, translate_rx) = mpsc::sync_channel(translate_capacity);
-        let (speech_tx, speech_rx) = mpsc::sync_channel(speech_capacity);
         Self {
             translate_tx,
             translate_rx: Mutex::new(translate_rx),
             translate_depth: AtomicU32::new(0),
-            speech_tx,
-            speech_rx: Mutex::new(speech_rx),
-            speech_depth: AtomicU32::new(0),
+            speech: Mutex::new(VecDeque::new()),
+            speech_ready: Condvar::new(),
+            speech_capacity,
             speech_dropped: AtomicU64::new(0),
         }
     }
@@ -326,45 +394,31 @@ impl Queues {
         Ok(job)
     }
 
-    /// 译文入待播报队列；队满丢最旧并计数（SPEC-05），返回 false 仅当投递线程已退出。
-    pub fn push_speech(&self, job: SpeechJob) -> bool {
-        match self.speech_tx.try_send(job) {
-            Ok(()) => {
-                self.speech_depth.fetch_add(1, Relaxed);
-                true
-            }
-            Err(TrySendError::Full(job)) => {
-                let rx = self
-                    .speech_rx
-                    .lock()
-                    .unwrap_or_else(|poisoned| poisoned.into_inner());
-                // 丢最旧腾位并减深度；取件竞态下可能已被消费（此时已有空位，不减）。
-                if rx.try_recv().is_ok() {
-                    self.speech_dropped.fetch_add(1, Relaxed);
-                    self.speech_depth.fetch_sub(1, Relaxed);
-                }
-                match self.speech_tx.try_send(job) {
-                    Ok(()) => {
-                        self.speech_depth.fetch_add(1, Relaxed);
-                        true
-                    }
-                    // 单生产者腾位后必有空位；此分支仅在投递线程退出（断开）时到达。
-                    Err(_) => false,
-                }
-            }
-            Err(TrySendError::Disconnected(_)) => false,
-        }
+    fn speech_queue(&self) -> MutexGuard<'_, VecDeque<SpeechJob>> {
+        self.speech
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
     }
 
-    /// 投递线程取件；超时返回 Timeout，深度随取件递减。
-    pub fn recv_speech(&self, timeout: Duration) -> Result<SpeechJob, RecvTimeoutError> {
-        let rx = self
-            .speech_rx
-            .lock()
+    /// 译文入待播报队列；队满丢最旧并计数（SPEC-05）。
+    pub fn push_speech(&self, job: SpeechJob) {
+        let mut queue = self.speech_queue();
+        if queue.len() == self.speech_capacity {
+            queue.pop_front();
+            self.speech_dropped.fetch_add(1, Relaxed);
+        }
+        queue.push_back(job);
+        drop(queue);
+        self.speech_ready.notify_one();
+    }
+
+    /// 投递线程取件；空队列等待期间释放队列锁。
+    pub fn recv_speech(&self, timeout: Duration) -> Option<SpeechJob> {
+        let (mut queue, _) = self
+            .speech_ready
+            .wait_timeout_while(self.speech_queue(), timeout, |queue| queue.is_empty())
             .unwrap_or_else(|poisoned| poisoned.into_inner());
-        let job = rx.recv_timeout(timeout)?;
-        self.speech_depth.fetch_sub(1, Relaxed);
-        Ok(job)
+        queue.pop_front()
     }
 
     pub fn translate_depth(&self) -> u32 {
@@ -372,7 +426,7 @@ impl Queues {
     }
 
     pub fn speech_depth(&self) -> u32 {
-        self.speech_depth.load(Relaxed)
+        self.speech_queue().len() as u32
     }
 
     /// 待播报队满丢弃累计（不含 speech stop 清空）。
@@ -382,15 +436,9 @@ impl Queues {
 
     /// speech stop：清空待播报队列，返回丢弃数。
     pub fn clear_speech(&self) -> u32 {
-        let rx = self
-            .speech_rx
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-        let mut cleared = 0;
-        while rx.try_recv().is_ok() {
-            cleared += 1;
-        }
-        self.speech_depth.fetch_sub(cleared, Relaxed);
+        let mut queue = self.speech_queue();
+        let cleared = queue.len() as u32;
+        queue.clear();
         cleared
     }
 
@@ -426,7 +474,7 @@ mod tests {
     }
 
     #[test]
-    fn set_switches_updates_live_atomics() {
+    fn set_switches_updates_live_state() {
         let dir = temp_dir("set");
         let shared = Shared::new(
             Switches {
@@ -446,10 +494,64 @@ mod tests {
     }
 
     #[test]
+    fn speech_fence_orders_reopen_tokens() {
+        let switches = |speech_enabled| Switches { translate_enabled: true, speech_enabled };
+        let shared = Shared::new(switches(true), PathBuf::new());
+        let first = shared.speech_generation().unwrap();
+        let cutoff = shared.stop_speech();
+        assert!(cutoff >= first.issued_ns());
+        assert!(shared.send_current_speech(first, || ()).is_none());
+        let next_cutoff = shared.stop_speech();
+        assert!(next_cutoff >= cutoff);
+        shared.set_switches(switches(true));
+        assert!(shared.speech_generation().unwrap().issued_ns() > next_cutoff);
+    }
+
+    #[test]
+    fn speech_generation_orders_submission_and_revocation() {
+        let dir = temp_dir("speech-gate");
+        let switches = |speech_enabled| Switches {
+            translate_enabled: true,
+            speech_enabled,
+        };
+        let shared = Shared::new(switches(true), dir.join("subtitles.jsonl"));
+        let initial = shared.speech_generation().unwrap();
+
+        // The gate must span the side effect itself, not just the check preceding it.
+        assert_eq!(
+            shared.send_current_speech(initial, || {
+                assert!(matches!(
+                    shared.speech_generation.try_lock(),
+                    Err(std::sync::TryLockError::WouldBlock)
+                ));
+                "sent"
+            }),
+            Some("sent")
+        );
+        shared.set_switches(switches(false));
+        assert!(shared
+            .send_current_speech(initial, || panic!("send after revocation"))
+            .is_none());
+        shared.set_switches(switches(true));
+        let current = shared.speech_generation().unwrap();
+        assert_ne!(initial, current);
+        shared.set_switches(switches(true));
+        assert_eq!(shared.speech_generation(), Some(current));
+        assert!(shared
+            .send_current_speech(initial, || panic!("old send after reopening"))
+            .is_none());
+        assert_eq!(shared.send_current_speech(current, || "sent"), Some("sent"));
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
     fn degraded_dedupes_and_resolves() {
         let dir = temp_dir("degraded");
         let shared = Shared::new(
-            Switches { translate_enabled: true, speech_enabled: true },
+            Switches {
+                translate_enabled: true,
+                speech_enabled: true,
+            },
             dir.join("subtitles.jsonl"),
         );
         shared.degrade("asr events disconnected");
@@ -471,22 +573,26 @@ mod tests {
         assert!(queues.push_translate(TranslateJob {
             utterance_id: "s:1".to_string(),
             text: "你好".to_string(),
+            speech_generation: None,
         }));
         assert!(queues.push_translate(TranslateJob {
             utterance_id: "s:2".to_string(),
             text: "世界".to_string(),
+            speech_generation: None,
         }));
         // 待翻译队满拒收。
         assert!(!queues.push_translate(TranslateJob {
             utterance_id: "s:3".to_string(),
             text: "满".to_string(),
+            speech_generation: None,
         }));
         assert_eq!(queues.translate_depth(), 2);
 
-        assert!(queues.push_speech(SpeechJob {
+        queues.push_speech(SpeechJob {
             utterance_id: "s:1".to_string(),
             text: "hello".to_string(),
-        }));
+            generation: SpeechGeneration::FIRST,
+        });
         assert_eq!(queues.speech_depth(), 1);
         assert_eq!(queues.clear_speech(), 1);
         assert_eq!(queues.speech_depth(), 0);
@@ -503,17 +609,19 @@ mod tests {
     fn speech_queue_full_drops_oldest_and_counts() {
         let queues = Queues::new(1, 2);
         for seq in 1..=2 {
-            assert!(queues.push_speech(SpeechJob {
+            queues.push_speech(SpeechJob {
                 utterance_id: format!("s:{seq}"),
                 text: format!("t{seq}"),
-            }));
+                generation: SpeechGeneration::FIRST,
+            });
         }
         assert_eq!(queues.speech_depth(), 2);
         // 队满丢最旧：s:1 被丢，s:3 入队。
-        assert!(queues.push_speech(SpeechJob {
+        queues.push_speech(SpeechJob {
             utterance_id: "s:3".to_string(),
             text: "t3".to_string(),
-        }));
+            generation: SpeechGeneration::FIRST,
+        });
         assert_eq!(queues.speech_depth(), 2);
         assert_eq!(queues.speech_dropped(), 1);
 
@@ -522,9 +630,7 @@ mod tests {
         let second = queues.recv_speech(Duration::from_millis(100)).unwrap();
         assert_eq!(second.utterance_id, "s:3");
         assert_eq!(queues.speech_depth(), 0);
-        assert!(queues
-            .recv_speech(Duration::from_millis(10))
-            .is_err_and(|err| err == RecvTimeoutError::Timeout));
+        assert!(queues.recv_speech(Duration::from_millis(10)).is_none());
     }
 
     #[test]
@@ -533,6 +639,7 @@ mod tests {
         assert!(queues.push_translate(TranslateJob {
             utterance_id: "s:1".to_string(),
             text: "你好".to_string(),
+            speech_generation: None,
         }));
         assert_eq!(queues.translate_depth(), 1);
         let job = queues.recv_translate(Duration::from_millis(100)).unwrap();
@@ -547,7 +654,10 @@ mod tests {
     fn status_reports_translate_and_speech_stats() {
         let dir = temp_dir("stats");
         let shared = Shared::new(
-            Switches { translate_enabled: true, speech_enabled: true },
+            Switches {
+                translate_enabled: true,
+                speech_enabled: true,
+            },
             dir.join("subtitles.jsonl"),
         );
         let queues = Queues::new(4, 4);
@@ -570,22 +680,27 @@ mod tests {
         queues.push_speech(SpeechJob {
             utterance_id: "s:1".to_string(),
             text: "hello".to_string(),
+            generation: SpeechGeneration::FIRST,
         });
         queues.push_speech(SpeechJob {
             utterance_id: "s:2".to_string(),
             text: "world".to_string(),
+            generation: SpeechGeneration::FIRST,
         });
         queues.push_speech(SpeechJob {
             utterance_id: "s:3".to_string(),
             text: "extra".to_string(),
+            generation: SpeechGeneration::FIRST,
         });
         queues.push_speech(SpeechJob {
             utterance_id: "s:4".to_string(),
             text: "more".to_string(),
+            generation: SpeechGeneration::FIRST,
         });
         queues.push_speech(SpeechJob {
             utterance_id: "s:5".to_string(),
             text: "drop".to_string(),
+            generation: SpeechGeneration::FIRST,
         });
 
         let status = shared.status(&queues);

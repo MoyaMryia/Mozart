@@ -89,6 +89,7 @@ impl StateFile {
         BridgeRestore {
             translate: get("bridge.translate_enabled"),
             speech: get("bridge.speech_enabled"),
+            speech_stop: None,
         }
     }
 }
@@ -114,6 +115,13 @@ pub fn overlay(config: &mut Config, overrides: &BTreeMap<String, Value>) {
 pub struct BridgeRestore {
     pub translate: Option<bool>,
     pub speech: Option<bool>,
+    pub speech_stop: Option<SpeechStop>,
+}
+
+#[derive(Clone, Copy)]
+pub enum SpeechStop {
+    Withdraw,
+    Fence(mozart_core::speech::StopFence),
 }
 
 #[cfg(test)]

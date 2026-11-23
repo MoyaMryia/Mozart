@@ -5,7 +5,7 @@
 
 use mozart_core::ctl::{self, Seqpacket};
 use mozart_core::dgram::FrameSocket;
-use mozart_core::OutputFrame;
+use mozart_core::SpeechFrame;
 use serde_json::{json, Value};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, ExitStatus};
@@ -175,7 +175,7 @@ fn stub_process_control_and_clean_exit() {
 fn job_submit_reply_and_output_frames() {
     let dir = run_dir("job");
     // 接收方先绑定 tts-out.sock（模拟 pre）：TTS 惰性建链后逐帧送达。
-    let rx = FrameSocket::<OutputFrame>::bind(&dir.join("tts-out.sock"), 8).unwrap();
+    let rx = FrameSocket::<SpeechFrame>::bind(&dir.join("tts-out.sock"), 8).unwrap();
     let mut child = spawn_tts(&dir, "");
     wait_sockets(&dir);
 
@@ -185,10 +185,11 @@ fn job_submit_reply_and_output_frames() {
     });
     let jobs = Seqpacket::connect(&dir.join("tts-jobs.sock")).unwrap();
 
+    let issued_ns = mozart_core::speech::monotonic_ns();
     let reply = submit_job(
         &jobs,
         42,
-        &json!({"text": "Hello world", "utterance_id": "ab12cd34:1"}),
+        &json!({"text": "Hello world", "utterance_id": "ab12cd34:1", "issued_ns": issued_ns}),
     );
     assert_eq!(reply["status"], "ok");
     assert_eq!(reply["code"], ctl::CODE_OK);
@@ -210,7 +211,9 @@ fn job_submit_reply_and_output_frames() {
     for idx in 0..5u32 {
         let frame = rx.recv(Some(Duration::from_secs(2))).unwrap();
         // packed 字段经解构按值读取，不能取引用。
-        let mozart_core::FrameMeta { frame_idx, pts_ns, vad_flag, .. } = frame.meta;
+        let stamp = frame.issued_ns;
+        assert_eq!(stamp, issued_ns);
+        let mozart_core::FrameMeta { frame_idx, pts_ns, vad_flag, .. } = frame.frame.meta;
         assert_eq!(frame_idx, idx);
         assert_eq!(pts_ns, idx as u64 * 20_000_000);
         assert_eq!(vad_flag, 1);

@@ -94,6 +94,14 @@ pub fn expect_known(msg: &Message, known: &[u16]) -> Result<(), Vec<u8>> {
 }
 
 pub fn serve(args: StubArgs, mut handler: impl FnMut(&Message) -> Vec<u8>) -> ! {
+    serve_optional_reply(args, |msg| Some(handler(msg)))
+}
+
+/// `None` closes the current connection without acknowledging the message.
+pub fn serve_optional_reply(
+    args: StubArgs,
+    mut handler: impl FnMut(&Message) -> Option<Vec<u8>>,
+) -> ! {
     if let Some(delay) = args.exit_after {
         std::thread::spawn(move || {
             std::thread::sleep(delay);
@@ -152,7 +160,7 @@ pub fn serve(args: StubArgs, mut handler: impl FnMut(&Message) -> Vec<u8>) -> ! 
                 let _ = log.write_all(line.as_bytes());
             }
             std::thread::sleep(args.reply_delay);
-            let reply = handler(&msg);
+            let Some(reply) = handler(&msg) else { break };
             if let Err(err) = conn.send(type_, request_id, &reply) {
                 eprintln!("{}: send: {err}", args.name);
                 break;

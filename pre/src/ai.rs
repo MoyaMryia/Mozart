@@ -92,9 +92,9 @@ impl Sender {
 /// 接收线程共享主体：绑定好的 output_socket → 接收环。
 /// 路由/播报相关丢弃由播放线程消费时决定，本线程只搬运。
 /// 返回 Err 表示致命 socket 错误；主线程据此退出进程。
-fn recv_loop_inner(
-    socket: FrameSocket<OutputFrame>,
-    ring: Arc<Ring<OutputFrame>>,
+fn recv_loop_inner<F: mozart_core::dgram::WirePacket>(
+    socket: FrameSocket<F>,
+    ring: Arc<Ring<F>>,
     shared: Arc<Shared>,
     stop: &'static AtomicBool,
     label: &str,
@@ -184,8 +184,8 @@ pub fn recv_loop(
 /// tts 播报支路接收线程：tts-out.sock → 播报接收环。坏包丢弃计入 tts_recv_dropped，
 /// 与播报环满丢最旧（控制线程读环）一并经 consumer_drops["tts"] 上报 GetStatus。
 pub fn tts_recv_loop(
-    socket: FrameSocket<OutputFrame>,
-    ring: Arc<Ring<OutputFrame>>,
+    socket: FrameSocket<mozart_core::SpeechFrame>,
+    ring: Arc<Ring<mozart_core::SpeechFrame>>,
     shared: Arc<Shared>,
     stop: &'static AtomicBool,
 ) -> Result<(), String> {
@@ -336,7 +336,10 @@ mod tests {
             rvc_dropped: 0,
             tts_dropped: 0,
         });
-        assert_eq!(status.consumer_drops["asr"], 3, "asr 未绑定：3 帧全部丢弃计数");
+        assert_eq!(
+            status.consumer_drops["asr"], 3,
+            "asr 未绑定：3 帧全部丢弃计数"
+        );
         assert_eq!(status.consumer_drops["rvc"], 0, "asr 丢弃不得串入 rvc 计数");
 
         let rx = FrameSocket::<InputFrame>::bind(&path, SEND_BUFFER_FRAMES).unwrap();
@@ -488,7 +491,12 @@ mod tests {
 
         let frame = OutputFrame::new_48k(
             FrameMeta {
-                pts_ns: 42, frame_idx: 7, vad_flag: 1, energy_db: 0, conf: 0, segment_id: 0,
+                pts_ns: 42,
+                frame_idx: 7,
+                vad_flag: 1,
+                energy_db: 0,
+                conf: 0,
+                segment_id: 0,
             },
             [0.5; mozart_core::OUTPUT_SAMPLES],
         );
@@ -522,7 +530,12 @@ mod tests {
         };
         let frame = OutputFrame::new_48k(
             FrameMeta {
-                pts_ns: 1, frame_idx: 1, vad_flag: 1, energy_db: 0, conf: 0, segment_id: 0,
+                pts_ns: 1,
+                frame_idx: 1,
+                vad_flag: 1,
+                energy_db: 0,
+                conf: 0,
+                segment_id: 0,
             },
             [0.25; mozart_core::OUTPUT_SAMPLES],
         );
@@ -604,7 +617,12 @@ mod tests {
         let tx = connect_output(&path, Duration::from_secs(2));
         let frame = OutputFrame::new_48k(
             FrameMeta {
-                pts_ns: 9, frame_idx: 9, vad_flag: 1, energy_db: 0, conf: 0, segment_id: 0,
+                pts_ns: 9,
+                frame_idx: 9,
+                vad_flag: 1,
+                energy_db: 0,
+                conf: 0,
+                segment_id: 0,
             },
             [0.5; mozart_core::OUTPUT_SAMPLES],
         );
@@ -623,9 +641,9 @@ mod tests {
     fn tts_recv_loop_pushes_frames_and_stops_on_flag() {
         let dir = socket_dir("tts-recv");
         let path = dir.join("tts-out.sock");
-        let rx = FrameSocket::<OutputFrame>::bind(&path, TTS_QUEUE_FRAMES).unwrap();
-        let tx = FrameSocket::<OutputFrame>::connect(&path, TTS_QUEUE_FRAMES).unwrap();
-        let ring = Arc::new(Ring::<OutputFrame>::new(TTS_QUEUE_FRAMES));
+        let rx = FrameSocket::<mozart_core::SpeechFrame>::bind(&path, TTS_QUEUE_FRAMES).unwrap();
+        let tx = FrameSocket::<mozart_core::SpeechFrame>::connect(&path, TTS_QUEUE_FRAMES).unwrap();
+        let ring = Arc::new(Ring::<mozart_core::SpeechFrame>::new(TTS_QUEUE_FRAMES));
         let shared = Arc::new(test_shared("cap", "play", "startup"));
         let stop: &'static AtomicBool = Box::leak(Box::new(AtomicBool::new(false)));
         let worker = {
@@ -645,9 +663,13 @@ mod tests {
             },
             [0.5; mozart_core::OUTPUT_SAMPLES],
         );
-        tx.send(&frame).unwrap();
+        tx.send(&mozart_core::SpeechFrame {
+            issued_ns: 1,
+            frame,
+        })
+        .unwrap();
         let got = ring.pop(Some(Duration::from_secs(1))).unwrap();
-        let FrameMeta { frame_idx, .. } = got.meta;
+        let FrameMeta { frame_idx, .. } = got.frame.meta;
         assert_eq!(frame_idx, 7, "接收线程必须把播报帧推入播报环");
 
         stop.store(true, Ordering::Relaxed);

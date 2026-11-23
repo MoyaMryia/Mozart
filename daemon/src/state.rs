@@ -1,6 +1,6 @@
 use mozart_core::ctl::schema::{
     Activity, ArbiterState, AsrStatus, BridgeStatus, DaemonInfo, EnhanceStatus, ExitInfo, GpuState,
-    HardwareStatus, PreStatus, ProcessInfo, ProcessState, Processes, Route, RouteState, RvcStatus,
+    HardwareStatus, OutputModeStatus, PreStatus, ProcessInfo, ProcessState, Processes, Route, RouteState, RvcStatus,
     Status, TtsStatus,
 };
 use std::sync::{Mutex, MutexGuard};
@@ -51,13 +51,24 @@ pub fn lock_state(state: &Mutex<State>) -> MutexGuard<'_, State> {
         .unwrap_or_else(|poisoned| poisoned.into_inner())
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum RvcLease {
+    Idle,
+    Realtime,
+    ReturningRealtime,
+    File,
+}
+
+const REALTIME_RETURN_REASON: &str = "rvc realtime return:";
+
 pub struct State {
     started: Instant,
     route_desired: Route,
     route_active: Route,
+    pub(crate) output_mode: Option<OutputModeStatus>,
     route_since_unix_ms: u64,
     mute: bool,
-    gpu_owner: Option<Activity>,
+    rvc_lease: RvcLease,
     processes: Processes,
     enhance: Option<EnhanceStatus>,
     pre: Option<PreStatus>,
@@ -90,9 +101,10 @@ impl State {
             started: Instant::now(),
             route_desired: Route::Direct,
             route_active: Route::Direct,
+            output_mode: None,
             route_since_unix_ms: now_unix_ms(),
             mute: false,
-            gpu_owner: None,
+            rvc_lease: RvcLease::Idle,
             pre_startup_id: None,
             processes: Processes {
                 enhance: ProcessInfo::stopped(),
@@ -130,10 +142,11 @@ impl State {
                 active: self.route_active,
                 since_unix_ms: self.route_since_unix_ms,
             },
+            output_mode: self.output_mode.clone(),
             mute: self.mute,
             arbiter: ArbiterState {
                 gpu: GpuState {
-                    owner: self.gpu_owner,
+                    owner: self.gpu_owner(),
                 },
             },
             processes: self.processes.clone(),
@@ -176,7 +189,28 @@ impl State {
     }
 
     pub fn gpu_owner(&self) -> Option<Activity> {
-        self.gpu_owner
+        match self.rvc_lease {
+            RvcLease::Idle => None,
+            RvcLease::Realtime | RvcLease::ReturningRealtime => Some(Activity::Realtime),
+            RvcLease::File => Some(Activity::File),
+        }
+    }
+
+    pub fn realtime_return_pending(&self) -> bool {
+        self.rvc_lease == RvcLease::ReturningRealtime
+    }
+
+    /// A stop ACK is evidence the RVC worker has finished. A lost or rejected
+    /// ACK is not evidence of release, even with the output routed to direct.
+    pub fn record_realtime_return(&mut self, failure: Option<String>) {
+        self.clear_degraded_prefix(REALTIME_RETURN_REASON);
+        self.rvc_lease = match failure {
+            None => RvcLease::Idle,
+            Some(reason) => {
+                self.push_degraded(format!("{REALTIME_RETURN_REASON} {reason}"));
+                RvcLease::ReturningRealtime
+            }
+        };
     }
 
     /// 最近一次轮询是否拿到 rvc 状态（可接受 LoadModel/StartStream）。
@@ -198,32 +232,28 @@ impl State {
         }
     }
 
-    /// 实时路由切换落地：desired/active/GPU 归属一次写齐。
-    /// 前置：gpu_owner 为 File 时不得调用（route_set 已先行分流）。
-    /// 本函数只写实时归属（Rvc→Realtime、Direct→None）；全局不变量见
-    /// file::arbitrate（Direct 不蕴含 gpu_owner 为 None，文件任务期间即如此）。
+    /// 提交路由意图和已确认的路由。直通不自动释放 RVC 租约。
     pub fn commit_route(&mut self, route: Route) {
         if self.route_active != route || self.route_desired != route {
             self.route_since_unix_ms = now_unix_ms();
         }
         self.route_desired = route;
         self.route_active = route;
-        self.gpu_owner = match route {
-            Route::Rvc => Some(Activity::Realtime),
-            Route::Direct => None,
-        };
+        if route == Route::Rvc {
+            self.rvc_lease = RvcLease::Realtime;
+        }
     }
 
     /// 文件任务启动时 claim GPU。调用方（poller 仲裁）持 transition 锁
     /// 且已确认 gpu_owner 为 None。
     pub fn claim_gpu_file(&mut self) {
-        self.gpu_owner = Some(Activity::File);
+        self.rvc_lease = RvcLease::File;
     }
 
     /// 文件任务收尾时释放 GPU。调用方持 transition 锁；
     /// 任务执行期间路由切换只动 desired，不会改走 File 归属。
     pub fn release_gpu_file(&mut self) {
-        self.gpu_owner = None;
+        self.rvc_lease = RvcLease::Idle;
     }
 
     pub fn commit_mute(&mut self, mute: bool) {

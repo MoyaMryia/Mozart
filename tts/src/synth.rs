@@ -236,22 +236,7 @@ pub fn run_with(
         Some(reference) => (reference.samples.as_slice(), reference.sample_rate),
         None => (&[][..], 0),
     };
-    let mut epoch = shared.job_epoch();
     while !stop.load(Relaxed) {
-        // 任务代际推进（TTS_JOB_STOP）：清空在队任务并计数。队列接收端归本线程
-        // 独占，jobs 线程只推进代际，由这里在下一轮（≤ QUEUE_POLL）排空。
-        let current = shared.job_epoch();
-        if current != epoch {
-            epoch = current;
-            let mut cleared = 0u64;
-            while jobs.try_recv().is_ok() {
-                shared.queue_pop();
-                cleared += 1;
-            }
-            if cleared > 0 {
-                shared.add_stopped(cleared);
-            }
-        }
         let job = match jobs.recv_timeout(QUEUE_POLL) {
             Ok(job) => job,
             Err(RecvTimeoutError::Timeout) => continue,
@@ -261,7 +246,8 @@ pub fn run_with(
         if stop.load(Relaxed) {
             break;
         }
-        let abort = shared.abort(stop);
+        let abort = shared.abort_job(stop, job.issued_ns);
+        if abort.aborted() { shared.add_stopped(1); continue; }
         shared.set_synthesizing(true);
         let text = precondition(&job.text);
         let cap_s = duration_cap_s(job.text.chars().count());
@@ -501,11 +487,11 @@ mod tests {
 
     /// 临时输出 socket + 接收方 + writer + shared。接收方先绑定（模拟 pre），
     /// writer 惰性建链后逐帧送达；_rx 保持存活到用例结束。
-    fn writer_fixture(tag: &str) -> (PathBuf, FrameWriter, Arc<Shared>, FrameSocket<OutputFrame>) {
+    fn writer_fixture(tag: &str) -> (PathBuf, FrameWriter, Arc<Shared>, FrameSocket<mozart_core::SpeechFrame>) {
         let dir = std::env::temp_dir().join(format!("mozart-tts-synth-{tag}-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join("out.sock");
-        let rx = FrameSocket::<OutputFrame>::bind(&path, 8).unwrap();
+        let rx = FrameSocket::<mozart_core::SpeechFrame>::bind(&path, 8).unwrap();
         let shared = Arc::new(Shared::new());
         let writer = FrameWriter::new(path.clone(), shared.clone());
         (path, writer, shared, rx)
@@ -517,7 +503,7 @@ mod tests {
     }
 
     fn job(id: &str) -> Job {
-        Job { text: "Hello world".to_string(), utterance_id: id.to_string() }
+        Job { issued_ns: mozart_core::speech::monotonic_ns(), text: "Hello world".to_string(), utterance_id: id.to_string() }
     }
 
     #[test]
@@ -616,7 +602,7 @@ mod tests {
         let (tx, rx) = mpsc::sync_channel(4);
         let stop = AtomicBool::new(false);
         let engine = FakeEngine { rate: TTS_NATIVE_SAMPLE_RATE, outcome: Ok(vec![0.1; 120000]), hook: None };
-        tx.send(Job { text: "x".to_string(), utterance_id: "a:1".to_string() }).unwrap();
+        tx.send(Job { issued_ns: mozart_core::speech::monotonic_ns(), text: "x".to_string(), utterance_id: "a:1".to_string() }).unwrap();
         shared.queue_push();
         drop(tx);
         run_with(rx, &engine, None, &mut writer, &shared, &stop);
@@ -730,7 +716,7 @@ mod tests {
                     if idx == 0 {
                         first.store(start.elapsed().as_millis() as u64, Relaxed);
                     }
-                    let mozart_core::FrameMeta { frame_idx, .. } = frame.meta;
+                    let mozart_core::FrameMeta { frame_idx, .. } = frame.frame.meta;
                     assert_eq!(frame_idx, idx, "帧序号须跨段连续");
                 }
             })
@@ -811,8 +797,8 @@ mod tests {
 
         let f0 = rx.recv(Some(Duration::from_secs(2))).unwrap();
         let f1 = rx.recv(Some(Duration::from_secs(2))).unwrap();
-        let p0 = f0.pcm;
-        let p1 = f1.pcm;
+        let p0 = f0.frame.pcm;
+        let p1 = f1.frame.pcm;
         assert!((p0[0] - TARGET_PEAK).abs() < 1e-6);
         assert!((p1[0] - 0.25).abs() < 1e-6, "次段须沿用 0.5 增益：{}", p1[0]);
         cleanup(&path);
