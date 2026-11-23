@@ -65,6 +65,7 @@ pub fn run(
     ring: Arc<Ring<CapturedFrame>>,
     shared: Arc<Shared>,
     stop: &'static AtomicBool,
+    mut probe: Option<crate::aec_probe::Stream>,
 ) -> Result<(), String> {
     let mut stereo = [0i16; PERIOD_FRAMES * 2];
     let mut block = [0f32; RAW_SAMPLES];
@@ -74,9 +75,20 @@ pub fn run(
     let mut reported = 0u64;
     loop {
         if shared.capture_switch.has_pending() {
+            let timestamp = probe.is_some();
             shared.capture_switch.apply_pending(
-                |target| alsa_stream::open_and_verify_io("capture", target, Direction::Capture),
+                |target| {
+                    alsa_stream::open_and_verify_io(
+                        "capture",
+                        target,
+                        Direction::Capture,
+                        timestamp,
+                    )
+                },
                 |_, new_pcm| {
+                    if let Some(probe) = &mut probe {
+                        probe.discontinuity();
+                    }
                     pcm = new_pcm;
                     filled = 0;
                     shared.bump_capture_epoch();
@@ -97,6 +109,7 @@ pub fn run(
             stop,
             shared.capture_switch.pending_flag(),
             &mut overruns,
+            probe.as_mut(),
         ) {
             Ok(()) => {}
             Err(StreamError::Cancelled) => return Ok(()),

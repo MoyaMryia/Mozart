@@ -3,7 +3,8 @@
 //! `ESTRPIPE` 走 resume；1 s 无进展返回 `NoProgress`；停止请求返回 `Cancelled`。
 //! 实时线程约束：稳态路径无堆分配；错误分支的字符串构造只在降级时发生。
 
-use alsa::pcm::{Access, Format, HwParams, IO, PCM};
+use crate::aec_probe;
+use alsa::pcm::{Access, Format, HwParams, TstampType, IO, PCM};
 use alsa::{Direction, ValueOr};
 use mozart_core::RAW_SAMPLE_RATE;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -37,14 +38,17 @@ fn step<T>(context: &str, result: alsa::Result<T>) -> Result<T, String> {
 /// start_threshold=1（旧 capture.c / playback.c）。
 /// 采集缓冲 = period × 4；播放缓冲 = max(period × 4, period + 960)，
 /// 后者保证一整帧 960 一次写入可容纳（旧 playback.c:74-76）。
-pub fn open(device: &str, dir: Direction) -> Result<PCM, String> {
+pub fn open(device: &str, dir: Direction, timestamp: bool) -> Result<PCM, String> {
     // nonblock=true 映射 SND_PCM_NONBLOCK。
     let pcm = step("open", PCM::new(device, dir, true))?;
     let hw = step("hw_params_any", HwParams::any(&pcm))?;
     step("set_access", hw.set_access(Access::RWInterleaved))?;
     step("set_format", hw.set_format(Format::s16()))?;
     step("set_channels", hw.set_channels(2))?;
-    let rate = step("set_rate_near", hw.set_rate_near(RAW_SAMPLE_RATE, ValueOr::Nearest))?;
+    let rate = step(
+        "set_rate_near",
+        hw.set_rate_near(RAW_SAMPLE_RATE, ValueOr::Nearest),
+    )?;
     if rate != RAW_SAMPLE_RATE {
         return Err(format!(
             "set_rate_near: device gave {rate} Hz, want {RAW_SAMPLE_RATE}"
@@ -58,11 +62,18 @@ pub fn open(device: &str, dir: Direction) -> Result<PCM, String> {
         Direction::Capture => period * N_PERIODS,
         Direction::Playback => (period * N_PERIODS).max(period + mozart_core::RAW_SAMPLES),
     };
-    step("set_buffer_size_near", hw.set_buffer_size_near(buffer as i64))?;
+    step(
+        "set_buffer_size_near",
+        hw.set_buffer_size_near(buffer as i64),
+    )?;
     step("hw_params", pcm.hw_params(&hw))?;
 
     let sw = step("sw_params_current", pcm.sw_params_current())?;
     step("set_start_threshold", sw.set_start_threshold(1))?;
+    if timestamp {
+        step("set_tstamp_mode", sw.set_tstamp_mode(true))?;
+        step("set_tstamp_type", sw.set_tstamp_type(TstampType::Monotonic))?;
+    }
     step("sw_params", pcm.sw_params(&sw))?;
     drop(sw);
 
@@ -82,9 +93,15 @@ pub fn log_stream_setup(role: &str, device: &str, pcm: &PCM) {
     }
 }
 
-pub fn open_and_verify_io(role: &str, device: &str, dir: Direction) -> Result<PCM, String> {
-    let pcm = open(device, dir)?;
-    pcm.io_i16().map_err(|err| format!("{role} io_i16: {err}"))?;
+pub fn open_and_verify_io(
+    role: &str,
+    device: &str,
+    dir: Direction,
+    timestamp: bool,
+) -> Result<PCM, String> {
+    let pcm = open(device, dir, timestamp)?;
+    pcm.io_i16()
+        .map_err(|err| format!("{role} io_i16: {err}"))?;
     log_stream_setup(role, device, &pcm);
     Ok(pcm)
 }
@@ -107,6 +124,7 @@ pub fn transfer(
     stop: &AtomicBool,
     reopen: &AtomicBool,
     xruns: &mut u64,
+    mut probe: Option<&mut aec_probe::Stream>,
 ) -> Result<(), StreamError> {
     let mut deadline = Instant::now() + NO_PROGRESS;
     let mut done = 0usize;
@@ -141,6 +159,9 @@ pub fn transfer(
             match result {
                 Ok(0) => {} // 无进展：不重置期限，等 2 ms 再试。
                 Ok(n) => {
+                    if let Some(probe) = &mut probe {
+                        probe.observe(pcm, &chunk[..n * 2]);
+                    }
                     done += n;
                     deadline = Instant::now() + NO_PROGRESS;
                     if done == frames {
@@ -150,10 +171,18 @@ pub fn transfer(
                 }
                 Err(err) => match err.errno() {
                     libc::EPIPE => {
+                        if let Some(probe) = &mut probe {
+                            probe.discontinuity();
+                        }
                         *xruns += 1;
                         step("prepare", pcm.prepare()).map_err(StreamError::Fatal)?;
                     }
-                    libc::ESTRPIPE => suspended = true,
+                    libc::ESTRPIPE => {
+                        if let Some(probe) = &mut probe {
+                            probe.discontinuity();
+                        }
+                        suspended = true;
+                    }
                     libc::EAGAIN | libc::EINTR => {}
                     _ => return Err(StreamError::Fatal(format!("transfer: {err}"))),
                 },
