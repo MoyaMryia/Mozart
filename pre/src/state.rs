@@ -3,7 +3,7 @@
 
 use mozart_core::config::{PreConsumerConfig, PreDspConfig};
 use mozart_core::ctl;
-use mozart_core::ctl::schema::{PreStatus, Route};
+use mozart_core::ctl::schema::{PlayoutPolicy, PreStatus, Route};
 use std::collections::BTreeMap;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicU8, AtomicUsize, Ordering};
 use std::sync::{mpsc, Mutex};
@@ -317,8 +317,9 @@ pub enum OutputBinding {
 
 pub struct Shared {
     pub speech_cutoff: AtomicU64,
-    pub speech_request: AtomicU64,
-    pub speech_ack: AtomicU64,
+    pub playback_request: AtomicU64,
+    pub playback_ack: AtomicU64,
+    playout_policy: AtomicU8,
     route_target: AtomicU8,
     mute_target: AtomicBool,
     /// 文件接管状态（SPEC-03 状态门控交接）：控制线程写，处理线程与
@@ -381,8 +382,9 @@ impl Shared {
     ) -> Self {
         Self {
             speech_cutoff: AtomicU64::new(0),
-            speech_request: AtomicU64::new(0),
-            speech_ack: AtomicU64::new(0),
+            playback_request: AtomicU64::new(0),
+            playback_ack: AtomicU64::new(0),
+            playout_policy: AtomicU8::new(PlayoutPolicy::Legacy as u8),
             route_target: AtomicU8::new(route_code(Route::Direct)),
             mute_target: AtomicBool::new(false),
             file_gate: AtomicU64::new(0),
@@ -490,6 +492,19 @@ impl Shared {
 
     pub fn sends_idle(&self) -> bool {
         self.in_flight.load(Ordering::SeqCst) == 0
+    }
+
+    pub fn set_playout_policy(&self, policy: PlayoutPolicy) {
+        self.playout_policy.store(policy as u8, Ordering::SeqCst);
+    }
+
+    pub fn playout_policy(&self) -> PlayoutPolicy {
+        match self.playout_policy.load(Ordering::SeqCst) {
+            p if p == PlayoutPolicy::RealtimeOnly as u8 => PlayoutPolicy::RealtimeOnly,
+            p if p == PlayoutPolicy::BroadcastOnly as u8 => PlayoutPolicy::BroadcastOnly,
+            p if p == PlayoutPolicy::Silent as u8 => PlayoutPolicy::Silent,
+            _ => PlayoutPolicy::Legacy,
+        }
     }
 
     pub fn output_released(&self) -> bool {
@@ -644,6 +659,7 @@ impl Shared {
             self.tts_recv_dropped.load(Ordering::Relaxed) + queue.tts_dropped,
         );
         PreStatus {
+            playout_policy: self.playout_policy(),
             state: "running".to_string(),
             denoise_backend: if self.enhancement.is_some() {
                 "ulunas"

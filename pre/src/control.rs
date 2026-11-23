@@ -8,7 +8,7 @@ use crate::state::{DspSwitches, QueueReadout, Shared, VERSION};
 use mozart_core::config::validate_device_name;
 use mozart_core::ctl::schema::{
     error_body, ok_body, DeviceUseRequest, DspSetRequest, FileModeSetRequest, MuteSetRequest,
-    RouteSetRequest,
+    PlayoutPolicy, RouteSetRequest,
 };
 use mozart_core::ctl::{self, Message, Seqpacket, ACCEPT_POLL, IDLE_TIMEOUT, RECV_POLL};
 use mozart_core::dgram::FRAME_SIZE_MISMATCH_REASON;
@@ -236,6 +236,18 @@ fn dispatch(
     )
 }
 
+fn wait_playback_boundary(shared: &Shared, stop: &AtomicBool) -> bool {
+    let request = shared.playback_request.fetch_add(1, Ordering::SeqCst) + 1;
+    let deadline = Instant::now() + Duration::from_secs(1);
+    while shared.playback_ack.load(Ordering::SeqCst) < request {
+        if stop.load(Ordering::Relaxed) || Instant::now() >= deadline {
+            return false;
+        }
+        std::thread::sleep(Duration::from_millis(1));
+    }
+    true
+}
+
 /// 命令分发。请求体是外部输入，在此校验一次；内部执行信任已校验的值。
 #[allow(clippy::too_many_arguments)]
 fn dispatch_with_stop(
@@ -266,6 +278,17 @@ fn dispatch_with_stop(
             Ok(request) => {
                 shared.set_mute_target(request.mute);
                 ok_body(json!({"mute": request.mute}))
+            }
+            Err(err) => error_body(ctl::CODE_INVALID_ARGUMENT, &err.to_string()),
+        },
+        ctl::PRE_SET_PLAYOUT => match serde_json::from_value::<PlayoutPolicy>(body) {
+            Ok(policy) => {
+                shared.set_playout_policy(policy);
+                if wait_playback_boundary(shared, stop) {
+                    ok_body(json!({"policy": policy}))
+                } else {
+                    error_body(ctl::CODE_NOT_READY, "playout acknowledgement timed out")
+                }
             }
             Err(err) => error_body(ctl::CODE_INVALID_ARGUMENT, &err.to_string()),
         },
@@ -366,16 +389,8 @@ fn dispatch_with_stop(
                     .speech_cutoff
                     .fetch_max(fence.cutoff_ns, Ordering::SeqCst)
                     .max(fence.cutoff_ns);
-                let request = shared.speech_request.fetch_add(1, Ordering::SeqCst) + 1;
-                let deadline = Instant::now() + Duration::from_secs(1);
-                while shared.speech_ack.load(Ordering::SeqCst) < request {
-                    if Instant::now() >= deadline {
-                        return error_body(
-                            ctl::CODE_NOT_READY,
-                            "speech stop playback acknowledgement timed out",
-                        );
-                    }
-                    std::thread::sleep(Duration::from_millis(1));
+                if !wait_playback_boundary(shared, stop) {
+                    return error_body(ctl::CODE_NOT_READY, "speech stop playback acknowledgement timed out");
                 }
                 return ok_body(json!({"stopped": true, "cutoff_ns": cutoff}));
             }

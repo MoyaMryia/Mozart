@@ -5,7 +5,7 @@ use crate::services::{self, Services};
 use crate::state::{lock_state, State};
 use crate::state_file::{BridgeRestore, StateFile};
 use mozart_core::config::Config;
-use mozart_core::ctl::schema::{OutputMode, OutputModeStatus, OutputPhase, Route};
+use mozart_core::ctl::schema::{OutputMode, OutputModeStatus, OutputPhase, PlayoutPolicy, Route};
 use std::sync::{Mutex, TryLockError};
 
 /// Called under the transition lock. A newer request withdraws an uncommitted route intent.
@@ -29,6 +29,7 @@ pub fn request(state: &mut State, mode: OutputMode) -> OutputModeStatus {
 pub fn unmanage(state: &mut State) {
     if state.output_mode.take().is_some() {
         state.set_route_desired(state.route_active());
+        state.playout_policy = PlayoutPolicy::Legacy;
     }
 }
 
@@ -54,10 +55,32 @@ pub fn tick(
         Err(TryLockError::Poisoned(error)) => error.into_inner(),
     };
 
+    let broadcast = current.requested == OutputMode::Broadcast;
     let phase = match current.phase {
         OutputPhase::ClosingSpeech => {
-            services::advance_speech_stop(state, services, state_file, &mut bridge)
-                .map(|_| Some(OutputPhase::Routing))
+            services::advance_speech_stop(state, services, state_file, &mut bridge).map(|_| {
+                Some(if broadcast {
+                    OutputPhase::ConfiguringPlayout
+                } else {
+                    OutputPhase::Routing
+                })
+            })
+        }
+        OutputPhase::ConfiguringPlayout => {
+            let policy = if broadcast {
+                PlayoutPolicy::BroadcastOnly
+            } else {
+                PlayoutPolicy::RealtimeOnly
+            };
+            // A lost reply may have changed pre already. Reassert the same policy on restart.
+            lock_state(state).playout_policy = policy;
+            services.assert_playout(policy).map(|_| {
+                Some(if broadcast {
+                    OutputPhase::Routing
+                } else {
+                    OutputPhase::Applied
+                })
+            })
         }
         OutputPhase::Routing => {
             let route = if current.requested == OutputMode::Rvc {
@@ -69,24 +92,27 @@ pub fn tick(
                 let state = lock_state(state);
                 if state.route_active() != route || state.realtime_return_pending() {
                     None
-                } else if current.requested == OutputMode::Broadcast {
+                } else if broadcast {
                     Some(OutputPhase::OpeningSpeech)
                 } else {
-                    Some(OutputPhase::Applied)
+                    Some(OutputPhase::ConfiguringPlayout)
                 }
             })
         }
-        OutputPhase::OpeningSpeech => services::speech_set(services, true).and_then(|data| {
-            if data["speech_enabled"] == true {
-                bridge.speech = None; // The selected mode, not a legacy override, owns this setting.
-                Ok(Some(OutputPhase::Applied))
-            } else {
-                Err((
-                    mozart_core::ctl::CODE_INTERNAL.into(),
-                    "bridge did not confirm new speech admission".into(),
-                ))
-            }
-        }),
+        OutputPhase::OpeningSpeech => services
+            .tts_ready()
+            .and_then(|()| services::speech_set(services, true))
+            .and_then(|data| {
+                if data["speech_enabled"] == true {
+                    bridge.speech = None; // The selected mode, not a legacy override, owns this setting.
+                    Ok(Some(OutputPhase::Applied))
+                } else {
+                    Err((
+                        mozart_core::ctl::CODE_INTERNAL.into(),
+                        "bridge did not confirm new speech admission".into(),
+                    ))
+                }
+            }),
         OutputPhase::Applied => return,
     };
     match phase {
@@ -102,6 +128,24 @@ pub fn tick(
         current.applied = Some(current.requested);
     }
     lock_state(state).output_mode = Some(current);
+}
+
+/// Called under the transition lock. Restarted pre begins silent with a fresh local cutoff.
+pub fn observe_pre_playout(state: &mut State, pre: &mozart_core::ctl::schema::PreStatus) {
+    if state.playout_startup_id.as_deref() == Some(pre.startup_id.as_str()) {
+        return;
+    }
+    state.playout_startup_id = Some(pre.startup_id.clone());
+    if state.playout_policy != PlayoutPolicy::BroadcastOnly {
+        return;
+    }
+    state.playout_policy = PlayoutPolicy::Silent;
+    if let Some(mode) = state.output_mode.as_mut() {
+        if mode.requested == OutputMode::Broadcast {
+            mode.phase = OutputPhase::ClosingSpeech;
+            mode.applied = None;
+        }
+    }
 }
 
 /// A restarted bridge must rejoin the selected policy instead of restoring its old user override.

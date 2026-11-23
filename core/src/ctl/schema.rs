@@ -54,6 +54,7 @@ pub enum OutputMode {
 #[serde(rename_all = "snake_case")]
 pub enum OutputPhase {
     ClosingSpeech,
+    ConfiguringPlayout,
     Routing,
     OpeningSpeech,
     Applied,
@@ -176,8 +177,22 @@ pub struct Processes {
     pub llama: ProcessInfo,
 }
 
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PlayoutPolicy {
+    #[default]
+    Legacy,
+    RealtimeOnly,
+    BroadcastOnly,
+    Silent,
+}
+
+pub const SUPERVISED_PLAYOUT_ENV: &str = "MOZART_SUPERVISED_PLAYOUT";
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PreStatus {
+    #[serde(default)]
+    pub playout_policy: PlayoutPolicy,
     #[serde(default)]
     pub enhancement: Option<PreEnhanceStatus>,
     #[serde(default = "default_denoise_backend")]

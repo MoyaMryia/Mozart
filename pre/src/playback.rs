@@ -10,7 +10,7 @@ use crate::alsa_stream::{self, Op, StreamError};
 use crate::route::{FadeIn, Mute, Router, FADE_SAMPLES};
 use crate::state::{Shared, Speaker};
 use alsa::Direction;
-use mozart_core::ctl::schema::Route;
+use mozart_core::ctl::schema::{PlayoutPolicy, Route};
 use mozart_core::ring::Ring;
 use mozart_core::{OutputFrame, RawFrame, OUTPUT_SAMPLES, RAW_SAMPLES, RAW_SAMPLE_RATE};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -182,6 +182,7 @@ fn apply_speaker_fade(
 fn step_broadcast(
     prev: Speaker,
     tts_frame: Option<OutputFrame>,
+    allow_realtime_tail: bool,
     trunk: &Ring<RawFrame>,
     rvc: &Ring<OutputFrame>,
     shared: &Shared,
@@ -189,7 +190,7 @@ fn step_broadcast(
     rvc_resampler: &mut BoundaryResampler,
 ) -> [f32; RAW_SAMPLES] {
     let mut realtime_tail = [0f32; RAW_SAMPLES];
-    if prev == Speaker::Realtime {
+    if allow_realtime_tail && prev == Speaker::Realtime {
         realtime_tail = match router.route() {
             Route::Direct => {
                 drain_rvc_skipped(rvc, shared);
@@ -294,14 +295,16 @@ pub fn run(
     let mut mute = Mute::new();
     let mut fade_in = FadeIn::new();
     let mut speaker = SpeakerScheduler::new();
+    let mut previous_speaker = Speaker::Realtime;
     let mut rvc_resampler = BoundaryResampler::new();
     let mut underruns = 0u64;
     let mut reported = 0u64;
     loop {
         // This boundary follows the previous ALSA write. Acknowledgement here
         // precedes selection using the installed cutoff.
-        let request = shared.speech_request.load(Ordering::SeqCst);
-        shared.speech_ack.store(request, Ordering::SeqCst);
+        let request = shared.playback_request.load(Ordering::SeqCst);
+        let policy = shared.playout_policy();
+        shared.playback_ack.store(request, Ordering::SeqCst);
         if shared.playback_switch.has_pending() {
             shared.playback_switch.apply_pending(
                 |target| alsa_stream::open_and_verify_io("playback", target, Direction::Playback),
@@ -321,19 +324,29 @@ pub fn run(
         mute.request(shared.mute_target());
 
         // 播报优先：仅播报连续发帧期给微抖动等待，holdoff 空窗期与实时态零等待。
+        let tts_allowed = matches!(policy, PlayoutPolicy::Legacy | PlayoutPolicy::BroadcastOnly);
+        let wait = if tts_allowed { speaker.poll_wait() } else { Duration::ZERO };
         let tts_frame = tts
-            .pop(Some(speaker.poll_wait()))
+            .pop(Some(wait))
+            .filter(|_| tts_allowed)
             .and_then(|tagged| select_speech(tagged, shared.speech_cutoff.load(Ordering::SeqCst)));
-        let prev = speaker.state;
-        let state = speaker.advance(tts_frame.is_some(), Instant::now());
+        let prev = previous_speaker;
+        let scheduled = speaker.advance(tts_frame.is_some(), Instant::now());
+        let state = match policy {
+            PlayoutPolicy::Legacy => scheduled,
+            PlayoutPolicy::RealtimeOnly => Speaker::Realtime,
+            PlayoutPolicy::BroadcastOnly | PlayoutPolicy::Silent => Speaker::Broadcast,
+        };
         if state != prev {
             shared.set_speaker_state(state);
+            previous_speaker = state;
         }
 
         let mut mono = match state {
             Speaker::Broadcast => step_broadcast(
                 prev,
                 tts_frame,
+                policy == PlayoutPolicy::Legacy,
                 &trunk,
                 &rvc,
                 &shared,
@@ -700,6 +713,24 @@ mod tests {
     }
 
     #[test]
+    fn exclusive_playout_has_no_microphone_tail_or_gap_audio() {
+        let shared = crate::state::test_shared("cap", "play", "startup");
+        let trunk = Ring::<RawFrame>::new(4);
+        let rvc = Ring::<OutputFrame>::new(4);
+        let mut router = Router::new(Route::Direct);
+        let mut resampler = BoundaryResampler::new();
+        let meta = FrameMeta { pts_ns: 0, frame_idx: 0, vad_flag: 1, energy_db: 0, conf: 0, segment_id: 0 };
+        trunk.push(RawFrame { meta, pcm: [0.8; RAW_SAMPLES] });
+        let gap = step_broadcast(Speaker::Realtime, None, false, &trunk, &rvc, &shared, &mut router, &mut resampler);
+        assert!(gap.iter().all(|&sample| sample == 0.0));
+        trunk.push(RawFrame { meta, pcm: [0.8; RAW_SAMPLES] });
+        let voiced = step_broadcast(Speaker::Broadcast, Some(OutputFrame::new_48k(meta, [0.25; OUTPUT_SAMPLES])), false,
+            &trunk, &rvc, &shared, &mut router, &mut resampler);
+        assert!(voiced.iter().all(|&sample| sample == 0.25));
+        assert!(trunk.pop(Some(Duration::ZERO)).is_none());
+    }
+
+    #[test]
     fn broadcast_isolates_router_fade_and_resets_resampler() {
         let shared = crate::state::test_shared("cap", "play", "startup");
         let trunk = Ring::<RawFrame>::new(4);
@@ -725,6 +756,7 @@ mod tests {
         let out1 = step_broadcast(
             Speaker::Broadcast,
             Some(OutputFrame::new_48k(meta, [0.5; OUTPUT_SAMPLES])),
+            true,
             &trunk,
             &rvc,
             &shared,
@@ -737,6 +769,7 @@ mod tests {
         let out2 = step_broadcast(
             Speaker::Broadcast,
             Some(OutputFrame::new_48k(meta, [0.5; OUTPUT_SAMPLES])),
+            true,
             &trunk,
             &rvc,
             &shared,

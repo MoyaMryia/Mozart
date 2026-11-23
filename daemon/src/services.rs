@@ -181,6 +181,29 @@ impl Services {
             .map_err(CallError::into_rejection)
     }
 
+    pub(crate) fn assert_playout(&self, policy: mozart_core::ctl::schema::PlayoutPolicy) -> Result<(), (String, String)> {
+        let body = json!(policy);
+        let reply = self.pre().call_ok(ctl::PRE_SET_PLAYOUT, body.to_string().as_bytes())
+            .map_err(CallError::into_rejection)?;
+        if reply.data["policy"] == body {
+            Ok(())
+        } else {
+            Err((ctl::CODE_INTERNAL.into(), "pre did not confirm playout policy".into()))
+        }
+    }
+
+    pub(crate) fn tts_ready(&self) -> Result<(), (String, String)> {
+        let reply = self.tts().call_ok(ctl::TTS_GET_STATUS, b"{}")
+            .map_err(CallError::into_rejection)?;
+        let status: TtsStatus = serde_json::from_value(reply.data)
+            .map_err(|err| (ctl::CODE_INTERNAL.into(), format!("tts status: {err}")))?;
+        if status.model_loaded {
+            Ok(())
+        } else {
+            Err((ctl::CODE_NOT_READY.into(), "TTS model not loaded".into()))
+        }
+    }
+
     /// 文件接管开关（PRE_SET_FILE_MODE）：active=true 让 pre 暂停 rvc AI
     /// 发送并释放输出 socket（pre 确认交接完成才应答）；active=false 恢复。
     /// 返回时 pre 已确认释放或恢复绑定。
@@ -928,13 +951,17 @@ fn reconcile(
     rvc_status: Option<&RvcStatus>,
     degraded: &mut Vec<String>,
 ) {
-    let (active, mute, gpu_owner, returning_realtime) = {
-        let state = lock_state(state);
+    let (active, mute, gpu_owner, returning_realtime, playout) = {
+        let mut state = lock_state(state);
+        if let Some(pre) = pre_status {
+            crate::mode::observe_pre_playout(&mut state, pre);
+        }
         (
             state.route_active(),
             state.mute(),
             state.gpu_owner(),
             state.realtime_return_pending(),
+            state.playout_policy,
         )
     };
 
@@ -952,6 +979,11 @@ fn reconcile(
     };
 
     if let Some(status) = pre_status {
+        if status.playout_policy != playout {
+            if let Err((code, reason)) = services.assert_playout(playout) {
+                degraded.push(format!("pre playout: {code}: {reason}"));
+            }
+        }
         if status.route != active && rvc_route_ready {
             if let Err(err) = set_pre_route(services, active) {
                 degraded.push(format!("pre route apply: {}", err.describe()));

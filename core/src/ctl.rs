@@ -107,6 +107,7 @@ pub const PRE_SET_DSP: u16 = 0x0207;
 /// 体：schema::DeviceUseRequest {"kind","device"}；
 /// 运行中热替换采集/播放 ALSA 句柄，data 回 {"kind","device","previous_device"}。
 pub const PRE_SET_DEVICE: u16 = 0x0208;
+pub const PRE_SET_PLAYOUT: u16 = 0x0209;
 
 pub const RVC_HELLO: u16 = 0x0301;
 pub const RVC_LOAD_MODEL: u16 = 0x0302;
@@ -684,6 +685,7 @@ mod tests {
         assert_eq!(PRE_SET_FILE_MODE, 0x0206);
         assert_eq!(PRE_SET_DSP, 0x0207);
         assert_eq!(PRE_SET_DEVICE, 0x0208);
+        assert_eq!(PRE_SET_PLAYOUT, 0x0209);
         assert_eq!(ENHANCE_HELLO, 0x0701);
         assert_eq!(ENHANCE_GET_STATUS, 0x0702);
     }
@@ -725,6 +727,7 @@ mod tests {
         ("PRE_SET_FILE_MODE", PRE_SET_FILE_MODE),
         ("PRE_SET_DSP", PRE_SET_DSP),
         ("PRE_SET_DEVICE", PRE_SET_DEVICE),
+        ("PRE_SET_PLAYOUT", PRE_SET_PLAYOUT),
         ("RVC_HELLO", RVC_HELLO),
         ("RVC_LOAD_MODEL", RVC_LOAD_MODEL),
         ("RVC_START_STREAM", RVC_START_STREAM),

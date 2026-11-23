@@ -190,7 +190,7 @@ fn tts_stub_serves_control_plane() {
 
     let status = call(&conn, ctl::TTS_GET_STATUS, b"");
     assert_eq!(status["data"]["state"], "idle");
-    assert_eq!(status["data"]["model_loaded"], false);
+    assert_eq!(status["data"]["model_loaded"], true);
 
     let unknown = call(&conn, ctl::ASR_HELLO, b"");
     assert_eq!(unknown["code"], "UnknownCommand");

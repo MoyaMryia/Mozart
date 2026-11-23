@@ -28,6 +28,7 @@ fn handle(msg: &Message) -> Vec<u8> {
         },
         ctl::TTS_GET_STATUS => {
             let status = TtsStatus {
+                model_loaded: true,
                 version: "0.1.0".to_string(),
                 ..Default::default()
             };

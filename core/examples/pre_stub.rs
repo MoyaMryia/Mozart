@@ -65,6 +65,7 @@ fn parse_pre_args() -> (StubArgs, PreOverrides) {
 struct State {
     route: &'static str,
     mute: bool,
+    playout_policy: mozart_core::ctl::schema::PlayoutPolicy,
     file_mode: Arc<AtomicBool>,
     /// daemon 权威断言标志（SPEC-04 单一权威）：启动 false，恒发支路静默，
     /// 首个 PRE_SET_FILE_MODE 置 true。重启同理，不单边 reclaim。
@@ -111,6 +112,11 @@ fn main() {
     let mut state = State {
         route: "direct",
         mute: false,
+        playout_policy: if std::env::var_os(mozart_core::ctl::schema::SUPERVISED_PLAYOUT_ENV).is_some() {
+            mozart_core::ctl::schema::PlayoutPolicy::Silent
+        } else {
+            mozart_core::ctl::schema::PlayoutPolicy::Legacy
+        },
         file_mode,
         mode_asserted,
         startup_id,
@@ -176,6 +182,7 @@ fn handle(msg: &Message, state: &mut State) -> Vec<u8> {
         ctl::PRE_SET_FILE_MODE,
         ctl::PRE_SET_DSP,
         ctl::PRE_SET_DEVICE,
+        ctl::PRE_SET_PLAYOUT,
     ];
     if let Err(reply) = expect_known(msg, &known) {
         return reply;
@@ -250,6 +257,15 @@ fn handle(msg: &Message, state: &mut State) -> Vec<u8> {
             state.mute = mute;
             ok(json!({"mute": state.mute}))
         }
+        ctl::PRE_SET_PLAYOUT => {
+            match serde_json::from_value(body) {
+                Ok(policy) => {
+                    state.playout_policy = policy;
+                    ok(json!({"policy": policy}))
+                }
+                Err(err) => fail(ctl::CODE_INVALID_ARGUMENT, &err.to_string()),
+            }
+        }
         ctl::PRE_SET_FILE_MODE => {
             let Some(active) = body.get("active").and_then(|value| value.as_bool()) else {
                 return fail(ctl::CODE_INVALID_ARGUMENT, "active must be a boolean");
@@ -279,6 +295,7 @@ fn handle(msg: &Message, state: &mut State) -> Vec<u8> {
                 ).unwrap()
             }),
             "route": state.route,
+            "playout_policy": state.playout_policy,
             "mute": state.mute,
             "capture_device": state.capture_device,
             "playback_device": state.playback_device,

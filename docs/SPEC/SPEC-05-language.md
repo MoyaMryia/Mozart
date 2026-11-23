@@ -72,7 +72,7 @@
 
 - [x] 复核后再翻译播报：开启复核（`refinement_status = pending`）时，`final` 仅落盘原文字幕不入翻译队列；待 `refined`（`completed` / `failed` / `skipped`）到达后才以最终原文触发单次翻译与 TTS 播报（含终态复核状态校验、空 PCM 防挂起与替换时清理旧纠错字段）。复核未开启（`disabled`）时直接在 `final` 触发一次，消除同一句重复翻译播报两次的问题。（`bridge/src/subtitles.rs`、`asr/src/decoder.rs:216`、`bridge/tests/process.rs`）
 - [x] 复核丢失后有界收敛：等待到 30 s 单调时限后标记复核跳过，用在线原文继续文字翻译且不补播。桥重启从存档尾部最多 1 MiB、128 条最近 final 按最高修订恢复；仍未决的复核立即标记中断，已完成不重放，迟到复核不覆盖结果。超出读取范围记日志；无法翻译时标明原因。
-- [x] 字幕常驻与播报解耦：由 `SetOutputMode` 切换时不关闭识别和翻译字幕；仅 `broadcast` 模式启用 TTS。用户单独关闭翻译是独立设置，不由模式切换改写。`broadcast` 在无播报帧时沿用直通路由。验收见[模式往返报告](../../reports/speech-fence-20261123/RESULTS.md)。
+- [x] 字幕常驻与播报解耦：由 `SetOutputMode` 切换时不关闭识别和翻译字幕；仅 `broadcast` 模式启用 TTS。用户单独关闭翻译是独立设置，不由模式切换改写。`broadcast` 在无播报帧时静音，不回落到直通输出。验收见[模式往返报告](../../reports/speech-fence-20261123/RESULTS.md)。
 - [ ] 端到端 STS 选型边界：8 GB Jetson 端侧暂不以本地端到端中译英 STS 替换现有 `ASR + LLM + TTS` 管线（受限于统一内存与流式生态）；后续若引入云端 STS，仅作为翻译播报模式的可选在线后端，本地管线保留为离线默认兜底。
 
 ## 回归检查

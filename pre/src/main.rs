@@ -322,6 +322,10 @@ fn main() -> ExitCode {
         consumers.clone(),
         state::DspSwitches::from_config(&config.pre.dsp),
     );
+    if std::env::var_os(mozart_core::ctl::schema::SUPERVISED_PLAYOUT_ENV).is_some() {
+        shared.set_playout_policy(mozart_core::ctl::schema::PlayoutPolicy::Silent);
+        shared.speech_cutoff.store(mozart_core::speech::monotonic_ns(), Ordering::SeqCst);
+    }
     if config.pre.capture_file.is_some() {
         shared
             .capture_switch

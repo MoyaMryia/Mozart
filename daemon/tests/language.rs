@@ -25,7 +25,7 @@ fn wait_language_ready(conn: &Seqpacket) {
 
 #[test]
 fn output_modes_switch_speech_and_route_without_restarting_asr() {
-    use mozart_core::ctl::schema::{OutputMode, OutputPhase, Route};
+    use mozart_core::ctl::schema::{OutputMode, OutputPhase, PlayoutPolicy, Route};
     let daemon = DaemonProcess::start("lang-output-mode", &example("pre_stub"), &example("rvc_stub"));
     let conn = daemon.connect();
     wait_language_ready(&conn);
@@ -48,7 +48,11 @@ fn output_modes_switch_speech_and_route_without_restarting_asr() {
             view.output_mode.is_some_and(|m| m.phase == OutputPhase::Applied && m.applied == Some(requested))
                 && view.route.active == route
                 && view.bridge.is_some_and(|b| b.speech_enabled == speaking && b.translate_enabled)
-                && view.pre.is_some_and(|p| p.route == route)
+                && view.pre.is_some_and(|p| p.route == route && p.playout_policy == if speaking {
+                    PlayoutPolicy::BroadcastOnly
+                } else {
+                    PlayoutPolicy::RealtimeOnly
+                })
         }), "mode did not apply: {:?}", status(&conn).output_mode);
         let current = status(&conn);
         assert_eq!(current.processes.asr.pid, pid);
@@ -66,7 +70,23 @@ fn output_modes_switch_speech_and_route_without_restarting_asr() {
             && view.output_mode.is_some_and(|m| m.applied == Some(OutputMode::Broadcast))
             && view.bridge.is_some_and(|b| b.speech_enabled)
     }));
+    let pre_pid = status(&conn).processes.pre.pid.unwrap();
+    // SAFETY: this PID is the supervised pre child of this fixture.
+    assert_eq!(unsafe { libc::kill(pre_pid as i32, libc::SIGKILL) }, 0);
+    assert!(wait_until(Duration::from_secs(5), || {
+        let view = status(&conn);
+        view.processes.pre.pid.is_some_and(|current| current != pre_pid
+            && view.pre.as_ref().is_some_and(|pre| pre.startup_id == format!("stub-{current}")
+                && pre.playout_policy == PlayoutPolicy::BroadcastOnly))
+            && view.output_mode.is_some_and(|mode| mode.applied == Some(OutputMode::Broadcast))
+    }));
     assert_eq!(status(&conn).asr.unwrap().startup_id, startup);
+    let reply = call(&conn, ctl::DAEMON_ROUTE_SET, br#"{"route":"direct"}"#);
+    assert_eq!(reply.status, "ok", "{}", reply.reason);
+    assert!(wait_until(Duration::from_secs(5), || {
+        let view = status(&conn);
+        view.output_mode.is_none() && view.pre.is_some_and(|pre| pre.playout_policy == PlayoutPolicy::Legacy)
+    }));
 }
 
 #[test]
