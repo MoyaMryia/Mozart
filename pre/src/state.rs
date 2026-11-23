@@ -308,6 +308,13 @@ impl DspSwitches {
     }
 }
 
+#[derive(Clone, Copy)]
+pub enum OutputBinding {
+    Released,
+    Binding,
+    Bound,
+}
+
 pub struct Shared {
     pub speech_cutoff: AtomicU64,
     pub speech_request: AtomicU64,
@@ -324,7 +331,7 @@ pub struct Shared {
 
     /// 输出 socket 交接握手：rvc 接收线程解绑后置 true、重绑后清 false；
     /// 控制线程在 PRE_SET_FILE_MODE{active:true} 应答前等它置位。
-    output_released: AtomicBool,
+    output_binding: AtomicU8,
     frames_captured: AtomicU64,
     frames_played: AtomicU64,
     /// 消费者列表（启动时按配置固定）：每个消费者一个输入发送丢弃计数槽，
@@ -380,7 +387,7 @@ impl Shared {
             mute_target: AtomicBool::new(false),
             file_gate: AtomicU64::new(0),
             in_flight: AtomicUsize::new(0),
-            output_released: AtomicBool::new(false),
+            output_binding: AtomicU8::new(OutputBinding::Released as u8),
             frames_captured: AtomicU64::new(0),
             frames_played: AtomicU64::new(0),
             consumers: consumers.into_iter().map(Consumer::from_config).collect(),
@@ -485,13 +492,16 @@ impl Shared {
         self.in_flight.load(Ordering::SeqCst) == 0
     }
 
-    /// 输出 socket 已释放（接收线程解绑后置位，重绑后清零）。
     pub fn output_released(&self) -> bool {
-        self.output_released.load(Ordering::Acquire)
+        self.output_binding.load(Ordering::SeqCst) == OutputBinding::Released as u8
     }
 
-    pub fn set_output_released(&self, released: bool) {
-        self.output_released.store(released, Ordering::Release);
+    pub fn output_bound(&self) -> bool {
+        self.output_binding.load(Ordering::SeqCst) == OutputBinding::Bound as u8
+    }
+
+    pub fn set_output_binding(&self, binding: OutputBinding) {
+        self.output_binding.store(binding as u8, Ordering::SeqCst);
     }
 
     pub fn add_captured(&self, frames: u64) {

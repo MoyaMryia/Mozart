@@ -183,13 +183,19 @@ impl Services {
 
     /// 文件接管开关（PRE_SET_FILE_MODE）：active=true 让 pre 暂停 rvc AI
     /// 发送并释放输出 socket（pre 确认交接完成才应答）；active=false 恢复。
-    /// 文件 worker 在起流前/收尾后调用，与实时路由切换经 transition 锁互斥。
+    /// 返回时 pre 已确认释放或恢复绑定。
     pub fn pre_set_file_mode(&self, active: bool) -> Result<(), (String, String)> {
         let body = json!({"active": active}).to_string();
         self.pre()
             .call_ok(ctl::PRE_SET_FILE_MODE, body.as_bytes())
-            .map(|_| ())
             .map_err(CallError::into_rejection)
+            .and_then(|reply| {
+                if reply.data["active"].as_bool() == Some(active) {
+                    Ok(())
+                } else {
+                    Err((ctl::CODE_INTERNAL.into(), "pre file mode acknowledgement mismatch".into()))
+                }
+            })
     }
 
     /// SetParams：实时流活动期间在下一推理块边界无中断更新会话参数与 skip_silence。
@@ -712,7 +718,6 @@ pub fn poll(
     services: &Services,
     config: &Config,
     presets: &PresetManager,
-    pre_handoff_active: bool,
 ) {
     let mut degraded = Vec::new();
     let enhance_status = poll_enhance(services, &mut degraded);
@@ -735,7 +740,6 @@ pub fn poll(
             state,
             services,
             pre_status.as_ref(),
-            pre_handoff_active,
             &mut degraded,
         );
         reconcile(
@@ -888,30 +892,27 @@ fn poll_bridge(services: &Services, degraded: &mut Vec<String>) -> Option<Bridge
 
 /// 权威对账 pre 数据面模式（SPEC-04 单一权威）：pre 的 rvc AI 支路仅在 daemon
 /// 断言实时态时活跃，pre 启动/重启后不单边 reclaim，等 daemon 断言。daemon 每轮
-/// 把 pre 模式收敛到权威态（gpu_owner==File → 文件接管），并在 pre 重启（startup_id
-/// 变化）或尚未断言时重新断言。文件交接窗口内让位给 FileHandoff，避免争用。
+/// 在文件租约外重新断言 pre 实时态；文件租约期间由文件协调器负责。
 fn reconcile_pre_mode(
     state: &Mutex<State>,
     services: &Services,
     pre_status: Option<&PreStatus>,
-    handoff_active: bool,
     degraded: &mut Vec<String>,
 ) {
     let Some(pre) = pre_status else {
         return;
     };
-    // 交接建立期间 pre 模式由 FileHandoff 起停流直接管理，对账不介入。
-    if handoff_active {
+    // 文件租约期间由协调器独占交接，包括失败后的归还。
+    if lock_state(state).gpu_owner() == Some(Activity::File) {
         return;
     }
-    let expected_file = lock_state(state).gpu_owner() == Some(Activity::File);
     let restarted = {
         let state = lock_state(state);
         state.pre_startup_id() != Some(pre.startup_id.as_str())
     };
-    let needs_assert = restarted || !pre.mode_asserted || pre.file_mode != expected_file;
+    let needs_assert = restarted || !pre.mode_asserted || pre.file_mode;
     if needs_assert {
-        if let Err((code, reason)) = services.pre_set_file_mode(expected_file) {
+        if let Err((code, reason)) = services.pre_set_file_mode(false) {
             degraded.push(format!("pre mode assert: {code}: {reason}"));
         }
     }

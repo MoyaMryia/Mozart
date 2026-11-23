@@ -126,6 +126,8 @@ pub struct GpuState {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ArbiterState {
+    #[serde(default)]
+    pub file_return_pending: bool,
     pub gpu: GpuState,
 }
 

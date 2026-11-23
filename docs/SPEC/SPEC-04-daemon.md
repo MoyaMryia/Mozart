@@ -111,6 +111,7 @@ CLI 的 `--json` 输出通常为响应的 `data`，不是完整 socket 响应信
 - [x] 实时换模型命令与编排：`model use <id>`（0x0120）落地 [docs/config.md](../config.md)「运行时换模型走控制命令」的设计意图。编排定为断流切换（StopStream→LoadModel→预设提交→StartStream），失败用旧模型旧参数恢复并回报原因；`[rvc].model_id` 由本命令写回基线，`config set` 继续拒绝。命令契约、次序与回退见本文件「已确认」三条。推理侧状态语义见 SPEC-03。板端切换延迟、接缝与帧守恒未验证，见 SPEC-03 板端条目。（`ctl/src/main.rs:278,645-664`、`daemon/src/server.rs:340-341,490-506`）
 - [x] 实时原生多采样率（控制面）：不做播放采样率协商，播放固定 48 kHz、边界重采样归 pre（SPEC-02）；跨采样率换模型走 `model use` 断流切换，几何随 `StartStream` 重建。主条见 SPEC-03，板端断流代价与多采样率验收见 SPEC-03 板端条目。
 - [x] 音频设备实时热切换命令 `device use <capture|playback> <设备名>`（`DAEMON_DEVICE_USE` `0x0121`）：体 `{"kind","device"}`，data `{"kind","device","previous_device"}`。入口按设备清单校验存在性与方向匹配，再经 `PRE_SET_DEVICE`（`0x0208`）下发 pre 实时生效；不写回 `mozart.toml`、不进 `state.json`，`config set pre.capture_device/playback_device` 维持 S 类。daemon 内存保留当前临时生效设备，pre 意外崩溃自愈重启时通过 `--effective-capture-device` / `--effective-playback-device` 沿用；显式 `restart pre` 或 `down`/`up` 清空临时覆盖、恢复 `mozart.toml` 基线。（`daemon/src/server.rs`、`daemon/src/supervisor.rs`、`daemon/src/runtime.rs`、`ctl/src/main.rs`、`daemon/tests/device_use.rs`）
+- [x] 文件租约归还：文件结果与数据面归还分开；确认停流、释放输出 socket、确认 pre 恢复，才释放文件租约。未知结果由 daemon 对账，可查询且阻止新任务与实时起流。 `arbiter.file_return_pending` 与降级原因区分文件终态和资源状态；停流前、停流后丢应答及 pre 归还失败均有本机故障注入回归。
 - [ ] 主模式互斥切换与默认实时变声：将音频主输出收敛为三个互斥主模式，默认拉起进入实时变声模式——① 实时变声（输出 RVC、停播报）；② 翻译播报（输出 TTS 英文播报、停用并释放 RVC 实时占用、说话间隙静音）；③ 原声直出（仅输出降噪后麦克风原声、停 RVC 与播报）。三种模式下识别与翻译字幕均常驻运行，仅切换主输出与播报使能。
 
 ## 待讨论

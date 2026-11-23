@@ -10,11 +10,10 @@
 //! 都经 FileHandoff 守卫按「停流 → 解绑 → 恢复 pre」收尾（Drop 兜底 panic）。
 
 use super::decode::{self, ContractFrame};
-use super::{encode, JobContext, Outcome, StepError, Worker, FRAME_NS};
+use super::{encode, JobContext, Outcome, ReturnedHandoff, StepError, Worker, FRAME_NS};
 use mozart_core::ctl::schema::FileProgress;
 use mozart_core::dgram::FrameSocket;
 use mozart_core::{FrameMeta, InputFrame, OutputFrame, OUTPUT_SAMPLES};
-use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::Ordering;
@@ -120,9 +119,8 @@ fn process(ctx: &JobContext) -> Result<(), StepError> {
     let input_path = config.rvc_input_socket();
     let exchanged = feed(&frames, &input_path, &mut progress, &cancel)
         .and_then(|()| receive(ctx, handoff.output(), total, &mut progress, &cancel));
-    // 收尾：停流 → 解绑输出 socket → 恢复 pre。失败/取消/panic 由 Drop 兜底
-    // 同一顺序；降级原因经 status 可查。
-    handoff.finish();
+    // 把交接交还给协调器。文件发布不等待控制面归还应答。
+    drop(handoff);
     let samples = exchanged?;
 
     // ---- publish：48 kHz 裸流 → WAV → 原子改名 ----
@@ -295,33 +293,22 @@ impl<'a> Reporter<'a> {
     }
 }
 
-/// 文件数据面交接守卫（SPEC-03「复用 + 状态门控交接」）：持有 pre 暂停状态
-/// 与输出 socket 绑定。收尾顺序固定为「停流 → 解绑删 socket 文件 → 恢复 pre」：
-/// 停流先于解绑（C++ 停流前可能仍在回帧），解绑先于恢复（pre 重绑同一 socket，
-/// 顺序反了会撞绑）。显式 `finish` 后 Drop 不再重复；早退路径（含 panic 展开）
-/// 由 Drop 兜底同一顺序，降级原因经 status 可查。
+/// 交接守卫：起流前取得 pre 应答，退出（含 unwind）时移交仍持有的资源。
 struct FileHandoff<'a> {
     ctx: &'a JobContext,
     path: PathBuf,
     output: Option<FrameSocket<OutputFrame>>,
     stream_active: bool,
-    pre_paused: bool,
 }
 
 impl<'a> FileHandoff<'a> {
-    /// 暂停 pre 并确认输出 socket 已释放（PRE_SET_FILE_MODE{active:true}）。
-    /// 意图发出 → 任何出口都恢复：active:true 可能已在 pre 生效而应答丢失/
-    /// 超时（pre 控制线程延迟超过 rpc_timeout_ms），故先建立守卫
-    /// （pre_paused=true）再发 RPC，失败路径由 Drop 尝试恢复（active:false
-    /// 幂等，pre 未收到暂停也无害），与 StartStream 同一纪律。恢复失败记
-    /// 持久降级原因，status 可查。
+    /// 发送暂停前建立守卫；命令可能生效但丢失应答。
     fn begin(ctx: &'a JobContext) -> Result<Self, StepError> {
         let handoff = Self {
             ctx,
             path: ctx.config.rvc_output_socket(),
             output: None,
             stream_active: false,
-            pre_paused: true,
         };
         handoff
             .ctx
@@ -351,35 +338,16 @@ impl<'a> FileHandoff<'a> {
             .expect("output socket bound before data plane")
     }
 
-    /// 收尾：停流 → 解绑删 socket 文件 → 恢复 pre。幂等，Drop 兜底复用。
-    fn finish(&mut self) {
-        // 先清交接标志：恢复后 pre.file_mode=false 属合法，不得触发失接管检测。
-        self.ctx.handoff_active.store(false, Ordering::Release);
-        if self.stream_active {
-            self.stream_active = false;
-            if let Err((code, reason)) = self.ctx.services.stop_stream() {
-                self.ctx
-                    .push_degraded(format!("file stop stream: {code}: {reason}"));
-            }
-        }
-        // 解绑先于恢复 pre：pre 重绑同一 socket，顺序反了会撞绑。
-        if let Some(socket) = self.output.take() {
-            drop(socket);
-            let _ = fs::remove_file(&self.path);
-        }
-        if self.pre_paused {
-            self.pre_paused = false;
-            if let Err((code, reason)) = self.ctx.services.pre_set_file_mode(false) {
-                self.ctx
-                    .push_degraded(format!("pre file mode restore: {code}: {reason}"));
-            }
-        }
-    }
 }
 
 impl Drop for FileHandoff<'_> {
     fn drop(&mut self) {
-        self.finish();
+        self.ctx.handoff_active.store(false, Ordering::Release);
+        let output = self.output.take().map(|socket| (std::mem::take(&mut self.path), Some(socket)));
+        *super::lock_return(&self.ctx.returned_handoff) = Some(ReturnedHandoff {
+            stop_needed: self.stream_active,
+            output,
+        });
     }
 }
 
@@ -453,6 +421,7 @@ mod tests {
             presets,
             running: running.clone(),
             handoff_active: Arc::new(AtomicBool::new(false)),
+            returned_handoff: Arc::new(std::sync::Mutex::new(None)),
         };
 
         // 对端绑定输入 socket 但永不读帧（推理线程挂死）：缓冲填满后只能等待。
@@ -501,6 +470,6 @@ mod tests {
             "关停应走取消收尾：{result:?}"
         );
         drop(peer);
-        fs::remove_dir_all(&dir).unwrap();
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 }

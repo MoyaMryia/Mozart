@@ -57,9 +57,11 @@ enum RvcLease {
     Realtime,
     ReturningRealtime,
     File,
+    ReturningFile,
 }
 
 const REALTIME_RETURN_REASON: &str = "rvc realtime return:";
+const FILE_RETURN_REASON: &str = "rvc file return:";
 
 pub struct State {
     started: Instant,
@@ -145,6 +147,7 @@ impl State {
             output_mode: self.output_mode.clone(),
             mute: self.mute,
             arbiter: ArbiterState {
+                file_return_pending: self.file_return_pending(),
                 gpu: GpuState {
                     owner: self.gpu_owner(),
                 },
@@ -192,7 +195,7 @@ impl State {
         match self.rvc_lease {
             RvcLease::Idle => None,
             RvcLease::Realtime | RvcLease::ReturningRealtime => Some(Activity::Realtime),
-            RvcLease::File => Some(Activity::File),
+            RvcLease::File | RvcLease::ReturningFile => Some(Activity::File),
         }
     }
 
@@ -253,7 +256,18 @@ impl State {
     /// 文件任务收尾时释放 GPU。调用方持 transition 锁；
     /// 任务执行期间路由切换只动 desired，不会改走 File 归属。
     pub fn release_gpu_file(&mut self) {
+        self.clear_degraded_prefix(FILE_RETURN_REASON);
         self.rvc_lease = RvcLease::Idle;
+    }
+
+    pub fn record_file_return_pending(&mut self, reason: String) {
+        self.clear_degraded_prefix(FILE_RETURN_REASON);
+        self.push_degraded(format!("{FILE_RETURN_REASON} {reason}"));
+        self.rvc_lease = RvcLease::ReturningFile;
+    }
+
+    pub fn file_return_pending(&self) -> bool {
+        self.rvc_lease == RvcLease::ReturningFile
     }
 
     pub fn commit_mute(&mut self, mute: bool) {

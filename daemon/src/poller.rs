@@ -38,7 +38,7 @@ impl Poller {
                 while running.load(Ordering::Acquire) {
                     // 每轮读最新生效配置：poll_interval_ms 等运行时键即时生效。
                     let config = config.snapshot();
-                    services::poll(&state, &services, &config, &presets, file.handoff_active());
+                    services::poll(&state, &services, &config, &presets);
                     let bridge_pid = lock_state(&state).bridge_pid();
                     {
                         // 持 bridge_restore 锁覆盖重载与下发，锁序 bridge_restore → state_file / bridge，

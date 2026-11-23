@@ -300,6 +300,13 @@ fn dispatch_with_stop(
                     // 断言，实时恒发随断言激活（此支路实时帧属预期，非污染）。
                     shared.set_file_mode(false);
                     shared.set_mode_asserted(true);
+                    let deadline = Instant::now() + FILE_HANDOFF_TIMEOUT;
+                    while !shared.output_bound() {
+                        if Instant::now() >= deadline {
+                            return error_body(ctl::CODE_NOT_READY, "AI output socket restore timed out");
+                        }
+                        std::thread::sleep(FILE_HANDOFF_POLL);
+                    }
                     ok_body(json!({"active": false}))
                 }
             }
@@ -819,7 +826,7 @@ mod tests {
     }
 
     /// 文件接管握手：模拟接收线程按 file_mode 置/清 output_released，
-    /// active=true 必须等握手完成才应答 ok；active=false 立即恢复。
+    /// 释放和重绑均须在应答前确认。
     #[test]
     fn set_file_mode_waits_for_handshake_and_roundtrips() {
         let (shared, cap, trunk, rvc, tts, mut log) = context();
@@ -830,7 +837,13 @@ mod tests {
             std::thread::spawn(move || {
                 while !stop.load(Ordering::Relaxed) {
                     // 接收线程的握手行为：接管即释放，交还即重绑。
-                    shared.set_output_released(shared.file_mode());
+                    shared.set_output_binding(if shared.file_mode() {
+                        crate::state::OutputBinding::Released
+                    } else if shared.mode_asserted() {
+                        crate::state::OutputBinding::Bound
+                    } else {
+                        crate::state::OutputBinding::Released
+                    });
                     std::thread::sleep(Duration::from_millis(2));
                 }
             })
@@ -860,6 +873,7 @@ mod tests {
         );
         assert_eq!(data(&reply)["active"], false);
         assert!(!shared.file_mode());
+        assert!(shared.output_bound());
 
         stop.store(true, Ordering::Relaxed);
         watcher.join().unwrap();
@@ -871,7 +885,7 @@ mod tests {
         shared.set_mode_asserted(true);
         let generation = shared.file_generation();
         let permit = shared.begin_ai_send(generation).unwrap();
-        shared.set_output_released(true);
+        shared.set_output_binding(crate::state::OutputBinding::Released);
         let (tx, rx) = std::sync::mpsc::channel();
         let worker = {
             let shared = shared.clone();
@@ -947,6 +961,7 @@ mod tests {
     #[test]
     fn set_file_mode_timeout_rolls_back() {
         let (shared, cap, trunk, rvc, tts, mut log) = context();
+        shared.set_output_binding(crate::state::OutputBinding::Bound);
         let reply = dispatch(
             &message(ctl::PRE_SET_FILE_MODE, br#"{"active":true}"#),
             &shared,
@@ -958,6 +973,17 @@ mod tests {
         );
         assert_eq!(error_code(&reply), ctl::CODE_NOT_READY);
         assert!(!shared.file_mode(), "超时必须回滚门控");
+    }
+
+    #[test]
+    fn file_restore_does_not_acknowledge_an_unfinished_bind() {
+        let (shared, cap, trunk, rvc, tts, mut log) = context();
+        shared.set_output_binding(crate::state::OutputBinding::Binding);
+        let reply = dispatch(
+            &message(ctl::PRE_SET_FILE_MODE, br#"{"active":false}"#),
+            &shared, &cap, &trunk, &rvc, &tts, &mut log,
+        );
+        assert_eq!(error_code(&reply), ctl::CODE_NOT_READY);
     }
 
     #[test]

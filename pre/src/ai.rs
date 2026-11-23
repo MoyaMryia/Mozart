@@ -151,7 +151,7 @@ pub fn recv_loop(
                 shared.set_ai_recv_size_mismatch(mismatch_base);
                 // old 在此 drop：关闭 fd 解除绑定，文件留给 daemon bind 清理。
             }
-            shared.set_output_released(true);
+            shared.set_output_binding(crate::state::OutputBinding::Released);
             // 未断言或文件接管：数据面不归 pre，本线程空转；按 RECV_POLL 查停止与断言。
             std::thread::sleep(RECV_POLL);
             continue;
@@ -159,14 +159,14 @@ pub fn recv_loop(
         let current = match socket.as_ref() {
             Some(bound) => bound,
             None => {
-                // daemon 已断言实时态：绑定输出 socket（启动首次绑定或交接后重绑，
-                // daemon 已先解绑，次序见 worker 守卫）。先清握手标志再绑：重绑
-                // 窗口内 output_released 必须为 false，否则并发的 active=true 会
-                // 误判「已释放」而抢先绑定，与本线程撞绑（标志只在静默分支置 true，
-                // 该分支不会绑定）。绑定失败属部署错误，致命退出由 daemon 重启。
-                shared.set_output_released(false);
+                // 登记绑定意图后复核许可，防止覆盖同时已确认归文件链的 socket。
+                shared.set_output_binding(crate::state::OutputBinding::Binding);
+                if !shared.rvc_ai_active() {
+                    continue;
+                }
                 let fresh = FrameSocket::<OutputFrame>::bind(&path, RVC_QUEUE_FRAMES)
                     .map_err(|err| format!("rvc output socket bind: {err}"))?;
+                shared.set_output_binding(crate::state::OutputBinding::Bound);
                 socket.insert(fresh)
             }
         };
