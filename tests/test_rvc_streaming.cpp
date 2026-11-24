@@ -11,9 +11,12 @@
 //   5. 原生多采样率（40k/32k）：块节拍不变，输出帧与启动缓冲按模型采样率量化
 #include "rvc/streaming_pipeline.hpp"
 #include "rvc/realtime_geometry.hpp"
+#include "rvc/index_search.hpp"
 
 #include <cmath>
 #include <cstdio>
+#include <filesystem>
+#include <fstream>
 #include <future>
 #include <stdexcept>
 #include <vector>
@@ -924,6 +927,159 @@ int main()
             in_16k.data(), in_16k.size(), out_scaled, 48000, 0.0f, 0.99f);
         CHECK(std::fabs(out_scaled[7200] - 0.1f) < 0.01f,
               "rms_mix_rate=0.0 aligns output envelope to input RMS");
+    }
+
+    printf("test_index_search_parallel_parity\n");
+    {
+        // Construct a synthetic FAISS IndexIVFFlat ("IwFl") with nlist=260, dim=32
+        // to exercise both SIMD L2 and multi-threaded tiled centroid/list search.
+        const uint32_t dim = 32;
+        const uint32_t nlist = 260;
+        const uint32_t per_list = 10;
+        const uint32_t sparse_cid = 5;
+        const uint32_t sparse_count = 3; // < kNeighbours (8) -> skipped when nprobe=1
+        std::vector<float> centroids(nlist * dim);
+        std::vector<uint64_t> sizes(nlist, per_list);
+        sizes[sparse_cid] = sparse_count;
+        uint64_t ntotal = 0;
+        for (auto s : sizes) ntotal += s;
+
+        for (uint32_t c = 0; c < nlist; ++c) {
+            for (uint32_t j = 0; j < dim; ++j) {
+                centroids[c * dim + j] = std::sin(0.37f * static_cast<float>(c + 1) + 0.19f * static_cast<float>(j))
+                    + (j == 0 ? static_cast<float>(c) * 0.5f : 0.0f);
+            }
+        }
+        std::vector<std::vector<float>> list_vecs(nlist);
+        for (uint32_t c = 0; c < nlist; ++c) {
+            list_vecs[c].resize(sizes[c] * dim);
+            for (uint64_t k = 0; k < sizes[c]; ++k) {
+                for (uint32_t j = 0; j < dim; ++j) {
+                    list_vecs[c][k * dim + j] = centroids[c * dim + j]
+                        + 0.05f * std::cos(static_cast<float>(k * 13 + j * 7 + c));
+                }
+            }
+        }
+
+        const auto tmp_idx = std::filesystem::temp_directory_path() / "mozart_test_index_parity.index";
+        {
+            std::ofstream out(tmp_idx, std::ios::binary);
+            auto wu8 = [&](uint8_t v) { out.write(reinterpret_cast<const char*>(&v), 1); };
+            auto wi32 = [&](int32_t v) { out.write(reinterpret_cast<const char*>(&v), 4); };
+            auto wi64 = [&](int64_t v) { out.write(reinterpret_cast<const char*>(&v), 8); };
+            const int64_t dummy = 0x100000;
+            out.write("IwFl", 4);
+            wi32(static_cast<int32_t>(dim));
+            wi64(static_cast<int64_t>(ntotal));
+            wi64(dummy); wi64(dummy);
+            wu8(1);
+            wi32(1); // METRIC_L2
+            wi64(static_cast<int64_t>(nlist));
+            wi64(1); // nprobe
+            out.write("IxF2", 4);
+            wi32(static_cast<int32_t>(dim));
+            wi64(static_cast<int64_t>(nlist));
+            wi64(dummy); wi64(dummy);
+            wu8(1);
+            wi32(1);
+            wi64(static_cast<int64_t>(nlist * dim));
+            out.write(reinterpret_cast<const char*>(centroids.data()),
+                      static_cast<std::streamsize>(centroids.size() * sizeof(float)));
+            wu8(0); // direct map NoMap
+            wi64(0);
+            out.write("ilar", 4);
+            wi64(static_cast<int64_t>(nlist));
+            wi64(static_cast<int64_t>(dim * 4));
+            out.write("full", 4);
+            wi64(static_cast<int64_t>(nlist));
+            for (auto s : sizes) wi64(static_cast<int64_t>(s));
+            for (uint32_t c = 0; c < nlist; ++c) {
+                out.write(reinterpret_cast<const char*>(list_vecs[c].data()),
+                          static_cast<std::streamsize>(list_vecs[c].size() * sizeof(float)));
+                std::vector<int64_t> ids(sizes[c], 0);
+                out.write(reinterpret_cast<const char*>(ids.data()),
+                          static_cast<std::streamsize>(ids.size() * sizeof(int64_t)));
+            }
+        }
+
+        IndexSearch idx;
+        CHECK(idx.load(tmp_idx, dim), "synthetic FAISS IVF index loads cleanly");
+
+        // Build 40 query frames (spans > kQueryTile=32), frame 0 targets sparse_cid
+        const size_t n_frames = 40;
+        std::vector<float> queries(n_frames * dim);
+        for (size_t t = 0; t < n_frames; ++t) {
+            const uint32_t target_c = (t == 0) ? sparse_cid : static_cast<uint32_t>((t * 7) % nlist);
+            for (uint32_t j = 0; j < dim; ++j) {
+                queries[t * dim + j] = centroids[target_c * dim + j] + 0.01f * static_cast<float>(j % 5);
+            }
+        }
+
+        // Scalar reference solver
+        auto scalar_ref = [&](uint32_t nprobe, float rate) {
+            std::vector<float> ref = queries;
+            for (size_t t = 0; t < n_frames; ++t) {
+                const float* q = queries.data() + t * dim;
+                std::vector<std::pair<float, uint32_t>> cd;
+                for (uint32_t c = 0; c < nlist; ++c) {
+                    float d = 0.0f;
+                    for (uint32_t j = 0; j < dim; ++j) {
+                        const float dv = q[j] - centroids[c * dim + j];
+                        d += dv * dv;
+                    }
+                    cd.push_back({d, c});
+                }
+                std::stable_sort(cd.begin(), cd.end(),
+                    [](const auto& a, const auto& b) { return a.first < b.first; });
+                std::vector<std::pair<float, const float*>> cands;
+                for (uint32_t p = 0; p < nprobe; ++p) {
+                    const uint32_t cid = cd[p].second;
+                    for (uint64_t k = 0; k < sizes[cid]; ++k) {
+                        const float* v = list_vecs[cid].data() + k * dim;
+                        float d = 0.0f;
+                        for (uint32_t j = 0; j < dim; ++j) {
+                            const float dv = q[j] - v[j];
+                            d += dv * dv;
+                        }
+                        cands.push_back({d, v});
+                    }
+                }
+                if (cands.size() < IndexSearch::kNeighbours) continue;
+                std::stable_sort(cands.begin(), cands.end(),
+                    [](const auto& a, const auto& b) { return a.first < b.first; });
+                float w[IndexSearch::kNeighbours];
+                float tot = 0.0f;
+                for (size_t i = 0; i < IndexSearch::kNeighbours; ++i) {
+                    const float inv = 1.0f / (cands[i].first + 1e-12f);
+                    w[i] = inv * inv;
+                    tot += w[i];
+                }
+                for (uint32_t j = 0; j < dim; ++j) {
+                    float b = 0.0f;
+                    for (size_t i = 0; i < IndexSearch::kNeighbours; ++i) b += (w[i] / tot) * cands[i].second[j];
+                    ref[t * dim + j] = q[j] * (1.0f - rate) + b * rate;
+                }
+            }
+            return ref;
+        };
+
+        idx.set_nprobe(1);
+        const auto got1 = idx.search(queries, dim, 0.8f);
+        const auto ref1 = scalar_ref(1, 0.8f);
+        float max_diff1 = 0.0f;
+        for (size_t i = 0; i < got1.size(); ++i) max_diff1 = std::max(max_diff1, std::fabs(got1[i] - ref1[i]));
+        CHECK(max_diff1 < 1e-4f && idx.skipped_frames() == 1,
+              "parallel SIMD IndexSearch matches scalar reference (nprobe=1, sparse frame skipped)");
+
+        idx.set_nprobe(3);
+        const auto got3 = idx.search(queries, dim, 0.8f);
+        const auto ref3 = scalar_ref(3, 0.8f);
+        float max_diff3 = 0.0f;
+        for (size_t i = 0; i < got3.size(); ++i) max_diff3 = std::max(max_diff3, std::fabs(got3[i] - ref3[i]));
+        CHECK(max_diff3 < 1e-4f,
+              "parallel SIMD IndexSearch matches scalar reference (nprobe=3)");
+
+        std::filesystem::remove(tmp_idx);
     }
 
     if (g_fail) {
