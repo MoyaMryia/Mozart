@@ -34,9 +34,21 @@ fn step<T>(context: &str, result: alsa::Result<T>) -> Result<T, String> {
     result.map_err(|err| format!("{context}: {err}"))
 }
 
-/// 打开并配置设备：S16_LE、2 ch、48 kHz、RW 交错、`SND_PCM_NONBLOCK`、
-/// start_threshold=1（旧 capture.c / playback.c）。
-/// 请求采集缓冲 period × 4；播放额外容纳一整块。
+/// 采播共用的目标硬件缓冲样本数：基础周期余量外加两帧契约帧（`period = 64` 时为
+/// `2176` ≈ `45.33 ms`），吸收采集侧调度抖动与播放侧 20 ms 等帧预算防 XRUN。
+pub(crate) fn target_buffer_frames(period: usize) -> usize {
+    period * N_PERIODS + mozart_core::RAW_SAMPLES * 2
+}
+
+/// 播放起播阈值：攒满两帧契约帧（40 ms）再开播，受实际硬件缓冲夹紧；
+/// 避免 EPIPE 恢复或热切播放设备后仅写 1 帧（20 ms）即起播，吃不到额外缓冲余量。
+pub(crate) fn playback_start_threshold(buffer: usize) -> usize {
+    (mozart_core::RAW_SAMPLES * 2).min(buffer)
+}
+
+/// 打开并配置设备：S16_LE、2 ch、48 kHz、RW 交错、`SND_PCM_NONBLOCK`。
+/// 采播缓冲均请求 `target_buffer_frames(period)`；采集 `start_threshold = 1`，
+/// 播放 `start_threshold = playback_start_threshold(actual_buffer)`。
 pub fn open(device: &str, dir: Direction, timestamp: bool) -> Result<PCM, String> {
     // nonblock=true 映射 SND_PCM_NONBLOCK。
     let pcm = step("open", PCM::new(device, dir, true))?;
@@ -57,18 +69,22 @@ pub fn open(device: &str, dir: Direction, timestamp: bool) -> Result<PCM, String
         "set_period_size_near",
         hw.set_period_size_near(PERIOD_FRAMES as i64, ValueOr::Nearest),
     )? as usize;
-    let buffer = match dir {
-        Direction::Capture => period * N_PERIODS,
-        Direction::Playback => period * N_PERIODS + mozart_core::RAW_SAMPLES,
-    };
-    step(
+    let buffer = target_buffer_frames(period);
+    let actual_buffer = step(
         "set_buffer_size_near",
         hw.set_buffer_size_near(buffer as i64),
-    )?;
+    )? as usize;
     step("hw_params", pcm.hw_params(&hw))?;
 
     let sw = step("sw_params_current", pcm.sw_params_current())?;
-    step("set_start_threshold", sw.set_start_threshold(1))?;
+    let start_threshold = match dir {
+        Direction::Capture => 1,
+        Direction::Playback => playback_start_threshold(actual_buffer),
+    };
+    step(
+        "set_start_threshold",
+        sw.set_start_threshold(start_threshold as i64),
+    )?;
     if timestamp {
         step("set_tstamp_mode", sw.set_tstamp_mode(true))?;
         step("set_tstamp_type", sw.set_tstamp_type(TstampType::Monotonic))?;
@@ -190,4 +206,18 @@ pub fn transfer(
         thread::sleep(RETRY);
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn target_buffer_covers_two_contract_frames_plus_periods() {
+        let buffer = target_buffer_frames(PERIOD_FRAMES);
+        assert_eq!(buffer, 2176);
+        assert_eq!(buffer % PERIOD_FRAMES, 0);
+        assert_eq!(playback_start_threshold(buffer), mozart_core::RAW_SAMPLES * 2);
+        assert_eq!(playback_start_threshold(1024), 1024);
+    }
 }

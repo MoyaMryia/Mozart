@@ -88,7 +88,7 @@
 - [x] 受监管 pre 静音启动，重接 `PRE_SET_PLAYOUT` 在同一请求携带路由、静音和播放策略。实时播放确认前选定正确路由；后台未就绪时保持静音，daemon 报告 `reattaching_playout`。
 - [x] 零有效样本的 48 kHz 帧进入欠载淡出，不索引 PCM。 见[本机回归](../../reports/postprocessing-stability-20261124/RESULTS.md)。
 
-- [x] 播放连续性：按有效样本数区别后端补零，缺样淡出、恢复淡入；短帧保持原采样率比例。变声取帧等待上限 4 ms；播放缓冲请求 `period × 4 + 960` 样本。`rvc_playout_gap_frames` 与 ALSA 的 `playback_underruns` 分开报告。单测覆盖完整缺帧、恢复和短帧。
+- [x] 播放连续性：按有效样本数区别后端补零，缺样淡出、恢复淡入；短帧保持原采样率比例。变声与直出取帧等待上限 20 ms（`FRAME_MS`）；采播缓冲均请求 `period × 4 + 960 × 2` 样本，播放起播阈值为两帧契约帧（上限夹到实际缓冲）。`rvc_playout_gap_frames` 与 ALSA 的 `playback_underruns` 分开报告。单测覆盖完整缺帧、恢复、短帧与抖动等待。
 
 - [x] 禁用降噪时跳过全部计算。（`dsp/src/lib.rs:88-93`）
 - [x] 淡变逻辑加重入保护，参数做边界校验。（`pre/src/route.rs:72-75`）

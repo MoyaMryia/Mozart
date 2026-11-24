@@ -17,10 +17,10 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-/// 直通由采集定拍；变声和播报由播放硬件定拍。
-const TRUNK_WAIT: Duration = Duration::from_millis(20);
+/// 直通由采集定拍，实时变声也留出一帧（20 ms）等待预算吸收采播相位差与跨进程抖动。
+const REALTIME_FRAME_WAIT: Duration = Duration::from_millis(mozart_core::FRAME_MS as u64);
 
-/// 变声或连续播报只短暂等待跨进程帧，不等待整个播放帧周期。
+/// 连续播报只短暂等待跨进程帧，防止长等待抽干播放硬件缓冲。
 const PLAYBACK_JITTER_WAIT: Duration = Duration::from_millis(4);
 
 /// 播报空窗保持时长：TTS 环空后等待后续播报帧的窗口，期间静音实时；
@@ -286,7 +286,7 @@ fn step_realtime(
     let mut mono = match router.route() {
         Route::Direct => {
             // packed 字段按值整块搬出，不取引用。
-            let wait = if resumed { Duration::ZERO } else { TRUNK_WAIT };
+            let wait = if resumed { Duration::ZERO } else { REALTIME_FRAME_WAIT };
             let pcm = match trunk.pop(Some(wait)) {
                 Some(frame) => frame.pcm,
                 // 主干欠载：补零续流。属两时钟漂移吸收，不计为丢弃。
@@ -300,7 +300,7 @@ fn step_realtime(
         Route::Rvc => {
             // rvc 路由不消费主干；逐帧排空防积压。
             let _ = trunk.pop(Some(Duration::ZERO));
-            let wait = if resumed { Duration::ZERO } else { PLAYBACK_JITTER_WAIT };
+            let wait = if resumed { Duration::ZERO } else { REALTIME_FRAME_WAIT };
             let frame = rvc.pop(Some(wait));
             let (pcm, gap) = rvc_resampler.render_rvc(frame.as_ref());
             if gap {
@@ -540,7 +540,7 @@ mod tests {
     fn frame_wait_matches_frame_period() {
         // 等待预算等于一个契约帧周期（frame.h：960 样本 @ 48 kHz）。
         let frame_ms = RAW_SAMPLES as u64 * 1000 / mozart_core::RAW_SAMPLE_RATE as u64;
-        assert_eq!(TRUNK_WAIT, Duration::from_millis(frame_ms));
+        assert_eq!(REALTIME_FRAME_WAIT, Duration::from_millis(frame_ms));
     }
 
     #[test]
@@ -916,5 +916,49 @@ mod tests {
         );
         assert!(out2.iter().all(|&v| v == 0.5));
         assert_eq!(router.route(), Route::Rvc, "路由状态机须在后台完成切换");
+    }
+
+    #[test]
+    fn rvc_route_waits_past_4ms_jitter_without_playout_gap() {
+        let shared = crate::state::test_shared("cap", "play", "startup");
+        let trunk = Ring::<RawFrame>::new(4);
+        let rvc = Arc::new(Ring::<OutputFrame>::new(4));
+        let mut router = Router::new(Route::Rvc);
+        let mut resampler = BoundaryResampler::new();
+        let meta = FrameMeta {
+            pts_ns: 0,
+            frame_idx: 1,
+            vad_flag: 1,
+            energy_db: 0,
+            conf: 0,
+            segment_id: 0,
+        };
+        let rvc_tx = Arc::clone(&rvc);
+        let producer = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(10));
+            rvc_tx.push(OutputFrame::new_48k(meta, [0.35; OUTPUT_SAMPLES]));
+        });
+
+        let out = step_realtime(
+            Speaker::Realtime,
+            &trunk,
+            &rvc,
+            &shared,
+            &mut router,
+            &mut resampler,
+        );
+        producer.join().unwrap();
+
+        let status = shared.status(crate::state::QueueReadout {
+            depth: 0,
+            dropped: 0,
+            rvc_dropped: 0,
+            tts_dropped: 0,
+        });
+        assert_eq!(
+            status.rvc_playout_gap_frames, 0,
+            "10 ms 抖动不得超过实时变声等待预算"
+        );
+        assert!(out.iter().all(|&sample| (sample - 0.35).abs() < 1e-6));
     }
 }
