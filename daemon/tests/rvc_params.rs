@@ -320,7 +320,7 @@ fn start_failure_restores_old_params_and_keeps_toml_baseline() {
         "应先按新参起流：{starts:?}"
     );
     assert!(
-        starts.iter().any(|body| body["startup_delay_ms"] == 400),
+        starts.iter().any(|body| body["startup_delay_ms"] == 340),
         "失败后应用旧参恢复：{starts:?}"
     );
 
@@ -332,8 +332,8 @@ fn start_failure_restores_old_params_and_keeps_toml_baseline() {
     assert_eq!(reply.status, "ok", "reason: {}", reply.reason);
     assert_eq!(reply.data["value"], 200);
 
-    // 失败后 daemon 内存生效配置仍保持旧值 startup_delay_ms=400：
-    // 切换 direct → rvc 重建流时，StartStream 必须仍携带 400 而非 TOML 里的 200。
+    // 失败后 daemon 内存生效配置仍保持旧值 startup_delay_ms=340：
+    // 切换 direct → rvc 重建流时，StartStream 必须仍携带 340 而非 TOML 里的 200。
     h.clear_log();
     let direct = h.call(ctl::DAEMON_ROUTE_SET, br#"{"route":"direct"}"#);
     assert_eq!(direct.status, "ok", "route set direct: {}", direct.reason);
@@ -349,8 +349,8 @@ fn start_failure_restores_old_params_and_keeps_toml_baseline() {
     let starts = h.stream_starts("realtime");
     assert!(!starts.is_empty(), "重建流应发送 StartStream");
     assert!(
-        starts.iter().all(|body| body["startup_delay_ms"] == 400),
-        "生效配置必须保留旧 startup_delay_ms=400，不得被失败请求污染：{starts:?}"
+        starts.iter().all(|body| body["startup_delay_ms"] == 340),
+        "生效配置必须保留旧 startup_delay_ms=340，不得被失败请求污染：{starts:?}"
     );
 }
 
@@ -385,11 +385,11 @@ fn failed_restore_returns_combined_error_and_records_degraded() {
         h.status().degraded
     );
 
-    // 失败后的恢复与轮询补流仍使用内存生效配置里的旧 startup_delay_ms=400。
+    // 失败后的恢复与轮询补流仍使用内存生效配置里的旧 startup_delay_ms=340。
     let starts = h.stream_starts("realtime");
     assert!(
-        starts.last().is_some_and(|body| body["startup_delay_ms"] == 400),
-        "失败后恢复/补流 StartStream 必须仍带旧 startup_delay_ms=400：{starts:?}"
+        starts.last().is_some_and(|body| body["startup_delay_ms"] == 340),
+        "失败后恢复/补流 StartStream 必须仍带旧 startup_delay_ms=340：{starts:?}"
     );
     // 写回其他会话参数（仅更新生效配置中的对应键）验证未混入未生效的 startup_delay_ms=200。
     let pitch_reply = h.config_set("rvc.pitch_shift", "3");
@@ -403,7 +403,7 @@ fn failed_restore_returns_combined_error_and_records_degraded() {
     assert!(
         h.stream_starts("realtime")
             .iter()
-            .all(|body| body["startup_delay_ms"] == 400 && body["pitch_shift"] == 3),
+            .all(|body| body["startup_delay_ms"] == 340 && body["pitch_shift"] == 3),
         "合并新 pitch_shift 时不得混入失败的 startup_delay_ms=200：{:?}",
         h.stream_starts("realtime")
     );
@@ -435,19 +435,19 @@ fn recovery_busy_records_unknown_running_params() {
         h.status().degraded
     );
 
-    // 失败未替换内存生效配置：仍为 startup_delay_ms=400，因此再写回 400
+    // 失败未替换内存生效配置：仍为 startup_delay_ms=340，因此再写回 340
     // 判定未变化、不会触发 Stop/Start。
     h.clear_log();
-    let noop = h.config_set("rvc.realtime.startup_delay_ms", "400");
+    let noop = h.config_set("rvc.realtime.startup_delay_ms", "340");
     assert_eq!(noop.status, "ok", "reason: {}", noop.reason);
     assert_eq!(
         h.rvc_count(ctl::RVC_STOP_STREAM),
         0,
-        "生效配置保留旧值 400 时写回 400 不得触发停流重起"
+        "生效配置保留旧值 340 时写回 340 不得触发停流重起"
     );
     assert!(
         h.stream_starts("realtime").is_empty(),
-        "生效配置保留旧值 400 时写回 400 不得重起流：{:?}",
+        "生效配置保留旧值 340 时写回 340 不得重起流：{:?}",
         h.stream_starts("realtime")
     );
 }

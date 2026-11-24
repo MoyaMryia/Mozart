@@ -36,7 +36,7 @@ inline constexpr size_t kRealtimeSolaSearchMaxOut48k = 480;
 
 inline constexpr uint32_t kRealtimeDefaultCrossfadeMs = 50;
 inline constexpr uint32_t kRealtimeDefaultSolaSearchMs = 10;
-inline constexpr uint32_t kRealtimeDefaultStartupDelayMs = 400;
+inline constexpr uint32_t kRealtimeDefaultStartupDelayMs = 340;
 inline constexpr size_t kRealtimeStartupBufferBlocks = 1;
 inline constexpr bool kRealtimeDefaultSkipSilence = true;
 

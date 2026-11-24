@@ -38,7 +38,7 @@
 - C++ 进程只保留推理：`StreamSession` 封装 `StreamingRvc` 和 `RVCInferencer`；`RealtimeRvcWorker` 与 `AudioWorker` 的外层传输、队列、模式、统计归 Rust。
 - 静音和旁路归音频进程；C++ 不实现这两个概念。
 - 初始参数随 `StartStream` 下发，实时流活动期间 `pitch_shift`、`index_rate`、`f0_method` 与 `[rvc.realtime].skip_silence` 经 `SetParams`（`0x0308`）在下一推理块边界无中断生效（保留 `StreamingRvc` 缓冲与 `RVCInferencer` 音高缓存/随机状态）；`startup_delay_ms` 仍走 `StopStream`→`StartStream`（见 [SPEC-04](SPEC-04-daemon.md)）；模型切换时 `[rvc]` 会话参数由该模型的预设载入（见 [SPEC-11](SPEC-11-preset.md)），`StartStream` 契约不变。实时换模型由 daemon `model use` 断流编排（SPEC-04），rvc 不新增命令。
-- 输出节拍由输入帧驱动：C++ 每收到一帧输入就回一帧输出，输出环不足时补零。启动缓冲留在 `StreamingRvc.startup_delay_out`（默认 400 ms，`startup_delay_ms` 旋钮），音频进程只保留小缓冲吸收送达抖动。大缓冲只有一个主人。
+- 输出节拍由输入帧驱动：C++ 每收到一帧输入就回一帧输出，输出环不足时补零。启动缓冲留在 `StreamingRvc.startup_delay_out`（默认 340 ms，`startup_delay_ms` 旋钮），音频进程只保留小缓冲吸收送达抖动。大缓冲只有一个主人。
 - [ ] 1:1 泵假设采集与播放时钟同源；使用不同声卡时，长期漂移会导致周期性欠载或缓冲增长，需时钟漂移补偿（见 [FUTURE.md](../FUTURE.md)）。推迟项，未实现。
 
 ## 接口约束
@@ -130,7 +130,7 @@ RMVPE 前端 mel 128 带、n_fft 1024、hop 160、30–8000 Hz、HTK Slaney（�
 | --- | --- | --- | --- |
 | `crossfade_ms` | 50 | 定值 50，偏离拒绝 | StartStream |
 | `sola_search_ms` | 10 | 定值 10，偏离拒绝 | StartStream |
-| `startup_delay_ms` | 400 | 0..=15000，且 % 20 == 0 | StartStream |
+| `startup_delay_ms` | 340 | 0..=15000，且 % 20 == 0 | StartStream |
 | `skip_silence` | true | bool | StartStream / SetParams |
 
 `crossfade_ms + sola_search_ms` 锁为定值 60 ms（50 + 10），等于最大 overlap。入口按「各自 ≤ 上限且和 == 60」判定，等价于两键各锁定值，任何偏离都拒绝；拒绝原因写明「引擎形状按最大 overlap 固定，可调 overlap 尚未实现」。定值按 48 kHz 契约换算：`crossfade_max_out 2400 / 48 = 50`、`sola_search_max_out 480 / 48 = 10`、两者之和 `2880 / 48 = 60`；各采样率的 max_out 同比缩放，故 ms 边界与采样率无关。ms 按模型输出采样率换算样本。`startup_delay_ms` 与 `skip_silence` 不参与块几何，保持可调；前者上限 15000 来自 C++ 输出环 16 s @48 kHz 留 1 s 余量（`rvc/src/rvc/streaming_pipeline.cpp:24`）。
@@ -223,6 +223,6 @@ RMVPE 前端 mel 128 带、n_fft 1024、hop 160、30–8000 Hz、HTK Slaney（�
 
 #### 降延迟三步待办（按成本从低到高推进）
 
-- [ ] **降延迟步骤 A（零代码/配置级验证，目标 500 ms → ~380 ms）**：在板端固定现有几何，通过 `config set rvc.realtime.startup_delay_ms` 扫描 `360 / 320 / 280 / 260 ms`（须为 20 ms 倍数，且 ≥ `240 ms 块长 + 87 ms 推理 P95 - 240 ms = 87 ms` 的安全水位），测量物理回录净延迟与 60 s 长跑 `output_underruns`，找到零欠载下的最小启动缓冲默认值并更新 `realtime_chain_params.json`。
-- [ ] **降延迟步骤 B（同机 FP16 重编实时引擎，目标推理 81 ms → ~50 ms、总延迟 → ~320 ms）**：在 Jetson 本机用 `tools/model/build_realtime_engines.py --fp16` 重建 `hubert-realtime`、`rmvpe-realtime` 与目标模型的 `front` / `decoder` 引擎（同时消除跨设备 plan 警告），实测对比 FP16 与 FP32 的单块推理耗时（last/avg/p95）、F0/log-mel 误差与主观音质，再将 `startup_delay_ms` 随推理提速进一步下探。
-- [ ] **降延迟步骤 C（短块 profile 实验：240 ms → 160 ms，目标总延迟 → ~220–250 ms）**：在步骤 B 确认单块推理 P95 ≤ 60 ms 后，试验 `window_samples = 2560`（160 ms 块，整除 160 契约网格）导出并编译一套短块实时资产，评估 160 ms 块下的接缝频率（每秒 6.25 缝 vs 4.17 缝）、GPU 占空比与端到端物理回录延迟。
+- [x] **降延迟步骤 A（配置级 `startup_delay_ms` 扫描与下界验证）**：实测验证流式块化启动延迟硬下界满足 $D_{\min} = W + T_{\text{infer,max}}$。原始 FP32 引擎下（大索引 `bocchi-v2-48k` 单块 177 ms，含 88.6 ms 标量索引检索），下调 `startup_delay_ms` 至 `320/280/240/200 ms` 不会降低净延迟（维持 ~582 ms），反而导致 `pre_gap_frames` 线性增至 `6~10`；在完成 `IndexSearch` NEON 向量化 + 质心分块 + 多线程并行优化（单块 177 ms → 101 ms）后，既有 48k/40k FP32 资产在 `startup_delay_ms = 340 ms` 均达零缺帧（净延迟 ~479 ms，较基线降 ~103 ms），已将默认 `startup_delay_ms` 同步更新为 `340`。
+- [x] **降延迟步骤 B（同机 `--fp16` 重编实时引擎与索引加速）**：在 Jetson 本机使用 `build_realtime_engines.py --fp16` 重建四引擎并消除跨设备 plan 警告；配合 `IndexSearch` 加速（88.6 ms → 6.0 ms），`bocchi-v2-48k`（`index_rate=0.8`，3561 质心 / 138915 向量）单块推理从 `176.7 ms` 降至 `58.6 ms`（P95 `63.8 ms`，3.0× 提速），声学近无损（vs 文件参考 Log-Mel L1 `4.864` vs FP32 `4.742 dB`，RMS L1 `2.691` vs `2.529 dB`）；`startup_delay_ms = 320 ms` 实测物理回录净延迟 `460.2 ms`（`-122.2 ms`），60 s 连续长跑 253 块零欠载、零缺帧、零重置。已将 `realtime_chain_params.json` 的 `compile.fp16` 默认设为 `true`。
+- [x] **降延迟步骤 C（短块 profile 实验：240 ms → 160 ms）**：在隔离目录完成 `window_samples = 2560`（160 ms 块，`front=272`、`decoder=22`、`hubert=43520`、`rmvpe=32`）全套 FP16 资产导出与板端实测：单块推理 `51.3~52.4 ms`（P95 `56.9~62.7 ms`，GPU 占空比 32.8%），`startup_delay_ms = 240 / 220 ms` 均通过 60 s 长跑（378 块零欠载、零缺帧、零重置），物理回录净延迟压至 **`385.6 / 365.6 ms`**（相对 `direct` 纯 RVC 滞后 `292 / 266 ms`，较基线降 **`216.8 ms` / `-37.2%`**）。但 160 ms 块相对 240 ms 存在轻微声学代价（Log-Mel L1 `+0.11~0.23 dB`、RMS L1 `+0.21~0.35 dB`、接缝频率 6.25 vs 4.17 缝/s）且破坏既有 240 ms 资产形状兼容，故**暂不切换主干默认块长**，完整数据归档于 [realtime-quality-latency-20261125/RESULTS.md](../../reports/realtime-quality-latency-20261125/RESULTS.md)。
