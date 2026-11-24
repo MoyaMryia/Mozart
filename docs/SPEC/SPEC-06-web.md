@@ -1,6 +1,6 @@
 # web：控制台与 HTTP API
 
-状态：v1 首批 HTTP/SSE 接口已实现，完整命令面和设备验收待完成。最后更新：2026-11-16。
+状态：v1 首批 HTTP/SSE 接口已实现，完整命令面和设备验收待完成。最后更新：2026-11-24。
 
 适配器作为独立进程连接 daemon 控制 socket；本机入口仍包括
 `mozart-ctl`，见 [SPEC-04](SPEC-04-daemon.md#本机程序集成)。
@@ -13,7 +13,7 @@
 - Rust crate `mozart-web-adapter` 位于 `web-adapter/`，二进制同名。
 - 适配器同时托管静态文件、REST API、服务器发送事件（SSE）和文件上传下载。
 - 适配器复用 `mozart-core` 的控制协议，连接 daemon；daemon 自身不起 HTTP。
-- 业务决策归 daemon。适配器不直连 pre、rvc、asr、bridge 或 tts 控制 socket。
+- 生命周期与控制权分离：进程监管按方案 1 归 `daemon`（与业务子进程同级，待实现）；控制面角色与 `mozart-ctl` 同级，一切控制读写均经 `daemon.sock` 由 `daemon` 仲裁并下发，不直连 `pre`、`enhance`、`rvc`、`asr`、`bridge`、`tts` 控制 socket（仅字幕 SSE 只读 `subtitles.jsonl` 为例外，清空等写动作仍须经 `daemon`）。
 - 音频帧继续走已有数据面；本文不定义网络音频上传流、WebSocket 或远程麦克风协议。
 - llama-server 的 `/v1/chat/completions` 是内部翻译接口，不转发为公共端点。
 
@@ -30,13 +30,13 @@ CLI／本机程序集成 ─────────→ daemon.sock
 音频采集／推理／播放 ─────→ 独立音频数据面
 ```
 
-适配器独立于 daemon 存活。`system/down` 只停止 daemon 及其子服务，页面仍可访问。
-适配器由部署入口及独立启动脚本管理，不加入 daemon 的子进程监管表；流程见 [SETUP](../SETUP.md#部署行为)。
+目标部署方式为由 `daemon` 统一监管适配器进程（方案 1，待实现，见 [SPEC-04](SPEC-04-daemon.md#改进点) 与下文待办）；迁移完成前暂由部署入口及独立脚本管理。
+迁移后网页启停改为控制音频与 AI 业务子服务启停，停机期间 `daemon` 与适配器保持在线、页面仍可访问；整机完全关停保留给 `mozart-ctl down`。
 默认接入方式为设备热点，保留局域网访问；热点配置归 [SPEC-09](SPEC-09-pipeline.md)。
 监听地址与静态资源位置等新增配置见 [config.md 的 web 段](../config.md#web)。
 适配器与 daemon 使用同一运行用户、同一 TOML 和同一运行目录，不放宽 socket 目录权限。
 独立进程支持 `--config` 和 `--ctl-bin`；main 使用 `Transport` 连接句柄关闭缓冲溢出的 TCP 客户端。
-监听低端口所需权限由部署提供，不以 root 身份运行整套系统。
+默认监听高端口 `0.0.0.0:8080`，不以 root 身份运行整套系统；手动配置低端口时的部署权限见 [SETUP](../SETUP.md#部署行为)。
 
 ## 二、HTTP 通用契约
 
@@ -259,6 +259,13 @@ v1 沿用本地设备／自有热点无认证的决定，不提供公网部署�
 配置写入、关停与取消必须使用写方法，不能通过链接或 GET 触发。
 
 ## 七、实现与验收待办
+
+- [x] 默认监听地址改为 `0.0.0.0:8080`，默认 `allowed_origins` 同步带 `:8080`；保留手动配置低端口（`< 1024`）时的 `cap_net_bind_service` 兼容路径。（`core/src/config.rs`、`tools/web-service.sh`）
+- [x] 上传目录首次不存在时由适配器创建并规范叶目录为 `0700`；已存在且不安全（符号链接、非目录、属主不符或权限宽于 `0700`）时仍拒绝且不修改其权限，并在启动报错中打印具体目录路径与实际权限/原因。（`web-adapter/src/uploads.rs`）
+- [ ] 迁入 `daemon` 统一监管并收敛启停入口（方案 1）：移除独立 `tools/web-service.sh`，改为由 `daemon` 按同一 `mozart.toml` 拉起和监管 `mozart-web-adapter`；网页启停接口改为调用 `daemon` 业务子服务组启停命令，不再由适配器子进程调用 `mozart-ctl`（前置：SPEC-04 `web` 监管与业务子服务组启停命令）。
+- [ ] 接口与前端收口：保持适配器为 `daemon.sock` 瘦透传层，补齐已有命令映射（前端接入 `PUT /api/v1/mode`，适配器与前端补齐 `DAEMON_DEVICE_USE`）；适配器缓存已加载配置，不再每次 RPC 重读磁盘 TOML；前端改为按需刷新，避免每次写入后并发重拉 ALSA 设备列表与模型列表。
+- [ ] 前端写锁与 SSE 断连加固：解耦 HTTP 状态主动查询版本号与 SSE 推送版本号，消除 `statusReadFresh` 被 SSE 抢跑打断的竞态与刷新闪烁；幂等写操作在拉回最新状态后自动解除未知结果锁，仅不可幂等的文件提交保留人工确认；前端 SSE 改用指数退避重连（`1 s` 起至上限 `10 s`），持久数据错误单独降级提示。
+- [ ] 适配器网络异常、字幕回放与上传额度回收加固：将 `transport.rs` 中 `accept()` 未覆盖错误码由 `panic!` 改为记错退避；优化字幕文件增量核验与近期窗口/游标回放，避免历史文件增大导致回放撑爆 `sse_buffer_bytes`；为文件提交超时保留目录补齐可确认回收路径（确认任务状态后释放上传并发额度，不再只能等待重启 daemon）。
 
 - [x] Rust 检查显式构建 daemon、ctl 和协议桩；适配器集成测试使用 Cargo 提供的正式产物路径，不依据测试可执行文件所在目录。使用不同的 `CARGO_TARGET_DIR` 和 `CARGO_BUILD_BUILD_DIR` 从空目录运行 `tools/ci-local.sh adapter`，两项真实 daemon 集成测试通过。
 

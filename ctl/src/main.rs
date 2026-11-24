@@ -1,5 +1,5 @@
 use clap::{Parser, Subcommand, ValueEnum};
-use mozart_core::config::{ensure_run_dir, Config, RvcSessionValues};
+use mozart_core::config::{ensure_log_dir, ensure_run_dir, Config, RvcSessionValues};
 use mozart_core::ctl::schema::{
     Activity, ConfigGetRequest, ConfigSetRequest, DeviceEntry, DeviceKind, DeviceListRequest,
     DeviceUseRequest, FileCancelRequest, FileFetchRequest, FileJob, FileJobState, FileProgress,
@@ -340,7 +340,7 @@ fn up(config: &Config, config_path: Option<&Path>, json_output: bool) -> Result<
             format!("prepare {}: {err}", config.daemon.run_dir.display()),
         )
     })?;
-    std::fs::create_dir_all(config.log_dir()).map_err(|err| {
+    ensure_log_dir(&config.log_dir()).map_err(|err| {
         CliError::new(
             EXIT_ERROR,
             format!("create {}: {err}", config.log_dir().display()),

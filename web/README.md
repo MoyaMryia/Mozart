@@ -17,7 +17,7 @@ npm --prefix web run dev
 开发服务器默认仅监听本机。配置上游时启动代理：
 
 ```bash
-MOZART_WEB_API_TARGET=http://127.0.0.1:80 npm --prefix web run dev
+MOZART_WEB_API_TARGET=http://127.0.0.1:8080 npm --prefix web run dev
 ```
 
 生产构建输出到 `web/dist/`，由独立进程 [mozart-web-adapter](../web-adapter/README.md) 同源托管。

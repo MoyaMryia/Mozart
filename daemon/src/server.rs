@@ -8,8 +8,8 @@ use crate::state::{lock_state, Role, State};
 use crate::state_file::{self, BridgeRestore, StateFile};
 use crate::supervisor::{RestartHandle, Supervisor};
 use mozart_core::config::{
-    device_key_kind, ensure_run_dir, get_key, runtime_key_owner, save_overrides, set_key,
-    state_file_path, validate_device_name, Config,
+    device_key_kind, ensure_log_dir, ensure_run_dir, get_key, runtime_key_owner, save_overrides,
+    set_key, state_file_path, validate_device_name, Config,
 };
 use mozart_core::ctl::schema::{
     self, ConfigGetRequest, ConfigSetRequest, DeviceKind, DeviceListRequest, DeviceUseRequest,
@@ -48,7 +48,7 @@ struct Ctx {
 
 pub fn serve(config: &Config, config_path: Option<&Path>) -> io::Result<()> {
     ensure_run_dir(&config.daemon.run_dir)?;
-    std::fs::create_dir_all(config.log_dir())?;
+    ensure_log_dir(&config.log_dir())?;
     let _lock = lock_instance(config)?;
 
     let socket_path = config.daemon_socket();

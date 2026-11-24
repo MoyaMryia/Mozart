@@ -231,10 +231,10 @@ core 接受此段；适配器与 daemon 读取同一 TOML。
 
 | 键 | 类型 | 默认 | 范围 | 类别 |
 | --- | --- | --- | --- | --- |
-| listen | socket address | 0.0.0.0:80 | 有效 IP 与端口 | S |
+| listen | socket address | 0.0.0.0:8080 | 有效 IP 与端口 | S |
 | static_dir | path | web/dist | 前端静态资源目录 | S |
 | upload_dir | path | ~/.local/state/mozart/web-uploads | 适配器私有临时目录，权限 0700 | S |
-| allowed_origins | array<string> | ["http://localhost", "http://127.0.0.1", "http://[::1]"] | 无路径的 HTTP origin，不含通配符 | S |
+| allowed_origins | array<string> | ["http://localhost:8080", "http://127.0.0.1:8080", "http://[::1]:8080"] | 无路径的 HTTP origin，不含通配符 | S |
 | max_concurrent_uploads | int | 2 | ≥1 | S |
 | upload_timeout_ms | int | 120000 | >0，接收一次 multipart 正文的总时限 | S |
 | sse_heartbeat_ms | int | 15000 | >0 | S |

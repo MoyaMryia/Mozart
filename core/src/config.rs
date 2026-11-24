@@ -73,13 +73,17 @@ pub struct WebConfig {
 impl Default for WebConfig {
     fn default() -> Self {
         Self {
-            listen: "0.0.0.0:80".parse().unwrap(),
+            listen: "0.0.0.0:8080".parse().unwrap(),
             static_dir: "web/dist".into(),
             upload_dir: "~/.local/state/mozart/web-uploads".into(),
-            allowed_origins: ["http://localhost", "http://127.0.0.1", "http://[::1]"]
-                .into_iter()
-                .map(String::from)
-                .collect(),
+            allowed_origins: [
+                "http://localhost:8080",
+                "http://127.0.0.1:8080",
+                "http://[::1]:8080",
+            ]
+            .into_iter()
+            .map(String::from)
+            .collect(),
             max_concurrent_uploads: 2,
             upload_timeout_ms: 120_000,
             sse_heartbeat_ms: 15_000,
@@ -1312,6 +1316,11 @@ pub fn ensure_run_dir(dir: &Path) -> io::Result<()> {
     Ok(())
 }
 
+/// 日志目录与运行目录同口径收敛到 0700，避免默认 umask 0002 生成 0775 与 Web 启动校验冲突。
+pub fn ensure_log_dir(dir: &Path) -> io::Result<()> {
+    ensure_run_dir(dir)
+}
+
 /// 设备键 → 方向（SPEC-04 设备存在性校验用）；非设备键返回 None。
 /// 设备键分类的唯一定义源，daemon 与 set_key 共用。
 pub fn device_key_kind(key: &str) -> Option<&'static str> {
@@ -2390,6 +2399,35 @@ mod tests {
         assert_eq!(mode & 0o777, 0o700);
 
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn ensure_log_dir_converges_to_0700() {
+        let dir = std::env::temp_dir().join(format!("mozart-logdir-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+
+        ensure_log_dir(&dir).unwrap();
+        assert_eq!(std::fs::metadata(&dir).unwrap().permissions().mode() & 0o777, 0o700);
+
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o775)).unwrap();
+        ensure_log_dir(&dir).unwrap();
+        assert_eq!(std::fs::metadata(&dir).unwrap().permissions().mode() & 0o777, 0o700);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn web_config_defaults_to_8080() {
+        let web = WebConfig::default();
+        assert_eq!(web.listen, "0.0.0.0:8080".parse::<SocketAddr>().unwrap());
+        assert_eq!(
+            web.allowed_origins,
+            vec![
+                "http://localhost:8080",
+                "http://127.0.0.1:8080",
+                "http://[::1]:8080",
+            ]
+        );
     }
 
     #[test]

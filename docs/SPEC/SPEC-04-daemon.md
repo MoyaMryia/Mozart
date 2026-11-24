@@ -22,7 +22,7 @@
 - [x] 启动方式：CLI 直接 spawn 控制 daemon；daemon 拉起并监管 pre、rvc 等服务进程。不依赖 systemd，systemd 部署留到流水线阶段再议。daemon spawn 子进程时传 `--socket`（控制面）与 `--config`（同一 TOML），子进程各读自己的配置段。（`daemon/src/supervisor.rs`）
 - [x] `--config` 传的是 daemon 自己解析出的 TOML 路径；内置默认启动（无配置文件）时不传，子进程按同一解析顺序得到同一默认值。（`daemon/src/supervisor.rs:260-269`）
 - [x] 部署布局：所有运行时二进制安装到 `~/mozart-runtime/bin`，daemon 按自身可执行文件同目录解析 pre/rvc（`process.*_bin` 为裸名时）；rvc 的 CMake 产物复制到同一目录，或用 `MOZART_RVC_BIN` 指绝对路径。目录规范见 [SETUP.md](../SETUP.md)。（`core/src/config.rs:504`）
-- [x] 控制 socket 固定在 `run_dir`（默认 `/run/mozart`）：`daemon.sock`、`pre.sock`、`rvc.sock`、`asr.sock`、`bridge.sock`、`tts.sock`；daemon 用 `daemon.lock` 独占实例。运行目录由 daemon 收敛为 0700。（`core/src/config.rs`）
+- [x] 控制 socket 固定在 `run_dir`（默认 `/run/mozart`）：`daemon.sock`、`pre.sock`、`rvc.sock`、`asr.sock`、`bridge.sock`、`tts.sock`；daemon 用 `daemon.lock` 独占实例。运行目录与 `run_dir/logs` 统一由 `ctl` 与 `daemon` 经共用入口收敛为 `0700`，避免默认 `umask 0002` 与 `web-service.sh` 目录校验冲突。（`core/src/config.rs`）
 - [x] daemon 平面命令：`Hello`、`GetStatus`、`RouteSet`、`MuteSet`、`Shutdown`。配置读 TOML：`--config` > `MOZART_CONFIG` > `./mozart.toml` > 内置默认；`MOZART_RUN_DIR`、`MOZART_PRE_BIN`、`MOZART_RVC_BIN`、`MOZART_DAEMON_BIN`、`MOZART_POLL_INTERVAL_MS` 覆盖。（`daemon/src/server.rs`）
 - [x] 配置持久化（模型甲）：TOML 是持久基线，运行时改动不自动写 TOML；只有显式写回动作（`config set` / `config save`）写 TOML，原子写。用户手改 TOML 随意，不做防冲突保护；手改在重启时被读取。（toml_edit 原子写）
 - [x] 运行时状态文件：daemon 在持久数据目录（默认 `~/.local/state/mozart/`，`MOZART_STATE_DIR` 可覆盖）维护 `state.json`，当前记录字幕开关的运行时覆盖（`bridge.translate_enabled` / `bridge.speech_enabled`）；`config set rvc.*` 与 `preset use` 直接写 TOML 基线并经 `SetParams`（或旋钮变化时 `StopStream`→`StartStream`）下发，不进 `state.json`。每次改动先更新内存覆盖再原子写盘（临时文件 + rename）；写盘失败只记 `degraded` 不阻断命令，桥重启仍由内存覆盖恢复，仅 daemon 自身重启失去未落盘更改。启动时读 TOML 基线叠加运行时状态，得到生效配置再拉起服务下发（字幕开关覆盖待桥就绪后下发一次；`Poller` 在桥进程重启且 pid 变化时重新从内存状态覆盖下发）。运行时状态文件是存档快照，不是第二份活权威；活权威在各服务，启动与桥重启恢复，运行时不对账。桥已不再自写 `bridge-state.json`。（`daemon/src/state_file.rs`、`daemon/src/poller.rs`、`daemon/src/server.rs`）
@@ -113,6 +113,10 @@ CLI 的 `--json` 输出通常为响应的 `data`，不是完整 socket 响应信
 - [x] 音频设备实时热切换命令 `device use <capture|playback> <设备名>`（`DAEMON_DEVICE_USE` `0x0121`）：体 `{"kind","device"}`，data `{"kind","device","previous_device"}`。入口按设备清单校验存在性与方向匹配，再经 `PRE_SET_DEVICE`（`0x0208`）下发 pre 实时生效；不写回 `mozart.toml`、不进 `state.json`，`config set pre.capture_device/playback_device` 维持 S 类。daemon 内存保留当前临时生效设备，pre 意外崩溃自愈重启时通过 `--effective-capture-device` / `--effective-playback-device` 沿用；显式 `restart pre` 或 `down`/`up` 清空临时覆盖、恢复 `mozart.toml` 基线。（`daemon/src/server.rs`、`daemon/src/supervisor.rs`、`daemon/src/runtime.rs`、`ctl/src/main.rs`、`daemon/tests/device_use.rs`）
 - [x] 文件租约归还：文件结果与数据面归还分开；确认停流、释放输出 socket、确认 pre 恢复，才释放文件租约。未知结果由 daemon 对账，可查询且阻止新任务与实时起流。 `arbiter.file_return_pending` 与降级原因区分文件终态和资源状态；停流前、停流后丢应答及 pre 归还失败均有本机故障注入回归。
 - [x] 主模式互斥切换与默认实时变声：有配置模型时默认托管实时变声，无模型时默认托管直出。翻译播报仅输出 TTS 并在空窗静音；实时变声和直出不插播 TTS。三种模式均保留识别和翻译字幕。旧命令与 `startup_mode = "manual"` 保留独立控制。
+- [ ] 统一监管 Web 适配器（方案 1）：将 `mozart-web-adapter` 纳入 `Supervisor`（新增 `web` 角色，读取 `[process].web_bin` 与 `[web]` 配置，随 daemon 拉起、崩溃退避重启、`PDEATHSIG` 孤儿防护、日志落 `run_dir/logs/web.log`）；`GetStatus.processes` 上报 `web` 状态，支持 `restart web`；`daemon` 自身仍不内置 HTTP，适配器继续经 `daemon.sock` 接入。
+- [ ] 业务子服务组启停控制命令（方案 1）：新增 daemon 控制命令，支持在保持 `daemon` 与 `web` 在线的前提下停止或恢复音频与 AI 业务子服务（`pre`、`enhance`、`rvc`、`asr`、`tts`、`bridge`、`llama-server`），供 Web 控制台释放或恢复 GPU 与内存资源；整机完全关停仍走 `mozart-ctl down` / `Shutdown`。
+- [ ] 控制面超时表与连接队列加固：将 `DAEMON_MODEL_USE`、`DAEMON_FILE_SUBMIT` 纳入 `core::ctl::request_timeout_ms` 共用长超时预算，避免切模型与大文件入队误超时；将 `daemon.sock` 的 `listen` 队列上限由 `8` 调大至 `64`，保留 `transition` 互斥锁串行语义。
+- [ ] 优雅关停与停机超时加固：关停标志置位后 `poller` 立即提前退出、不再继续对已停子服务做轮询等待；`mozart-ctl down` 停机等待时限与 `start_timeout_ms` 解耦并给足缓冲（至少 `10–15 s`），避免满载停栈误超时。
 
 ## 待讨论
 

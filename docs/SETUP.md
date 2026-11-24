@@ -120,7 +120,7 @@ MOZART_JETSON=<SSH目标> uv run tools/jetson-audio.py
 
 适配器不加入 daemon 子进程表。`system/down` 不停止页面。使用 `bin/mozart-web-service <运行目录> start|stop|restart|status` 管理它；启动脚本检查 PID、启动时间、可执行文件和配置参数，并等待绑定完成的原生确认。
 
-低端口需要 `cap_net_bind_service`，脚本通过 `sudo -n setcap` 授予；没有该权限时改用高端口配置。服务以运行目录所有者启动，不以 root 运行；绑定后、创建工作线程前清除进程 capability。设备需提供 `jq` 和 libcap 工具。
+默认配置监听 `8080` 高端口，无需 `cap_net_bind_service` 或免密 `sudo` 即可启动。若手动配置低端口（`< 1024`），脚本才通过 `sudo -n setcap` 授予 `cap_net_bind_service`；没有该权限时请保持高端口配置。服务以运行目录所有者启动，不以 root 运行；绑定后、创建工作线程前清除进程 capability。设备需提供 `jq` 和 libcap 工具。
 
 `deploy.json` 记录提交号、dirty 标记、时间、构建预设和构建模式；部署期间整栈重启。当前实测范围及标准整链部署阻塞见[适配器报告](../reports/web-adapter-20261117/RESULTS.md#适用范围)。
 
@@ -206,7 +206,7 @@ static_dir = "web/dist"
 upload_dir = "state/web-uploads"
 ```
 
-按实际访问地址配置 `allowed_origins`。适配器以同一运行用户独立运行；低端口权限和网络访问控制由部署提供。
+按实际访问地址配置 `allowed_origins`。适配器以同一运行用户独立运行，高端口默认配置与低端口权限见[部署行为](#部署行为)，网络访问控制由部署提供。运行期子进程环境变量（如 `LD_LIBRARY_PATH`）统一以 [process.env](config.md#processenv) 为唯一来源。
 手动文件变声 harness：`~/mozart-runtime/run-remote.sh`，执行 `ctl up → file submit → file fetch`。
 
 当前运行配置只启用 pre、rvc 与文件转换。未配置 `[process.env]`、`[asr]`、`[tts]`、`[bridge]` 时，`status` 显示 asr/tts/llama 降级属预期；语言链由 e2e 的临时配置验证。

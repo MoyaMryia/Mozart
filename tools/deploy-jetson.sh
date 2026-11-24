@@ -224,8 +224,6 @@ install_binary target/debug/examples/rvc_stub "$root/bin/examples/rvc_stub"
 install_binary tools/web-service.sh "$root/bin/mozart-web-service"
 rsync -a --checksum --delete web/dist/ "$root/web/dist/"
 "$root/bin/mozart-web-service" "$root" prepare
-assets=${MOZART_ASSETS_DIR:-$HOME/mozart-assets}
-export LD_LIBRARY_PATH="$assets/lib:$assets/llama${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
 "$root/bin/mozart-ctl" --config "$root/mozart.toml" up
 # 包括原本正常的可选服务；不把部署前已降级的服务冒充本次部署失败。
 healthy=0

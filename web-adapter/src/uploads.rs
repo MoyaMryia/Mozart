@@ -173,18 +173,63 @@ fn exited(peer: &Peer) -> std::io::Result<bool> {
     }
 }
 
+fn ensure_private_upload_dir(raw: &std::path::Path) -> Result<PathBuf, ApiError> {
+    use std::os::unix::fs::DirBuilderExt;
+    let dir: PathBuf = raw.components().collect();
+    let mut builder = fs::DirBuilder::new();
+    builder.mode(0o700);
+    let created = match builder.create(&dir) {
+        Ok(()) => true,
+        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => false,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            if let Some(parent) = dir.parent().filter(|p| !p.as_os_str().is_empty()) {
+                fs::create_dir_all(parent)
+                    .map_err(|err| internal(format!("创建上传父目录 {} 失败：{err}", parent.display())))?;
+            }
+            match builder.create(&dir) {
+                Ok(()) => true,
+                Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => false,
+                Err(err) => return Err(internal(format!("创建上传目录 {} 失败：{err}", dir.display()))),
+            }
+        }
+        Err(e) => return Err(internal(format!("创建上传目录 {} 失败：{e}", dir.display()))),
+    };
+    if created {
+        fs::set_permissions(&dir, fs::Permissions::from_mode(0o700))
+            .map_err(|e| internal(format!("设置上传目录 {} 权限失败：{e}", dir.display())))?;
+    }
+    let meta = fs::symlink_metadata(&dir)
+        .map_err(|e| internal(format!("读取上传目录 {} 元数据失败：{e}", dir.display())))?;
+    if meta.file_type().is_symlink() {
+        return Err(internal(format!("上传目录 {} 不能是符号链接", dir.display())));
+    }
+    if !meta.file_type().is_dir() {
+        return Err(internal(format!("上传路径 {} 不是目录", dir.display())));
+    }
+    // SAFETY: geteuid has no preconditions.
+    let euid = unsafe { libc::geteuid() };
+    if meta.uid() != euid {
+        return Err(internal(format!(
+            "上传目录 {} 属主 uid={} 与当前用户 uid={} 不一致",
+            dir.display(),
+            meta.uid(),
+            euid
+        )));
+    }
+    let mode = meta.mode() & 0o7777;
+    if mode & 0o077 != 0 {
+        return Err(internal(format!(
+            "上传目录 {} 权限为 {:04o}，必须为当前用户私有 0700（请执行 chmod 700 后重试）",
+            dir.display(),
+            mode
+        )));
+    }
+    Ok(dir)
+}
+
 impl UploadStore {
     pub fn new(config: &WebAdapterConfig, rpc: RpcClient) -> Result<Arc<Self>, ApiError> {
-        let dir = config.web.upload_dir.clone();
-        use std::os::unix::fs::DirBuilderExt;
-        let mut builder = fs::DirBuilder::new();
-        builder.recursive(true).mode(0o700);
-        builder.create(&dir).map_err(internal)?;
-        let meta = fs::symlink_metadata(&dir).map_err(internal)?;
-        // SAFETY: geteuid has no preconditions.
-        if !meta.file_type().is_dir() || meta.uid() != unsafe { libc::geteuid() } || meta.mode() & 0o077 != 0 {
-            return Err(internal("上传目录必须为当前用户的私有目录，且不能是符号链接"));
-        }
+        let dir = ensure_private_upload_dir(&config.web.upload_dir)?;
         let lock = OpenOptions::new().read(true).write(true).create(true).mode(0o600).open(dir.join(".lock")).map_err(internal)?;
         // SAFETY: lock owns a valid descriptor during this call.
         if unsafe { libc::flock(lock.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } != 0 { return Err(internal("上传目录已由其他实例占用")); }
@@ -387,16 +432,31 @@ mod tests {
         let link = root.path().join("link");
         std::os::unix::fs::symlink(&target, &link).unwrap();
         let mut config = WebAdapterConfig::load_from(None).unwrap();
-        for path in [&link, &target] {
-            config.web.upload_dir = path.to_owned();
-            assert!(UploadStore::new(&config, RpcClient::new(None, config.clone())).is_err());
-            assert_eq!(fs::metadata(&target).unwrap().mode() & 0o777, 0o755);
-        }
+        config.web.upload_dir = link.clone();
+        let link_err = UploadStore::new(&config, RpcClient::new(None, config.clone())).err().unwrap();
+        assert!(link_err.reason.contains(&link.display().to_string()), "{}", link_err.reason);
+        config.web.upload_dir = target.clone();
+        let mode_err = UploadStore::new(&config, RpcClient::new(None, config.clone())).err().unwrap();
+        assert!(mode_err.reason.contains(&target.display().to_string()), "{}", mode_err.reason);
+        assert!(mode_err.reason.contains("0755"), "{}", mode_err.reason);
+        assert_eq!(fs::metadata(&target).unwrap().mode() & 0o777, 0o755);
         fs::set_permissions(&target, fs::Permissions::from_mode(0o700)).unwrap();
         config.web.upload_dir = link;
         assert!(UploadStore::new(&config, RpcClient::new(None, config.clone())).is_err());
         config.web.upload_dir = target;
         assert!(UploadStore::new(&config, RpcClient::new(None, config.clone())).is_ok());
+    }
+
+    #[test]
+    fn upload_directory_creates_missing_parents_with_0700() {
+        let root = tempfile::tempdir().unwrap();
+        let upload_dir = root.path().join("nested/state/web-uploads");
+        let mut config = WebAdapterConfig::load_from(None).unwrap();
+        config.web.upload_dir = upload_dir.clone();
+        assert!(UploadStore::new(&config, RpcClient::new(None, config.clone())).is_ok());
+        let meta = fs::symlink_metadata(&upload_dir).unwrap();
+        assert!(meta.file_type().is_dir());
+        assert_eq!(meta.mode() & 0o7777, 0o700);
     }
 
     // This test is invoked only as a separate process so SO_PEERCRED identifies it.
