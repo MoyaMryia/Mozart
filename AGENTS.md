@@ -38,6 +38,7 @@ Mozart 是面向 NVIDIA Jetson Orin Nano Super 8 GB 的本地语音处理系统�
 `docs/SPEC/` 的待办清单是当前工作的唯一事实源，完成一项勾选 `[x]`。
 
 - 任何优化、修复或新功能，先写入对应模块规格的待办，再动手；没有归属模块时先在 `docs/SPEC/SPEC.md` 讨论定模块。
+- 规格读取定点化：起步只读 `docs/SPEC/SPEC.md`，动某模块前只读该模块规格，不要全量读 `docs/SPEC/`。已完成 `[x]` 的细节归档在 `docs/SPEC/archive/`，只在追溯决策细节时定点读；归档机制见 `docs/SPEC/SPEC.md`「归档」。
 - 跨模块事项记 `docs/SPEC/SPEC.md`，模块内事项记模块规格。
 - 临时不做的事项放 `docs/FUTURE.md`；它只是暂存区，不是待办。
 - 从 FUTURE 取条目：先讨论确认，再写入对应模块待办，然后动手。

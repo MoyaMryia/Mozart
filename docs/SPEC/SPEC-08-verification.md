@@ -1,11 +1,19 @@
 # verification：验证与记录
 
 状态：讨论中。2026-11-15 起为待办清单，`[x]` 已覆盖、`[ ]` 未覆盖，记法见 [SPEC.md](SPEC.md)。
+`[x]` 条目详情已于 2026-11-24 移入 [archive/SPEC-08-verification.md](archive/SPEC-08-verification.md)，本文件保留契约、关键决策摘要与活跃待办。
 
 ## 验收依据
 
-- [x] 评分标准见 [REQUIREMENTS.md](../REQUIREMENTS.md)。
-- [x] 产品目标与验收原则见 [TARGET.md](../../TARGET.md)。
+- 评分标准见 [REQUIREMENTS.md](../REQUIREMENTS.md)。
+- 产品目标与验收原则见 [TARGET.md](../../TARGET.md)。
+
+## 已确认决策（摘要）
+
+> 全文条目与证据见 [archive/SPEC-08-verification.md](archive/SPEC-08-verification.md)。与归档冲突时以归档原文为准并回来修正本节。
+
+- golden 对比沿用旧方法；实测记录按 `reports/` 约定（证据见归档「已确认」）。
+- 预设损坏测试仍在既有 `POLL_TIMEOUT` 内要求 `model-b` 已加载，不放宽目标或超时（竞态已修正，见归档「本次接入回归」）。
 
 ## 功能验收
 
@@ -14,38 +22,33 @@
 
 ### 实时变声
 
-- [x] 对着麦克风说话，扬声器持续输出目标音色；不中断、不爆音、无明显机械感。（真语音回录见 `reports/realtime-pipeline-20261112`；切换单样本阶跃复测见系统级条目）
+- 2 项验收通过（持续输出目标音色、稳态块时延不劣于旧基线），场景与证据见[归档](archive/SPEC-08-verification.md)。
 - [ ] 首帧出声不超过 400 ms（旧启动预算；旧实测 320 ms）。无独立计时：现报告 698 ms 含 LoadModel（`reports/realtime-pipeline-20261112/RESULTS.md:36`）。
-- [x] 稳态推理块时延不劣于旧基线（固定模型与配置；中位 88 ms、P95 93 ms）。
 - [ ] 连续 30 分钟不丢帧（建议门槛）。当前仅 60 s 单轮（`RESULTS.md:41-50`）。
 
 ### 翻译字幕
 
+- 1 项验收通过（每个输入都有结果或失败记录），场景见[归档](archive/SPEC-08-verification.md)。
 - [ ] 说话后，网页按句显示原文和译文；断线后能自动恢复。前端与适配器已实现；断线恢复有单测（`bridge/tests/process.rs:320`）。
 - [ ] 句末后 1–2 秒内出现译文。板端实测无此数据（language 链路报告仅单测）。
-- [x] 每个输入都有结果或失败记录；错误和未翻译项逐条列出。
 
 ### 翻译播报
 
-- [x] 译文用参考音色播出（v1 继承旧播报；经变声同音色见 FUTURE）；按句序、不丢句。（`reports/language-chain-20261113`）
-- [x] 播报队列有上限，积压时不无限等待。（`tts/tests/process.rs:228`）
+- 3 项验收通过（参考音色按句序播出、队列有上限、播放关系见 [SPEC-05-language.md](SPEC-05-language.md)），场景见[归档](archive/SPEC-08-verification.md)。
 - [ ] 句末到第一声播报的延迟门槛待定。门槛未定，未测量。
-- [x] 播放关系（分时或混音）见 [SPEC-05-language.md](SPEC-05-language.md)。
 
 ### 文件转换
 
-- [x] 用 CLI 提交音频文件（`file submit`）能得到变声结果并取回（`file fetch`）；v1 用 CLI 验收，网页上传下载归 web 适配器。（`reports/file-chain-20261113/RESULTS.md:60-63`，`tools/jetson-file-test.sh`）
-- [x] 任务可取消；每个输入都有结果或明确失败原因。（取消清理见同报告）
-- [x] 多模型文件转换：40k/48k、静态/动态生成器共 10 个模型完成且帧守恒；`frieren-v2-40k` 与 PyTorch 参考对拍 log-mel 相关 0.9930、F0 中位偏差 10 音分、对齐 0 ms。（`reports/multi-model-file-20261115/RESULTS.md`）
+- 3 项验收通过（CLI 提交取回、可取消且有失败原因、10 模型帧守恒与参考对拍），场景与证据见[归档](archive/SPEC-08-verification.md)。
 - [ ] 长文件不会耗尽内存。现按 completed + 帧守恒验收，未测峰值内存——口径偏松，需补测量。
 
 ### HTTP API 与网页
 
 以下是新增接口的验收要求，不替代现有 CLI、音质或性能验收。
 
+- 1 项验收通过（daemon 停止后页面与适配器仍可访问并能从网页再次启动），场景见[归档](archive/SPEC-08-verification.md)。
 - [ ] 按 [SPEC-06](SPEC-06-web.md#七实现与验收待办) 逐项验收 HTTP、文件传输和 SSE 契约。
 - [ ] 对同一 daemon 比较 CLI 与 HTTP 的结果，保留上游错误码、待重启提示和异步状态。
-- [x] daemon 停止后页面与适配器仍可访问，并能从网页再次启动 daemon。（[板端浏览器联调](../../reports/web-adapter-20261117/RESULTS.md)）
 - [ ] 网页完成文件上传、排队观察、取消与 WAV 下载；不得把受理成功视为转换完成。
 - [ ] 字幕断线恢复和文件变化测试核对全部修订，不以最终一条字幕相等代替无漏行检查。
 
@@ -63,12 +66,11 @@
 
 ## 本次接入回归
 
-- [x] 修正预设损坏测试中文件完成与状态轮询之间的竞态；仍在既有 `POLL_TIMEOUT` 内要求 `model-b` 已加载，不放宽目标或超时。
+- 预设损坏测试竞态已修正；全文见[归档](archive/SPEC-08-verification.md)。
 
 ## 已确认
 
-- [x] golden 对比沿用旧方法。（`reports/rvc-fulllength-golden-20261113/RESULTS.md`）
-- [x] 实测记录按 `reports/` 约定。
+- golden 对比方法与实测记录约定已确认；全文与证据见[归档](archive/SPEC-08-verification.md)。
 
 ## 待讨论
 

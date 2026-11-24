@@ -1,6 +1,7 @@
 # web：控制台与 HTTP API
 
 状态：v1 首批 HTTP/SSE 接口已实现，完整命令面和设备验收待完成。最后更新：2026-11-24。
+`[x]` 条目详情已于 2026-11-24 移入 [archive/SPEC-06-web.md](archive/SPEC-06-web.md)，本文件保留契约、关键决策摘要与活跃待办。
 
 适配器作为独立进程连接 daemon 控制 socket；本机入口仍包括
 `mozart-ctl`，见 [SPEC-04](SPEC-04-daemon.md#本机程序集成)。
@@ -252,51 +253,48 @@ v1 沿用本地设备／自有热点无认证的决定，不提供公网部署�
 这些检查不构成用户鉴权，网络访问控制由部署负责。
 配置写入、关停与取消必须使用写方法，不能通过链接或 GET 触发。
 
+## 已确认决策（摘要）
+
+> 全文条目与证据见 [archive/SPEC-06-web.md](archive/SPEC-06-web.md)。与归档冲突时以归档原文为准并回来修正本节。
+
+- 默认监听 `0.0.0.0:8080`，默认 `allowed_origins` 同步带 `:8080`；手动低端口保留 `cap_net_bind_service` 兼容路径，孤儿保护缺口见第一节。
+- 上传目录首次创建并规范叶目录为 `0700`；不安全的现有目录拒绝且不修改其权限，启动报错打印具体路径与实际权限/原因。
+- 适配器归 `daemon` 统一监管（方案 1）：移除独立 `tools/web-service.sh` 与 `--ctl-bin`/`--ready-file` 及子进程 CLI 调起，启停透传 `DAEMON_SERVICES_START`/`DAEMON_SERVICES_STOP`。
+- Rust 检查显式构建 daemon、ctl 和协议桩；适配器集成测试取 Cargo 正式产物路径，不依据测试可执行文件所在目录。
+- 部署回滚恢复原先不存在的源码目录；Web 服务状态查询不修改运行目录权限。
+- Web 后端与部署改动已迁移到当前主线，保留增强和 ASR 修复；资源读取失败后的写入限制与未知结果确认已修复并补前端回归，未知写入不重试。
+- `web/` Vue 工程与 Rust 适配器已创建，接入共用配置、新 REST/SSE 客户端和本机检查入口；设备构建部署入口已接入，标准脚本整链的当前阻塞与已测范围见归档所引报告。
+- 系统面板显示增强进程与工作状态，支持重启增强服务。
+- 生效上传上限与轮询间隔查询已按 SPEC-04 补齐并接入对应 HTTP 路由。
+- 验收通过：适配器存活期间 down → 页面可达 → up → 状态恢复（真实浏览器联调）；未声明下载安全能力的旧 daemon 下载明确拒绝且不透出本机路径；未知路由、方法、正文类型、同源限制、目录穿越与下载文件名编码的 HTTP 边界测试通过。
+
 ## 七、实现与验收待办
 
-- [x] 默认监听地址改为 `0.0.0.0:8080`，默认 `allowed_origins` 同步带 `:8080`；保留手动配置低端口（`< 1024`）时的 `cap_net_bind_service` 兼容路径。（`core/src/config.rs`、`tools/deploy-jetson.sh`）
-- [x] 上传目录首次不存在时由适配器创建并规范叶目录为 `0700`；已存在且不安全（符号链接、非目录、属主不符或权限宽于 `0700`）时仍拒绝且不修改其权限，并在启动报错中打印具体目录路径与实际权限/原因。（`web-adapter/src/uploads.rs`）
-- [x] 迁入 `daemon` 统一监管并收敛启停入口（方案 1）：移除独立 `tools/web-service.sh`，改为由 `daemon` 按同一 `mozart.toml` 拉起和监管 `mozart-web-adapter`；`POST /system/up` 与 `POST /system/down` 改为透传 `DAEMON_SERVICES_START` / `DAEMON_SERVICES_STOP`，移除 `--ctl-bin` 与 `--ready-file` 及子进程 CLI 调起路径。（`web-adapter/src/{main,lib,routes}.rs`、`web-adapter/tests/{http,daemon}.rs`、`tools/ci-local.sh`）
 - [ ] 接口与前端收口：保持适配器为 `daemon.sock` 瘦透传层，补齐已有命令映射（前端接入 `PUT /api/v1/mode`，适配器与前端补齐 `DAEMON_DEVICE_USE`）；适配器缓存已加载配置，不再每次 RPC 重读磁盘 TOML；前端改为按需刷新，避免每次写入后并发重拉 ALSA 设备列表与模型列表。
 - [ ] 前端写锁与 SSE 断连加固：解耦 HTTP 状态主动查询版本号与 SSE 推送版本号，消除 `statusReadFresh` 被 SSE 抢跑打断的竞态与刷新闪烁；幂等写操作在拉回最新状态后自动解除未知结果锁，仅不可幂等的文件提交保留人工确认；前端 SSE 改用指数退避重连（`1 s` 起至上限 `10 s`），持久数据错误单独降级提示。
 - [ ] 适配器网络异常、字幕回放与上传额度回收加固：将 `transport.rs` 中 `accept()` 未覆盖错误码由 `panic!` 改为记错退避；优化字幕文件增量核验与近期窗口/游标回放，避免历史文件增大导致回放撑爆 `sse_buffer_bytes`；为文件提交超时保留目录补齐可确认回收路径（确认任务状态后释放上传并发额度，不再只能等待重启 daemon）。
 
-- [x] Rust 检查显式构建 daemon、ctl 和协议桩；适配器集成测试使用 Cargo 提供的正式产物路径，不依据测试可执行文件所在目录。使用不同的 `CARGO_TARGET_DIR` 和 `CARGO_BUILD_BUILD_DIR` 从空目录运行 `tools/ci-local.sh adapter`，两项真实 daemon 集成测试通过。
+- 非文件写入结果未知后，确认须等待未被新状态覆盖的后续 HTTP 状态查询成功；SSE 不得替代查询。
 
-- [x] 部署回滚恢复原先不存在的源码目录；Web 服务状态查询不修改运行目录权限。
-
-- [x] 修复资源读取失败后的写入限制和未知结果确认，补充前端回归测试。
-- [x] 非文件写入结果未知后，确认须等待未被新状态覆盖的后续 HTTP 状态查询成功；SSE 不得替代查询。
-
-- [x] 上传目录必须为当前用户私有目录，拒绝符号链接及不安全的现有目录，不修改其权限。
-
-- [x] 将已保存的 Web 后端与部署改动迁移到当前主线，保留增强和 ASR 修复，并验证未知写入不重试。
+- 上传目录必须为当前用户私有目录，拒绝符号链接及不安全的现有目录，不修改其权限。
 
 勾选项以代码和所列测试为依据；设备部署和产品验收单独保留。
 `tools/ci-local.sh adapter` 的两个 daemon 集成测试使用真实 daemon（拉起真实 `mozart-web-adapter`）、真实 ctl 与协议桩，不执行实际 RVC 推理（`web-adapter/tests/daemon.rs`）。
 该测试覆盖 HTTP 业务启停（`system/down`/`system/up`）、`ctl down` 全栈停机、配置、文件提交与下载，以及无模型时的路由拒绝。
 上传恢复、字幕游标和 HTTP 边界另有单元及集成测试；下列复合验收保留完整门槛。
 
-- [x] 创建 `web/` Vue 工程，拆分展示组件，接入新 REST/SSE 客户端和本机检查入口。
-- [x] 创建 Rust 适配器并接入共用配置。（`web-adapter/src/main.rs`、`core/src/config.rs`）
-- [x] 接入设备构建部署入口；标准脚本整链的当前阻塞与已测范围见[报告](../../reports/web-adapter-20261117/RESULTS.md#适用范围)。
-- [x] 对接单 default 预设和模型选择：`GET /api/v1/preset` 映射 `DAEMON_PRESET_LIST`；`POST /api/v1/preset/save` 和 `/api/v1/preset/use` 分别映射 `DAEMON_PRESET_SAVE` 和 `DAEMON_PRESET_USE`，请求体为空对象；`PUT /api/v1/model` 使用 `ModelUseRequest` 映射 `DAEMON_MODEL_USE`。响应透传 daemon 数据和错误，不复用旧多预设端点。
-- [x] 在系统面板显示增强进程与工作状态，并支持重启增强服务。
-- [x] 补齐 SPEC-04 的生效上传上限与轮询间隔查询，再接入对应 HTTP 路由。（`web-adapter/tests/daemon.rs`）
+- 对接单 default 预设和模型选择：`GET /api/v1/preset` 映射 `DAEMON_PRESET_LIST`；`POST /api/v1/preset/save` 和 `/api/v1/preset/use` 分别映射 `DAEMON_PRESET_SAVE` 和 `DAEMON_PRESET_USE`，请求体为空对象；`PUT /api/v1/model` 使用 `ModelUseRequest` 映射 `DAEMON_MODEL_USE`。响应透传 daemon 数据和错误，不复用旧多预设端点。
 - [ ] CLI 与 HTTP 对同一 daemon 操作，核对业务状态和错误信封一致。
-- [x] 测试适配器存活期间执行 down → 页面仍可达 → up → 状态恢复。（[真实浏览器联调](../../reports/web-adapter-20261117/RESULTS.md)）
 - [ ] 测试配置拒绝、待重启提示、路由等待与服务降级，网页不显示虚假成功。
 - [ ] 测试 multipart 任意字段顺序、超限 chunked、并发额度、断连清理和提交超时不重发。
 - [ ] 阻塞 daemon 的 submit 锁后使 HTTP 超时，再重启适配器；核对源文件仍在，直到明确应答或原 daemon 退出。
 - [ ] 测试任务排队、执行失败、取消、重启续转，以及下载前驱逐和下载中断。
-- [x] 使用未声明下载安全能力的旧 daemon，核对下载明确拒绝且不透出本机文件路径。（`web-adapter/tests/http.rs`、`rpc.rs`）
 - [ ] 真实字幕恢复验收核对页面读模型中的话语身份、修订号和正文，不仅检查事件到达。
 - [ ] 测试字幕修订、断线恢复、适配器重启、文件替换／截断、半行和坏行。
 - [ ] 页面刷新只保留游标而丢失读模型时，核对客户端从头回放；同时恢复二者时才接续游标。
 - [ ] 测试回放期间持续追加及 inotify 通知丢失，按游标核对无漏行。
 - [ ] 同 inode 截断后立即写至超过旧偏移，并丢失通知；核对 generation 重置及新文件完整回放。
 - [ ] 测试慢 SSE 客户端缓冲有界，控制请求和音频链路不受阻塞。
-- [x] 测试未知路由、方法、正文类型、同源限制、目录穿越与下载文件名编码。（`web-adapter/tests/http.rs`）
 - [ ] 完成网页启动、切换、查看状态和停止的产品验收，保留 SPEC-08 原有门槛。
 - [ ] 热点部署与低端口权限接入 SPEC-09。
 

@@ -1,6 +1,7 @@
 # SPEC-12 文件链参数
 
 状态：讨论中。最后更新：2026-11-16。
+`[x]` 条目详情已于 2026-11-24 移入 [archive/SPEC-12-file-chain-params.md](archive/SPEC-12-file-chain-params.md)，本文件保留契约、关键决策摘要与活跃待办。
 
 ## 目的
 
@@ -13,6 +14,14 @@
 - 运行时会话参数（`pitch_shift`、`index_rate`、`rms_mix_rate`、`protect`、`f0_method`）归 [SPEC-11](SPEC-11-preset.md) 与 [config.md](../config.md)，本文不重复。
 - 实时链路的几何与固定形状（front 280 / decoder 30 / HuBERT 44800 / RMVPE 32）归 [SPEC-03](SPEC-03-rvc.md) 实时几何与资产参数节，本文不覆盖。
 - 文件时长和上传上限归 [config.md](../config.md) 的 `[file]`，本文不重复。
+
+## 已确认决策（摘要）
+
+> 全文条目与证据见 [archive/SPEC-12-file-chain-params.md](archive/SPEC-12-file-chain-params.md)。与归档冲突时以归档原文为准并回来修正本节。
+
+- 档位数值单一来源已落地：脚本读取 `tools/model/file_chain_tiers.json`，`--list-tiers` 打印，SETUP 只链接。
+- 共享特征引擎已构建部署（HuBERT 512000、RMVPE 3232）；30 s 文件实测 2 窗、峰值 4.47 GiB，无 ONNX 特征兜底。
+- 窗几何落地为 `offline_window_geometry` 并带几何对拍测试，native 9/9 通过。
 
 ## 数值来源
 
@@ -48,9 +57,6 @@
 
 ## 实施状态
 
-- [x] 档位数值单一来源：`tools/model/file_chain_tiers.json`；脚本读取，`--list-tiers` 打印；SETUP 只链接。
-- [x] 共享特征引擎：HuBERT 512000、RMVPE 3232 已构建并部署；30 s miku/gkw 实测 2 窗、峰值 4.47 GiB、8.27/6.74 s，无 ONNX 特征兜底。
-- [x] 窗几何：`offline_window_geometry` + `tests/test_rvc_window_geometry.cpp`，native 9/9 通过。
 - [ ] `max` 档板端验证：40 s 窗的构建耗时和峰值显存；阻塞与解除条件见 SETUP。
 - [ ] 当前模型集按 `large` 重建；qiqi-zh large 生成器重建中。miku 生成器仍为旧 opt=398。
 

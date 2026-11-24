@@ -1,6 +1,7 @@
 # environment：环境管理（模型资产与工具链）
 
 状态：讨论中。最后更新：2026-11-15。待办记法见 [SPEC.md](SPEC.md)。
+`[x]` 条目详情已于 2026-11-24 移入 [archive/SPEC-10-env.md](archive/SPEC-10-env.md)，本文件保留契约、关键决策摘要与活跃待办。
 
 ## 目的
 
@@ -11,23 +12,29 @@
 
 ## 边界
 
-- [x] 本规格 owns：模型资产分层与命名、模型生命周期、导出/编译工具链、资产配置。
+- 本规格 owns：模型资产分层与命名、模型生命周期、导出/编译工具链、资产配置。
 - 运行时模型注册与加载契约归 [SPEC-03-rvc.md](SPEC-03-rvc.md)，本规格只引用。
 - golden 验收门槛与记录归 [SPEC-08-verification.md](SPEC-08-verification.md)；对拍工具的实现归本规格。
 - 代码构建与部署流水线归 [SPEC-09-pipeline.md](SPEC-09-pipeline.md)，不复述部署。
 - 模型、音频、权重在仓外，不进仓库与流水线产物。
 
+## 已确认决策（摘要）
+
+> 全文条目与证据见 [archive/SPEC-10-env.md](archive/SPEC-10-env.md)。与归档冲突时以归档原文为准并回来修正本节。
+
+- 模型存在性报错统一归推理层：daemon 不做存在预检，入队原样收模型 id，执行时 LoadModel 失败标 failed 带原因、队列继续。
+
 ## 资产分层与命名
 
 两层分离：原料层放待处理内容，成品层放可直接推理的整套资产。
 
-- [x] 原料层 `~/rvc-pth/`：原始权重与下载后待本地处理的内容，按 `<id>.pth` 命名，可选配 `<id>.index`。
-- [x] 成品层 `~/mozart-assets/models/rvc/<id>/`：目录名 = 模型 id = 文件前缀，不带 `-run` 后缀。
-- [x] 成品目录契约：`config.json` + `<id>.onnx`/`.engine`（离线生成器）+ `<id>-front.*`/`<id>-decoder.*`（实时，可选）+ `<id>.index`（可选）+ `presets/default.toml`（daemon 写入，可选）。加载器按 `<id>` 前缀找文件（`rvc/src/rvc/model_loader.cpp:103-120`）。
-- [x] 资产树默认只读；`presets/` 是唯一可写例外，由 daemon 原子写模型预设（SPEC-11）。首次加载模型时自动创建 `presets/default.toml`。
-- [x] 引擎优先：同名 `.engine` 存在则优先于 `.onnx`（`rvc/src/rvc/model_loader.cpp:167-178`）。
-- [x] 共享特征引擎（HuBERT/RMVPE）放一处，各模型引用，不每份复制；`[rvc]` 全局路径显式指向共享目录（`rvc/config/rvc_config.cpp:112-116`）。
-- [x] 成品层资产自包含，不依赖旧仓库符号链接。
+- 原料层 `~/rvc-pth/`：原始权重与下载后待本地处理的内容，按 `<id>.pth` 命名，可选配 `<id>.index`。
+- 成品层 `~/mozart-assets/models/rvc/<id>/`：目录名 = 模型 id = 文件前缀，不带 `-run` 后缀。
+- 成品目录契约：`config.json` + `<id>.onnx`/`.engine`（离线生成器）+ `<id>-front.*`/`<id>-decoder.*`（实时，可选）+ `<id>.index`（可选）+ `presets/default.toml`（daemon 写入，可选）。加载器按 `<id>` 前缀找文件（`rvc/src/rvc/model_loader.cpp:103-120`）。
+- 资产树默认只读；`presets/` 是唯一可写例外，由 daemon 原子写模型预设（SPEC-11）。首次加载模型时自动创建 `presets/default.toml`。
+- 引擎优先：同名 `.engine` 存在则优先于 `.onnx`（`rvc/src/rvc/model_loader.cpp:167-178`）。
+- 共享特征引擎（HuBERT/RMVPE）放一处，各模型引用，不每份复制；`[rvc]` 全局路径显式指向共享目录（`rvc/config/rvc_config.cpp:112-116`）。
+- 成品层资产自包含，不依赖旧仓库符号链接。
 
 设备上现有模型以 `mozart-ctl model list --available` 为准，不在文档中维护清单。
 
@@ -37,10 +44,10 @@
 
 Python 脚本，居 `tools/model/`，直接调用。导出依赖 PyTorch，不能用 Rust 重写；编译是 trtexec 包装。
 
-- [x] 导出 pth→onnx：`export_generator_onnx.py`、`export_generator_split_onnx.py`、`export_hubert_onnx.py`、`export_rmvpe_onnx.py`。`--rvc-source` 必填，指向 RVC 源码树。
-- [x] 编译 onnx→engine：`build_dynamic_engines.py`、`build_realtime_engines.py`。trtexec 须在目标设备执行，引擎绑设备；路径可用 `TRTEXEC` 或 `--trtexec` 指定。
-- [x] golden 对拍：`run_reference.py`、`run_streaming_reference.py`、`verify_golden.py`、`compare_streaming_quality.py`。`RVC_SOURCE` 环境变量必填。
-- [x] 资产路径全部参数化：RVC 源码树（`--rvc-source`/`RVC_SOURCE`）、基础特征模型（`--hubert-path`/`--rmvpe-path`）、目标权重、golden 参考均由调用方注入，脚本不写死。外部依赖清单见 [SETUP](../SETUP.md)。
+- 导出 pth→onnx：`export_generator_onnx.py`、`export_generator_split_onnx.py`、`export_hubert_onnx.py`、`export_rmvpe_onnx.py`。`--rvc-source` 必填，指向 RVC 源码树。
+- 编译 onnx→engine：`build_dynamic_engines.py`、`build_realtime_engines.py`。trtexec 须在目标设备执行，引擎绑设备；路径可用 `TRTEXEC` 或 `--trtexec` 指定。
+- golden 对拍：`run_reference.py`、`run_streaming_reference.py`、`verify_golden.py`、`compare_streaming_quality.py`。`RVC_SOURCE` 环境变量必填。
+- 资产路径全部参数化：RVC 源码树（`--rvc-source`/`RVC_SOURCE`）、基础特征模型（`--hubert-path`/`--rmvpe-path`）、目标权重、golden 参考均由调用方注入，脚本不写死。外部依赖清单见 [SETUP](../SETUP.md)。
 
 每模型只需编译自己的生成器（离线 1 个，实时再加 front/decoder 2 个）。特征引擎编译一次共享。
 
@@ -53,15 +60,14 @@ Python 脚本，居 `tools/model/`，直接调用。导出依赖 PyTorch，不�
 - [ ] 编译：设备上运行编译脚本，产出生成器 engine。
 - [ ] 登记：编辑 `[[models]]` 注册表（id、type=rvc、path），复用现有加载路径解析（`rvc/src/rvc/model_loader.cpp:262-292`）。
 - [ ] 测试：`file submit --model <id>`，按需 golden 对拍（SPEC-08 验收）。
-- [x] 预设：首次加载自动创建 `presets/default.toml`；运行时调参用 `preset save` 写回该模型（SPEC-11）。
+- 预设：首次加载自动创建 `presets/default.toml`；运行时调参用 `preset save` 写回该模型（SPEC-11）。
 
 ## 配置
 
-- [x] 加载注册表优先，入口不硬拼 `models_dir/<id>`（`rvc/control/stream_session.cpp:450-465`，提交 09e396c）。
-- [x] LoadModel 三态枚举：NotFound / Failed / Ok（`rvc/control/stream_session.h:71-73`）。
-- [x] model not found 只在推理层运行时报错：NotFound → InvalidArgument（`rvc/control/stream_session.cpp:456-458`），不做复杂回退。
-- [x] daemon 去掉模型存在预检，报错统一归推理层：入队原样收模型 id，执行时 LoadModel 失败标 failed 带原因、队列继续（`daemon/src/file/mod.rs:369-387`，回归 `daemon/tests/file_worker.rs` unknown_model_fails_at_load_and_queue_continues）。
-- [x] model list 可选自动过滤资产缺失的模型（滤空）：CLI `model list --available` 只列 exists=true，缺省列全部；CLI 侧过滤，不改 ListModels 协议（`ctl/src/main.rs:584-613`）。运行时请求缺失模型再报错。
+- 加载注册表优先，入口不硬拼 `models_dir/<id>`（`rvc/control/stream_session.cpp:450-465`，提交 09e396c）。
+- LoadModel 三态枚举：NotFound / Failed / Ok（`rvc/control/stream_session.h:71-73`）。
+- model not found 只在推理层运行时报错：NotFound → InvalidArgument（`rvc/control/stream_session.cpp:456-458`），不做复杂回退。
+- model list 可选自动过滤资产缺失的模型（滤空）：CLI `model list --available` 只列 exists=true，缺省列全部；CLI 侧过滤，不改 ListModels 协议（`ctl/src/main.rs:584-613`）。运行时请求缺失模型再报错。
 - [ ] 资产根与编译产出路径：资产根由 runtime 配置 `models_dir` 给定，编译输出走脚本参数。
 
 ## 待决策
