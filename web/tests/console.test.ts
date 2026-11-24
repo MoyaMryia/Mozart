@@ -68,6 +68,7 @@ function mockBackend() {
       return jsonResponse({ job_id: 'job-new', state: 'queued', queue_position: 1 }, 202);
     }
     if (path === '/api/v1/files') return jsonResponse({ jobs, paused: false });
+    if (path.startsWith('/api/v1/logs')) { const name = new URLSearchParams(path.split('?')[1] ?? '').get('name') ?? 'rvc'; return jsonResponse({ name, tail: `${name} 日志第一行\n${name} 日志第二行` }); }
     return jsonResponse({});
   });
   vi.stubGlobal('fetch', fetcher);
@@ -108,8 +109,8 @@ describe('控制台', () => {
     expect(subtitlesOf(root)).toContain('在途句子');
     sendSubtitle('g1:400', { utterance_id: 'boot-b:1', received_at: now, zh: '新句子', en: 'new', translation_status: 'completed' });
     await nextTick();
-    // 只显示最新一句：上一句不再显示。
-    expect(subtitlesOf(root)).toContain('新句子'); expect(subtitlesOf(root)).not.toContain('在途句子'); expect(subtitlesOf(root)).not.toContain('上次');
+    // 最新一句高亮；上一句保留在可滚动的历史里。
+    expect(subtitlesOf(root)).toContain('新句子'); expect(subtitlesOf(root)).toContain('在途句子'); expect(subtitlesOf(root)).not.toContain('上次');
     const saved = JSON.parse(sessionStorage.getItem('mozart-subtitles')!);
     expect(saved.cursor).toBe('g1:400'); expect(saved.records).toHaveLength(2);
     // 打开前 20 秒说的那句被过滤；它的翻译修订带着新时间戳到达，同样不显示。
@@ -119,6 +120,24 @@ describe('控制台', () => {
     sendSubtitle('g1:600', { utterance_id: 'boot-b:2', seq: 2, received_at: now + 2, zh: '之后的句子', en: 'later', translation_status: 'completed' });
     await nextTick();
     expect(subtitlesOf(root)).not.toContain('打开前 20 秒'); expect(subtitlesOf(root)).toContain('之后的句子');
+  });
+  it('INFO 展开后尾随服务日志，收起后停止轮询', async () => {
+    const backend = mockBackend(); const root = mount(); await flush();
+    const details = root.querySelector('details')!;
+    const calls = () => backend.fetcher.mock.calls.filter(([path]) => String(path).startsWith('/api/v1/logs'));
+    expect(calls()).toHaveLength(0);
+    details.open = true; details.dispatchEvent(new Event('toggle')); await flush();
+    expect(calls()).toHaveLength(1);
+    expect(details.querySelector('pre')!.textContent).toContain('rvc 日志第一行');
+    await vi.advanceTimersByTimeAsync(2000); await flush();
+    expect(calls()).toHaveLength(2);
+    const select = details.querySelector<HTMLSelectElement>('#log-service')!;
+    select.value = 'pre'; select.dispatchEvent(new Event('change')); await flush();
+    expect(String(calls().at(-1)![0])).toContain('name=pre');
+    details.open = false; details.dispatchEvent(new Event('toggle')); await flush();
+    const settled = calls().length;
+    await vi.advanceTimersByTimeAsync(4000); await flush();
+    expect(calls()).toHaveLength(settled);
   });
   it('浏览器拒绝保存字幕进度时给出提示', async () => {
     const backend = mockBackend(); withDeviceClock(backend);
@@ -139,7 +158,7 @@ describe('控制台', () => {
     expect(subtitlesOf(reloaded)).toContain('刷新前的句子');
     sendSubtitle('g1:200', { utterance_id: 'boot-a:2', seq: 2, received_at: now, zh: '刷新后的句子', en: 'after', translation_status: 'completed' });
     await nextTick();
-    expect(subtitlesOf(reloaded)).toContain('刷新后的句子'); expect(subtitlesOf(reloaded)).not.toContain('刷新前的句子');
+    expect(subtitlesOf(reloaded)).toContain('刷新后的句子'); expect(subtitlesOf(reloaded)).toContain('刷新前的句子');
     subtitleStream().dispatchEvent(new MessageEvent('reset', { data: JSON.stringify({ generation: 'g2' }) })); await nextTick();
     expect(reloaded.querySelector('section[aria-label="实时字幕"]')).toBeNull(); expect(sessionStorage.getItem('mozart-subtitles')).toBeNull();
   });

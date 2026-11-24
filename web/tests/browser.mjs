@@ -46,6 +46,7 @@ async function handleApi(req, res) {
     if (path === '/devices') return response(res, { devices: [{ id: 'mic-a', label: '麦克风 A', kind: 'capture' }, { id: 'mic-b', label: '麦克风 B', kind: 'capture' }, { id: 'speaker-a', label: '扬声器 A', kind: 'playback' }] });
     if (path === '/config') return response(res, { value: url.searchParams.get('key') === 'pre.capture_device' ? baselineCapture : 'speaker-a' });
     if (path === '/files') return response(res, { jobs, paused: queuePaused });
+    if (path === '/logs') return response(res, { name: url.searchParams.get('name') ?? 'rvc', tail: '[mock] frame=100\n[mock] frame=200' });
     if (path === '/files/job-new/result') {
       res.writeHead(200, { 'Content-Type': 'audio/wav', 'Content-Disposition': "attachment; filename*=UTF-8''result.wav", 'Content-Length': wav.length }); res.end(wav); return;
     }
@@ -162,10 +163,15 @@ try {
   await page.getByText('Recovered while offline', { exact: true }).waitFor();
   await page.waitForFunction(() => document.querySelector('section[aria-label="实时字幕"]')?.getAttribute('data-online') === 'true');
   assert.equal(await page.getByText('推送连接已断开，正在重连', { exact: true }).count(), 0);
-  assert.equal(await page.getByText('Updated translation', { exact: true }).count(), 0);
-  assert.equal(await card('SUB').locator('.subtitle-item').count(), 1);
+  assert.equal(await page.getByText('Updated translation', { exact: true }).count(), 1);
+  assert.equal(await card('SUB').locator('.subtitle-item').count(), 2);
   assert.equal(await card('SUB').getByText('Recovered while offline', { exact: true }).count(), 1);
   assert.equal(await card('SUB').getByText('Hello', { exact: true }).count(), 0);
+  // 新字幕到达后歌词自动滚到底部。
+  assert.equal(await page.evaluate(() => { const box = document.querySelector('.subtitle-scroll'); return box.scrollTop + box.clientHeight >= box.scrollHeight - 1; }), true);
+  // INFO 展开后尾随服务日志。
+  await page.getByText('INFO', { exact: true }).click();
+  await page.getByText('frame=200', { exact: false }).waitFor();
   await page.screenshot({ path: join(evidence, 'desktop.png'), fullPage: true });
   assert.equal(await page.evaluate(() => document.documentElement.scrollWidth <= innerWidth), true);
   await page.setViewportSize({ width: 390, height: 844 });

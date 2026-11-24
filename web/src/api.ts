@@ -95,6 +95,7 @@ export const client = {
   files: (signal?: AbortSignal) => request('/files', fileListSchema, { signal }),
   config: (key?: string) => request(`/config${key ? `?key=${encodeURIComponent(key)}` : ''}`, configSchema),
   deviceConfig: (key: 'pre.capture_device' | 'pre.playback_device') => request(`/config?key=${key}`, z.object({ value: z.string() })),
+  logTail: (name: string) => request(`/logs?name=${encodeURIComponent(name)}`, z.object({ name: z.string(), tail: z.string() })),
   up: () => request('/system/up', lifecycleSchema, json('POST', {})),
   down: () => request('/system/down', lifecycleSchema, json('POST', {})),
   route: (route: Route) => request('/route', objectSchema, json('PUT', { route })),
