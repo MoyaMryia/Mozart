@@ -789,6 +789,100 @@ int main()
               "advance_realtime_silence shifts pitch cache by exact 24 frames");
     }
 
+    printf("test_realtime_excitation_grid_continuity_and_sola_floor\n");
+    {
+        RVCInferencer inf(nullptr, nullptr);
+        constexpr size_t kChannels = 4;
+        constexpr size_t kLatentFrames = 54;
+        constexpr size_t kReturnFrames = 30;
+        constexpr size_t kOutPerFrame = 480;
+        constexpr size_t kSourceDim = 3;
+        constexpr size_t kShift = 24;
+
+        const auto e0 = inf.build_realtime_excitation(
+            kChannels, kLatentFrames, kReturnFrames, kOutPerFrame, kSourceDim);
+        std::vector<float> pitchf(kReturnFrames, 213.5f);
+        inf.advance_realtime_excitation(pitchf, kShift);
+        const auto e1 = inf.build_realtime_excitation(
+            kChannels, kLatentFrames, kReturnFrames, kOutPerFrame, kSourceDim);
+
+        // latent_noise overlap: block0 t=24..53 (abs 0..29) == block1 t=0..29 (abs 0..29)
+        bool latent_match = true;
+        for (size_t c = 0; c < kChannels; ++c) {
+            for (size_t i = 0; i < kReturnFrames; ++i) {
+                if (e0.latent_noise[c * kLatentFrames + (kShift + i)]
+                    != e1.latent_noise[c * kLatentFrames + i]) {
+                    latent_match = false;
+                }
+            }
+        }
+        CHECK(latent_match, "adjacent realtime blocks share identical latent_noise in overlap");
+
+        // source_noise overlap: block0 frames 24..29 == block1 frames 0..5
+        const size_t overlap_samples = (kReturnFrames - kShift) * kOutPerFrame * kSourceDim;
+        const size_t shift_samples = kShift * kOutPerFrame * kSourceDim;
+        bool source_match = true;
+        for (size_t i = 0; i < overlap_samples; ++i) {
+            if (e0.source_noise[shift_samples + i] != e1.source_noise[i]) {
+                source_match = false;
+            }
+        }
+        CHECK(source_match, "adjacent realtime blocks share identical source_noise in overlap");
+
+        // source_phase continuity mod 1 for all harmonics
+        const double expected_cycles = std::fmod(24.0 * 213.5 * 0.01, 1.0);
+        bool phase_match = true;
+        for (size_t h = 0; h < kSourceDim; ++h) {
+            double expect = std::fmod(
+                static_cast<double>(e0.source_phase[h])
+                + expected_cycles * static_cast<double>(h + 1), 1.0);
+            if (expect < 0.0) expect += 1.0;
+            if (std::fabs(static_cast<double>(e1.source_phase[h]) - expect) > 1e-5) {
+                phase_match = false;
+            }
+        }
+        CHECK(phase_match, "source_phase advances continuously mod 1 across harmonics");
+
+        inf.reset_realtime();
+        const auto snap = inf.realtime_state_snapshot();
+        CHECK(snap.frame_cursor == 0 && snap.phase_cycles == 0.0,
+              "reset_realtime clears frame cursor and phase cycles");
+
+        // Weak-signal SOLA locks offset to 0 instead of chasing sub-floor noise.
+        struct WeakSolaPipe : public RVCPipelineBase {
+            std::vector<float> process(const std::vector<float>& audio) override {
+                return std::vector<float>(audio.size() * 3, 0.0f);
+            }
+            std::vector<float> process_realtime(
+                const std::vector<float>&, const RvcRealtimeRequest& req) override {
+                std::vector<float> out(req.output_samples, 0.0f);
+                if (call++ == 0) {
+                    // Quiet tail below 3e-3 floor with a distinct tiny peak at tail[100]
+                    out[11520 + 100] = 5e-4f;
+                } else {
+                    // Block 2 has matching tiny peak shifted by +300 samples, plus strong marker at 6000
+                    out[300 + 100] = 5e-4f;
+                    out[6000] = 0.9f;
+                }
+                return out;
+            }
+            size_t call = 0;
+        } weak_pipe;
+
+        StreamingRvc::Config cfg = realtime_config();
+        cfg.skip_silence = false;
+        StreamingRvc s(cfg);
+        uint32_t idx = 1;
+        for (size_t i = 0; i < 12; ++i) s.push(make_frame(idx++, 1, 0.01f));
+        CHECK(s.try_process_one(weak_pipe), "weak SOLA block 1 runs");
+        drain(s);
+        for (size_t i = 0; i < 12; ++i) s.push(make_frame(idx++, 1, 0.01f));
+        CHECK(s.try_process_one(weak_pipe), "weak SOLA block 2 runs");
+        const auto out2 = drain(s);
+        CHECK(std::fabs(out2[6000] - 0.9f) < 1e-6f && std::fabs(out2[5700]) < 1e-6f,
+              "weak-signal SOLA keeps offset == 0 without jumping to noise peak");
+    }
+
     if (g_fail) {
         printf("\n%d test(s) FAILED\n", g_fail);
         return 1;

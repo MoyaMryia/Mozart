@@ -371,20 +371,30 @@ bool StreamingRvc::try_process_one(RVCPipelineBase& pipeline)
 
     if (cfg_.upstream_realtime) {
         size_t sola_offset = 0;
-        if (tail_valid_) {
-            double best_score = -std::numeric_limits<double>::infinity();
-            for (size_t offset = 0; offset <= cfg_.sola_search_out; ++offset) {
-                double numerator = 0.0;
-                double energy = 1e-8;
-                for (size_t i = 0; i < cf; ++i) {
-                    const double sample = converted[offset + i];
-                    numerator += static_cast<double>(tail_[i]) * sample;
-                    energy += sample * sample;
-                }
-                const double score = numerator / std::sqrt(energy);
-                if (score > best_score) {
-                    best_score = score;
-                    sola_offset = offset;
+        if (tail_valid_ && cf > 0) {
+            constexpr double kSolaRmsFloor = 3e-3; // 约 -50 dBFS 静音门限
+            const double min_energy = kSolaRmsFloor * kSolaRmsFloor * static_cast<double>(cf);
+            double tail_energy = 0.0;
+            for (size_t i = 0; i < cf; ++i) {
+                const double t = tail_[i];
+                tail_energy += t * t;
+            }
+            if (tail_energy >= min_energy) {
+                double best_score = -std::numeric_limits<double>::infinity();
+                for (size_t offset = 0; offset <= cfg_.sola_search_out; ++offset) {
+                    double numerator = 0.0;
+                    double cand_energy = 0.0;
+                    for (size_t i = 0; i < cf; ++i) {
+                        const double sample = converted[offset + i];
+                        numerator += static_cast<double>(tail_[i]) * sample;
+                        cand_energy += sample * sample;
+                    }
+                    if (cand_energy < min_energy) continue;
+                    const double score = numerator / std::sqrt(tail_energy * cand_energy);
+                    if (score > best_score) {
+                        best_score = score;
+                        sola_offset = offset;
+                    }
                 }
             }
         }

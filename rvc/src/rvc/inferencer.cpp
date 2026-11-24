@@ -94,6 +94,54 @@ float normal_from_key(uint64_t key) {
         radius * std::cos(2.0 * 3.14159265358979323846 * u2));
 }
 
+// 绝对时间网格激励生成（文件分窗与实时流共用）：按绝对帧/样本索引键噪声，
+// 相邻块重叠区天然同键同噪声；source_phase 按累计 F0 周期接续。
+RVCInferencer::RealtimeExcitation build_absolute_excitation(
+    size_t latent_channels,
+    size_t latent_frames,
+    int64_t latent_frame_start,
+    size_t source_frames,
+    int64_t source_frame_start,
+    size_t output_per_frame,
+    size_t source_dim,
+    double absolute_cycles
+) {
+    RVCInferencer::RealtimeExcitation out;
+    out.latent_noise.resize(latent_channels * latent_frames);
+    for (size_t channel = 0; channel < latent_channels; ++channel) {
+        for (size_t t = 0; t < latent_frames; ++t) {
+            out.latent_noise[channel * latent_frames + t] = normal_from_key(
+                noise_key(0x1ULL,
+                    static_cast<uint64_t>(latent_frame_start + static_cast<int64_t>(t)),
+                    channel));
+        }
+    }
+    out.source_phase.resize(source_dim);
+    std::mt19937 phase_random(114514);
+    std::uniform_real_distribution<float> uniform(0.0f, 1.0f);
+    for (float& value : out.source_phase) value = uniform(phase_random);
+    out.source_phase.front() = 0.0f;
+    for (size_t harmonic = 0; harmonic < source_dim; ++harmonic) {
+        const double cycles = absolute_cycles * static_cast<double>(harmonic + 1);
+        double phase = std::fmod(
+            static_cast<double>(out.source_phase[harmonic]) + cycles, 1.0);
+        if (phase < 0.0) phase += 1.0;
+        out.source_phase[harmonic] = static_cast<float>(phase);
+    }
+    out.source_noise.resize(source_frames * output_per_frame * source_dim);
+    const int64_t sample_start =
+        source_frame_start * static_cast<int64_t>(output_per_frame);
+    for (size_t sample = 0; sample < source_frames * output_per_frame; ++sample) {
+        for (size_t channel = 0; channel < source_dim; ++channel) {
+            out.source_noise[sample * source_dim + channel] = normal_from_key(
+                noise_key(0x2ULL,
+                    static_cast<uint64_t>(sample_start + static_cast<int64_t>(sample)),
+                    channel));
+        }
+    }
+    return out;
+}
+
 void peak_normalize(std::vector<float>& audio, float ceiling) {
     float peak = 0.0f;
     for (float sample : audio) peak = std::max(peak, std::fabs(sample));
@@ -304,11 +352,47 @@ void RVCInferencer::reset_realtime() {
     realtime_pitch_cache_.assign(kRealtimePitchCacheFrames, 0);
     realtime_pitchf_cache_.assign(kRealtimePitchCacheFrames, 0.0f);
     realtime_random_.seed(114514);
+    realtime_frame_cursor_ = 0;
+    realtime_phase_cycles_ = 0.0;
 }
 
 void RVCInferencer::advance_realtime_silence(size_t shift_frames) {
     if (shift_frames == 0) return;
     push_realtime_pitch_cache({}, {}, shift_frames);
+    realtime_frame_cursor_ += shift_frames;
+}
+
+RVCInferencer::RealtimeExcitation RVCInferencer::build_realtime_excitation(
+    size_t latent_channels,
+    size_t latent_frames,
+    size_t return_frames,
+    size_t output_per_frame,
+    size_t source_dim
+) const {
+    const int64_t source_frame_start = static_cast<int64_t>(realtime_frame_cursor_);
+    const int64_t latent_frame_start =
+        static_cast<int64_t>(realtime_frame_cursor_ + return_frames)
+        - static_cast<int64_t>(latent_frames);
+    return build_absolute_excitation(
+        latent_channels, latent_frames, latent_frame_start,
+        return_frames, source_frame_start,
+        output_per_frame, source_dim, realtime_phase_cycles_
+    );
+}
+
+void RVCInferencer::advance_realtime_excitation(
+    const std::vector<float>& decoder_pitchf,
+    size_t shift_frames
+) {
+    const size_t advance = std::min(shift_frames, decoder_pitchf.size());
+    for (size_t t = 0; t < advance; ++t) {
+        if (decoder_pitchf[t] > 0.0f) {
+            realtime_phase_cycles_ += static_cast<double>(decoder_pitchf[t]) * kF0FrameSeconds;
+        }
+    }
+    realtime_phase_cycles_ = std::fmod(realtime_phase_cycles_, 1.0);
+    if (realtime_phase_cycles_ < 0.0) realtime_phase_cycles_ += 1.0;
+    realtime_frame_cursor_ += shift_frames;
 }
 
 void RVCInferencer::push_realtime_pitch_cache(
@@ -370,6 +454,8 @@ RVCInferencer::RealtimeStateSnapshot RVCInferencer::realtime_state_snapshot() co
         realtime_pitch_cache_,
         realtime_pitchf_cache_,
         static_cast<uint32_t>(peek()),
+        realtime_frame_cursor_,
+        realtime_phase_cycles_,
     };
 }
 
@@ -756,10 +842,20 @@ std::vector<float> RVCInferencer::infer_realtime(
     }
     const size_t latent_channels = static_cast<size_t>(latent_shape[1]);
     const size_t latent_frames = static_cast<size_t>(latent_shape[2]);
-    std::normal_distribution<float> normal(0.0f, 1.0f);
-    std::uniform_real_distribution<float> uniform(0.0f, 1.0f);
-    std::vector<float> latent_noise(latent_channels * latent_frames);
-    for (float& value : latent_noise) value = normal(realtime_random_);
+    std::vector<float> decoder_pitchf(request.return_frames, 0.0f);
+    std::copy_n(
+        pitchf.begin() + static_cast<std::ptrdiff_t>(request.skip_head_frames),
+        request.return_frames, decoder_pitchf.begin()
+    );
+    const auto source_shape = decoder.input_shape("source_noise");
+    const size_t source_dim = source_shape.size() == 3 && source_shape[2] > 0
+        ? static_cast<size_t>(source_shape[2]) : 1;
+    const size_t output_per_frame = model_->config().sample_rate / 100;
+    auto excitation = build_realtime_excitation(
+        latent_channels, latent_frames, request.return_frames,
+        output_per_frame, source_dim
+    );
+    advance_realtime_excitation(decoder_pitchf, shift);
 
     std::vector<int64_t> sid_int64 = {model_->config().spk_id};
     std::vector<int64_t> p_len_int64 = {static_cast<int64_t>(frames)};
@@ -794,25 +890,8 @@ std::vector<float> RVCInferencer::infer_realtime(
     front_inputs.push_back(typed_input(
         front, "latent_noise",
         {1, static_cast<int64_t>(latent_channels), static_cast<int64_t>(latent_frames)},
-        std::move(latent_noise), {}
+        std::move(excitation.latent_noise), {}
     ));
-
-    std::vector<float> decoder_pitchf(request.return_frames, 0.0f);
-    std::copy_n(
-        pitchf.begin() + static_cast<std::ptrdiff_t>(request.skip_head_frames),
-        request.return_frames, decoder_pitchf.begin()
-    );
-    const auto source_shape = decoder.input_shape("source_noise");
-    const size_t source_dim = source_shape.size() == 3 && source_shape[2] > 0
-        ? static_cast<size_t>(source_shape[2]) : 1;
-    const size_t output_per_frame = model_->config().sample_rate / 100;
-    std::vector<float> source_phase(source_dim);
-    for (float& value : source_phase) value = uniform(realtime_random_);
-    source_phase.front() = 0.0f;
-    std::vector<float> source_noise(
-        request.return_frames * output_per_frame * source_dim
-    );
-    for (float& value : source_noise) value = normal(realtime_random_);
 
     std::vector<OnnxInput> decoder_inputs;
     decoder_inputs.reserve(5);
@@ -830,13 +909,13 @@ std::vector<float> RVCInferencer::infer_realtime(
     ));
     decoder_inputs.push_back(typed_input(
         decoder, "source_phase", {1, 1, static_cast<int64_t>(source_dim)},
-        std::move(source_phase), {}
+        std::move(excitation.source_phase), {}
     ));
     decoder_inputs.push_back(typed_input(
         decoder, "source_noise",
         {1, static_cast<int64_t>(request.return_frames * output_per_frame),
          static_cast<int64_t>(source_dim)},
-        std::move(source_noise), {}
+        std::move(excitation.source_noise), {}
     ));
     const auto profile_prepared = profile::Clock::now();
     auto output = front.run_chained(front_inputs, "z", decoder, decoder_inputs, "z", "audio");
@@ -1043,36 +1122,14 @@ std::vector<float> RVCInferencer::synthesize_window(
             // 分窗路径按绝对帧/样本索引键噪声：重叠区绝对索引≥0，跨窗同键。
             // 第 0 窗左 pad 绝对索引<0，wrap 成 uint64 仍确定（该区被裁剪）。
             // source_phase 用累计 F0 周期补偿本地 cumsum 的相位起点。
-            const int64_t frame_start = absolute_frame_start;
-            for (size_t channel = 0; channel < channels; ++channel) {
-                for (size_t t = 0; t < T; ++t) {
-                    latent_noise[channel * T + t] = normal_from_key(
-                        noise_key(0x1ULL,
-                            static_cast<uint64_t>(frame_start + static_cast<int64_t>(t)),
-                            channel));
-                }
-            }
-            std::mt19937 phase_random(114514);
-            std::uniform_real_distribution<float> uniform(0.0f, 1.0f);
-            for (float& value : source_phase) value = uniform(phase_random);
-            source_phase.front() = 0.0f;
-            for (size_t harmonic = 0; harmonic < source_dim; ++harmonic) {
-                const double cycles = absolute_cycles * static_cast<double>(harmonic + 1);
-                double phase = std::fmod(
-                    static_cast<double>(source_phase[harmonic]) + cycles, 1.0);
-                if (phase < 0.0) phase += 1.0;
-                source_phase[harmonic] = static_cast<float>(phase);
-            }
-            const int64_t sample_start =
-                frame_start * static_cast<int64_t>(output_per_frame);
-            for (size_t sample = 0; sample < T * output_per_frame; ++sample) {
-                for (size_t channel = 0; channel < source_dim; ++channel) {
-                    source_noise[sample * source_dim + channel] = normal_from_key(
-                        noise_key(0x2ULL,
-                            static_cast<uint64_t>(sample_start + static_cast<int64_t>(sample)),
-                            channel));
-                }
-            }
+            auto excitation = build_absolute_excitation(
+                channels, T, absolute_frame_start,
+                T, absolute_frame_start,
+                output_per_frame, source_dim, absolute_cycles
+            );
+            latent_noise = std::move(excitation.latent_noise);
+            source_phase = std::move(excitation.source_phase);
+            source_noise = std::move(excitation.source_noise);
         }
 
         inputs.push_back(typed_input(
