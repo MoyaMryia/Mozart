@@ -501,7 +501,13 @@ int main()
         s.push(make_frame(301, 1, .1f, 1, 1000000ull));
         CHECK(s.stats().resets.load() == 1, "backward clock triggers reset");
         s.push(make_frame(302, 1, .1f, 1, 2000000000ull));
-        CHECK(s.stats().resets.load() == 2, "large forward clock jump triggers reset");
+        CHECK(s.stats().resets.load() == 1, "continuous frame_idx with forward pts jitter does not reset");
+        for (uint32_t i = 303; i <= 405; ++i) {
+            s.push(make_frame(i, 1, .1f, 1, 2000000000ull + (i - 302) * 20000000ull));
+            while (s.try_process_one(pipe)) {}
+        }
+        CHECK(s.stats().resets.load() == 1 && s.stats().blocks.load() == 4,
+              "stream stays continuous across forward pts jitter");
     }
 
     printf("test_native_40k_realtime_streaming\n");

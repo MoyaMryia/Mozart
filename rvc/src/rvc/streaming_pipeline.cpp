@@ -19,7 +19,6 @@
 namespace rvc {
 
 namespace {
-constexpr uint64_t kPtsResetGapNs = 200000000ull; // pts 跳变 >200ms 视为不连续
 constexpr uint32_t kFrameIdxResetGap = 4;        // frame_idx 缺口 >4 帧视为不连续
 constexpr size_t kOutRingCapacity = 96000 * 8;   // 16s @48k（推理可领先消费端数块）
 constexpr float kPi = 3.14159265358979323846f;
@@ -124,10 +123,9 @@ void StreamingRvc::push(const mozart_input_frame_t& frame)
     if (have_last_meta_) {
         const uint32_t idx_gap = frame.meta.frame_idx - last_frame_idx_; // u32 回绕安全
         const bool idx_gap_bad = idx_gap == 0 || idx_gap > kFrameIdxResetGap;
-        const bool pts_jump = frame.meta.pts_ns < last_pts_ns_
-            || frame.meta.pts_ns - last_pts_ns_ > kPtsResetGapNs;
-        // ASR utterance boundaries do not interrupt the PCM timeline.
-        if (idx_gap_bad || pts_jump) {
+        const bool pts_backward = frame.meta.pts_ns < last_pts_ns_;
+        // frame_idx 连续时的正向送达抖动不触发全量重置，避免吞字 0.64 s。
+        if (idx_gap_bad || pts_backward) {
             handle_discontinuity();
         }
     }
