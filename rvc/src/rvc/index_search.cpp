@@ -1,4 +1,5 @@
-// 搬运自 Mozart-Old/rvc-backend/src/rvc/index_search.cpp，未改动。
+// 搬运自 Mozart-Old/rvc-backend/src/rvc/index_search.cpp，改动：
+//   - 引入 AArch64 NEON 向量化、32 帧质心分块与多线程并行检索。
 #include "rvc/index_search.hpp"
 #include <spdlog/spdlog.h>
 #include <fstream>
@@ -8,7 +9,7 @@
 #include <limits>
 #include <stdexcept>
 #include <thread>
-#if defined(__ARM_NEON)
+#if defined(__ARM_NEON) && defined(__aarch64__)
 #include <arm_neon.h>
 #endif
 
@@ -329,7 +330,7 @@ bool IndexSearch::parse_ivf_index(const std::filesystem::path& path) {
 namespace {
 
 inline float l2_distance_sq(const float* a, const float* b, size_t dim) noexcept {
-#if defined(__ARM_NEON)
+#if defined(__ARM_NEON) && defined(__aarch64__)
     float32x4_t acc0 = vdupq_n_f32(0.0f);
     float32x4_t acc1 = vdupq_n_f32(0.0f);
     float32x4_t acc2 = vdupq_n_f32(0.0f);
@@ -394,6 +395,28 @@ inline void insert_centroid(
         [](const CentroidEntry& e, float value) { return e.dist < value; });
     best.insert(pos, CentroidEntry{dist, id});
     if (best.size() > nprobe) best.pop_back();
+}
+
+struct ThreadJoiner {
+    std::vector<std::thread>& threads;
+    ~ThreadJoiner() {
+        for (auto& th : threads) {
+            if (th.joinable()) th.join();
+        }
+    }
+};
+
+template <typename Fn>
+void run_parallel(size_t workers, Fn&& fn) {
+    if (workers <= 1) {
+        fn(0);
+        return;
+    }
+    std::vector<std::thread> threads;
+    threads.reserve(workers - 1);
+    ThreadJoiner guard{threads};
+    for (size_t w = 1; w < workers; ++w) threads.emplace_back(fn, w);
+    fn(0);
 }
 
 } // namespace
@@ -479,15 +502,7 @@ std::vector<float> IndexSearch::search(
                 }
             }
         };
-        if (workers == 1) {
-            scan_centroids(0);
-        } else {
-            std::vector<std::thread> threads;
-            threads.reserve(workers - 1);
-            for (size_t w = 1; w < workers; ++w) threads.emplace_back(scan_centroids, w);
-            scan_centroids(0);
-            for (auto& th : threads) th.join();
-        }
+        run_parallel(workers, scan_centroids);
         for (size_t t = 0; t < n_frames; ++t) {
             float best_d = part_dist[0][t];
             uint32_t best_i = part_id[0][t];
@@ -518,15 +533,7 @@ std::vector<float> IndexSearch::search(
                 }
             }
         };
-        if (workers == 1) {
-            scan_centroids(0);
-        } else {
-            std::vector<std::thread> threads;
-            threads.reserve(workers - 1);
-            for (size_t w = 1; w < workers; ++w) threads.emplace_back(scan_centroids, w);
-            scan_centroids(0);
-            for (auto& th : threads) th.join();
-        }
+        run_parallel(workers, scan_centroids);
         std::vector<CentroidEntry> merged;
         merged.reserve(nprobe);
         for (size_t t = 0; t < n_frames; ++t) {
@@ -600,15 +607,7 @@ std::vector<float> IndexSearch::search(
         }
         local_skipped[w] = skipped;
     };
-    if (blend_workers == 1) {
-        search_frames(0);
-    } else {
-        std::vector<std::thread> threads;
-        threads.reserve(blend_workers - 1);
-        for (size_t w = 1; w < blend_workers; ++w) threads.emplace_back(search_frames, w);
-        search_frames(0);
-        for (auto& th : threads) th.join();
-    }
+    run_parallel(blend_workers, search_frames);
     for (uint64_t s : local_skipped) skipped_frames_ += s;
 
     return result;

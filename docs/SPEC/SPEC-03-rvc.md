@@ -16,7 +16,7 @@
 | 链路 | 目标 | 资产 | 几何与约束 |
 | --- | --- | --- | --- |
 | 文件 | 质量优先 | 整段、大窗或动态生成器；可用文件专用 profile | 无实时节拍；优先大窗，小窗只作回退 |
-| 实时 | 延迟优先 | 必须实时 front/decoder 与实时 HuBERT/RMVPE；模型可与文件链路不同 | 固定 240 ms 块、2.5 s 过去上下文；淡化 50 ms 与 SOLA 10 ms 为定值，启动 400 ms 可调；输出采样率随模型，块几何由采样率推导 |
+| 实时 | 延迟优先 | 必须实时 front/decoder 与实时 HuBERT/RMVPE；模型可与文件链路不同 | 固定 240 ms 块、2.5 s 过去上下文；淡化 50 ms 与 SOLA 10 ms 为定值，启动 340 ms 可调；输出采样率随模型，块几何由采样率推导 |
 
 - 同一模型可以同时具备文件和实时能力；缺实时资产时只提供文件能力，不静默降级。
 - 文件链路的大窗/小窗策略不能直接搬到实时链路；实时链路已有的 SOLA、淡化与启动缓冲按实时约束单独优化。
@@ -63,7 +63,7 @@
 | `StartStream` | Rust 控制命令 | `kind`、`model_handle`、`pitch_shift`、`index_rate`、`rms_mix_rate`、`protect`、`f0_method`；实时模式另带四个 `[rvc.realtime]` 旋钮（可选，缺省用 JSON 默认）；文件模式另带 `total_frames`、可选 `total_samples`，见下文 |
 | `SetParams` | Rust 控制命令 | `pitch_shift`、`index_rate`、`rms_mix_rate`、`protect`、`f0_method`、可选 `skip_silence`；实时流活动时在下一推理块边界无中断生效 |
 | C++ 内部 preset | C++ | `StreamingRvc` 的分块、历史、淡化、SOLA 和启动缓冲参数 |
-| Rust / 音频进程 | Rust | 播放侧小缓冲、静音 / 旁路、数据面队列；400 ms 启动缓冲留在 C++，不重复设大缓冲 |
+| Rust / 音频进程 | Rust | 播放侧小缓冲、静音 / 旁路、数据面队列；340 ms 启动缓冲留在 C++，不重复设大缓冲 |
 
 - `kind` 只分 `realtime` 和 `file`。C++ 按模型能力选择实时资产或 quality / full-history preset；缺实时资产时拒绝实时，不静默降级。
 - 文件模式的 `total_frames` 必填，类型为正整数 u32，表示本次输入帧数。C++ 收齐后开始整段推理；取消仍用 `StopStream`。`total_samples` 可选，类型为 u64，表示 16 kHz 输入的有效采样数。显式传入时须在 `1..=total_frames × 320` 内；C++ 在推理前据此裁掉尾帧补零。省略时保留全部帧样本。实时模式忽略这两个字段。
@@ -153,7 +153,7 @@ RMVPE 前端 mel 128 带、n_fft 1024、hop 160、30–8000 Hz、HTK Slaney（�
 - [ ] 文件分窗几何动态化：398 只作默认参考；窗长、hop、pad 和超 profile 分块由引擎 min/opt/max、T、采样率与输入时长推导；拟增 `[file].chunk_frames`。验收：10/30/120 s 的 F0、log-mel、内存和延迟，22 s 内整段结果不变。（`rvc/src/rvc/inferencer.cpp:26,262-266,336-346`）
 - [ ] 文件链路优先大窗资产：编译时为文件链路提供覆盖目标时长的大窗或动态大 profile；加载器区分实时/文件资产，长文件不默认 T=200。验收：同输入的窗数、F0、log-mel、显存和延迟。
 - [ ] 文件小窗质量方向：必须小窗时，先做互相关/SOLA 对齐，再用等功率淡化；评估真实前后文、跨窗 F0 平滑、窗级增益匹配和噪声/相位连续性。验收看 F0 P90、log-mel、边界阶跃、显存与延迟。
-- [ ] 实时链路单独优化：实时模型可与文件不同，能力区分仅文件/仅实时/两者；按 240 ms 块、overlap 定值 60 ms、400 ms 启动单独调优；40 kHz 见上方实时原生多采样率条。几何与旋钮契约见实时几何与资产参数节。验收：48 kHz 无回归，具备实时资产的新模型起流、延迟 P95 与连续性。
+- [ ] 实时链路单独优化：实时模型可与文件不同，能力区分仅文件/仅实时/两者；按 240 ms 块、overlap 定值 60 ms、340 ms 启动单独调优；40 kHz 见上方实时原生多采样率条。几何与旋钮契约见实时几何与资产参数节。验收：48 kHz 无回归，具备实时资产的新模型起流、延迟 P95 与连续性。
 - [ ] 淡化与 SOLA 真正可调（解耦分析窗与淡化量）：分析窗恒按引擎形状喂帧（16 kHz 侧 280 帧，与采样率无关，`margin_16k` 按最大 overlap 算），实际 `crossfade_ms`/`sola_search_ms` 只用于 overlap-add 与 SOLA 搜索，不再决定分析窗长度（耦合点 `rvc/src/rvc/streaming_pipeline.cpp:40-43`，拼接点同文件 `349-360`）。解耦后入口才放开两键范围；现状锁为定值 60 ms，原因见实时几何与资产参数节。现在不做：引擎形状按最大 overlap 固定，解耦要同时改取窗与拼接两处，且淡化量变化的音质与接缝收益须板端声学对拍才有意义，单独开一轮。解除条件：完成解耦，并通过板端 32k/40k/48k 声学对拍与接缝听感验证（按 [RVC-FILE-BENCHMARK](../RVC-FILE-BENCHMARK.md) 四层适配实时），再放开范围校验、恢复 overlap 的 10 ms 整除校验（锁定期间作为不可达守卫已移除），并扫淡化/SOLA 定值。
 - [ ] 板端剩余未验证：延迟 P95/连续性/长跑稳定性、`model use` 与 `SetParams` 在线调参（变调/调检索比/切换 `skip_silence`）期间的接缝声学听感与音质主观评价。阻塞原因：现有套件仅对 Loopback 静音流置 `skip_silence=false` 驱动推理并断言日志计数、块递增、帧守恒与 `last_error=None`，不测延迟 P95 也不做带人声输出的听感评价。解除条件：在 Jetson 上向 Loopback 播放测试人声同时执行在线调参与 `model use`，录制输出音频并按 `reports/` 测量流程做声学波形与主观听感验收。32 kHz 实时冒烟已由上条覆盖。
 - 板端已实测（2026-11-18，接入 `SetParams` 后）：`tools/jetson-e2e.sh --unit --smoke --preset --realtime-mm --file` 全部通过（设备端 `cargo test` 30 套 647 项、`ctest` 10/10 全部通过；三进程冒烟与 `--file` 通过；`--preset` 8 场景含实时 `preset use` 通过；`--realtime-mm` 10 场景全过，含新增 `SetParams 在线调参不断流` 场景：6 次调参均落入 `rvc.log`、`StartStream` 计数未增、`frames_in` 与 `blocks` 单调递增、`帧守恒=94`、`last_error=None`）。

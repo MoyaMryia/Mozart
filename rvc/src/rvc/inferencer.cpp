@@ -120,7 +120,7 @@ RVCInferencer::RealtimeExcitation build_absolute_excitation(
     std::mt19937 phase_random(114514);
     std::uniform_real_distribution<float> uniform(0.0f, 1.0f);
     for (float& value : out.source_phase) value = uniform(phase_random);
-    out.source_phase.front() = 0.0f;
+    if (!out.source_phase.empty()) out.source_phase.front() = 0.0f;
     for (size_t harmonic = 0; harmonic < source_dim; ++harmonic) {
         const double cycles = absolute_cycles * static_cast<double>(harmonic + 1);
         double phase = std::fmod(
@@ -386,7 +386,7 @@ void RVCInferencer::advance_realtime_excitation(
 ) {
     const size_t advance = std::min(shift_frames, decoder_pitchf.size());
     for (size_t t = 0; t < advance; ++t) {
-        if (decoder_pitchf[t] > 0.0f) {
+        if (std::isfinite(decoder_pitchf[t]) && decoder_pitchf[t] > 0.0f) {
             realtime_phase_cycles_ += static_cast<double>(decoder_pitchf[t]) * kF0FrameSeconds;
         }
     }
