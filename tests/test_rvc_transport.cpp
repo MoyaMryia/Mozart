@@ -18,6 +18,7 @@
 #include <cstring>
 #include <filesystem>
 #include <fstream>
+#include <iterator>
 #include <string>
 #include <thread>
 #include <vector>
@@ -136,6 +137,30 @@ std::vector<uint8_t> read_fixture(const char* name) {
 } // namespace
 
 int main() {
+    std::printf("test_initialization_errors_release_descriptors\n");
+    {
+        Sockets sockets("setup-failure");
+        const auto count = [] {
+            return std::distance(std::filesystem::directory_iterator("/proc/self/fd"),
+                                 std::filesystem::directory_iterator{});
+        };
+        const auto before = count();
+        for (const auto& bad : {sockets.dir / "missing.sock", sockets.dir / std::string(160, 'x')}) {
+            unsigned rejected = 0;
+            for (unsigned i = 0; i < 12; ++i) {
+                try {
+                    UnixDgramStream stream(sockets.in_path, bad, 8, true);
+                } catch (const std::runtime_error&) {
+                    ++rejected;
+                }
+            }
+            CHECK(rejected == 12, "setup faults occur for each attempt");
+            CHECK(!std::filesystem::exists(sockets.in_path), "failed init does not leave input socket");
+            CHECK(count() == before, "failed init releases all file descriptors");
+        }
+        UnixDgramStream restored(sockets.in_path, sockets.out_path, 8, true);
+        CHECK(restored.IsOpen(), "subsequent valid initialization recovers");
+    }
     std::printf("test_wire_bytes_match_rust\n");
     {
         // 与 core/src/dgram.rs 的 input_packet_bytes_are_little_endian 对拍。

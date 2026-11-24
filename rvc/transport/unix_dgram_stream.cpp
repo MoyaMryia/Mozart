@@ -92,6 +92,24 @@ void decode_pcm(const uint8_t* bytes, size_t samples, float* pcm) {
     std::memcpy(pcm, bytes + MOZART_PACKET_HEADER_SIZE, samples * sizeof(float));
 }
 
+// Own partially initialized sockets until construction has completely succeeded.
+class ScopedSocket {
+public:
+    explicit ScopedSocket(int fd) : fd_(fd) {}
+    ScopedSocket(const ScopedSocket&) = delete;
+    ScopedSocket& operator=(const ScopedSocket&) = delete;
+    ~ScopedSocket() { if (fd_ >= 0) ::close(fd_); }
+    int get() const { return fd_; }
+    int release() {
+        const int fd = fd_;
+        fd_ = -1;
+        return fd;
+    }
+
+private:
+    int fd_;
+};
+
 int new_dgram_socket() {
     const int fd = ::socket(AF_UNIX, SOCK_DGRAM | SOCK_CLOEXEC, 0);
     if (fd < 0) {
@@ -159,51 +177,41 @@ UnixDgramStream::UnixDgramStream(const std::filesystem::path& input_path,
                                  const std::filesystem::path& output_path,
                                  size_t queue_frames, bool blocking_send)
     : blocking_send_(blocking_send) {
-    // ---- 输入侧：绑定收输入帧 ----
-    const int in_fd = new_dgram_socket();
-    int value = static_cast<int>(queue_frames * kInputPacketBytes);
-    if (::setsockopt(in_fd, SOL_SOCKET, SO_RCVBUF, &value, sizeof(value)) != 0) {
-        ::close(in_fd);
-        throw std::runtime_error(std::string("SO_RCVBUF: ") + std::strerror(errno));
-    }
-    std::error_code ignored;
-    std::filesystem::remove(input_path, ignored);
     socklen_t in_len = 0;
     const sockaddr_un in_addr = make_addr(input_path, in_len);
-    if (::bind(in_fd, reinterpret_cast<const sockaddr*>(&in_addr), in_len) != 0) {
-        const std::string reason = std::strerror(errno);
-        ::close(in_fd);
-        throw std::runtime_error("bind " + input_path.string() + ": " + reason);
-    }
-    input_fd_.store(in_fd, std::memory_order_release);
+    peer_addr_ = make_addr(output_path, peer_len_);
 
-    // ---- 输出侧：connect 到 pre 绑定的输出 socket ----
-    const int out_fd = new_dgram_socket();
+    ScopedSocket in_fd(new_dgram_socket());
+    int value = static_cast<int>(queue_frames * kInputPacketBytes);
+    if (::setsockopt(in_fd.get(), SOL_SOCKET, SO_RCVBUF, &value, sizeof(value)) != 0) {
+        throw std::runtime_error(std::string("SO_RCVBUF: ") + std::strerror(errno));
+    }
+
+    ScopedSocket out_fd(new_dgram_socket());
     value = static_cast<int>(queue_frames * kOutputPacketBytes);
-    if (::setsockopt(out_fd, SOL_SOCKET, SO_SNDBUF, &value, sizeof(value)) != 0) {
-        ::close(out_fd);
+    if (::setsockopt(out_fd.get(), SOL_SOCKET, SO_SNDBUF, &value, sizeof(value)) != 0) {
         throw std::runtime_error(std::string("SO_SNDBUF: ") + std::strerror(errno));
     }
-    peer_addr_ = make_addr(output_path, peer_len_);
-    if (::connect(out_fd, reinterpret_cast<const sockaddr*>(&peer_addr_),
-                  peer_len_) != 0) {
+    if (::connect(out_fd.get(), reinterpret_cast<const sockaddr*>(&peer_addr_), peer_len_) != 0) {
         const std::string reason = std::strerror(errno);
-        ::close(out_fd);
-        ::close(input_fd_.exchange(-1, std::memory_order_acq_rel));
         throw std::runtime_error("connect " + output_path.string() + ": " + reason);
     }
     if (blocking_send_) {
-        // 阻塞发送模式：send 不带 MSG_DONTWAIT，O_NONBLOCK 让缓冲满时立即
-        // EAGAIN，由 send_blocking 的 poll(POLLOUT) 等待重试（见文件头语义）。
-        const int flags = ::fcntl(out_fd, F_GETFL, 0);
-        if (flags < 0 || ::fcntl(out_fd, F_SETFL, flags | O_NONBLOCK) != 0) {
-            const std::string reason = std::strerror(errno);
-            ::close(out_fd);
-            ::close(input_fd_.exchange(-1, std::memory_order_acq_rel));
-            throw std::runtime_error("O_NONBLOCK: " + reason);
+        // 非阻塞 fd 配合 poll 实现可取消的阻塞发送。
+        const int flags = ::fcntl(out_fd.get(), F_GETFL, 0);
+        if (flags < 0 || ::fcntl(out_fd.get(), F_SETFL, flags | O_NONBLOCK) != 0) {
+            throw std::runtime_error(std::string("O_NONBLOCK: ") + std::strerror(errno));
         }
     }
-    output_fd_.store(out_fd, std::memory_order_release);
+    // Bind only once all fallible output setup has completed.
+    std::error_code ignored;
+    std::filesystem::remove(input_path, ignored);
+    if (::bind(in_fd.get(), reinterpret_cast<const sockaddr*>(&in_addr), in_len) != 0) {
+        const std::string reason = std::strerror(errno);
+        throw std::runtime_error("bind " + input_path.string() + ": " + reason);
+    }
+    input_fd_.store(in_fd.release(), std::memory_order_release);
+    output_fd_.store(out_fd.release(), std::memory_order_release);
 }
 
 UnixDgramStream::~UnixDgramStream() {
