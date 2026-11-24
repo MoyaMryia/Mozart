@@ -65,12 +65,14 @@ fn parse_pre_args() -> (StubArgs, PreOverrides) {
 struct State {
     route: &'static str,
     mute: bool,
+    playout_policy: mozart_core::ctl::schema::PlayoutPolicy,
     file_mode: Arc<AtomicBool>,
     /// daemon 权威断言标志（SPEC-04 单一权威）：启动 false，恒发支路静默，
     /// 首个 PRE_SET_FILE_MODE 置 true。重启同理，不单边 reclaim。
     mode_asserted: Arc<AtomicBool>,
     startup_id: String,
     file_mode_delay: Duration,
+    file_restore_fault: Option<std::path::PathBuf>,
     dsp: mozart_core::config::PreDspConfig,
     capture_device: String,
     playback_device: String,
@@ -110,10 +112,16 @@ fn main() {
     let mut state = State {
         route: "direct",
         mute: false,
+        playout_policy: if std::env::var_os(mozart_core::ctl::schema::SUPERVISED_PLAYOUT_ENV).is_some() {
+            mozart_core::ctl::schema::PlayoutPolicy::Silent
+        } else {
+            mozart_core::ctl::schema::PlayoutPolicy::Legacy
+        },
         file_mode,
         mode_asserted,
         startup_id,
         file_mode_delay,
+        file_restore_fault: std::env::var_os("MOZART_PRE_STUB_FILE_RESTORE_FAULT").map(Into::into),
         dsp: config.pre.dsp,
         capture_device: config.pre.capture_device,
         playback_device: config.pre.playback_device,
@@ -174,6 +182,7 @@ fn handle(msg: &Message, state: &mut State) -> Vec<u8> {
         ctl::PRE_SET_FILE_MODE,
         ctl::PRE_SET_DSP,
         ctl::PRE_SET_DEVICE,
+        ctl::PRE_SET_PLAYOUT,
     ];
     if let Err(reply) = expect_known(msg, &known) {
         return reply;
@@ -248,6 +257,15 @@ fn handle(msg: &Message, state: &mut State) -> Vec<u8> {
             state.mute = mute;
             ok(json!({"mute": state.mute}))
         }
+        ctl::PRE_SET_PLAYOUT => {
+            match serde_json::from_value(body) {
+                Ok(policy) => {
+                    state.playout_policy = policy;
+                    ok(json!({"policy": policy}))
+                }
+                Err(err) => fail(ctl::CODE_INVALID_ARGUMENT, &err.to_string()),
+            }
+        }
         ctl::PRE_SET_FILE_MODE => {
             let Some(active) = body.get("active").and_then(|value| value.as_bool()) else {
                 return fail(ctl::CODE_INVALID_ARGUMENT, "active must be a boolean");
@@ -255,15 +273,19 @@ fn handle(msg: &Message, state: &mut State) -> Vec<u8> {
             // 桩无数据面绑定，交接握手平凡成立：置门控即应答（恒发支路随即可见）。
             // daemon 权威断言（SPEC-04）：先置 file_mode 再置 mode_asserted，
             // 杜绝「mode_asserted 先 true、file_mode 尚 false」窗口抢发实时帧。
+            if !active && state.file_restore_fault.as_ref().is_some_and(|path| path.exists()) {
+                return fail(ctl::CODE_NOT_READY, "restore fault");
+            }
             state.file_mode.store(active, Ordering::Relaxed);
             state.mode_asserted.store(true, Ordering::Relaxed);
             // 测试旋钮：先执行门控再延迟应答，模拟「命令已生效而应答丢失/超时」。
-            if !state.file_mode_delay.is_zero() {
+            if active && !state.file_mode_delay.is_zero() {
                 std::thread::sleep(state.file_mode_delay);
             }
             ok(json!({"active": active}))
         }
-        ctl::PRE_SPEECH_STOP => ok(json!({"stopped": true, "frames_cleared": 0})),
+        ctl::PRE_SPEECH_STOP => ok(json!({"stopped": true, "frames_cleared": 0,
+            "cutoff_ns": body.get("cutoff_ns")})),
         ctl::PRE_GET_STATUS => ok(json!({
             "state": "ok",
             "dsp": state.dsp,
@@ -273,6 +295,7 @@ fn handle(msg: &Message, state: &mut State) -> Vec<u8> {
                 ).unwrap()
             }),
             "route": state.route,
+            "playout_policy": state.playout_policy,
             "mute": state.mute,
             "capture_device": state.capture_device,
             "playback_device": state.playback_device,

@@ -79,7 +79,8 @@ fn run(cli: Cli) -> Result<(), String> {
     // 开关：启动取 TOML 基线；运行时覆盖由 daemon 存 state.json 并在就绪/重启时下发。
     let switches = Switches {
         translate_enabled: config.bridge.translate_enabled,
-        speech_enabled: config.bridge.speech_enabled,
+        speech_enabled: config.bridge.speech_enabled
+            && std::env::var_os(mozart_core::speech::SUPERVISED_BRIDGE_BOOT_ENV).as_deref() != Some(std::ffi::OsStr::new("1")),
     };
 
     let shared = Arc::new(Shared::new(

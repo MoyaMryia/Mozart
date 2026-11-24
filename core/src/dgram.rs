@@ -3,7 +3,7 @@
 //! 线包总长由各帧类型的 `WirePacket::PACKET_BYTES` 单点定义。
 //! 实时线程约束：send/recv 热路径只使用栈缓冲，不做堆分配。
 
-use crate::{FrameMeta, InputFrame, OutputFrame, PACKET_HEADER_SIZE};
+use crate::{FrameMeta, InputFrame, OutputFrame, SpeechFrame, PACKET_HEADER_SIZE};
 use std::io;
 use std::mem;
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
@@ -26,9 +26,8 @@ pub trait WirePacket: Copy {
     fn decode(bytes: &[u8]) -> Self;
 }
 
-/// send/recv 栈缓冲上限：两种线包取较大者（`OutputFrame::PACKET_BYTES`）。
-/// 实际收发长度按各帧类型的 `PACKET_BYTES` 截取。
-const MAX_PACKET_BYTES: usize = <OutputFrame as WirePacket>::PACKET_BYTES;
+/// send/recv 栈缓冲上限取最大的播报包；实际长度按帧类型截取。
+const MAX_PACKET_BYTES: usize = <SpeechFrame as WirePacket>::PACKET_BYTES;
 
 /// 阻塞发送等可写的分片上限，也是取消检查点间隔：对端活着但停止读帧时，
 /// 取消/关停必须能在一个分片内打断等待。与 C++ 侧 `kWaitPollMs` 同值
@@ -80,6 +79,27 @@ impl WirePacket for OutputFrame {
             sample_rate: u32::from_le_bytes(bytes[20..24].try_into().unwrap()),
             valid_samples: u32::from_le_bytes(bytes[24..28].try_into().unwrap()),
             pcm: decode_pcm_at(bytes, PACKET_HEADER_SIZE + 8),
+        }
+    }
+}
+
+impl WirePacket for SpeechFrame {
+    const MAGIC: u32 = crate::SPEECH_PACKET_MAGIC;
+    const PACKET_BYTES: usize = OutputFrame::PACKET_BYTES + 8;
+
+    fn encode(&self, out: &mut [u8]) {
+        // Write the OutputFrame contents using its existing codec. The TTS token
+        // replaces the embedded output magic; only the outer magic is on the wire.
+        let frame = self.frame;
+        frame.encode(&mut out[8..]);
+        out[..4].copy_from_slice(&Self::MAGIC.to_le_bytes());
+        out[4..12].copy_from_slice(&self.issued_ns.to_le_bytes());
+    }
+
+    fn decode(bytes: &[u8]) -> Self {
+        Self {
+            issued_ns: u64::from_le_bytes(bytes[4..12].try_into().unwrap()),
+            frame: OutputFrame::decode(&bytes[8..]),
         }
     }
 }
@@ -702,6 +722,23 @@ mod tests {
         let back = <OutputFrame as WirePacket>::decode(&packet);
         assert_same_meta(back.meta, output.meta);
         assert_same_pcm(back.pcm, output.pcm);
+    }
+
+    #[test]
+    fn speech_packet_preserves_timestamp_and_admission_token() {
+        let stamp = 0x0102_0304_0506_0708;
+        let frame = OutputFrame::new_48k(FrameMeta { pts_ns: 40_000_000, frame_idx: 2,
+            vad_flag: 1, energy_db: 0, conf: 0, segment_id: 0 }, [0.5; crate::OUTPUT_SAMPLES]);
+        let tagged = SpeechFrame { issued_ns: stamp, frame };
+        let mut bytes = [0; SpeechFrame::PACKET_BYTES];
+        tagged.encode(&mut bytes);
+        assert_eq!(&bytes[..4], b"MZSP");
+        assert_eq!(&bytes[4..12], &stamp.to_le_bytes());
+        assert_eq!(&bytes[12..20], &40_000_000u64.to_le_bytes());
+        assert_eq!(&bytes[36..40], &0.5f32.to_le_bytes());
+        let decoded = SpeechFrame::decode(&bytes);
+        let (issued_ns, decoded_pts) = (decoded.issued_ns, decoded.frame.meta.pts_ns);
+        assert_eq!((issued_ns, decoded_pts), (stamp, 40_000_000));
     }
 
     #[test]

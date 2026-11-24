@@ -302,6 +302,7 @@ print(next((j["state"] for j in d.get("jobs", []) if j["job_id"] == sys.argv[2])
 
 cat > "$CFG" <<EOF
 [daemon]
+startup_mode = "manual"
 run_dir = "$RUN"
 rpc_timeout_ms = 2000
 start_timeout_ms = 30000

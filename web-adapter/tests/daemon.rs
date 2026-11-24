@@ -48,7 +48,7 @@ impl Harness {
             );
         }
         let config = root.join("config.toml");
-        std::fs::write(&config, format!("[daemon]\nrun_dir = {:?}\nrpc_timeout_ms = 300\npoll_interval_ms = 137\n\n[rvc]\nmodel_id = {:?}\n\n[file]\nstorage_dir = {:?}\nmax_upload_bytes = 100000\n", root.join("run"), if model { "demo" } else { "" }, root.join("storage"))).unwrap();
+        std::fs::write(&config, format!("[daemon]\nrun_dir = {:?}\nrpc_timeout_ms = 300\npoll_interval_ms = 137\nstartup_mode = \"manual\"\n\n[rvc]\nmodel_id = {:?}\n\n[file]\nstorage_dir = {:?}\nmax_upload_bytes = 100000\n", root.join("run"), if model { "demo" } else { "" }, root.join("storage"))).unwrap();
         let wrapper = root.join("ctl");
         // Fixed arguments and a clean environment prevent lifecycle calls escaping the sandbox.
         let script = format!("#!/bin/sh\n[ \"$1\" = --config ] && [ \"$2\" = '{config}' ] && [ \"$4\" = --json ] && [ \"$#\" = 4 ] || exit 2\ncase \"$3\" in up|down) ;; *) exit 2 ;; esac\nexec env -i PATH=/usr/bin:/bin HOME='{root}' MOZART_STATE_DIR='{root}/state' MOZART_DAEMON_BIN='{bin}/mozart-daemon' MOZART_PRE_BIN='{bin}/examples/pre_stub' MOZART_RVC_BIN='{bin}/examples/rvc_stub' MOZART_ASR_BIN='{bin}/examples/asr_stub' MOZART_TTS_BIN='{bin}/examples/tts_stub' MOZART_BRIDGE_BIN='{bin}/examples/bridge_stub' MOZART_LLAMA_BIN='{bin}/examples/llama_stub' '{bin}/mozart-ctl' --config '{config}' \"$3\" --json\n", config=config.display(), root=root.display(), bin=bin.display());

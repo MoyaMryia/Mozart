@@ -95,6 +95,23 @@ impl MockLlama {
         })
     }
 
+    pub fn spawn_gated_reply(
+        self,
+        response: String,
+        received: mpsc::Sender<()>,
+        release: mpsc::Receiver<()>,
+    ) -> JoinHandle<()> {
+        std::thread::spawn(move || {
+            let (mut stream, _) = self.listener.accept().expect("accept");
+            let _ = read_http_request(&mut stream);
+            received.send(()).unwrap();
+            release
+                .recv_timeout(std::time::Duration::from_secs(2))
+                .unwrap();
+            stream.write_all(response.as_bytes()).unwrap();
+        })
+    }
+
     /// 收下 count 条请求但不应答（超时/停止测试）；每收一条发一个信号。
     /// 连接保持在手里不关闭，直到 release 通道关闭/收到消息，避免客户端提前读到 EOF。
     pub fn spawn_stall(

@@ -48,7 +48,17 @@ pub fn run(
             store.publish_translation_skipped(&job.utterance_id, "translate disabled", &shared)?;
             continue;
         }
-        process_job(&job, &queues, &shared, &store, &client, retry_max, &glossary, &mut context, stop)?;
+        process_job(
+            &job,
+            &queues,
+            &shared,
+            &store,
+            &client,
+            retry_max,
+            &glossary,
+            &mut context,
+            stop,
+        )?;
     }
     Ok(())
 }
@@ -107,7 +117,12 @@ fn process_job(
         return Ok(());
     }
     let content = completion.content.trim();
-    if let Err(reason) = quality::check(&job.text, content, completion.finish_reason.as_deref(), context.make_contiguous()) {
+    if let Err(reason) = quality::check(
+        &job.text,
+        content,
+        completion.finish_reason.as_deref(),
+        context.make_contiguous(),
+    ) {
         stats.add_qc_rejected();
         eprintln!("mozart-bridge: qc reject {}：{reason}", job.utterance_id);
         store.publish_translation_failed(&job.utterance_id, &reason, shared)?;
@@ -126,10 +141,14 @@ fn process_job(
     while context.len() > CONTEXT_HISTORY {
         context.pop_front();
     }
-    if shared.speech_enabled() {
+    if let Some(generation) = job
+        .speech_generation
+        .filter(|&value| Some(value) == shared.speech_generation())
+    {
         queues.push_speech(SpeechJob {
             utterance_id: job.utterance_id.clone(),
             text: content.to_string(),
+            generation,
         });
     }
     Ok(())
@@ -157,7 +176,10 @@ mod tests {
             let dir = temp_dir(tag);
             let path = dir.join("subtitles.jsonl");
             let shared = Arc::new(Shared::new(
-                Switches { translate_enabled: true, speech_enabled: true },
+                Switches {
+                    translate_enabled: true,
+                    speech_enabled: true,
+                },
                 path.clone(),
             ));
             let store = Arc::new(SubtitleStore::new(
@@ -205,7 +227,9 @@ mod tests {
             let store = self.store.clone();
             let stop = self.stop.clone();
             let client = LlamaClient::new(socket.to_path_buf());
-            std::thread::spawn(move || run(queues, shared, store, client, retry_max, &stop).unwrap())
+            std::thread::spawn(move || {
+                run(queues, shared, store, client, retry_max, &stop).unwrap()
+            })
         }
 
         fn wait_for(&self, what: &str, pred: impl Fn() -> bool) {
@@ -218,7 +242,10 @@ mod tests {
     }
 
     fn llama_ok(body: &str) -> String {
-        http_response(200, &format!("{{\"choices\":[{{\"message\":{{\"content\":\"{body}\"}}}}]}}"))
+        http_response(
+            200,
+            &format!("{{\"choices\":[{{\"message\":{{\"content\":\"{body}\"}}}}]}}"),
+        )
     }
 
     #[test]
@@ -232,9 +259,12 @@ mod tests {
         fixture.queues.push_translate(TranslateJob {
             utterance_id: "s:1".to_string(),
             text: "你好".to_string(),
+            speech_generation: fixture.shared.speech_generation(),
         });
         let worker = fixture.spawn_worker(&socket, 2);
-        fixture.wait_for("译文入待播报队列", || fixture.queues.speech_depth() == 1);
+        fixture.wait_for("译文入待播报队列", || {
+            fixture.queues.speech_depth() == 1
+        });
         fixture.stop.store(true, Relaxed);
         worker.join().unwrap();
         server.join().unwrap();
@@ -258,6 +288,40 @@ mod tests {
     }
 
     #[test]
+    fn in_flight_translation_finishes_after_off_on_without_old_speech() {
+        let fixture = Fixture::new("tr-generation");
+        let socket = fixture.dir.join("llama.sock");
+        let (seen_tx, seen) = std::sync::mpsc::channel();
+        let (release, release_rx) = std::sync::mpsc::channel();
+        let server =
+            MockLlama::bind(&socket).spawn_gated_reply(llama_ok("Hello."), seen_tx, release_rx);
+        fixture.final_record("s:1", "你好");
+        fixture.queues.push_translate(TranslateJob {
+            utterance_id: "s:1".to_string(),
+            text: "你好".to_string(),
+            speech_generation: fixture.shared.speech_generation(),
+        });
+        let worker = fixture.spawn_worker(&socket, 0);
+        seen.recv_timeout(Duration::from_secs(2)).unwrap();
+        for speech_enabled in [false, true] {
+            fixture.shared.set_switches(Switches {
+                translate_enabled: true,
+                speech_enabled,
+            });
+        }
+        release.send(()).unwrap();
+        fixture.wait_for("旧句译文仍落盘", || {
+            fixture.shared.status(&fixture.queues).translated == 1
+        });
+        fixture.stop.store(true, Relaxed);
+        worker.join().unwrap();
+        server.join().unwrap();
+        assert_eq!(fixture.lines()[1]["en"], "Hello.");
+        assert_eq!(fixture.queues.speech_depth(), 0);
+        let _ = std::fs::remove_dir_all(&fixture.dir);
+    }
+
+    #[test]
     fn retry_then_success_counts_retries() {
         let fixture = Fixture::new("tr-retry");
         let socket = fixture.dir.join("llama.sock");
@@ -271,6 +335,7 @@ mod tests {
         let job = TranslateJob {
             utterance_id: "s:1".to_string(),
             text: "你好".to_string(),
+            speech_generation: fixture.shared.speech_generation(),
         };
         let client = LlamaClient::new(socket);
         let mut context = VecDeque::new();
@@ -311,6 +376,7 @@ mod tests {
         let job = TranslateJob {
             utterance_id: "s:1".to_string(),
             text: "你好".to_string(),
+            speech_generation: fixture.shared.speech_generation(),
         };
         let client = LlamaClient::new(socket);
         let mut context = VecDeque::new();
@@ -364,6 +430,7 @@ mod tests {
         let job = TranslateJob {
             utterance_id: "s:1".to_string(),
             text: "你好".to_string(),
+            speech_generation: fixture.shared.speech_generation(),
         };
         let client = LlamaClient::new(socket);
         let mut context = VecDeque::new();
@@ -402,10 +469,13 @@ mod tests {
         fixture.queues.push_translate(TranslateJob {
             utterance_id: "s:1".to_string(),
             text: "你好".to_string(),
+            speech_generation: fixture.shared.speech_generation(),
         });
         // llama socket 不存在：若误调用会立即失败计数，可据此断言未调用。
         let worker = fixture.spawn_worker(&fixture.dir.join("missing.sock"), 2);
-        fixture.wait_for("在队句被跳过", || fixture.queues.translate_depth() == 0);
+        fixture.wait_for("在队句被跳过", || {
+            fixture.queues.translate_depth() == 0
+        });
         fixture.stop.store(true, Relaxed);
         worker.join().unwrap();
         let status = fixture.shared.status(&fixture.queues);

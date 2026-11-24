@@ -248,6 +248,7 @@ impl Harness {
     }
 
     fn set_route_rvc(&self) {
+        assert!(wait_until(POLL_TIMEOUT, || self.status().pre.is_some()), "pre 控制面未就绪");
         let reply = self.call(ctl::DAEMON_ROUTE_SET, br#"{"route":"rvc"}"#);
         assert_eq!(reply.status, "ok", "route set rvc: {}", reply.reason);
         self.wait_streaming();

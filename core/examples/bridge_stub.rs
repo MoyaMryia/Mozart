@@ -17,7 +17,8 @@ fn main() {
     let args = parse_args("mozart-bridge-stub");
     let mut state = State {
         translate_enabled: true,
-        speech_enabled: true,
+        speech_enabled: std::env::var_os(mozart_core::speech::SUPERVISED_BRIDGE_BOOT_ENV)
+            .as_deref() != Some(std::ffi::OsStr::new("1")),
     };
     serve(args, move |msg| handle(msg, &mut state));
 }
@@ -65,7 +66,8 @@ fn handle(msg: &Message, state: &mut State) -> Vec<u8> {
         }
         ctl::BRIDGE_SPEECH_STOP => {
             state.speech_enabled = false;
-            ok(json!({"speech_enabled": false, "queue_cleared": 0}))
+            ok(json!({"speech_enabled": false, "queue_cleared": 0,
+                "cutoff_ns": mozart_core::speech::monotonic_ns()}))
         }
         _ => unreachable!("expect_known covers all commands"),
     }

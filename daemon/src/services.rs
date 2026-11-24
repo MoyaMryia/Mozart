@@ -5,7 +5,7 @@
 use crate::preset::PresetManager;
 use crate::runtime::SharedConfig;
 use crate::state::{lock_state, State};
-use crate::state_file::BridgeRestore;
+use crate::state_file::{BridgeRestore, SpeechStop, StateFile};
 use mozart_core::config::{Config, RvcConfig};
 use mozart_core::ctl::schema::{
     Activity, AsrStatus, BridgeStatus, EnhanceStatus, ModelEntry, PreStatus, Response, Route,
@@ -181,15 +181,44 @@ impl Services {
             .map_err(CallError::into_rejection)
     }
 
+    pub(crate) fn assert_playout(&self, policy: mozart_core::ctl::schema::PlayoutPolicy) -> Result<(), (String, String)> {
+        let body = json!(policy);
+        let reply = self.pre().call_ok(ctl::PRE_SET_PLAYOUT, body.to_string().as_bytes())
+            .map_err(CallError::into_rejection)?;
+        if reply.data["policy"] == body {
+            Ok(())
+        } else {
+            Err((ctl::CODE_INTERNAL.into(), "pre did not confirm playout policy".into()))
+        }
+    }
+
+    pub(crate) fn tts_ready(&self) -> Result<(), (String, String)> {
+        let reply = self.tts().call_ok(ctl::TTS_GET_STATUS, b"{}")
+            .map_err(CallError::into_rejection)?;
+        let status: TtsStatus = serde_json::from_value(reply.data)
+            .map_err(|err| (ctl::CODE_INTERNAL.into(), format!("tts status: {err}")))?;
+        if status.model_loaded {
+            Ok(())
+        } else {
+            Err((ctl::CODE_NOT_READY.into(), "TTS model not loaded".into()))
+        }
+    }
+
     /// 文件接管开关（PRE_SET_FILE_MODE）：active=true 让 pre 暂停 rvc AI
     /// 发送并释放输出 socket（pre 确认交接完成才应答）；active=false 恢复。
-    /// 文件 worker 在起流前/收尾后调用，与实时路由切换经 transition 锁互斥。
+    /// 返回时 pre 已确认释放或恢复绑定。
     pub fn pre_set_file_mode(&self, active: bool) -> Result<(), (String, String)> {
         let body = json!({"active": active}).to_string();
         self.pre()
             .call_ok(ctl::PRE_SET_FILE_MODE, body.as_bytes())
-            .map(|_| ())
             .map_err(CallError::into_rejection)
+            .and_then(|reply| {
+                if reply.data["active"].as_bool() == Some(active) {
+                    Ok(())
+                } else {
+                    Err((ctl::CODE_INTERNAL.into(), "pre file mode acknowledgement mismatch".into()))
+                }
+            })
     }
 
     /// SetParams：实时流活动期间在下一推理块边界无中断更新会话参数与 skip_silence。
@@ -377,6 +406,7 @@ impl ServiceLink {
     }
 }
 
+#[cfg(test)]
 pub fn route_set(
     state: &Mutex<State>,
     services: &Services,
@@ -402,10 +432,8 @@ pub(crate) fn route_set_locked(
         if current.route_desired() == target && current.route_active() == target {
             return Ok(target);
         }
-        if current.gpu_owner() == Some(Activity::File) {
-            // 文件任务占用 GPU：接受意图但不抢 GPU。rvc 挂等待槽（desired
-            // 单槽，后覆盖前），任务结束后 poller 应用；direct 清等待意图，
-            // 不碰 rvc 流（文件数据面正在用）。
+        if current.gpu_owner() == Some(Activity::File) || current.realtime_return_pending() {
+            // 租约不可用时只记录最新意图；poller 在归还确认后应用。
             current.set_route_desired(target);
             return Ok(target);
         }
@@ -448,17 +476,88 @@ pub fn speech_set(services: &Services, enabled: bool) -> Result<Value, (String, 
     Ok(response.data)
 }
 
-pub fn speech_stop(state: &Mutex<State>, services: &Services) -> Result<Value, (String, String)> {
-    let response = services
-        .bridge()
-        .call_ok(ctl::BRIDGE_SPEECH_STOP, b"{}")
+const SPEECH_STOP_REASON: &str = "speech stop fence:";
+
+fn begin_speech_stop(
+    services: &Services,
+) -> Result<(mozart_core::speech::StopFence, Value), (String, String)> {
+    let response = services.bridge()
+        .call_ok(ctl::BRIDGE_SPEECH_STOP, br#"{"fenced":true}"#)
         .map_err(CallError::into_rejection)?;
-    // 桥已关播报并停新合成（桥向 TTS 下发 TTS_JOB_STOP）；再清 pre 播报环里
-    // 已送达未播的帧。pre 缺席只记降级，不阻断停止（与路由切换同一纪律）。
-    if let Err(err) = services.pre().call_ok(ctl::PRE_SPEECH_STOP, b"{}") {
-        lock_state(state).push_degraded(format!("pre speech stop: {}", err.describe()));
+    let cutoff_ns = response.data["cutoff_ns"].as_u64()
+        .filter(|&value| mozart_core::speech::valid_timestamp(value));
+    match cutoff_ns {
+        Some(cutoff_ns) if response.data["speech_enabled"] == false => {
+            Ok((mozart_core::speech::StopFence { cutoff_ns }, response.data))
+        }
+        _ => Err((ctl::CODE_INTERNAL.into(), "bridge did not confirm speech admission closed".into())),
     }
-    Ok(response.data)
+}
+
+fn confirm_speech_stop(
+    state: &Mutex<State>, services: &Services, fence: mozart_core::speech::StopFence,
+) -> Result<(), (String, String)> {
+    let body = serde_json::to_vec(&fence).expect("speech fence serializes");
+    let confirm = |result: Result<Response, CallError>| {
+        let response = result?;
+        if response.data["stopped"] == true
+            && response.data["cutoff_ns"].as_u64().is_some_and(|value| value >= fence.cutoff_ns)
+        {
+            Ok(())
+        } else {
+            Err(CallError::Protocol("missing or stale speech fence acknowledgement".into()))
+        }
+    };
+    // Close the producer before confirming the playback boundary. Try both even if one fails.
+    let tts = confirm(services.tts().call_ok(ctl::TTS_JOB_STOP, &body));
+    let pre = confirm(services.pre().call_ok(ctl::PRE_SPEECH_STOP, &body));
+    let mut state = lock_state(state);
+    state.clear_degraded_prefix(SPEECH_STOP_REASON);
+    let mut failure = None;
+    for (peer, result) in [("pre", pre), ("tts", tts)] {
+        if let Err(err) = result {
+            let (code, reason) = err.into_rejection();
+            let message = format!("{SPEECH_STOP_REASON} {peer}: {reason}");
+            state.push_degraded(message.clone());
+            failure.get_or_insert((code, message));
+        }
+    }
+    failure.map_or(Ok(()), Err)
+}
+
+/// 在 bridge_restore 锁内推进停止。桥明确撤权后，即使后续失败也保留关闭状态。
+pub fn advance_speech_stop(
+    state: &Mutex<State>,
+    services: &Services,
+    state_file: &Mutex<StateFile>,
+    pending: &mut BridgeRestore,
+) -> Result<Value, (String, String)> {
+    let (fence, data) = match pending.speech_stop {
+        Some(SpeechStop::Fence(fence)) => (fence, json!({"speech_enabled":false,"cutoff_ns":fence.cutoff_ns})),
+        Some(SpeechStop::Withdraw) | None => match begin_speech_stop(services) {
+            Ok((fence, data)) => {
+                pending.speech_stop = Some(SpeechStop::Fence(fence));
+                pending.speech = None;
+                let saved = state_file.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
+                    .set_key("bridge.speech_enabled", json!(false));
+                if let Err(err) = saved {
+                    lock_state(state).push_degraded(format!("state file write bridge.speech_enabled: {err}"));
+                }
+                (fence, data)
+            }
+            Err((code, reason)) => {
+                pending.speech_stop = Some(SpeechStop::Withdraw);
+                let reason = format!("{SPEECH_STOP_REASON} bridge: {reason}");
+                let mut state = lock_state(state);
+                state.clear_degraded_prefix(SPEECH_STOP_REASON);
+                state.push_degraded(reason.clone());
+                return Err((code, reason));
+            }
+        },
+    };
+    confirm_speech_stop(state, services, fence)?;
+    pending.speech_stop = None;
+    Ok(data)
 }
 
 /// 启动/重启恢复（SPEC-04）：把状态文件的字幕开关覆盖一次性下发到桥。
@@ -470,7 +569,7 @@ pub fn restore_bridge_switches(services: &Services, pending: &mut BridgeRestore)
             pending.translate = None;
         }
     }
-    if let Some(enabled) = pending.speech {
+    if let Some(enabled) = pending.speech.filter(|&enabled| !enabled || pending.speech_stop.is_none()) {
         if speech_set(services, enabled).is_ok() {
             pending.speech = None;
         }
@@ -479,11 +578,15 @@ pub fn restore_bridge_switches(services: &Services, pending: &mut BridgeRestore)
 
 fn switch_direct(state: &Mutex<State>, services: &Services) -> Result<Route, (String, String)> {
     set_pre_route(services, Route::Direct).map_err(CallError::into_rejection)?;
-    if let Err(err) = stop_rvc_stream(services) {
-        lock_state(state).push_degraded(format!("rvc stream stop: {}", err.describe()));
-    }
     lock_state(state).commit_route(Route::Direct);
+    return_realtime_lease(state, services);
     Ok(Route::Direct)
+}
+
+/// 调用方持 transition 锁。只归还实时租约，不改已应用路由。
+fn return_realtime_lease(state: &Mutex<State>, services: &Services) {
+    let release = stop_rvc_stream(services);
+    lock_state(state).record_realtime_return(release.err().map(|err| err.describe()));
 }
 
 /// rvc 模型清单（RVC_LIST_MODELS）。model list 命令转发用；文件入队不预检
@@ -518,8 +621,13 @@ fn switch_rvc(
             .load_model_handle(&model_id)
             .map_err(CallError::into_rejection)?;
         let fresh = presets.commit_for_model_locked(&model_id, resolution)?;
-        start_rvc_stream_with_handle(services, &fresh.rvc, handle, true)
-            .map_err(CallError::into_rejection)?;
+        if let Err(error) = start_rvc_stream_with_handle(services, &fresh.rvc, handle, true) {
+            // 明确拒绝未起流；其余错误可能是起流后丢失应答。
+            if !matches!(&error, CallError::Remote(_)) {
+                return_realtime_lease(state, services);
+            }
+            return Err(error.into_rejection());
+        }
     }
 
     let pre_result = {
@@ -528,9 +636,7 @@ fn switch_rvc(
             .map_err(CallError::into_rejection)
     };
     if let Err(rejection) = pre_result {
-        if let Err(err) = stop_rvc_stream(services) {
-            lock_state(state).push_degraded(format!("rvc stream rollback: {}", err.describe()));
-        }
+        return_realtime_lease(state, services);
         return Err(rejection);
     }
 
@@ -620,12 +726,21 @@ fn set_pre_mute(services: &Services, mute: bool) -> Result<(), CallError> {
         .map(|_| ())
 }
 
+impl Services {
+    pub(crate) fn try_transition(&self) -> Option<MutexGuard<'_, ()>> {
+        match self.transition.try_lock() {
+            Ok(guard) => Some(guard),
+            Err(TryLockError::WouldBlock) => None,
+            Err(TryLockError::Poisoned(error)) => Some(error.into_inner()),
+        }
+    }
+}
+
 pub fn poll(
     state: &Mutex<State>,
     services: &Services,
     config: &Config,
     presets: &PresetManager,
-    pre_handoff_active: bool,
 ) {
     let mut degraded = Vec::new();
     let enhance_status = poll_enhance(services, &mut degraded);
@@ -648,7 +763,6 @@ pub fn poll(
             state,
             services,
             pre_status.as_ref(),
-            pre_handoff_active,
             &mut degraded,
         );
         reconcile(
@@ -801,30 +915,27 @@ fn poll_bridge(services: &Services, degraded: &mut Vec<String>) -> Option<Bridge
 
 /// 权威对账 pre 数据面模式（SPEC-04 单一权威）：pre 的 rvc AI 支路仅在 daemon
 /// 断言实时态时活跃，pre 启动/重启后不单边 reclaim，等 daemon 断言。daemon 每轮
-/// 把 pre 模式收敛到权威态（gpu_owner==File → 文件接管），并在 pre 重启（startup_id
-/// 变化）或尚未断言时重新断言。文件交接窗口内让位给 FileHandoff，避免争用。
+/// 在文件租约外重新断言 pre 实时态；文件租约期间由文件协调器负责。
 fn reconcile_pre_mode(
     state: &Mutex<State>,
     services: &Services,
     pre_status: Option<&PreStatus>,
-    handoff_active: bool,
     degraded: &mut Vec<String>,
 ) {
     let Some(pre) = pre_status else {
         return;
     };
-    // 交接建立期间 pre 模式由 FileHandoff 起停流直接管理，对账不介入。
-    if handoff_active {
+    // 文件租约期间由协调器独占交接，包括失败后的归还。
+    if lock_state(state).gpu_owner() == Some(Activity::File) {
         return;
     }
-    let expected_file = lock_state(state).gpu_owner() == Some(Activity::File);
     let restarted = {
         let state = lock_state(state);
         state.pre_startup_id() != Some(pre.startup_id.as_str())
     };
-    let needs_assert = restarted || !pre.mode_asserted || pre.file_mode != expected_file;
+    let needs_assert = restarted || !pre.mode_asserted || pre.file_mode;
     if needs_assert {
-        if let Err((code, reason)) = services.pre_set_file_mode(expected_file) {
+        if let Err((code, reason)) = services.pre_set_file_mode(false) {
             degraded.push(format!("pre mode assert: {code}: {reason}"));
         }
     }
@@ -840,9 +951,18 @@ fn reconcile(
     rvc_status: Option<&RvcStatus>,
     degraded: &mut Vec<String>,
 ) {
-    let (active, mute, gpu_owner) = {
-        let state = lock_state(state);
-        (state.route_active(), state.mute(), state.gpu_owner())
+    let (active, mute, gpu_owner, returning_realtime, playout) = {
+        let mut state = lock_state(state);
+        if let Some(pre) = pre_status {
+            crate::mode::observe_pre_playout(&mut state, pre);
+        }
+        (
+            state.route_active(),
+            state.mute(),
+            state.gpu_owner(),
+            state.realtime_return_pending(),
+            state.playout_policy,
+        )
     };
 
     // 文件任务持有 GPU 时 rvc 流归文件数据面，实时对账不得停/起流；
@@ -859,6 +979,11 @@ fn reconcile(
     };
 
     if let Some(status) = pre_status {
+        if status.playout_policy != playout {
+            if let Err((code, reason)) = services.assert_playout(playout) {
+                degraded.push(format!("pre playout: {code}: {reason}"));
+            }
+        }
         if status.route != active && rvc_route_ready {
             if let Err(err) = set_pre_route(services, active) {
                 degraded.push(format!("pre route apply: {}", err.describe()));
@@ -871,13 +996,18 @@ fn reconcile(
         }
     }
 
-    if !file_gpu && active == Route::Direct {
-        if let Some(status) = rvc_status {
-            if status.state == "streaming" {
-                if let Err(err) = stop_rvc_stream(services) {
-                    degraded.push(format!("rvc stream stop: {}", err.describe()));
-                }
-            }
+    if returning_realtime {
+        // 用本轮串行 StopStream 应答确认；轮询快照在拿锁前采集，可能早于归还。
+        return_realtime_lease(state, services);
+    } else if !file_gpu
+        && active == Route::Direct
+        && rvc_status.is_some_and(|status| status.state == "streaming")
+    {
+        // 锁外快照可能早于另一转换已确认的停流；不能据此重占租约。
+        match services.rvc_status() {
+            Ok(fresh) if fresh.state == "streaming" => return_realtime_lease(state, services),
+            Ok(_) => {}
+            Err((code, reason)) => degraded.push(format!("rvc direct reconcile: {code}: {reason}")),
         }
     }
 }
@@ -1111,6 +1241,12 @@ pub(crate) fn switch_rvc_model_locked(
             "cannot switch realtime model while file job owns GPU".to_string(),
         ));
     }
+    if lock_state(state).realtime_return_pending() {
+        return Err((
+            ctl::CODE_BUSY.to_string(),
+            "realtime RVC lease is awaiting return".to_string(),
+        ));
+    }
     let status = services.rvc_status()?;
     let previous = status.model_id.clone();
     let was_realtime_streaming =
@@ -1270,6 +1406,69 @@ mod tests {
             assert_eq!(code, ctl::CODE_INTERNAL);
             assert!(reason.contains("echo"));
         }
+    }
+
+    #[test]
+    fn old_streaming_snapshot_cannot_reopen_confirmed_lease() {
+        use std::sync::Arc;
+
+        let dir = crate::file::testutil::temp_dir("stale-rvc-poll");
+        let mut config = Config::default();
+        config.daemon.run_dir = dir.clone();
+        config.daemon.rpc_timeout_ms = 300;
+        let shared = SharedConfig::new(config.clone());
+        let services = Arc::new(Services::new(&shared));
+        let state = Arc::new(Mutex::new(State::new()));
+        let presets = PresetManager::new(
+            shared,
+            state.clone(),
+            services.clone(),
+            Arc::new(Mutex::new(
+                crate::state_file::StateFile::load(dir.join("state.json")).unwrap(),
+            )),
+            None,
+            Arc::new(Mutex::new(())),
+        );
+        let loaded = json!({"state":"loaded","model_id":"demo","capabilities":[],
+            "frames_in":0,"frames_out":0,"frames_dropped":0,"blocks":0,"queue_depth":0});
+        let mut stale: RvcStatus = serde_json::from_value(loaded.clone()).unwrap();
+        stale.state = "streaming".into();
+        stale.stream_kind = Some("realtime".into());
+        let listener = Seqpacket::bind(&config.rvc_socket()).unwrap();
+        listener.listen(1).unwrap();
+        let peer = std::thread::spawn(move || {
+            let timeout = Duration::from_secs(2);
+            listener.wait_readable(Some(timeout)).unwrap();
+            let conn = listener.accept().unwrap();
+            for (expected, data) in [(ctl::RVC_HELLO, json!({})), (ctl::RVC_GET_STATUS, loaded)] {
+                let msg = conn.recv(Some(timeout)).unwrap();
+                let type_ = msg.header.type_;
+                assert_eq!(type_, expected);
+                conn.send(
+                    type_,
+                    msg.header.request_id,
+                    &mozart_core::ctl::schema::ok_body(data),
+                )
+                .unwrap();
+            }
+            // Closing after the fresh status would make an unnecessary StopStream fail.
+        });
+        let _transition = services.transition();
+        let mut degraded = Vec::new();
+        reconcile(
+            &state,
+            &services,
+            &config,
+            &presets,
+            None,
+            Some(&stale),
+            &mut degraded,
+        );
+        peer.join().unwrap();
+        assert!(degraded.is_empty(), "{degraded:?}");
+        assert!(lock_state(&state).gpu_owner().is_none());
+        assert!(lock_state(&state).status().degraded.is_empty());
+        std::fs::remove_dir_all(dir).unwrap();
     }
 
     /// core 新增 RVC 运行时键但 daemon 未实现编排时返回错误，不 panic 控制线程。

@@ -72,12 +72,13 @@ enum {
     MOZART_CTL_DAEMON_PRESET_LIST = 0x011F,  // data {"model_id","preset","preset_values","live_values","dirty"}
     MOZART_CTL_DAEMON_MODEL_USE   = 0x0120,  // 体 {"model_id"}，data {"model_id","previous_model_id"}；实时/空闲切换模型
     MOZART_CTL_DAEMON_DEVICE_USE  = 0x0121,  // 体 {"kind","device"}，data {"kind","device","previous_device"}；临时热切换音频设备（不写回 TOML）
+    MOZART_CTL_DAEMON_OUTPUT_MODE_SET = 0x0122, // {"mode":"direct"|"rvc"|"broadcast"}
 
     MOZART_CTL_PRE_HELLO      = 0x0201,
     MOZART_CTL_PRE_SET_ROUTE  = 0x0202,
     MOZART_CTL_PRE_SET_MUTE   = 0x0203,
     MOZART_CTL_PRE_GET_STATUS = 0x0204,
-    MOZART_CTL_PRE_SPEECH_STOP = 0x0205,  // 体 {}（空）；清播报环，speech stop 经 daemon 转发
+    MOZART_CTL_PRE_SPEECH_STOP = 0x0205,  // {"cutoff_ns":u64}；应答等待播放边界。空对象仅清旧式队列
     // 体 {"active": bool}；文件任务接管实时数据面（SPEC-03 复用 + 状态门控交接）：
     // active=true 暂停 rvc AI 发送并释放 output_socket（应答前确认释放完成），
     // active=false 恢复发送并重绑 output_socket。asr 支路不受影响。
@@ -89,6 +90,7 @@ enum {
     // 体 {"kind":"capture"|"playback","device":string}；运行中热替换采集/播放 ALSA 句柄（SPEC-02）：
     // 先试打开新设备再关旧句柄，失败保留旧设备；切 capture 清半帧并重置 WOLA，切 playback 首帧 10 ms 淡入。
     MOZART_CTL_PRE_SET_DEVICE = 0x0208,
+    MOZART_CTL_PRE_SET_PLAYOUT = 0x0209,  // body: playout policy string; ACK at playback boundary
 
     MOZART_CTL_RVC_HELLO        = 0x0301,
     MOZART_CTL_RVC_LOAD_MODEL   = 0x0302,
@@ -117,7 +119,7 @@ enum {
     MOZART_CTL_TTS_JOB_REPLY  = 0x0611,  // 受理应答：submitted→ok/Ok、队满→error/Busy、无效→error；type 回显请求号（0x0610/0x0612）
     MOZART_CTL_ENHANCE_HELLO = 0x0701,
     MOZART_CTL_ENHANCE_GET_STATUS = 0x0702,
-    MOZART_CTL_TTS_JOB_STOP   = 0x0612   // 桥→TTS，体 {}（空）；清队列并中止在途合成，应答 data {"stopped":true}
+    MOZART_CTL_TTS_JOB_STOP   = 0x0612   // 任务面或控制面；{"cutoff_ns":u64}，应答回显已安装的截止
 };
 
 // ---- 响应体 {"status","code","reason","data"} 的 code 值 -----------------------

@@ -7,7 +7,7 @@ mod common;
 use common::{
     call, file_job, status, submit_file, wait_job_state, wait_ready, wait_until, DaemonProcess,
 };
-use mozart_core::ctl::schema::FileJobState;
+use mozart_core::ctl::schema::{Activity, FileJobState, OutputMode, Route};
 use mozart_core::ctl::{self, Seqpacket};
 use serde_json::json;
 use std::path::{Path, PathBuf};
@@ -416,39 +416,61 @@ fn begin_rpc_timeout_restores_pre_and_fails_with_reason() {
     );
 }
 
-/// 回归（Important #1 + #3）：暂停与恢复的应答都超时（桩延迟 800 ms > 2×rpc，
-/// 恢复 HELLO 也赶不上）→ 恢复失败必须留下可查询降级原因，且不被后续轮询抹掉。
-/// 旧代码 push_degraded 写入唯一 vec，下一秒 set_degraded 整体替换即丢失。
 #[test]
-fn begin_restore_failure_reason_survives_polls() {
-    let h = Harness::new(
-        "worker-restore-fail",
-        "",
-        &[("MOZART_PRE_STUB_FILE_MODE_DELAY_MS", "800".to_string())],
-    );
-    let (job_id, _pcm) = h.submit("tone.wav", 1, 16000);
-    let job = wait_job_state(&h.conn, &job_id, FileJobState::Failed, JOB_TIMEOUT);
-    let error = job.error.expect("失败必须带可查询原因");
-    assert!(error.contains("pre file mode pause"), "{error}");
-    h.assert_gpu_free();
-    assert!(
-        wait_until(POLL_TIMEOUT, || {
-            status(&h.conn)
-                .degraded
-                .iter()
-                .any(|reason| reason.contains("pre file mode restore"))
-        }),
-        "恢复失败必须留下可查询降级原因"
-    );
-    // 数轮轮询（100 ms 间隔）后原因仍在：持久通道不被 poll 覆写。
-    std::thread::sleep(Duration::from_millis(400));
-    assert!(
-        status(&h.conn)
-            .degraded
-            .iter()
-            .any(|reason| reason.contains("pre file mode restore")),
-        "恢复失败原因必须跨轮询存活（旧代码下一秒即被抹掉）"
-    );
+fn file_result_is_published_but_pre_restore_holds_lease() {
+    let fault = std::env::temp_dir().join(format!("mozart-pre-restore-{}", std::process::id()));
+    let h = Harness::new("worker-restore-fail", "", &[
+        ("MOZART_PRE_STUB_FILE_RESTORE_FAULT", fault.display().to_string()),
+    ]);
+    std::fs::write(&fault, "").unwrap();
+    let (job, _) = h.submit("tone.wav", 1, 16000);
+    wait_job_state(&h.conn, &job, FileJobState::Completed, JOB_TIMEOUT);
+    assert!(h.result(&job).is_file());
+    assert!(wait_until(POLL_TIMEOUT, || {
+        let view = status(&h.conn);
+        view.arbiter.file_return_pending
+            && view.arbiter.gpu.owner == Some(Activity::File)
+            && view.degraded.iter().any(|reason| reason.contains("restore fault"))
+    }));
+    let (next, _) = h.submit("second.wav", 1, 16000);
+    let mode = call(&h.conn, ctl::DAEMON_OUTPUT_MODE_SET, br#"{"mode":"rvc"}"#);
+    assert_eq!(mode.status, "ok", "{}", mode.reason);
+    assert!(wait_until(POLL_TIMEOUT, || status(&h.conn).route.desired == Route::Rvc));
+    assert_eq!(status(&h.conn).route.active, Route::Direct);
+    assert_eq!(file_job(&h.conn, &next).state, FileJobState::Queued);
+    std::fs::remove_file(&fault).unwrap();
+    assert!(wait_until(POLL_TIMEOUT, || {
+        let view = status(&h.conn);
+        !view.arbiter.file_return_pending
+            && view.output_mode.is_some_and(|mode| mode.applied == Some(OutputMode::Rvc))
+    }));
+    assert_eq!(file_job(&h.conn, &next).state, FileJobState::Queued);
+}
+
+#[test]
+fn file_lease_waits_for_stop_ack_before_or_after_execution() {
+    for (fault, rvc_state) in [("before", "streaming"), ("after", "loaded")] {
+        let flag = std::env::temp_dir().join(format!("mozart-file-release-{}-{fault}", std::process::id()));
+        let h = Harness::new(&format!("worker-stop-{fault}"), "", &[
+            ("MOZART_RVC_STUB_STOP_FAULT_FILE", flag.display().to_string()),
+        ]);
+        std::fs::write(&flag, fault).unwrap();
+        let (job, _) = h.submit("tone.wav", 1, 16000);
+        wait_job_state(&h.conn, &job, FileJobState::Completed, JOB_TIMEOUT);
+        let (next, _) = h.submit("second.wav", 1, 16000);
+        assert!(wait_until(POLL_TIMEOUT, || {
+            let view = status(&h.conn);
+            view.arbiter.file_return_pending
+                && view.arbiter.gpu.owner == Some(Activity::File)
+                && view.rvc.is_some_and(|rvc| rvc.state == rvc_state)
+                && view.pre.is_some_and(|pre| pre.file_mode)
+        }));
+        assert_eq!(file_job(&h.conn, &next).state, FileJobState::Queued);
+        std::fs::remove_file(&flag).unwrap();
+        wait_job_state(&h.conn, &next, FileJobState::Completed, JOB_TIMEOUT);
+        h.assert_gpu_free();
+        assert!(!status(&h.conn).arbiter.file_return_pending);
+    }
 }
 
 /// 根因治愈（SPEC-04 单一权威）：文件任务期间 kill pre，监管重启后 pre 处于

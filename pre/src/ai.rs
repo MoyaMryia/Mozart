@@ -92,9 +92,9 @@ impl Sender {
 /// 接收线程共享主体：绑定好的 output_socket → 接收环。
 /// 路由/播报相关丢弃由播放线程消费时决定，本线程只搬运。
 /// 返回 Err 表示致命 socket 错误；主线程据此退出进程。
-fn recv_loop_inner(
-    socket: FrameSocket<OutputFrame>,
-    ring: Arc<Ring<OutputFrame>>,
+fn recv_loop_inner<F: mozart_core::dgram::WirePacket>(
+    socket: FrameSocket<F>,
+    ring: Arc<Ring<F>>,
     shared: Arc<Shared>,
     stop: &'static AtomicBool,
     label: &str,
@@ -151,7 +151,7 @@ pub fn recv_loop(
                 shared.set_ai_recv_size_mismatch(mismatch_base);
                 // old 在此 drop：关闭 fd 解除绑定，文件留给 daemon bind 清理。
             }
-            shared.set_output_released(true);
+            shared.set_output_binding(crate::state::OutputBinding::Released);
             // 未断言或文件接管：数据面不归 pre，本线程空转；按 RECV_POLL 查停止与断言。
             std::thread::sleep(RECV_POLL);
             continue;
@@ -159,14 +159,14 @@ pub fn recv_loop(
         let current = match socket.as_ref() {
             Some(bound) => bound,
             None => {
-                // daemon 已断言实时态：绑定输出 socket（启动首次绑定或交接后重绑，
-                // daemon 已先解绑，次序见 worker 守卫）。先清握手标志再绑：重绑
-                // 窗口内 output_released 必须为 false，否则并发的 active=true 会
-                // 误判「已释放」而抢先绑定，与本线程撞绑（标志只在静默分支置 true，
-                // 该分支不会绑定）。绑定失败属部署错误，致命退出由 daemon 重启。
-                shared.set_output_released(false);
+                // 登记绑定意图后复核许可，防止覆盖同时已确认归文件链的 socket。
+                shared.set_output_binding(crate::state::OutputBinding::Binding);
+                if !shared.rvc_ai_active() {
+                    continue;
+                }
                 let fresh = FrameSocket::<OutputFrame>::bind(&path, RVC_QUEUE_FRAMES)
                     .map_err(|err| format!("rvc output socket bind: {err}"))?;
+                shared.set_output_binding(crate::state::OutputBinding::Bound);
                 socket.insert(fresh)
             }
         };
@@ -184,8 +184,8 @@ pub fn recv_loop(
 /// tts 播报支路接收线程：tts-out.sock → 播报接收环。坏包丢弃计入 tts_recv_dropped，
 /// 与播报环满丢最旧（控制线程读环）一并经 consumer_drops["tts"] 上报 GetStatus。
 pub fn tts_recv_loop(
-    socket: FrameSocket<OutputFrame>,
-    ring: Arc<Ring<OutputFrame>>,
+    socket: FrameSocket<mozart_core::SpeechFrame>,
+    ring: Arc<Ring<mozart_core::SpeechFrame>>,
     shared: Arc<Shared>,
     stop: &'static AtomicBool,
 ) -> Result<(), String> {
@@ -336,7 +336,10 @@ mod tests {
             rvc_dropped: 0,
             tts_dropped: 0,
         });
-        assert_eq!(status.consumer_drops["asr"], 3, "asr 未绑定：3 帧全部丢弃计数");
+        assert_eq!(
+            status.consumer_drops["asr"], 3,
+            "asr 未绑定：3 帧全部丢弃计数"
+        );
         assert_eq!(status.consumer_drops["rvc"], 0, "asr 丢弃不得串入 rvc 计数");
 
         let rx = FrameSocket::<InputFrame>::bind(&path, SEND_BUFFER_FRAMES).unwrap();
@@ -488,7 +491,12 @@ mod tests {
 
         let frame = OutputFrame::new_48k(
             FrameMeta {
-                pts_ns: 42, frame_idx: 7, vad_flag: 1, energy_db: 0, conf: 0, segment_id: 0,
+                pts_ns: 42,
+                frame_idx: 7,
+                vad_flag: 1,
+                energy_db: 0,
+                conf: 0,
+                segment_id: 0,
             },
             [0.5; mozart_core::OUTPUT_SAMPLES],
         );
@@ -522,7 +530,12 @@ mod tests {
         };
         let frame = OutputFrame::new_48k(
             FrameMeta {
-                pts_ns: 1, frame_idx: 1, vad_flag: 1, energy_db: 0, conf: 0, segment_id: 0,
+                pts_ns: 1,
+                frame_idx: 1,
+                vad_flag: 1,
+                energy_db: 0,
+                conf: 0,
+                segment_id: 0,
             },
             [0.25; mozart_core::OUTPUT_SAMPLES],
         );
@@ -604,7 +617,12 @@ mod tests {
         let tx = connect_output(&path, Duration::from_secs(2));
         let frame = OutputFrame::new_48k(
             FrameMeta {
-                pts_ns: 9, frame_idx: 9, vad_flag: 1, energy_db: 0, conf: 0, segment_id: 0,
+                pts_ns: 9,
+                frame_idx: 9,
+                vad_flag: 1,
+                energy_db: 0,
+                conf: 0,
+                segment_id: 0,
             },
             [0.5; mozart_core::OUTPUT_SAMPLES],
         );
@@ -623,9 +641,9 @@ mod tests {
     fn tts_recv_loop_pushes_frames_and_stops_on_flag() {
         let dir = socket_dir("tts-recv");
         let path = dir.join("tts-out.sock");
-        let rx = FrameSocket::<OutputFrame>::bind(&path, TTS_QUEUE_FRAMES).unwrap();
-        let tx = FrameSocket::<OutputFrame>::connect(&path, TTS_QUEUE_FRAMES).unwrap();
-        let ring = Arc::new(Ring::<OutputFrame>::new(TTS_QUEUE_FRAMES));
+        let rx = FrameSocket::<mozart_core::SpeechFrame>::bind(&path, TTS_QUEUE_FRAMES).unwrap();
+        let tx = FrameSocket::<mozart_core::SpeechFrame>::connect(&path, TTS_QUEUE_FRAMES).unwrap();
+        let ring = Arc::new(Ring::<mozart_core::SpeechFrame>::new(TTS_QUEUE_FRAMES));
         let shared = Arc::new(test_shared("cap", "play", "startup"));
         let stop: &'static AtomicBool = Box::leak(Box::new(AtomicBool::new(false)));
         let worker = {
@@ -645,9 +663,13 @@ mod tests {
             },
             [0.5; mozart_core::OUTPUT_SAMPLES],
         );
-        tx.send(&frame).unwrap();
+        tx.send(&mozart_core::SpeechFrame {
+            issued_ns: 1,
+            frame,
+        })
+        .unwrap();
         let got = ring.pop(Some(Duration::from_secs(1))).unwrap();
-        let FrameMeta { frame_idx, .. } = got.meta;
+        let FrameMeta { frame_idx, .. } = got.frame.meta;
         assert_eq!(frame_idx, 7, "接收线程必须把播报帧推入播报环");
 
         stop.store(true, Ordering::Relaxed);

@@ -17,6 +17,7 @@ use crate::services::{self, Services};
 use crate::state::{lock_state, State};
 use mozart_core::config::Config;
 use mozart_core::ctl;
+use mozart_core::dgram::OutputSocket;
 use mozart_core::ctl::schema::{
     Activity, FileFetchRequest, FileJob, FileJobState, FileProgress, FileSubmitRequest,
 };
@@ -78,10 +79,38 @@ pub struct JobContext {
     pub config: Arc<Config>,
     pub presets: Arc<PresetManager>,
     pub running: Arc<AtomicBool>,
-    /// 文件交接已建立（PRE_SET_FILE_MODE{active:true} 已应答）：FileHandoff
-    /// begin 成功后置位、finish 起手清除。协调器据此门控失接管检测：
-    /// decode 段尚未暂停、finish 已恢复，file_mode=false 均属合法。
+    /// 文件工作线程持有已确认的 pre 交接；用于重启后重新断言。
     pub handoff_active: Arc<AtomicBool>,
+    returned_handoff: Arc<Mutex<Option<ReturnedHandoff>>>,
+}
+
+struct ReturnedHandoff {
+    stop_needed: bool,
+    output: Option<(PathBuf, Option<OutputSocket>)>,
+}
+
+impl ReturnedHandoff {
+    /// Retain each uncertain step. A confirmed step is never repeated.
+    fn advance(&mut self, services: &Services) -> Result<(), String> {
+        if self.stop_needed {
+            services.stop_stream().map_err(|(code, reason)| format!("stop stream: {code}: {reason}"))?;
+            self.stop_needed = false;
+        }
+        if let Some((path, socket)) = &mut self.output {
+            drop(socket.take());
+            match fs::remove_file(path) {
+                Ok(()) => {},
+                Err(err) if err.kind() == io::ErrorKind::NotFound => {},
+                Err(err) => return Err(format!("unlink output socket: {err}")),
+            }
+            self.output = None;
+        }
+        services.pre_set_file_mode(false).map_err(|(code, reason)| format!("restore pre: {code}: {reason}"))
+    }
+}
+
+fn lock_return(slot: &Mutex<Option<ReturnedHandoff>>) -> MutexGuard<'_, Option<ReturnedHandoff>> {
+    slot.lock().unwrap_or_else(|err| err.into_inner())
 }
 
 impl JobContext {
@@ -127,6 +156,7 @@ pub struct FileCoordinator {
     job_thread: Mutex<Option<(String, JoinHandle<()>)>>,
     /// 当前任务的文件交接标志（与 JobContext 共享）：tick 失接管检测用。
     handoff_active: Arc<AtomicBool>,
+    returned_handoff: Arc<Mutex<Option<ReturnedHandoff>>>,
     /// 失接管两轮确认：首轮 false 可能是交接建立前的陈旧 pre 快照。
     handoff_lost_seen: AtomicBool,
 }
@@ -155,14 +185,9 @@ impl FileCoordinator {
             submit_lock: Mutex::new(()),
             job_thread: Mutex::new(None),
             handoff_active: Arc::new(AtomicBool::new(false)),
+            returned_handoff: Arc::new(Mutex::new(None)),
             handoff_lost_seen: AtomicBool::new(false),
         })
-    }
-
-    /// 文件交接是否已建立（FileHandoff begin 已应答、finish 未恢复）。
-    /// 权威对账在此窗口内让位给 FileHandoff，避免与起停流争用 pre 模式。
-    pub fn handoff_active(&self) -> bool {
-        self.handoff_active.load(Ordering::Acquire)
     }
 
     /// 运行时键即时生效（SPEC-04）：[file] 容量与大小阈值更新到队列与存储。
@@ -178,22 +203,27 @@ impl FileCoordinator {
     /// poller 每 tick 驱动一次仲裁。
     pub fn tick(self: &Arc<Self>) {
         self.reap_job_thread();
-        self.restore_handoff_on_pre_restart();
         let _transition = self.services.transition();
-        let (owner, desired, active, rvc_ready) = {
+        self.restore_handoff_on_pre_restart();
+        let return_pending = lock_state(&self.state).file_return_pending();
+        if return_pending {
+            self.advance_file_return();
+        }
+        let (owner, desired, active, rvc_ready, reserved) = {
             let state = lock_state(&self.state);
             (
                 state.gpu_owner(),
                 state.route_desired(),
                 state.route_active(),
                 state.rvc_ready(),
+                state.output_mode.as_ref().is_some_and(|mode| mode.requested == mozart_core::ctl::schema::OutputMode::Rvc),
             )
         };
         let (paused, next) = {
             let queue = lock_queue(&self.queue);
             (queue.paused(), queue.next_queued())
         };
-        match arbitrate::next_action(owner, paused, next.as_deref(), desired, active, rvc_ready) {
+        match arbitrate::next_action(owner, paused || reserved, next.as_deref(), desired, active, rvc_ready) {
             arbitrate::Action::StartJob(job_id) => self.start_job(&job_id),
             arbitrate::Action::ApplyRoute(route) => {
                 if let Err((code, reason)) = services::route_set_locked(
@@ -435,6 +465,7 @@ impl FileCoordinator {
             presets: self.presets.clone(),
             running: self.running.clone(),
             handoff_active: self.handoff_active.clone(),
+            returned_handoff: self.returned_handoff.clone(),
         };
         let worker = self.worker.clone();
         let coordinator = Arc::clone(self);
@@ -493,6 +524,19 @@ impl FileCoordinator {
             }
         }
         // 关停时不落终态：任务保持 processing，重启读回重跑（D3）。
+        self.advance_file_return();
+    }
+
+    /// 调用方持 transition 锁；与交接重申、起流和队列调度串行。
+    fn advance_file_return(&self) {
+        let mut slot = lock_return(&self.returned_handoff);
+        if let Some(handoff) = slot.as_mut() {
+            if let Err(reason) = handoff.advance(&self.services) {
+                lock_state(&self.state).record_file_return_pending(reason);
+                return;
+            }
+            *slot = None;
+        }
         lock_state(&self.state).release_gpu_file();
     }
 
@@ -537,7 +581,7 @@ impl FileCoordinator {
         let _transition = self.services.transition();
         self.settle_failed(job_id, format!("file worker panicked: {reason}"));
         self.storage.cleanup_temp(job_id);
-        lock_state(&self.state).release_gpu_file();
+        self.advance_file_return();
     }
 }
 

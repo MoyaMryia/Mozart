@@ -160,6 +160,104 @@ fn realtime_busy_file_waits_then_auto_starts() {
 }
 
 #[test]
+fn file_waits_when_stop_disconnects_before_execution() {
+    file_waits_for_confirmed_stop("before", "streaming");
+}
+
+#[test]
+fn file_waits_when_stop_executes_but_reply_is_lost() {
+    file_waits_for_confirmed_stop("after", "loaded");
+}
+
+fn file_waits_for_confirmed_stop(fault: &str, observed_rvc_state: &str) {
+    let tag = format!("file-stop-{fault}");
+    let dir = std::env::temp_dir().join(format!("mozart-daemon-{}-{tag}", std::process::id()));
+    let fault_file = dir.join("stop-fault");
+    let log = dir.join("commands.log");
+    let daemon = DaemonProcess::start_file(
+        &tag,
+        &dir.join("files"),
+        "",
+        true,
+        &[
+            (
+                "MOZART_RVC_STUB_STOP_FAULT_FILE",
+                fault_file.display().to_string(),
+            ),
+            ("MOZART_STUB_LOG", log.display().to_string()),
+        ],
+    );
+    let conn = daemon.connect();
+    wait_ready(&conn);
+    assert_eq!(
+        call(&conn, ctl::DAEMON_ROUTE_SET, br#"{"route":"rvc"}"#).status,
+        "ok"
+    );
+    let reply = submit_file(&conn, &source(&daemon.dir, "a.wav"), Some("demo"));
+    assert_eq!(reply.status, "ok", "{}", reply.reason);
+    let job_id = reply.data["job_id"].as_str().unwrap();
+
+    std::fs::write(&fault_file, fault).unwrap();
+    assert_eq!(
+        call(&conn, ctl::DAEMON_ROUTE_SET, br#"{"route":"direct"}"#).status,
+        "ok"
+    );
+    let stop_prefix = format!("mozart-rvc-stub {} ", ctl::RVC_STOP_STREAM);
+    let start_prefix = format!("mozart-rvc-stub {} ", ctl::RVC_START_STREAM);
+    let count = |prefix: &str| {
+        std::fs::read_to_string(&log)
+            .unwrap()
+            .lines()
+            .filter(|line| line.starts_with(prefix))
+            .count()
+    };
+    assert!(
+        wait_until(Duration::from_secs(5), || {
+            let view = status(&conn);
+            count(&stop_prefix) >= 3
+                && view
+                    .rvc
+                    .as_ref()
+                    .is_some_and(|rvc| rvc.state == observed_rvc_state)
+        }),
+        "did not observe the intended fault and repeated reconciliation"
+    );
+    let view = status(&conn);
+    assert_eq!(view.route.active, Route::Direct);
+    assert_eq!(view.arbiter.gpu.owner, Some(Activity::Realtime));
+    assert!(view
+        .degraded
+        .iter()
+        .any(|reason| reason.starts_with("rvc realtime return:")));
+    assert_eq!(file_job(&conn, job_id).state, FileJobState::Queued);
+
+    // A new realtime request waits too; a subsequent direct request withdraws it.
+    assert_eq!(
+        call(&conn, ctl::DAEMON_ROUTE_SET, br#"{"route":"rvc"}"#).status,
+        "ok"
+    );
+    assert_eq!(status(&conn).route.desired, Route::Rvc);
+    assert_eq!(status(&conn).route.active, Route::Direct);
+    assert_eq!(count(&start_prefix), 1);
+    assert_eq!(
+        call(&conn, ctl::DAEMON_ROUTE_SET, br#"{"route":"direct"}"#).status,
+        "ok"
+    );
+
+    std::fs::remove_file(&fault_file).unwrap();
+    // 占位源应在调度后因解码失败落终态，而不是永远排队。
+    wait_job_state(&conn, job_id, FileJobState::Failed, Duration::from_secs(5));
+    assert!(wait_until(Duration::from_secs(2), || {
+        let view = status(&conn);
+        view.arbiter.gpu.owner.is_none()
+            && !view
+                .degraded
+                .iter()
+                .any(|reason| reason.starts_with("rvc realtime return:"))
+    }));
+}
+
+#[test]
 fn fetch_rejects_unknown_unfinished_and_failed() {
     let dir = std::env::temp_dir().join(format!("mozart-daemon-{}-file-fetch", std::process::id()));
     let storage = dir.join("files");

@@ -3,7 +3,7 @@
 
 use mozart_core::config::{PreConsumerConfig, PreDspConfig};
 use mozart_core::ctl;
-use mozart_core::ctl::schema::{PreStatus, Route};
+use mozart_core::ctl::schema::{PlayoutPolicy, PreStatus, Route};
 use std::collections::BTreeMap;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicU8, AtomicUsize, Ordering};
 use std::sync::{mpsc, Mutex};
@@ -79,7 +79,10 @@ impl DeviceSwitchSlot {
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         if stop.load(Ordering::Relaxed) {
-            return Err((ctl::CODE_BUSY.to_string(), "pre is shutting down".to_string()));
+            return Err((
+                ctl::CODE_BUSY.to_string(),
+                "pre is shutting down".to_string(),
+            ));
         }
         let rx = {
             let mut inner = self
@@ -104,7 +107,10 @@ impl DeviceSwitchSlot {
         loop {
             if stop.load(Ordering::Relaxed) {
                 self.clear_pending();
-                return Err((ctl::CODE_BUSY.to_string(), "pre is shutting down".to_string()));
+                return Err((
+                    ctl::CODE_BUSY.to_string(),
+                    "pre is shutting down".to_string(),
+                ));
             }
             let remaining = deadline.saturating_duration_since(Instant::now());
             if remaining.is_zero() {
@@ -302,7 +308,18 @@ impl DspSwitches {
     }
 }
 
+#[derive(Clone, Copy)]
+pub enum OutputBinding {
+    Released,
+    Binding,
+    Bound,
+}
+
 pub struct Shared {
+    pub speech_cutoff: AtomicU64,
+    pub playback_request: AtomicU64,
+    pub playback_ack: AtomicU64,
+    playout_policy: AtomicU8,
     route_target: AtomicU8,
     mute_target: AtomicBool,
     /// 文件接管状态（SPEC-03 状态门控交接）：控制线程写，处理线程与
@@ -315,7 +332,7 @@ pub struct Shared {
 
     /// 输出 socket 交接握手：rvc 接收线程解绑后置 true、重绑后清 false；
     /// 控制线程在 PRE_SET_FILE_MODE{active:true} 应答前等它置位。
-    output_released: AtomicBool,
+    output_binding: AtomicU8,
     frames_captured: AtomicU64,
     frames_played: AtomicU64,
     /// 消费者列表（启动时按配置固定）：每个消费者一个输入发送丢弃计数槽，
@@ -364,11 +381,15 @@ impl Shared {
         dsp: DspSwitches,
     ) -> Self {
         Self {
+            speech_cutoff: AtomicU64::new(0),
+            playback_request: AtomicU64::new(0),
+            playback_ack: AtomicU64::new(0),
+            playout_policy: AtomicU8::new(PlayoutPolicy::Legacy as u8),
             route_target: AtomicU8::new(route_code(Route::Direct)),
             mute_target: AtomicBool::new(false),
             file_gate: AtomicU64::new(0),
             in_flight: AtomicUsize::new(0),
-            output_released: AtomicBool::new(false),
+            output_binding: AtomicU8::new(OutputBinding::Released as u8),
             frames_captured: AtomicU64::new(0),
             frames_played: AtomicU64::new(0),
             consumers: consumers.into_iter().map(Consumer::from_config).collect(),
@@ -473,13 +494,29 @@ impl Shared {
         self.in_flight.load(Ordering::SeqCst) == 0
     }
 
-    /// 输出 socket 已释放（接收线程解绑后置位，重绑后清零）。
-    pub fn output_released(&self) -> bool {
-        self.output_released.load(Ordering::Acquire)
+    pub fn set_playout_policy(&self, policy: PlayoutPolicy) {
+        self.playout_policy.store(policy as u8, Ordering::SeqCst);
     }
 
-    pub fn set_output_released(&self, released: bool) {
-        self.output_released.store(released, Ordering::Release);
+    pub fn playout_policy(&self) -> PlayoutPolicy {
+        match self.playout_policy.load(Ordering::SeqCst) {
+            p if p == PlayoutPolicy::RealtimeOnly as u8 => PlayoutPolicy::RealtimeOnly,
+            p if p == PlayoutPolicy::BroadcastOnly as u8 => PlayoutPolicy::BroadcastOnly,
+            p if p == PlayoutPolicy::Silent as u8 => PlayoutPolicy::Silent,
+            _ => PlayoutPolicy::Legacy,
+        }
+    }
+
+    pub fn output_released(&self) -> bool {
+        self.output_binding.load(Ordering::SeqCst) == OutputBinding::Released as u8
+    }
+
+    pub fn output_bound(&self) -> bool {
+        self.output_binding.load(Ordering::SeqCst) == OutputBinding::Bound as u8
+    }
+
+    pub fn set_output_binding(&self, binding: OutputBinding) {
+        self.output_binding.store(binding as u8, Ordering::SeqCst);
     }
 
     pub fn add_captured(&self, frames: u64) {
@@ -622,6 +659,7 @@ impl Shared {
             self.tts_recv_dropped.load(Ordering::Relaxed) + queue.tts_dropped,
         );
         PreStatus {
+            playout_policy: self.playout_policy(),
             state: "running".to_string(),
             denoise_backend: if self.enhancement.is_some() {
                 "ulunas"

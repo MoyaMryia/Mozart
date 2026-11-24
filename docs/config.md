@@ -27,12 +27,15 @@
 | --- | --- | --- | --- | --- |
 | run_dir | path | /run/mozart | — | S |
 | socket | string | daemon.sock | 纯文件名 | S |
+| startup_mode | enum | rvc | rvc / direct / broadcast / manual | S |
 | poll_interval_ms | int | 1000 | >0 | R |
 | rpc_timeout_ms | int | 2000 | >0 | R |
 | start_timeout_ms | int | 5000 | >0 | R |
 | restart_backoff_ms | int | 500 | >0 | R |
 | restart_backoff_max_ms | int | 10000 | ≥ restart_backoff_ms | R |
 | restart_stable_ms | int | 30000 | >0 | R |
+
+`startup_mode` 只在启动 daemon 时读取，`MOZART_STARTUP_MODE` 可覆盖。`rvc` 未配置模型时启动为直出；配置了模型但起流失败时保持静音并报告错误。`manual` 保留旧路由和播报命令的独立控制。一次运行期间的模式请求不改启动配置。
 
 ### [process]
 

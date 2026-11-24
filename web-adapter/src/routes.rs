@@ -108,7 +108,7 @@ async fn serve(s: &State, req: Request, api: bool) -> Result<Response, ApiError>
     let allow = match p.as_slice() {
         ["preset", "save" | "use"] | ["system", "up" | "down"] | ["speech", "stop"] | ["config", "save"] | ["services", _, "restart"] | ["files", "pause" | "resume"] | ["files", _, "cancel"] => "POST",
         ["health" | "status" | "models" | "devices" | "preset"] | ["events", "status" | "subtitles"] | ["files", _, "result"] | ["files", _] => "GET",
-        ["route" | "mute" | "translate" | "speech" | "model"] => "PUT",
+        ["route" | "mute" | "translate" | "speech" | "model" | "mode"] => "PUT",
         ["config"] => "GET, PUT",
         ["files"] => "GET, POST",
         _ => return Err(ApiError::code("NotFound", "API route not found")),
@@ -132,6 +132,7 @@ async fn serve(s: &State, req: Request, api: bool) -> Result<Response, ApiError>
                 (Method::GET, ["models"]) => (ctl::DAEMON_MODEL_LIST, json!({})),
                 (Method::GET, ["preset"]) => (ctl::DAEMON_PRESET_LIST, json!({})),
                 (Method::PUT, ["model"]) => (ctl::DAEMON_MODEL_USE, body::<schema::ModelUseRequest>(req).await?),
+                (Method::PUT, ["mode"]) => (ctl::DAEMON_OUTPUT_MODE_SET, body::<schema::OutputModeSetRequest>(req).await?),
                 (Method::POST, ["preset", "save"]) => { body::<Empty>(req).await?; (ctl::DAEMON_PRESET_SAVE, json!({})) },
                 (Method::POST, ["preset", "use"]) => { body::<Empty>(req).await?; (ctl::DAEMON_PRESET_USE, json!({})) },
                 (Method::GET, ["devices"]) => { let all = match q.get("all").map(String::as_str) { None | Some("false") => false, Some("true") => true, _ => return Err(bad("invalid all parameter")) }; (ctl::DAEMON_DEVICE_LIST, json!({"all":all})) },

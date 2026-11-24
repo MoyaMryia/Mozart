@@ -10,7 +10,6 @@ use mozart_core::ctl::{self, Seqpacket};
 use serde_json::json;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering::Relaxed};
-use std::sync::mpsc::RecvTimeoutError;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -48,23 +47,17 @@ pub fn run(
     let mut request_id: u32 = 0;
     let mut pending: Option<SpeechJob> = None;
     while !stop.load(Relaxed) {
-        if !shared.speech_enabled() {
-            // 停新投递：静默清空在队句；已送达的在途任务自然播完。
-            queues.clear_speech();
-            pending = None;
-            sleep_checked(QUEUE_POLL, stop);
-            continue;
-        }
         let job = match pending.take() {
             Some(job) => job,
             None => match queues.recv_speech(QUEUE_POLL) {
-                Ok(job) => job,
-                Err(RecvTimeoutError::Timeout) => continue,
-                // 队列随进程销毁。
-                Err(RecvTimeoutError::Disconnected) => break,
+                Some(job) => job,
+                None => continue,
             },
         };
         if conn.is_none() {
+            if Some(job.generation) != shared.speech_generation() {
+                continue;
+            }
             match Seqpacket::connect_timeout(&path, Some(CONNECT_TIMEOUT)) {
                 Ok(fresh) => {
                     shared.speech_stats().set_connected(true);
@@ -83,8 +76,9 @@ pub fn run(
         }
         let current = conn.as_ref().expect("connection established above");
         request_id = request_id.wrapping_add(1);
-        match submit(current, request_id, &job) {
-            Ok(status) => {
+        match submit(current, request_id, &job, &shared) {
+            Ok(None) => {} // 关停／重新开启期间失去资格。
+            Ok(Some(status)) => {
                 let stats = shared.speech_stats();
                 stats.add_delivered();
                 match status {
@@ -106,14 +100,25 @@ pub fn run(
 }
 
 /// 发一条任务并等受理应答；入口校验应答类型（回显请求号）、句编号与状态取值。
-fn submit(conn: &Seqpacket, request_id: u32, job: &SpeechJob) -> Result<JobStatus, String> {
+fn submit(
+    conn: &Seqpacket,
+    request_id: u32,
+    job: &SpeechJob,
+    shared: &Shared,
+) -> Result<Option<JobStatus>, String> {
     let body = serde_json::to_vec(&json!({
         "text": job.text,
         "utterance_id": job.utterance_id,
+        "issued_ns": job.generation.issued_ns(),
     }))
     .expect("speech job is JSON-serializable");
-    conn.send_timeout(ctl::TTS_JOB_SUBMIT, request_id, &body, Some(IO_TIMEOUT))
-        .map_err(|err| format!("send：{err}"))?;
+    // 建链、序列化和等待应答都不持门控；仅将一次非阻塞发送与撤销许可串行化。
+    let Some(sent) = shared.send_current_speech(job.generation, || {
+        conn.send_timeout(ctl::TTS_JOB_SUBMIT, request_id, &body, Some(Duration::ZERO))
+    }) else {
+        return Ok(None);
+    };
+    sent.map_err(|err| format!("send：{err}"))?;
     let reply = conn
         .recv(Some(IO_TIMEOUT))
         .map_err(|err| format!("recv：{err}"))?;
@@ -129,13 +134,13 @@ fn submit(conn: &Seqpacket, request_id: u32, job: &SpeechJob) -> Result<JobStatu
     }
     // 受理三态映射：ok→submitted，error/Busy→skipped（队满），其余 error→failed。
     match parsed.status.as_str() {
-        "ok" => Ok(JobStatus::Submitted),
-        "error" if parsed.code == ctl::CODE_BUSY => Ok(JobStatus::Skipped),
+        "ok" => Ok(Some(JobStatus::Submitted)),
+        "error" if parsed.code == ctl::CODE_BUSY => Ok(Some(JobStatus::Skipped)),
         "error" => {
             if !parsed.reason.is_empty() {
                 eprintln!("mozart-bridge: tts failed {}：{}", job.utterance_id, parsed.reason);
             }
-            Ok(JobStatus::Failed)
+            Ok(Some(JobStatus::Failed))
         }
         other => Err(format!("unknown job status: {other}")),
     }
@@ -143,11 +148,13 @@ fn submit(conn: &Seqpacket, request_id: u32, job: &SpeechJob) -> Result<JobStatu
 
 /// speech stop：向 TTS 下发 TTS_JOB_STOP（清任务队列并中止在途合成，TTS 侧处理见 Wave 2）。
 /// 尽力而为：TTS 缺席或拒收只记降级，不阻断桥侧关开关与清队列。
-pub fn send_stop(path: &Path, shared: &Shared) {
+pub fn send_stop(path: &Path, shared: &Shared, cutoff_ns: u64) {
+    let body =
+        serde_json::to_vec(&json!({ "cutoff_ns": cutoff_ns })).expect("stop fence serializable");
     let result = Seqpacket::connect_timeout(path, Some(CONNECT_TIMEOUT))
         .map_err(|err| format!("connect {}：{err}", path.display()))
         .and_then(|conn| {
-            conn.send_timeout(ctl::TTS_JOB_STOP, 0, b"", Some(IO_TIMEOUT))
+            conn.send_timeout(ctl::TTS_JOB_STOP, 0, &body, Some(IO_TIMEOUT))
                 .map_err(|err| format!("send：{err}"))
         });
     if let Err(reason) = result {
@@ -183,7 +190,10 @@ mod tests {
         fn new(tag: &str, speech_enabled: bool) -> Self {
             let dir = temp_dir(tag);
             let shared = Arc::new(Shared::new(
-                Switches { translate_enabled: true, speech_enabled },
+                Switches {
+                    translate_enabled: true,
+                    speech_enabled,
+                },
                 dir.join("subtitles.jsonl"),
             ));
             Self {
@@ -195,10 +205,14 @@ mod tests {
         }
 
         fn push(&self, seq: u64) {
-            assert!(self.queues.push_speech(SpeechJob {
+            self.queues.push_speech(SpeechJob {
                 utterance_id: format!("s:{seq}"),
                 text: format!("hello {seq}"),
-            }));
+                generation: self
+                    .shared
+                    .speech_generation()
+                    .unwrap_or(crate::state::SpeechGeneration::FIRST),
+            });
         }
 
         fn spawn_worker(&self, path: &Path) -> std::thread::JoinHandle<()> {
@@ -318,6 +332,40 @@ mod tests {
         let status = fixture.shared.status(&fixture.queues);
         assert_eq!(status.speech_delivered, 0);
         assert_eq!(status.speech_dropped, 0);
+        let _ = std::fs::remove_dir_all(&fixture.dir);
+    }
+
+    #[test]
+    fn reconnect_after_off_on_discards_previous_generation() {
+        let fixture = Fixture::new("sp-generation", true);
+        let path = fixture.dir.join("tts-jobs.sock");
+        fixture.push(1);
+        let worker = fixture.spawn_worker(&path);
+        fixture.wait_for("旧任务正在等待 TTS 重连", || {
+            fixture
+                .shared
+                .status(&fixture.queues)
+                .degraded
+                .iter()
+                .any(|d| d.starts_with(DEGRADED_TTS_JOBS))
+        });
+        for speech_enabled in [false, true] {
+            fixture.shared.set_switches(Switches {
+                translate_enabled: true,
+                speech_enabled,
+            });
+        }
+        let mock = MockTts::bind(&path);
+        let (jobs, server) = mock.spawn(vec!["submitted"]);
+        fixture.push(2);
+        fixture.wait_for("新代任务已投递", || {
+            fixture.shared.status(&fixture.queues).speech_submitted == 1
+        });
+        fixture.finish(worker);
+        server.join().unwrap();
+        let jobs = jobs.lock().unwrap();
+        assert_eq!(jobs.len(), 1);
+        assert_eq!(jobs[0]["utterance_id"], "s:2");
         let _ = std::fs::remove_dir_all(&fixture.dir);
     }
 

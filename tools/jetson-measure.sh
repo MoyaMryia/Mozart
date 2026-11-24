@@ -52,6 +52,7 @@ kill_mozart() {
 gen_config() {
   cat > "$M_DIR/smoke.toml" <<EOF
 [daemon]
+startup_mode = "manual"
 run_dir = "$M_DIR/run"
 rpc_timeout_ms = 2000
 start_timeout_ms = 30000

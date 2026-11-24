@@ -142,18 +142,19 @@ struct MockAsr {
 
 impl MockAsr {
     fn bind(path: &Path) -> Self {
-        let raw = unsafe {
-            libc::socket(
-                libc::AF_UNIX,
-                libc::SOCK_SEQPACKET | libc::SOCK_CLOEXEC,
-                0,
-            )
-        };
+        let raw =
+            unsafe { libc::socket(libc::AF_UNIX, libc::SOCK_SEQPACKET | libc::SOCK_CLOEXEC, 0) };
         assert!(raw >= 0, "socket: {}", io::Error::last_os_error());
         let fd = unsafe { OwnedFd::from_raw_fd(raw) };
         let _ = std::fs::remove_file(path);
         let (addr, len) = sockaddr(path);
-        let rc = unsafe { libc::bind(fd.as_raw_fd(), (&addr as *const libc::sockaddr_un).cast(), len) };
+        let rc = unsafe {
+            libc::bind(
+                fd.as_raw_fd(),
+                (&addr as *const libc::sockaddr_un).cast(),
+                len,
+            )
+        };
         assert_eq!(rc, 0, "bind: {}", io::Error::last_os_error());
         let rc = unsafe { libc::listen(fd.as_raw_fd(), 1) };
         assert_eq!(rc, 0, "listen: {}", io::Error::last_os_error());
@@ -414,7 +415,9 @@ fn corrections_file_overrides_and_extends_builtin() {
     let conn = mock.accept();
 
     conn.send_event(&event("final", "s", 1, "我以经王独在见"));
-    wait_until("字幕落盘", Duration::from_secs(5), || read_lines(&dir).len() == 1);
+    wait_until("字幕落盘", Duration::from_secs(5), || {
+        read_lines(&dir).len() == 1
+    });
     let lines = read_lines(&dir);
     // 内置「以经→已经」保留，「在见」被文件覆盖，「王独」新增；zh 存纠错后原文。
     assert_eq!(lines[0]["zh"], "我已经网赌再会");
@@ -481,10 +484,7 @@ fn switches_toggle_without_writing_state_file() {
 fn toml_baseline_applies_without_state_file() {
     let dir = run_dir("baseline");
     let mock = MockAsr::bind(&dir.join("asr-events.sock"));
-    let mut child = spawn_bridge(
-        &dir,
-        "translate_enabled = false\nspeech_enabled = false\n",
-    );
+    let mut child = spawn_bridge(&dir, "translate_enabled = false\nspeech_enabled = false\n");
     let control = connect_control(&dir);
     let conn = mock.accept();
 
@@ -659,7 +659,11 @@ impl MockLlama {
     }
 
     /// 收下请求但不应答（SIGTERM 宽限测试）；连接保持到 release 通道关闭。
-    fn spawn_stall(self, received: mpsc::Sender<()>, release: mpsc::Receiver<()>) -> JoinHandle<()> {
+    fn spawn_stall(
+        self,
+        received: mpsc::Sender<()>,
+        release: mpsc::Receiver<()>,
+    ) -> JoinHandle<()> {
         std::thread::spawn(move || {
             let (mut stream, _) = self.listener.accept().expect("accept");
             let _ = read_http_request(&mut stream);
@@ -749,9 +753,11 @@ fn translation_and_speech_full_chain() {
     let conn = asr.accept();
 
     conn.send_event(&event("final", "a1b2c3d4", 1, "你好"));
-    wait_until("原文 + 译文修订落盘", Duration::from_secs(5), || {
-        read_lines(&dir).len() == 2
-    });
+    wait_until(
+        "原文 + 译文修订落盘",
+        Duration::from_secs(5),
+        || read_lines(&dir).len() == 2,
+    );
     let lines = read_lines(&dir);
     assert_eq!(lines[0]["zh"], "你好");
     assert_eq!(lines[0]["en"], "");
@@ -820,10 +826,14 @@ fn translation_retries_then_succeeds() {
     let conn = asr.accept();
 
     conn.send_event(&event("final", "s", 1, "你好"));
-    wait_until("重试后翻译和播报提交成功", Duration::from_secs(5), || {
-        let status = get_status(&control);
-        status["translated"] == 1 && status["speech_submitted"] == 1
-    });
+    wait_until(
+        "重试后翻译和播报提交成功",
+        Duration::from_secs(5),
+        || {
+            let status = get_status(&control);
+            status["translated"] == 1 && status["speech_submitted"] == 1
+        },
+    );
     let status = get_status(&control);
     assert_eq!(status["translate_retried"], 2);
     assert_eq!(status["translate_failed"], 0);
@@ -995,18 +1005,22 @@ fn review_pending_waits_for_refined_and_broadcasts_once() {
     let mut pending_final = event("final", "a1b2c3d4", 1, "初版错字");
     pending_final["refinement_status"] = json!("pending");
     conn.send_event(&pending_final);
-    wait_until("pending final 仅落盘原文字幕", Duration::from_secs(5), || {
-        read_lines(&dir).len() == 1
-    });
+    wait_until(
+        "pending final 仅落盘原文字幕",
+        Duration::from_secs(5),
+        || read_lines(&dir).len() == 1,
+    );
     // 复核未完成前不得入翻译与播报队列。
     std::thread::sleep(Duration::from_millis(120));
     assert!(requests.lock().unwrap().is_empty());
     assert!(jobs.lock().unwrap().is_empty());
 
     conn.send_event(&refined_event("a1b2c3d4", 1, "初版错字", "复核正文"));
-    wait_until("复核后单次翻译与播报完成", Duration::from_secs(5), || {
-        get_status(&control)["speech_submitted"] == 1
-    });
+    wait_until(
+        "复核后单次翻译与播报完成",
+        Duration::from_secs(5),
+        || get_status(&control)["speech_submitted"] == 1,
+    );
 
     let status = get_status(&control);
     assert_eq!(status["subtitles_published"], 1);
@@ -1043,6 +1057,97 @@ fn review_pending_waits_for_refined_and_broadcasts_once() {
 }
 
 #[test]
+fn reenabled_speech_does_not_broadcast_a_final_waiting_for_old_review() {
+    let dir = run_dir("speech-review-generation");
+    let asr = MockAsr::bind(&dir.join("asr-events.sock"));
+    let llama = MockLlama::bind(&dir.join("llama.sock"));
+    let (requests, llama_server) =
+        llama.spawn(vec![llama_ok("Reviewed."), llama_ok("New sentence.")]);
+    let tts = MockTts::bind(&dir.join("tts-jobs.sock"));
+    let (jobs, tts_server) = tts.spawn(vec!["submitted"]);
+    let mut child = spawn_bridge(&dir, "");
+    let control = connect_control(&dir);
+    let conn = asr.accept();
+
+    let mut pending = event("final", "a1b2c3d4", 1, "初版错字");
+    pending["refinement_status"] = json!("pending");
+    conn.send_event(&pending);
+    wait_until("旧句原文已落盘", Duration::from_secs(5), || {
+        read_lines(&dir).len() == 1
+    });
+    call_ok(&control, ctl::BRIDGE_SPEECH_SET, 3, br#"{"enabled":false}"#);
+    call_ok(&control, ctl::BRIDGE_SPEECH_SET, 4, br#"{"enabled":true}"#);
+
+    conn.send_event(&refined_event("a1b2c3d4", 1, "初版错字", "复核正文"));
+    conn.send_event(&event("final", "a1b2c3d4", 2, "另一句新话"));
+    wait_until(
+        "旧句和新句都有译文，新句已受理播报",
+        Duration::from_secs(5),
+        || {
+            let status = get_status(&control);
+            status["translated"] == 2 && status["speech_submitted"] == 1
+        },
+    );
+    assert_eq!(requests.lock().unwrap().len(), 2);
+    let lines = read_lines(&dir);
+    assert!(lines
+        .iter()
+        .any(|line| line["utterance_id"] == "a1b2c3d4:1" && line["en"] == "Reviewed."));
+    assert!(lines
+        .iter()
+        .any(|line| line["utterance_id"] == "a1b2c3d4:2" && line["en"] == "New sentence."));
+    {
+        let jobs = jobs.lock().unwrap();
+        assert_eq!(jobs.len(), 1);
+        assert_eq!(jobs[0]["utterance_id"], "a1b2c3d4:2");
+    }
+    sigterm(&child.0);
+    assert!(wait_exit(&mut child.0, Duration::from_secs(2)).success());
+    llama_server.join().unwrap();
+    tts_server.join().unwrap();
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn bridge_crash_recovers_pending_review_without_broadcasting() {
+    let dir = run_dir("crash-review");
+    let asr = MockAsr::bind(&dir.join("asr-events.sock"));
+    let llama = MockLlama::bind(&dir.join("llama.sock"));
+    let (requests, server) = llama.spawn(vec![llama_ok("Recovered.")]);
+    let tts = MockTts::bind(&dir.join("tts-jobs.sock"));
+    let mut first = spawn_bridge(&dir, "");
+    let asr_first = asr.accept();
+    let mut final_event = event("final", "a1b2c3d4", 1, "在线原文");
+    final_event["refinement_status"] = json!("pending");
+    asr_first.send_event(&final_event);
+    wait_until("原文已落盘", Duration::from_secs(5), || read_lines(&dir).len() == 1);
+    first.0.kill().unwrap();
+    assert!(!wait_exit(&mut first.0, Duration::from_secs(2)).success());
+    drop(asr_first);
+
+    let mut second = spawn_bridge(&dir, "");
+    let asr_second = asr.accept();
+    let control = connect_control(&dir);
+    wait_until("原文兜底译文已落盘", Duration::from_secs(5), || get_status(&control)["translated"] == 1);
+    asr_second.send_event(&refined_event("a1b2c3d4", 1, "在线原文", "迟到的复核结果"));
+    asr_second.send_event(&event("partial", "a1b2c3d4", 2, "下一句"));
+    wait_until("后续事件已到达", Duration::from_secs(5), || read_lines(&dir).iter().any(|l| l["utterance_id"] == "a1b2c3d4:2"));
+    let lines = read_lines(&dir);
+    let old: Vec<_> = lines.iter().filter(|line| line["utterance_id"] == "a1b2c3d4:1").collect();
+    assert_eq!(old.len(), 3);
+    assert_eq!(old[1]["refinement_status"], "skipped");
+    assert_eq!(old[2]["zh"], "在线原文");
+    assert_eq!(old[2]["en"], "Recovered.");
+    assert_eq!(get_status(&control)["speech_submitted"], 0);
+    assert!(tts.wait_connection(Duration::from_millis(150)).is_none());
+    assert_eq!(requests.lock().unwrap().len(), 1);
+    sigterm(&second.0);
+    assert!(wait_exit(&mut second.0, Duration::from_secs(2)).success());
+    server.join().unwrap();
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
 fn review_skipped_falls_back_to_online_final_once() {
     let dir = run_dir("review-skip");
     let asr = MockAsr::bind(&dir.join("asr-events.sock"));
@@ -1064,9 +1169,11 @@ fn review_skipped_falls_back_to_online_final_once() {
     let mut skipped_refined = event("refined", "a1b2c3d4", 1, "在线文本");
     skipped_refined["refinement_status"] = json!("skipped");
     conn.send_event(&skipped_refined);
-    wait_until("复核 skipped 后兜底翻译播报完成", Duration::from_secs(5), || {
-        get_status(&control)["speech_submitted"] == 1
-    });
+    wait_until(
+        "复核 skipped 后兜底翻译播报完成",
+        Duration::from_secs(5),
+        || get_status(&control)["speech_submitted"] == 1,
+    );
 
     let status = get_status(&control);
     assert_eq!(status["translated"], 1);

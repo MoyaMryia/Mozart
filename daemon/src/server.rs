@@ -62,13 +62,19 @@ pub fn serve(config: &Config, config_path: Option<&Path>) -> io::Result<()> {
     let state_file = StateFile::load(state_file_path())?;
     let mut effective = config.clone();
     state_file::overlay(&mut effective, state_file.overrides());
-    let bridge_restore = Arc::new(Mutex::new(state_file.bridge_restore()));
+    let mut initial_state = State::new();
+    crate::mode::initialize(&mut initial_state, &effective);
+    let mut restore = state_file.bridge_restore();
+    if initial_state.output_mode.is_some() {
+        restore.speech = None;
+    }
+    let bridge_restore = Arc::new(Mutex::new(restore));
     let state_file = Arc::new(Mutex::new(state_file));
     let shared = SharedConfig::new(effective);
 
     // 子进程与 daemon 读同一 TOML：解析出的路径随 spawn 传递（--config）。
     let config_path = config_path.map(|path| path.to_path_buf());
-    let state = Arc::new(Mutex::new(State::new()));
+    let state = Arc::new(Mutex::new(initial_state));
     let services = Arc::new(Services::new(&shared));
     let running = Arc::new(AtomicBool::new(true));
     // 预设载入与 config set/save 共用 TOML 串行锁与 transition 锁。
@@ -284,10 +290,22 @@ fn handle_request(ctx: &Ctx, msg: &Message) -> (Vec<u8>, bool) {
                 ),
             }
         }
+        ctl::DAEMON_OUTPUT_MODE_SET => match parse_body::<schema::OutputModeSetRequest>(&msg.body) {
+            Ok(request) => {
+                let _transition = ctx.services.transition();
+                let mut restore = lock_bridge_restore(&ctx.bridge_restore);
+                restore.speech = None;
+                let mode = crate::mode::request(&mut lock_state(&ctx.state), request.mode);
+                (schema::ok_body(json!(mode)), false)
+            }
+            Err(reply) => (reply, false),
+        },
         ctl::DAEMON_ROUTE_SET => match parse_body::<RouteSetRequest>(&msg.body) {
             Ok(request) => {
+                let _transition = ctx.services.transition();
+                crate::mode::unmanage(&mut lock_state(&ctx.state));
                 let config = ctx.config.snapshot();
-                match services::route_set(
+                match services::route_set_locked(
                     &ctx.state,
                     &ctx.services,
                     &config,
@@ -317,20 +335,10 @@ fn handle_request(ctx: &Ctx, msg: &Message) -> (Vec<u8>, bool) {
             Err(reply) => (reply, false),
         },
         ctl::DAEMON_SPEECH_SET => match parse_body::<SwitchSetRequest>(&msg.body) {
-            Ok(request) => apply_bridge_switch(
-                ctx,
-                "bridge.speech_enabled",
-                request.enabled,
-                || services::speech_set(&ctx.services, request.enabled),
-            ),
+            Ok(request) => (speech_set_reply(ctx, request.enabled), false),
             Err(reply) => (reply, false),
         },
-        ctl::DAEMON_SPEECH_STOP => apply_bridge_switch(
-            ctx,
-            "bridge.speech_enabled",
-            false,
-            || services::speech_stop(&ctx.state, &ctx.services),
-        ),
+        ctl::DAEMON_SPEECH_STOP => (speech_stop_reply(ctx, &msg.body), false),
         ctl::DAEMON_FILE_SUBMIT => match parse_body::<FileSubmitRequest>(&msg.body) {
             Ok(request) => file_reply(ctx.file.submit(request)),
             Err(reply) => (reply, false),
@@ -410,17 +418,52 @@ where
     let mut restore = lock_bridge_restore(&ctx.bridge_restore);
     match call() {
         Ok(data) => {
-            if let Err(err) = lock_state_file(&ctx.state_file).set_key(key, json!(enabled)) {
-                lock_state(&ctx.state).push_degraded(format!("state file write {key}: {err}"));
-            }
-            match key {
-                "bridge.translate_enabled" => restore.translate = None,
-                "bridge.speech_enabled" => restore.speech = None,
-                _ => {}
-            }
+            save_bridge_switch(ctx, &mut restore, key, enabled);
             (schema::ok_body(data), false)
         }
         Err((code, reason)) => (schema::error_body(&code, &reason), false),
+    }
+}
+
+fn save_bridge_switch(ctx: &Ctx, restore: &mut BridgeRestore, key: &str, enabled: bool) {
+    if let Err(err) = lock_state_file(&ctx.state_file).set_key(key, json!(enabled)) {
+        lock_state(&ctx.state).push_degraded(format!("state file write {key}: {err}"));
+    }
+    match key {
+        "bridge.translate_enabled" => restore.translate = None,
+        "bridge.speech_enabled" => restore.speech = None,
+        _ => {}
+    }
+}
+
+fn speech_set_reply(ctx: &Ctx, enabled: bool) -> Vec<u8> {
+    let _transition = ctx.services.transition();
+    crate::mode::unmanage(&mut lock_state(&ctx.state));
+    let mut restore = lock_bridge_restore(&ctx.bridge_restore);
+    if enabled && restore.speech_stop.is_some() {
+        if let Err((code, reason)) = services::advance_speech_stop(&ctx.state, &ctx.services, &ctx.state_file, &mut restore) {
+            return schema::error_body(&code, &reason);
+        }
+    }
+    match services::speech_set(&ctx.services, enabled) {
+        Ok(data) => {
+            save_bridge_switch(ctx, &mut restore, "bridge.speech_enabled", enabled);
+            schema::ok_body(data)
+        }
+        Err((code, reason)) => schema::error_body(&code, &reason),
+    }
+}
+
+fn speech_stop_reply(ctx: &Ctx, body: &[u8]) -> Vec<u8> {
+    if !body.is_empty() && !serde_json::from_slice::<serde_json::Map<String, serde_json::Value>>(body).is_ok_and(|value| value.is_empty()) {
+        return schema::error_body(ctl::CODE_INVALID_ARGUMENT, "speech stop body must be an empty object");
+    }
+    let _transition = ctx.services.transition();
+    crate::mode::unmanage(&mut lock_state(&ctx.state));
+    let mut restore = lock_bridge_restore(&ctx.bridge_restore);
+    match services::advance_speech_stop(&ctx.state, &ctx.services, &ctx.state_file, &mut restore) {
+        Ok(data) => schema::ok_body(data),
+        Err((code, reason)) => schema::error_body(&code, &reason),
     }
 }
 

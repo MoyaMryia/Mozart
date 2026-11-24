@@ -48,6 +48,11 @@ enum Action {
     Down,
     /// 查询整机状态
     Status,
+    /// 设置输出模式
+    Mode {
+        #[arg(value_enum)]
+        mode: ModeArg,
+    },
     /// 切换音频路由
     Route {
         #[command(subcommand)]
@@ -106,6 +111,13 @@ enum RouteAction {
         #[arg(value_enum)]
         route: RouteArg,
     },
+}
+
+#[derive(Clone, Copy, ValueEnum)]
+enum ModeArg {
+    Direct,
+    Rvc,
+    Broadcast,
 }
 
 #[derive(Clone, Copy, ValueEnum)]
@@ -277,6 +289,19 @@ fn run(cli: Cli) -> Result<(), CliError> {
         Action::Up => up(&config, config_path.as_deref(), cli.json),
         Action::Down => down(&config, cli.json),
         Action::Status => status(&config, cli.json),
+        Action::Mode { mode } => {
+            let mode = match mode {
+                ModeArg::Direct => ctl::schema::OutputMode::Direct,
+                ModeArg::Rvc => ctl::schema::OutputMode::Rvc,
+                ModeArg::Broadcast => ctl::schema::OutputMode::Broadcast,
+            };
+            let body = body_json(&ctl::schema::OutputModeSetRequest { mode })?;
+            let command = ctl::DAEMON_OUTPUT_MODE_SET;
+            let timeout = ctl::request_timeout_ms(config.daemon.rpc_timeout_ms, command);
+            let data = call_with_timeout(&config, command, &body, timeout)?;
+            println!("{data}");
+            Ok(())
+        },
         Action::Route { action } => {
             let RouteAction::Set { route } = action;
             route_set(&config, route, cli.json)
@@ -490,8 +515,8 @@ fn speech(config: &Config, action: SpeechAction, json_output: bool) -> Result<()
         SpeechAction::Stop => (ctl::DAEMON_SPEECH_STOP, "{}".to_string(), "speech: stopped"),
     };
     let conn = connect(config)?;
-    let response = request(&conn, type_, body.as_bytes(), config.daemon.rpc_timeout_ms)
-        .map_err(classify_io)?;
+    let budget = ctl::request_timeout_ms(config.daemon.rpc_timeout_ms, type_);
+    let response = request(&conn, type_, body.as_bytes(), budget).map_err(classify_io)?;
     let data = expect_ok(response)?;
     if json_output {
         println!("{data}");

@@ -72,6 +72,8 @@ pub const DAEMON_MODEL_USE: u16 = 0x0120;
 /// 体：schema::DeviceUseRequest {"kind","device"}；
 /// data {"kind","device","previous_device"}；临时热切换音频设备（不写回 TOML）。
 pub const DAEMON_DEVICE_USE: u16 = 0x0121;
+/// 体：{"mode":"direct"|"rvc"|"broadcast"}，返回输出模式转换快照。
+pub const DAEMON_OUTPUT_MODE_SET: u16 = 0x0122;
 
 /// Budget for operations involving up to six serial RPCs.
 pub fn config_set_timeout_ms(rpc_timeout_ms: u64) -> u64 {
@@ -80,7 +82,8 @@ pub fn config_set_timeout_ms(rpc_timeout_ms: u64) -> u64 {
 
 pub fn request_timeout_ms(rpc_timeout_ms: u64, command: u16) -> u64 {
     match command {
-        DAEMON_CONFIG_SET | DAEMON_PRESET_SAVE | DAEMON_PRESET_USE | DAEMON_PRESET_LIST => {
+        DAEMON_CONFIG_SET | DAEMON_PRESET_SAVE | DAEMON_PRESET_USE | DAEMON_PRESET_LIST
+        | DAEMON_SPEECH_SET | DAEMON_SPEECH_STOP | DAEMON_OUTPUT_MODE_SET => {
             config_set_timeout_ms(rpc_timeout_ms)
         }
         _ => rpc_timeout_ms,
@@ -91,7 +94,7 @@ pub const PRE_HELLO: u16 = 0x0201;
 pub const PRE_SET_ROUTE: u16 = 0x0202;
 pub const PRE_SET_MUTE: u16 = 0x0203;
 pub const PRE_GET_STATUS: u16 = 0x0204;
-/// 体：{}（空）；清播报环。speech stop 经 daemon 转发（桥→TTS 走 TTS_JOB_STOP）。
+/// 体：{"cutoff_ns":u64} 安装播报截止并等待播放边界；空对象只清旧式队列。
 pub const PRE_SPEECH_STOP: u16 = 0x0205;
 /// 体：schema::FileModeSetRequest {"active": bool}；文件任务接管实时数据面
 /// （SPEC-03 复用 + 状态门控交接）。active=true：pre 暂停 rvc AI 发送并释放
@@ -104,6 +107,7 @@ pub const PRE_SET_DSP: u16 = 0x0207;
 /// 体：schema::DeviceUseRequest {"kind","device"}；
 /// 运行中热替换采集/播放 ALSA 句柄，data 回 {"kind","device","previous_device"}。
 pub const PRE_SET_DEVICE: u16 = 0x0208;
+pub const PRE_SET_PLAYOUT: u16 = 0x0209;
 
 pub const RVC_HELLO: u16 = 0x0301;
 pub const RVC_LOAD_MODEL: u16 = 0x0302;
@@ -675,11 +679,13 @@ mod tests {
         assert_eq!(DAEMON_PRESET_LIST, 0x011F);
         assert_eq!(DAEMON_MODEL_USE, 0x0120);
         assert_eq!(DAEMON_DEVICE_USE, 0x0121);
+        assert_eq!(DAEMON_OUTPUT_MODE_SET, 0x0122);
         assert_eq!(RVC_LIST_MODELS, 0x0307);
         assert_eq!(RVC_SET_PARAMS, 0x0308);
         assert_eq!(PRE_SET_FILE_MODE, 0x0206);
         assert_eq!(PRE_SET_DSP, 0x0207);
         assert_eq!(PRE_SET_DEVICE, 0x0208);
+        assert_eq!(PRE_SET_PLAYOUT, 0x0209);
         assert_eq!(ENHANCE_HELLO, 0x0701);
         assert_eq!(ENHANCE_GET_STATUS, 0x0702);
     }
@@ -712,6 +718,7 @@ mod tests {
         ("DAEMON_PRESET_LIST", DAEMON_PRESET_LIST),
         ("DAEMON_MODEL_USE", DAEMON_MODEL_USE),
         ("DAEMON_DEVICE_USE", DAEMON_DEVICE_USE),
+        ("DAEMON_OUTPUT_MODE_SET", DAEMON_OUTPUT_MODE_SET),
         ("PRE_HELLO", PRE_HELLO),
         ("PRE_SET_ROUTE", PRE_SET_ROUTE),
         ("PRE_SET_MUTE", PRE_SET_MUTE),
@@ -720,6 +727,7 @@ mod tests {
         ("PRE_SET_FILE_MODE", PRE_SET_FILE_MODE),
         ("PRE_SET_DSP", PRE_SET_DSP),
         ("PRE_SET_DEVICE", PRE_SET_DEVICE),
+        ("PRE_SET_PLAYOUT", PRE_SET_PLAYOUT),
         ("RVC_HELLO", RVC_HELLO),
         ("RVC_LOAD_MODEL", RVC_LOAD_MODEL),
         ("RVC_START_STREAM", RVC_START_STREAM),

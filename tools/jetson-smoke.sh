@@ -51,6 +51,7 @@ EOF
 
 cat > "$CFG" <<EOF
 [daemon]
+startup_mode = "manual"
 run_dir = "$RUN"
 rpc_timeout_ms = 2000
 start_timeout_ms = 30000

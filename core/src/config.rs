@@ -33,9 +33,20 @@ pub struct ModelEntry {
     pub path: PathBuf,
 }
 
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum StartupMode {
+    #[default]
+    Rvc,
+    Direct,
+    Broadcast,
+    Manual,
+}
+
 #[derive(Debug, Clone, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct DaemonConfig {
+    pub startup_mode: StartupMode,
     pub run_dir: PathBuf,
     pub socket: String,
     pub poll_interval_ms: u64,
@@ -623,6 +634,7 @@ impl Default for DaemonConfig {
     fn default() -> Self {
         Self {
             run_dir: PathBuf::from("/run/mozart"),
+            startup_mode: StartupMode::default(),
             socket: "daemon.sock".to_string(),
             poll_interval_ms: 1000,
             rpc_timeout_ms: 2000,
@@ -636,6 +648,10 @@ impl Default for DaemonConfig {
 
 impl DaemonConfig {
     fn apply_env(&mut self) -> Result<(), ConfigError> {
+        if let Ok(mode) = std::env::var("MOZART_STARTUP_MODE") {
+            self.startup_mode = serde_json::from_value(serde_json::Value::String(mode))
+                .map_err(|err| ConfigError::Invalid(format!("MOZART_STARTUP_MODE: {err}")))?;
+        }
         if let Some(dir) = std::env::var_os("MOZART_RUN_DIR") {
             self.run_dir = dir.into();
         }

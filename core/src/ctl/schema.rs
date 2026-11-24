@@ -44,6 +44,32 @@ pub enum Route {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
+pub enum OutputMode {
+    Direct,
+    Rvc,
+    Broadcast,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum OutputPhase {
+    ClosingSpeech,
+    ConfiguringPlayout,
+    Routing,
+    OpeningSpeech,
+    Applied,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct OutputModeStatus {
+    pub requested: OutputMode,
+    pub applied: Option<OutputMode>,
+    pub phase: OutputPhase,
+    pub last_error: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
 pub enum Activity {
     Realtime,
     File,
@@ -101,6 +127,8 @@ pub struct GpuState {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ArbiterState {
+    #[serde(default)]
+    pub file_return_pending: bool,
     pub gpu: GpuState,
 }
 
@@ -149,8 +177,22 @@ pub struct Processes {
     pub llama: ProcessInfo,
 }
 
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PlayoutPolicy {
+    #[default]
+    Legacy,
+    RealtimeOnly,
+    BroadcastOnly,
+    Silent,
+}
+
+pub const SUPERVISED_PLAYOUT_ENV: &str = "MOZART_SUPERVISED_PLAYOUT";
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PreStatus {
+    #[serde(default)]
+    pub playout_policy: PlayoutPolicy,
     #[serde(default)]
     pub enhancement: Option<PreEnhanceStatus>,
     #[serde(default = "default_denoise_backend")]
@@ -277,6 +319,8 @@ pub struct Status {
     pub enhance: Option<EnhanceStatus>,
     pub daemon: DaemonInfo,
     pub route: RouteState,
+    #[serde(default)]
+    pub output_mode: Option<OutputModeStatus>,
     pub mute: bool,
     pub arbiter: ArbiterState,
     pub processes: Processes,
@@ -461,6 +505,12 @@ impl Default for BridgeStatus {
 #[serde(deny_unknown_fields)]
 pub struct RouteSetRequest {
     pub route: Route,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct OutputModeSetRequest {
+    pub mode: OutputMode,
 }
 
 #[derive(Debug, Deserialize)]

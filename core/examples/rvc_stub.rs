@@ -21,6 +21,8 @@
 //! 之后全部回 InferenceFailed，模拟新参与旧参恢复都失败。
 //! 测试旋钮 `MOZART_RVC_STUB_STOP_KEEP_STREAM=1`：StopStream 应答成功但保持
 //! 流在跑，模拟停流未实际生效（恢复起流会收到 Busy）。
+//! 测试旋钮 `MOZART_RVC_STUB_STOP_FAULT_FILE=<path>`：文件内容 `before`／`after`
+//! 分别在执行 StopStream 前／后断开连接，不发送应答。缺失时正常应答。
 //! 测试旋钮 `MOZART_RVC_STUB_STATUS_FAIL_FILE=<path>`：该文件存在时 GetStatus
 //! 回 NotReady，模拟 rvc 不可达。
 //! 测试旋钮 `MOZART_RVC_STUB_MODELS=<a,b>`：可加载模型清单（缺省 demo），
@@ -40,7 +42,7 @@ use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
-use stub_common::{body, expect_known, fail, ok, parse_args, serve};
+use stub_common::{body, expect_known, fail, ok, parse_args, serve_optional_reply};
 
 /// 数据面 socket 缓冲帧数：SPEC-02「接收缓冲 4–8 帧」取上沿。
 const QUEUE_FRAMES: usize = 8;
@@ -160,7 +162,23 @@ fn main() {
         status_fail_file,
         starts: 0,
     };
-    serve(args, move |msg| handle(msg, &mut state));
+    let stop_fault = std::env::var_os("MOZART_RVC_STUB_STOP_FAULT_FILE").map(PathBuf::from);
+    serve_optional_reply(args, move |msg| {
+        if msg.header.type_ == ctl::RVC_STOP_STREAM {
+            if let Some(path) = &stop_fault {
+                match std::fs::read_to_string(path) {
+                    Ok(mode) if mode == "before" => return None,
+                    Ok(mode) if mode == "after" => {
+                        handle(msg, &mut state);
+                        return None;
+                    }
+                    Err(error) if error.kind() == ErrorKind::NotFound => {}
+                    other => panic!("invalid StopStream test fault: {other:?}"),
+                }
+            }
+        }
+        Some(handle(msg, &mut state))
+    });
 }
 
 fn handle(msg: &Message, state: &mut State) -> Vec<u8> {

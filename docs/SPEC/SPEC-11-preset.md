@@ -119,6 +119,8 @@ v1 体均空（固定 default、当前模型）。多预设阶段体扩 `{"name"
 
 ## 测试策略
 
+- [x] 预设测试首次切实时路由前等待 pre 控制面应答，不将子进程 `Running` 视为 socket 就绪；保持原等待预算和业务断言。
+
 - 单元（Rust，各 crate `src/` 或 `tests/`）：预设解析与校验、首次自动建、save 原子写、载入批量写基线 + 编排、模型切换检测、NotReady 与损坏分支。
 - 集成（`daemon/tests/`）：模型切换载入、preset use 实时 `SetParams` 热更与回退、文件下任务生效、跨链不污染、`model use` 成功与四条失败路径。
 - 板端（`tools/jetson-e2e.sh`）：新增 preset 功能套件；file-models 套件用临时模型目录副本或测后清理 `presets/`，避免污染资产。

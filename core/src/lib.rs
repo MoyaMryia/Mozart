@@ -6,6 +6,7 @@ pub mod ctl;
 pub mod dgram;
 pub mod preset;
 pub mod ring;
+pub mod speech;
 pub mod thread;
 
 pub const RAW_SAMPLE_RATE: u32 = 48000;
@@ -20,6 +21,7 @@ pub const CHANNELS: usize = 1;
 
 pub const INPUT_PACKET_MAGIC: u32 = 0x4D5A_5254;
 pub const OUTPUT_PACKET_MAGIC: u32 = 0x5452_5A4D;
+pub const SPEECH_PACKET_MAGIC: u32 = 0x5053_5A4D;
 pub const PACKET_HEADER_SIZE: usize = 20;
 
 #[repr(C, packed)]
@@ -91,6 +93,17 @@ const _: () = assert!(std::mem::size_of::<EnhanceRequest>() == 1300);
 const _: () = assert!(std::mem::size_of::<EnhanceReply>() == 1304);
 const _: () = assert!(std::mem::offset_of!(EnhanceRequest, frame) == 4);
 const _: () = assert!(std::mem::offset_of!(EnhanceReply, frame) == 8);
+
+/// TTS output carries a whole-utterance admission token without changing frame timestamps.
+#[repr(C, packed)]
+#[derive(Clone, Copy)]
+pub struct SpeechFrame {
+    pub issued_ns: u64,
+    pub frame: OutputFrame,
+}
+
+const _: () = assert!(std::mem::size_of::<SpeechFrame>() + 4 == 3876);
+const _: () = assert!(std::mem::offset_of!(SpeechFrame, frame) == 8);
 
 /// 48 kHz 原始采集帧（进程内使用，不跨进程边界），对应 frame.h 的 `mozart_raw_frame_t`。
 #[repr(C, packed)]

@@ -8,7 +8,7 @@ use crate::state::{DspSwitches, QueueReadout, Shared, VERSION};
 use mozart_core::config::validate_device_name;
 use mozart_core::ctl::schema::{
     error_body, ok_body, DeviceUseRequest, DspSetRequest, FileModeSetRequest, MuteSetRequest,
-    RouteSetRequest,
+    PlayoutPolicy, RouteSetRequest,
 };
 use mozart_core::ctl::{self, Message, Seqpacket, ACCEPT_POLL, IDLE_TIMEOUT, RECV_POLL};
 use mozart_core::dgram::FRAME_SIZE_MISMATCH_REASON;
@@ -110,7 +110,7 @@ pub fn serve(
     capture_ring: Arc<Ring<crate::capture::CapturedFrame>>,
     trunk: Arc<Ring<RawFrame>>,
     rvc_ring: Arc<Ring<OutputFrame>>,
-    tts_ring: Arc<Ring<OutputFrame>>,
+    tts_ring: Arc<Ring<mozart_core::SpeechFrame>>,
     device_switch_timeout: Duration,
     stop: &'static AtomicBool,
 ) {
@@ -159,7 +159,7 @@ fn serve_connection(
     capture_ring: &Ring<crate::capture::CapturedFrame>,
     trunk: &Ring<RawFrame>,
     rvc_ring: &Ring<OutputFrame>,
-    tts_ring: &Ring<OutputFrame>,
+    tts_ring: &Ring<mozart_core::SpeechFrame>,
     drop_log: &mut DropLog,
     device_switch_timeout: Duration,
     stop: &AtomicBool,
@@ -219,7 +219,7 @@ fn dispatch(
     capture_ring: &Ring<crate::capture::CapturedFrame>,
     trunk: &Ring<RawFrame>,
     rvc_ring: &Ring<OutputFrame>,
-    tts_ring: &Ring<OutputFrame>,
+    tts_ring: &Ring<mozart_core::SpeechFrame>,
     drop_log: &mut DropLog,
 ) -> Vec<u8> {
     let stop = AtomicBool::new(false);
@@ -236,6 +236,18 @@ fn dispatch(
     )
 }
 
+fn wait_playback_boundary(shared: &Shared, stop: &AtomicBool) -> bool {
+    let request = shared.playback_request.fetch_add(1, Ordering::SeqCst) + 1;
+    let deadline = Instant::now() + Duration::from_secs(1);
+    while shared.playback_ack.load(Ordering::SeqCst) < request {
+        if stop.load(Ordering::Relaxed) || Instant::now() >= deadline {
+            return false;
+        }
+        std::thread::sleep(Duration::from_millis(1));
+    }
+    true
+}
+
 /// 命令分发。请求体是外部输入，在此校验一次；内部执行信任已校验的值。
 #[allow(clippy::too_many_arguments)]
 fn dispatch_with_stop(
@@ -244,7 +256,7 @@ fn dispatch_with_stop(
     capture_ring: &Ring<crate::capture::CapturedFrame>,
     trunk: &Ring<RawFrame>,
     rvc_ring: &Ring<OutputFrame>,
-    tts_ring: &Ring<OutputFrame>,
+    tts_ring: &Ring<mozart_core::SpeechFrame>,
     drop_log: &mut DropLog,
     device_switch_timeout: Duration,
     stop: &AtomicBool,
@@ -266,6 +278,17 @@ fn dispatch_with_stop(
             Ok(request) => {
                 shared.set_mute_target(request.mute);
                 ok_body(json!({"mute": request.mute}))
+            }
+            Err(err) => error_body(ctl::CODE_INVALID_ARGUMENT, &err.to_string()),
+        },
+        ctl::PRE_SET_PLAYOUT => match serde_json::from_value::<PlayoutPolicy>(body) {
+            Ok(policy) => {
+                shared.set_playout_policy(policy);
+                if wait_playback_boundary(shared, stop) {
+                    ok_body(json!({"policy": policy}))
+                } else {
+                    error_body(ctl::CODE_NOT_READY, "playout acknowledgement timed out")
+                }
             }
             Err(err) => error_body(ctl::CODE_INVALID_ARGUMENT, &err.to_string()),
         },
@@ -300,6 +323,13 @@ fn dispatch_with_stop(
                     // 断言，实时恒发随断言激活（此支路实时帧属预期，非污染）。
                     shared.set_file_mode(false);
                     shared.set_mode_asserted(true);
+                    let deadline = Instant::now() + FILE_HANDOFF_TIMEOUT;
+                    while !shared.output_bound() {
+                        if Instant::now() >= deadline {
+                            return error_body(ctl::CODE_NOT_READY, "AI output socket restore timed out");
+                        }
+                        std::thread::sleep(FILE_HANDOFF_POLL);
+                    }
                     ok_body(json!({"active": false}))
                 }
             }
@@ -328,8 +358,7 @@ fn dispatch_with_stop(
         },
         ctl::PRE_SET_DEVICE => match serde_json::from_value::<DeviceUseRequest>(body) {
             Ok(request) => {
-                if let Err(err) = validate_device_name(&request.device, request.kind.config_key())
-                {
+                if let Err(err) = validate_device_name(&request.device, request.kind.config_key()) {
                     return error_body(ctl::CODE_INVALID_ARGUMENT, &err.to_string());
                 }
                 let slot = match request.kind {
@@ -348,7 +377,27 @@ fn dispatch_with_stop(
             Err(err) => error_body(ctl::CODE_INVALID_ARGUMENT, &err.to_string()),
         },
         ctl::PRE_SPEECH_STOP => {
-            // speech stop 经 daemon 转发：清播报环，丢弃已送达未播的播报帧。
+            if body.get("cutoff_ns").is_some() {
+                let fence: mozart_core::speech::StopFence = match serde_json::from_value(body) {
+                    Ok(fence) => fence,
+                    Err(err) => return error_body(ctl::CODE_INVALID_ARGUMENT, &err.to_string()),
+                };
+                if !mozart_core::speech::valid_timestamp(fence.cutoff_ns) {
+                    return error_body(ctl::CODE_INVALID_ARGUMENT, "invalid speech cutoff");
+                }
+                let cutoff = shared
+                    .speech_cutoff
+                    .fetch_max(fence.cutoff_ns, Ordering::SeqCst)
+                    .max(fence.cutoff_ns);
+                if !wait_playback_boundary(shared, stop) {
+                    return error_body(ctl::CODE_NOT_READY, "speech stop playback acknowledgement timed out");
+                }
+                return ok_body(json!({"stopped": true, "cutoff_ns": cutoff}));
+            }
+            if body != json!({}) {
+                return error_body(ctl::CODE_INVALID_ARGUMENT, "invalid speech stop body");
+            }
+            // 旧式命令只清播报环，丢弃已送达未播的播报帧。
             // 播放线程下一帧见环空，holdoff 后恢复实时；计数经应答可查。
             let mut frames_cleared = 0u64;
             while tts_ring.pop(Some(Duration::ZERO)).is_some() {
@@ -401,7 +450,7 @@ mod tests {
         Arc<Ring<crate::capture::CapturedFrame>>,
         Arc<Ring<RawFrame>>,
         Arc<Ring<OutputFrame>>,
-        Arc<Ring<OutputFrame>>,
+        Arc<Ring<mozart_core::SpeechFrame>>,
         DropLog,
     ) {
         (
@@ -792,7 +841,7 @@ mod tests {
     }
 
     /// 文件接管握手：模拟接收线程按 file_mode 置/清 output_released，
-    /// active=true 必须等握手完成才应答 ok；active=false 立即恢复。
+    /// 释放和重绑均须在应答前确认。
     #[test]
     fn set_file_mode_waits_for_handshake_and_roundtrips() {
         let (shared, cap, trunk, rvc, tts, mut log) = context();
@@ -803,7 +852,13 @@ mod tests {
             std::thread::spawn(move || {
                 while !stop.load(Ordering::Relaxed) {
                     // 接收线程的握手行为：接管即释放，交还即重绑。
-                    shared.set_output_released(shared.file_mode());
+                    shared.set_output_binding(if shared.file_mode() {
+                        crate::state::OutputBinding::Released
+                    } else if shared.mode_asserted() {
+                        crate::state::OutputBinding::Bound
+                    } else {
+                        crate::state::OutputBinding::Released
+                    });
                     std::thread::sleep(Duration::from_millis(2));
                 }
             })
@@ -833,6 +888,7 @@ mod tests {
         );
         assert_eq!(data(&reply)["active"], false);
         assert!(!shared.file_mode());
+        assert!(shared.output_bound());
 
         stop.store(true, Ordering::Relaxed);
         watcher.join().unwrap();
@@ -844,7 +900,7 @@ mod tests {
         shared.set_mode_asserted(true);
         let generation = shared.file_generation();
         let permit = shared.begin_ai_send(generation).unwrap();
-        shared.set_output_released(true);
+        shared.set_output_binding(crate::state::OutputBinding::Released);
         let (tx, rx) = std::sync::mpsc::channel();
         let worker = {
             let shared = shared.clone();
@@ -920,6 +976,7 @@ mod tests {
     #[test]
     fn set_file_mode_timeout_rolls_back() {
         let (shared, cap, trunk, rvc, tts, mut log) = context();
+        shared.set_output_binding(crate::state::OutputBinding::Bound);
         let reply = dispatch(
             &message(ctl::PRE_SET_FILE_MODE, br#"{"active":true}"#),
             &shared,
@@ -931,6 +988,17 @@ mod tests {
         );
         assert_eq!(error_code(&reply), ctl::CODE_NOT_READY);
         assert!(!shared.file_mode(), "超时必须回滚门控");
+    }
+
+    #[test]
+    fn file_restore_does_not_acknowledge_an_unfinished_bind() {
+        let (shared, cap, trunk, rvc, tts, mut log) = context();
+        shared.set_output_binding(crate::state::OutputBinding::Binding);
+        let reply = dispatch(
+            &message(ctl::PRE_SET_FILE_MODE, br#"{"active":false}"#),
+            &shared, &cap, &trunk, &rvc, &tts, &mut log,
+        );
+        assert_eq!(error_code(&reply), ctl::CODE_NOT_READY);
     }
 
     #[test]
@@ -951,7 +1019,18 @@ mod tests {
             let trunk = trunk.clone();
             let rvc = rvc.clone();
             let tts = tts.clone();
-            move || serve(listener, shared, cap, trunk, rvc, tts, Duration::from_secs(1), stop)
+            move || {
+                serve(
+                    listener,
+                    shared,
+                    cap,
+                    trunk,
+                    rvc,
+                    tts,
+                    Duration::from_secs(1),
+                    stop,
+                )
+            }
         });
 
         let conn = Seqpacket::connect(&path).unwrap();
@@ -976,28 +1055,34 @@ mod tests {
         assert_eq!(data(&reply.body)["route"], "rvc");
 
         // speech stop 清播报环：先塞两帧，停止后环空、应答计 frames_cleared。
-        tts.push(OutputFrame::new_48k(
-            mozart_core::FrameMeta {
-                pts_ns: 0,
-                frame_idx: 0,
-                vad_flag: 1,
-                energy_db: 0,
-                conf: 0,
-                segment_id: 0,
-            },
-            [0.0; mozart_core::OUTPUT_SAMPLES],
-        ));
-        tts.push(OutputFrame::new_48k(
-            mozart_core::FrameMeta {
-                pts_ns: 0,
-                frame_idx: 1,
-                vad_flag: 1,
-                energy_db: 0,
-                conf: 0,
-                segment_id: 0,
-            },
-            [0.0; mozart_core::OUTPUT_SAMPLES],
-        ));
+        tts.push(mozart_core::SpeechFrame {
+            issued_ns: 1,
+            frame: OutputFrame::new_48k(
+                mozart_core::FrameMeta {
+                    pts_ns: 0,
+                    frame_idx: 0,
+                    vad_flag: 1,
+                    energy_db: 0,
+                    conf: 0,
+                    segment_id: 0,
+                },
+                [0.0; mozart_core::OUTPUT_SAMPLES],
+            ),
+        });
+        tts.push(mozart_core::SpeechFrame {
+            issued_ns: 1,
+            frame: OutputFrame::new_48k(
+                mozart_core::FrameMeta {
+                    pts_ns: 0,
+                    frame_idx: 1,
+                    vad_flag: 1,
+                    energy_db: 0,
+                    conf: 0,
+                    segment_id: 0,
+                },
+                [0.0; mozart_core::OUTPUT_SAMPLES],
+            ),
+        });
         conn.send(ctl::PRE_SPEECH_STOP, 4, b"{}").unwrap();
         let reply = conn.recv(Some(Duration::from_secs(2))).unwrap();
         let stopped = data(&reply.body);
