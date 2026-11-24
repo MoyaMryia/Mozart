@@ -38,6 +38,12 @@ node_modules/
 /dist/
 *.tsbuildinfo
 .npm/
+# 前端自托管字体（OFL 许可，latin 子集，共约 60 KB）：设备热点离线时保持控制台字形。
+# plus-jakarta-sans-latin.woff2 标题与正文可变字体（400–800）
+!web/public/fonts/plus-jakarta-sans-latin.woff2
+# space-mono-400.woff2 / space-mono-700.woff2 等宽数字、徽章与终端日志
+!web/public/fonts/space-mono-400.woff2
+!web/public/fonts/space-mono-700.woff2
 
 # ---- 模型与运行时资产（仓外归档） ----
 /assets/

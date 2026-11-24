@@ -1,6 +1,6 @@
 import { z } from 'zod';
 import { API_ROOT, ApiError, parsePayload } from './api';
-import { envelopeSchema, type ConnectionState, type SubtitleRecord } from './contracts';
+import { envelopeSchema, subtitleSchema, type ConnectionState, type SubtitleRecord } from './contracts';
 
 const RECONNECT_MS = 1000;
 export const SUBTITLE_HISTORY_LIMIT = 50;
@@ -42,21 +42,61 @@ export class SubtitleHistory {
   clear() { this.records = []; this.sessions.clear(); }
 }
 
+const SNAPSHOT_KEY = 'mozart-subtitles';
+const snapshotSchema = z.object({ cursor: cursorSchema, records: z.array(subtitleSchema) });
+const storageDenied = (error: unknown) => error instanceof DOMException && (error.name === 'SecurityError' || error.name === 'QuotaExceededError');
+
+/**
+ * 读模型与游标作为同一快照存入 sessionStorage：页面重建时接续，新打开的标签页从头回放。
+ * 存储不可用时放弃持久化，由调用方按返回值提示。
+ */
+export class SubtitleStore {
+  private history = new SubtitleHistory();
+  private cursor?: string;
+
+  restore(): SubtitleRecord[] | null {
+    let saved: unknown;
+    try { saved = JSON.parse(sessionStorage.getItem(SNAPSHOT_KEY) ?? 'null'); }
+    catch (error) { if (error instanceof SyntaxError || storageDenied(error)) return null; throw error; }
+    const parsed = snapshotSchema.safeParse(saved);
+    if (!parsed.success) return null;
+    this.cursor = parsed.data.cursor;
+    for (const record of parsed.data.records) this.history.accept(record);
+    return parsed.data.records;
+  }
+  get current() { return this.cursor; }
+  accept(record: SubtitleRecord) { return this.history.accept(record); }
+  // 没有游标就无法接续，不保存。
+  save(cursor: string | undefined, records: SubtitleRecord[]): boolean {
+    if (cursor) this.cursor = cursor;
+    if (!this.cursor) return true;
+    try { sessionStorage.setItem(SNAPSHOT_KEY, JSON.stringify({ cursor: this.cursor, records })); return true; }
+    catch (error) { if (!storageDenied(error)) throw error; return false; }
+  }
+  clear() {
+    this.cursor = undefined; this.history.clear();
+    try { sessionStorage.removeItem(SNAPSHOT_KEY); }
+    catch (error) { if (!storageDenied(error)) throw error; }
+  }
+}
+
 export interface StreamOptions<T> {
   path: '/events/status' | '/events/subtitles';
   event: 'status' | 'subtitle';
   schema: z.ZodType<T>;
-  accept(value: T): void;
+  /** 已保存的游标：有则从断点接续，没有则由服务端从头回放。 */
+  cursor?: string;
+  accept(value: T, cursor?: string): void;
   state(value: ConnectionState): void;
   error(reason: string): void;
   reset?(): void;
 }
 
-// 游标只与当前内存读模型共存；刷新页面从头回放，不持久化孤立游标。
+// 游标与读模型由 SubtitleStore 作为同一快照保存；没有可恢复的快照时，服务端从头回放。
 export function subscribeStream<T>(options: StreamOptions<T>, factory = (url: string) => new EventSource(url)) {
   let source: EventSource | null = null;
   let timer: ReturnType<typeof setTimeout> | undefined;
-  let cursor: string | undefined;
+  let cursor = options.cursor;
   let dataError: string | undefined;
 
   const disconnect = () => {
@@ -104,7 +144,7 @@ export function subscribeStream<T>(options: StreamOptions<T>, factory = (url: st
         fail(error.message, true);
         return;
       }
-      options.accept(value);
+      options.accept(value, nextCursor);
       dataError = undefined;
       cursor = nextCursor;
       options.error('');

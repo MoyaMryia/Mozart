@@ -1,40 +1,77 @@
 <script setup lang="ts">
 import { ref } from 'vue';
-import type { FileJob, ModelEntry } from '../contracts';
+import type { FileJob } from '../contracts';
 import PendingResult from './PendingResult.vue';
+import RefreshIcon from './RefreshIcon.vue';
 
-const props = defineProps<{ jobs: FileJob[]; paused: boolean; models: ModelEntry[]; ready: boolean; busy: boolean; downloadSupported: boolean; error: string; modelsError?: boolean; unknowns: string[]; ackReady: boolean }>();
+// 文件任务与实时共用右侧选择并已加载的模型；不带 model_id 时后端使用当前模型。
+const props = defineProps<{ jobs: FileJob[]; paused: boolean; ready: boolean; busy: boolean; downloadSupported: boolean; error: string; unknowns: string[]; refreshBlocked?: boolean; ackReady: boolean }>();
 const emit = defineEmits<{ submit: [file: File, modelId: string | undefined]; cancel: [jobId: string]; pause: [paused: boolean]; refresh: []; download: [jobId: string]; acknowledge: [] }>();
-const file = ref<File | null>(null);
-const model = ref('');
+const dropped = ref('');
 const labels: Record<FileJob['state'], string> = { queued: '排队中', processing: '处理中', cancelling: '取消中', completed: '已完成', failed: '失败', cancelled: '已取消' };
-function selectFile(event: Event) { file.value = (event.target as HTMLInputElement).files?.[0] ?? null; }
-function submit() { if (file.value && !props.unknowns.length && (!model.value || (!props.modelsError && props.models.some(item => item.id === model.value && item.exists)))) emit('submit', file.value, model.value || undefined); }
+const tone: Record<FileJob['state'], string> = { queued: 'text-ink-3', processing: 'state-warn', cancelling: 'state-warn', completed: 'state-ok', failed: 'state-err', cancelled: 'text-ink-4' };
+// 选择或拖入即开始转换；清空输入以便再次选择同一个文件。
+function pick(event: Event) {
+  const input = event.target as HTMLInputElement;
+  const chosen = input.files?.[0];
+  dropped.value = chosen?.name ?? '';
+  input.value = '';
+  if (chosen && !props.unknowns.length) emit('submit', chosen, undefined);
+}
 </script>
 
 <template>
-  <section class="card">
-    <div class="card-head"><h2>文件转换</h2><button class="btn" :disabled="busy" @click="emit('refresh')">刷新</button></div>
-    <p v-if="error" class="banner banner-error">{{ error }}</p>
+  <section class="card p-4 space-y-4" aria-label="文件转换">
+    <div class="flex items-center gap-3 min-w-0">
+      <h2 class="text-lg font-extrabold text-ink shrink-0">文件转换</h2>
+      <span v-if="error" class="banner banner-error text-micro min-w-0 truncate" role="alert" :title="error">{{ error }}</span>
+      <div class="ml-auto flex items-center gap-1 shrink-0">
+        <button type="button" class="icon-button" :aria-label="paused ? '继续队列' : '暂停队列'" :title="paused ? '继续队列' : '暂停队列'" :disabled="busy || !ready || !!unknowns.length" @click="emit('pause', !paused)">
+          <svg v-if="paused" class="w-4 h-4" aria-hidden="true" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" viewBox="0 0 24 24"><path d="M7 4.5v15l12-7.5-12-7.5Z"/></svg>
+          <svg v-else class="w-4 h-4" aria-hidden="true" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" viewBox="0 0 24 24"><rect x="6" y="4" width="4" height="16" rx="1"/><rect x="14" y="4" width="4" height="16" rx="1"/></svg>
+        </button>
+        <button type="button" class="icon-button" aria-label="刷新" title="刷新队列" :disabled="busy || refreshBlocked" @click="emit('refresh')"><RefreshIcon /></button>
+      </div>
+    </div>
     <PendingResult :messages="unknowns" :enabled="ackReady" :busy="busy" label="已核对队列" @acknowledge="emit('acknowledge')" />
-    <form class="stack" @submit.prevent="submit">
-      <label class="file-picker" :class="{ disabled: busy || !ready }"><input class="sr-only" type="file" aria-label="待转换音频" required :disabled="busy || !ready" @change="selectFile"><span class="btn">选择音频</span><span class="muted">{{ file?.name ?? '未选择文件' }}</span></label>
-      <label class="field">模型<select v-model="model" :disabled="busy || !ready || modelsError"><option value="">默认</option><option v-for="item in models" :key="item.id" :value="item.id" :disabled="!item.exists">{{ item.id }}{{ item.exists ? '' : '（缺失）' }}{{ item.loaded ? '（已加载）' : '' }}</option></select></label>
-      <div class="actions"><button class="btn btn-primary" type="submit" :disabled="busy || !ready || !file || !!unknowns.length || (!!model && (modelsError || !models.some(item => item.id === model && item.exists)))">加入队列</button><button class="btn" type="button" :disabled="busy || !ready || !!unknowns.length" @click="emit('pause', !paused)">{{ paused ? '继续队列' : '暂停队列' }}</button></div>
-    </form>
-    <p v-if="!jobs.length" class="muted">暂无任务</p>
-    <ul v-else class="job-list">
-      <li v-for="job in jobs" :key="job.job_id">
-        <div class="row"><strong>{{ job.name }}</strong><span class="chip">{{ labels[job.state] }}</span></div>
-        <p class="muted">{{ job.progress.stage }} · {{ job.progress.percent }}%<template v-if="job.progress.blocks_done !== null && job.progress.blocks_total !== null"> · {{ job.progress.blocks_done }}/{{ job.progress.blocks_total }}</template></p>
-        <progress :value="job.progress.percent" max="100">{{ job.progress.percent }}%</progress>
-        <p v-if="job.error" class="state-err">{{ job.error }}</p>
-        <div class="actions">
-          <button v-if="job.state === 'queued' || job.state === 'processing'" class="btn" :disabled="busy || !ready || !!unknowns.length" @click="emit('cancel', job.job_id)">取消</button>
-          <button v-if="job.state === 'completed' && job.result_ready && downloadSupported" class="btn" :disabled="busy || !ready" @click="emit('download', job.job_id)">下载</button>
-          <span v-if="job.state === 'completed' && job.result_ready && !downloadSupported" class="muted">下载未接入</span>
-        </div>
-      </li>
-    </ul>
+    <label class="dropzone relative p-6 flex flex-col items-center justify-center cursor-pointer" :class="{ 'opacity-50 cursor-not-allowed': busy || !ready }">
+      <input type="file" accept="audio/*" aria-label="待转换音频" required class="absolute inset-0 w-full h-full opacity-0 cursor-pointer" :disabled="busy || !ready" @change="pick">
+      <svg class="w-8 h-8 text-ink-4 mb-2" aria-hidden="true" fill="currentColor" viewBox="0 0 24 24">
+        <path d="M5 16h2v2h10v-2h2v2.25A2.75 2.75 0 0 1 16.25 21h-8.5A2.75 2.75 0 0 1 5 18.25V16Zm7-13a1 1 0 0 1 1 1v8.59l2.29-2.3 1.42 1.42-4.42 4.42-4.42-4.42 1.42-1.42 2.29 2.3V4a1 1 0 0 1 1-1Z"/>
+      </svg>
+      <span class="block text-xs font-bold text-ink mb-1">点击或拖拽音频文件开始转换</span>
+      <span class="block text-tiny text-ink-4 max-w-full truncate">{{ dropped || '未选择文件' }}</span>
+    </label>
+    <div>
+      <div class="flex items-center justify-between mb-2">
+        <h3 class="text-xs font-extrabold tracking-wider text-ink uppercase section-title">处理队列</h3>
+        <span class="text-micro font-mono text-ink-3">{{ jobs.length }} 项</span>
+      </div>
+      <ul class="bg-surface border-2 border-[color:var(--edge)] card-shadow overflow-hidden max-h-[280px] overflow-y-auto list-none">
+        <li v-if="!jobs.length" class="px-3 py-6 text-center text-xs text-ink-4">暂无任务</li>
+        <li v-for="job in jobs" :key="job.job_id" class="border-b border-edge-soft last:border-b-0">
+          <div class="px-3 py-2.5">
+            <div class="flex items-center gap-3">
+              <div class="min-w-0 flex-1">
+                <div class="text-sm font-bold text-ink truncate">{{ job.name }}</div>
+                <div class="text-micro text-ink-4 tabular-nums mt-0.5 truncate"><span class="text-ink-3">模型 {{ job.model_id }}</span> · {{ job.progress.stage }} · {{ job.progress.percent }}%<template v-if="job.progress.blocks_done !== null && job.progress.blocks_total !== null"> · {{ job.progress.blocks_done }}/{{ job.progress.blocks_total }}</template></div>
+              </div>
+              <span :class="['text-xs font-bold shrink-0 min-w-[3.5rem] text-right', tone[job.state]]">{{ labels[job.state] }}</span>
+              <span class="flex w-8 shrink-0 items-center justify-center">
+                <button v-if="job.state === 'queued' || job.state === 'processing'" class="icon-button" :aria-label="'取消 ' + job.name" title="取消任务" :disabled="busy || !ready || !!unknowns.length" @click="emit('cancel', job.job_id)">
+                  <svg class="w-4 h-4" aria-hidden="true" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" viewBox="0 0 24 24"><path d="M18 6 6 18"/><path d="m6 6 12 12"/></svg>
+                </button>
+                <button v-else-if="job.state === 'completed' && job.result_ready && downloadSupported" class="icon-button" aria-label="下载" title="下载结果" :disabled="busy || !ready" @click="emit('download', job.job_id)">
+                  <svg class="w-4 h-4" aria-hidden="true" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" viewBox="0 0 24 24"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><path d="m7 10 5 5 5-5"/><path d="M12 15V3"/></svg>
+                </button>
+                <span v-else-if="job.state === 'completed' && job.result_ready" class="text-micro text-ink-4" title="下载未接入">—</span>
+              </span>
+            </div>
+            <p v-if="job.error" class="mt-1 text-micro state-err break-words">{{ job.error }}</p>
+          </div>
+          <progress v-if="job.state === 'processing' || job.state === 'cancelling'" class="queue-progress" :value="job.progress.percent" max="100">{{ job.progress.percent }}%</progress>
+        </li>
+      </ul>
+    </div>
   </section>
 </template>

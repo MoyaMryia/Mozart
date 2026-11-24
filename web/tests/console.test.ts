@@ -6,8 +6,8 @@ import { ApiError } from '../src/api';
 import DevicesPanel from '../src/components/DevicesPanel.vue';
 import SystemPanel from '../src/components/SystemPanel.vue';
 import { statusSchema } from '../src/contracts';
-import { statusFixture, healthFixture, jobFixture, jsonResponse, errorResponse } from './fixtures';
-import type { FileJob } from '../src/contracts';
+import { statusFixture, healthFixture, jobFixture, subtitleFixture, jsonResponse, errorResponse, envelope } from './fixtures';
+import type { FileJob, SubtitleRecord } from '../src/contracts';
 
 const mounts: Array<{ app: VueApp; root: HTMLElement }> = [];
 const sources: Source[] = [];
@@ -26,6 +26,10 @@ function button(root: ParentNode, text: string) {
   const found = [...root.querySelectorAll('button')].find(item => item.textContent?.trim() === text);
   if (!found) throw new Error(`没有按钮：${text}`); return found;
 }
+function iconButton(root: ParentNode, label: string) {
+  const found = root.querySelector<HTMLButtonElement>(`[aria-label="${label}"]`);
+  if (!found) throw new Error(`没有图标按钮：${label}`); return found;
+}
 function section(root: HTMLElement, title: string) {
   const found = [...root.querySelectorAll('section')].find(item => item.querySelector('h2')?.textContent === title);
   if (!found) throw new Error(`没有卡片：${title}`); return found;
@@ -36,6 +40,7 @@ function mockBackend() {
   let running = true;
   let jobs: FileJob[] = [];
   let submitFailure = false;
+  let presetDirty = false;
   const baseline = { capture: 'mic-a', playback: 'speaker-a' };
   const fetcher = vi.fn(async (path: string, init: RequestInit = {}) => {
     const method = init.method ?? 'GET'; const body = typeof init.body === 'string' ? JSON.parse(init.body) : undefined;
@@ -44,16 +49,17 @@ function mockBackend() {
     if (path === '/api/v1/system/up') { running = true; return jsonResponse({ state: 'running' }); }
     if (path === '/api/v1/system/down') { running = false; return jsonResponse({ state: 'stopped' }); }
     if (path === '/api/v1/route') { snapshot.route.desired = body.route; return jsonResponse({ route: body.route }); }
+    if (path === '/api/v1/mute') { snapshot.mute = body.mute; return jsonResponse({ mute: body.mute }); }
     if (path === '/api/v1/models') return jsonResponse({ models: [{ id: 'model-a', exists: true, loaded: true }] });
-    if (path === '/api/v1/preset') return jsonResponse({ model_id: 'model-a', preset: 'default', preset_values: snapshot.rvc_params, live_values: snapshot.rvc_params, dirty: false });
+    if (path === '/api/v1/preset') return jsonResponse({ model_id: 'model-a', preset: 'default', preset_values: snapshot.rvc_params, live_values: snapshot.rvc_params, dirty: presetDirty });
     if (path === '/api/v1/model') return jsonResponse({ model_id: body.model_id, previous_model_id: 'model-a' });
-    if (path === '/api/v1/preset/save' || path === '/api/v1/preset/use') return jsonResponse({ model_id: 'model-a', preset: 'default', values: snapshot.rvc_params });
+    if (path === '/api/v1/preset/save' || path === '/api/v1/preset/use') { presetDirty = false; return jsonResponse({ model_id: 'model-a', preset: 'default', values: snapshot.rvc_params }); }
     if (path === '/api/v1/devices') return jsonResponse({ devices: [{ id: 'mic-a', label: '麦克风 A', kind: 'capture' }, { id: 'mic-b', label: '麦克风 B', kind: 'capture' }, { id: 'speaker-a', label: '扬声器 A', kind: 'playback' }] });
     if (path === '/api/v1/config?key=pre.capture_device') return jsonResponse({ value: baseline.capture });
     if (path === '/api/v1/config?key=pre.playback_device') return jsonResponse({ value: baseline.playback });
     if (path === '/api/v1/config' && method === 'PUT') {
       if (body.key === 'pre.capture_device') { baseline.capture = body.value; snapshot.pending_restart = ['pre']; }
-      if (body.key === 'rvc.pitch_shift') snapshot.rvc_params!.pitch_shift = Number(body.value);
+      if (body.key.startsWith('rvc.')) { const params = snapshot.rvc_params! as unknown as Record<string, unknown>; params[body.key.slice(4)] = Number(body.value); }
       return jsonResponse({ ...body, restart_required: body.key.startsWith('pre.'), affected: body.key.startsWith('pre.') ? ['pre'] : [] });
     }
     if (path === '/api/v1/files' && method === 'POST') {
@@ -65,24 +71,89 @@ function mockBackend() {
     return jsonResponse({});
   });
   vi.stubGlobal('fetch', fetcher);
-  return { snapshot, fetcher, failSubmit: () => { submitFailure = true; } };
+  return { snapshot, fetcher, failSubmit: () => { submitFailure = true; }, markPresetDirty: () => { presetDirty = true; } };
 }
 
-beforeEach(() => { vi.useFakeTimers(); sources.length = 0; vi.stubGlobal('EventSource', Source); localStorage.clear(); });
+beforeEach(() => { vi.useFakeTimers(); sources.length = 0; vi.stubGlobal('EventSource', Source); localStorage.clear(); sessionStorage.clear(); });
 afterEach(() => { for (const { app, root } of mounts.splice(0)) { app.unmount(); root.remove(); } vi.unstubAllGlobals(); vi.useRealTimers(); });
 
+// 适配器的真实响应带 Date 头，页面用它得到设备时钟。
+function withDeviceClock(backend: ReturnType<typeof mockBackend>) {
+  const original = backend.fetcher.getMockImplementation()!;
+  backend.fetcher.mockImplementation((path, init) => path === '/api/v1/health'
+    ? Promise.resolve(new Response(JSON.stringify(envelope(healthFixture)), { headers: { 'Content-Type': 'application/json', Date: new Date().toISOString() } }))
+    : original(path, init));
+}
+const subtitleStream = () => sources.filter(item => item.url.includes('/events/subtitles')).at(-1)!;
+const sendSubtitle = (id: string, record: Partial<SubtitleRecord>) => subtitleStream().dispatchEvent(new MessageEvent('subtitle', { data: JSON.stringify(subtitleFixture(record)), lastEventId: id }));
+const subtitlesOf = (root: HTMLElement) => root.querySelector('section[aria-label="实时字幕"]')?.textContent ?? '';
+function pickFile(root: ParentNode, name: string) {
+  const input = root.querySelector<HTMLInputElement>('input[type=file]')!;
+  Object.defineProperty(input, 'files', { value: [new File(['sound'], name)], configurable: true });
+  input.dispatchEvent(new Event('change', { bubbles: true }));
+}
+
 describe('控制台', () => {
+  it('新打开的页面只显示打开之后收到的字幕，存档回放不显示', async () => {
+    const backend = mockBackend(); withDeviceClock(backend); const root = mount(); await flush();
+    const now = Date.now() / 1000;
+    expect(subtitleStream().url).not.toContain('cursor=');
+    subtitleStream().dispatchEvent(new MessageEvent('reset', { data: JSON.stringify({ generation: 'g1' }) }));
+    sendSubtitle('g1:100', { utterance_id: 'old:1', received_at: now - 3600, zh: '上次的句子', en: 'old', translation_status: 'completed' });
+    sendSubtitle('g1:200', { utterance_id: 'old:2', seq: 2, received_at: now - 3600, zh: '上次的第二句', en: 'old 2', translation_status: 'completed' });
+    await nextTick();
+    expect(root.querySelector('section[aria-label="实时字幕"]')).toBeNull(); expect(subtitlesOf(root)).not.toContain('上次');
+    sendSubtitle('g1:300', { received_at: now - 3, zh: '在途句子', en: 'in flight', translation_status: 'completed' });
+    await nextTick();
+    expect(subtitlesOf(root)).toContain('在途句子');
+    sendSubtitle('g1:400', { utterance_id: 'boot-b:1', received_at: now, zh: '新句子', en: 'new', translation_status: 'completed' });
+    await nextTick();
+    // 只显示最新一句：上一句不再显示。
+    expect(subtitlesOf(root)).toContain('新句子'); expect(subtitlesOf(root)).not.toContain('在途句子'); expect(subtitlesOf(root)).not.toContain('上次');
+    const saved = JSON.parse(sessionStorage.getItem('mozart-subtitles')!);
+    expect(saved.cursor).toBe('g1:400'); expect(saved.records).toHaveLength(2);
+    // 打开前 20 秒说的那句被过滤；它的翻译修订带着新时间戳到达，同样不显示。
+    sendSubtitle('g1:250', { utterance_id: 'old:3', seq: 3, received_at: now - 20, zh: '打开前 20 秒的句子', translation_status: 'pending' });
+    await nextTick(); expect(subtitlesOf(root)).not.toContain('打开前 20 秒');
+    sendSubtitle('g1:500', { utterance_id: 'old:3', seq: 3, revision: 1, received_at: now + 2, zh: '打开前 20 秒的句子', en: 'late', translation_status: 'completed' });
+    sendSubtitle('g1:600', { utterance_id: 'boot-b:2', seq: 2, received_at: now + 2, zh: '之后的句子', en: 'later', translation_status: 'completed' });
+    await nextTick();
+    expect(subtitlesOf(root)).not.toContain('打开前 20 秒'); expect(subtitlesOf(root)).toContain('之后的句子');
+  });
+  it('浏览器拒绝保存字幕进度时给出提示', async () => {
+    const backend = mockBackend(); withDeviceClock(backend);
+    vi.spyOn(Storage.prototype, 'setItem').mockImplementation(() => { throw new DOMException('denied', 'SecurityError'); });
+    const root = mount(); await flush();
+    sendSubtitle('g1:100', { received_at: Date.now() / 1000, translation_status: 'completed' }); await nextTick();
+    expect(root.querySelector('details')!.textContent).toContain('浏览器拒绝保存字幕进度');
+    expect(subtitlesOf(root)).toContain('你好');
+  });
+  it('页面重建后恢复字幕并从游标接续，reset 清空', async () => {
+    const backend = mockBackend(); withDeviceClock(backend); mount(); await flush();
+    const now = Date.now() / 1000;
+    sendSubtitle('g1:100', { received_at: now, zh: '刷新前的句子', en: 'before', translation_status: 'completed' });
+    await nextTick();
+    const first = mounts.pop()!; first.app.unmount(); first.root.remove();
+    const reloaded = mount(); await flush();
+    expect(subtitleStream().url).toContain('?cursor=g1%3A100');
+    expect(subtitlesOf(reloaded)).toContain('刷新前的句子');
+    sendSubtitle('g1:200', { utterance_id: 'boot-a:2', seq: 2, received_at: now, zh: '刷新后的句子', en: 'after', translation_status: 'completed' });
+    await nextTick();
+    expect(subtitlesOf(reloaded)).toContain('刷新后的句子'); expect(subtitlesOf(reloaded)).not.toContain('刷新前的句子');
+    subtitleStream().dispatchEvent(new MessageEvent('reset', { data: JSON.stringify({ generation: 'g2' }) })); await nextTick();
+    expect(reloaded.querySelector('section[aria-label="实时字幕"]')).toBeNull(); expect(sessionStorage.getItem('mozart-subtitles')).toBeNull();
+  });
   it('模型和预设读取失败后禁止使用旧数据，恢复读取后解除', async () => {
     const backend = mockBackend(); const original = backend.fetcher.getMockImplementation()!;
     const root = mount(); await flush();
     const select = [...root.querySelectorAll('select')].find(item => item.textContent?.includes('选择模型'))!;
     select.value = 'model-a'; select.dispatchEvent(new Event('change')); await flush();
     backend.fetcher.mockImplementation((path, init) => path === '/api/v1/models' || path === '/api/v1/preset' ? Promise.resolve(errorResponse('Unavailable', '读取失败', 503)) : original(path, init));
-    button(root, '刷新').click(); await flush();
+    iconButton(root, '刷新').click(); await flush();
     expect(root.textContent).toContain('读取失败');
     expect(button(root, '使用模型').disabled).toBe(true);
-    expect(button(root, '使用 default 预设').disabled).toBe(true);
-    backend.fetcher.mockImplementation(original); button(root, '刷新').click(); await flush();
+    expect(root.querySelector('.preset-actions.is-visible')).toBeNull();
+    backend.fetcher.mockImplementation(original); iconButton(root, '刷新').click(); await flush();
     expect(button(root, '使用模型').disabled).toBe(false);
   });
   it('未知结果刷新后仍需确认，边界拒绝重复写入且不自动重试', async () => {
@@ -123,7 +194,7 @@ describe('控制台', () => {
     backend.fetcher.mockImplementation((path, init) => path === '/api/v1/status'
       ? new Promise<Response>(resolve => { complete = resolve; }) : original(path, init));
     const reload = ui.reload(); await flush();
-    sendStatus(); complete(jsonResponse(statusFixture())); await reload;
+        sendStatus(); complete(jsonResponse(statusFixture())); await reload;
     expect(ui.canAcknowledge('system')).toBe(false);
     backend.fetcher.mockImplementation(original); await ui.reload();
     expect(ui.canAcknowledge('system')).toBe(true);
@@ -144,17 +215,26 @@ describe('控制台', () => {
     backend.fetcher.mockImplementation(original); await ui.reload();
     expect(ui.canAcknowledge('devices')).toBe(true);
   });
-  it('选择模型并保存和使用 default 预设', async () => {
+  it('与默认不同时才显示保存与恢复按钮，操作后隐藏', async () => {
     const backend = mockBackend(); const root = mount(); await flush();
-    expect(root.textContent).toContain('与当前值一致');
+    const actions = () => root.querySelector('.preset-actions')!;
+    expect(actions().classList.contains('is-visible')).toBe(false);
+    expect(iconButton(root, '保存为 default 预设').disabled).toBe(true);
     const select = [...root.querySelectorAll('select')].find(item => item.textContent?.includes('选择模型'))!;
     select.value = 'model-a'; select.dispatchEvent(new Event('change')); await flush();
     button(root, '使用模型').click(); await flush();
-    button(root, '保存 default 预设').click(); await flush();
-    button(root, '使用 default 预设').click(); await flush();
     expect(backend.fetcher.mock.calls.some(([path, init]) => path === '/api/v1/model' && init?.method === 'PUT')).toBe(true);
+    backend.markPresetDirty(); iconButton(root, '刷新').click(); await flush();
+    expect(actions().classList.contains('is-visible')).toBe(true);
+    expect(iconButton(root, '保存为 default 预设').disabled).toBe(false);
+    expect(iconButton(root, '恢复 default 预设').disabled).toBe(false);
+    iconButton(root, '保存为 default 预设').click(); await flush();
     expect(backend.fetcher.mock.calls.some(([path]) => path === '/api/v1/preset/save')).toBe(true);
+    expect(actions().classList.contains('is-visible')).toBe(false);
+    backend.markPresetDirty(); iconButton(root, '刷新').click(); await flush();
+    iconButton(root, '恢复 default 预设').click(); await flush();
     expect(backend.fetcher.mock.calls.some(([path]) => path === '/api/v1/preset/use')).toBe(true);
+    expect(actions().classList.contains('is-visible')).toBe(false);
   });
   it('显示增强状态并请求重启增强进程', async () => {
     const restart = vi.fn();
@@ -171,7 +251,7 @@ describe('控制台', () => {
     const route = root.querySelector<HTMLSelectElement>('#system-route')!;
     route.value = 'rvc'; route.dispatchEvent(new Event('change', { bubbles: true })); await flush();
     expect(backend.snapshot.route.desired).toBe('rvc'); expect(backend.snapshot.route.active).toBe('direct');
-    expect(route.value).toBe('rvc'); expect(section(root, '系统').textContent).toContain('实际：direct');
+    expect(route.value).toBe('rvc'); expect(section(root, '路由').textContent).toContain('实际：direct');
     const writes = backend.fetcher.mock.calls.filter(([, init]) => init?.method && init.method !== 'GET');
     expect(writes).toHaveLength(1); expect(writes[0][0]).toBe('/api/v1/route');
   });
@@ -192,7 +272,7 @@ describe('控制台', () => {
     const source = sources.find(item => item.url.endsWith('/events/status'))!;
     source.dispatchEvent(new MessageEvent('status', { data: JSON.stringify(statusFixture()) })); await nextTick();
     complete(errorResponse('UpstreamUnavailable', '过期的查询错误', 503)); await flush();
-    expect(root.textContent).not.toContain('过期的查询错误'); expect(section(root, '系统').textContent).toContain('已连接');
+    expect(root.textContent).not.toContain('过期的查询错误'); expect(root.querySelector('[data-service="pre"][data-state="running"]')).not.toBeNull();
     expect(root.querySelector<HTMLSelectElement>('#system-route')!.disabled).toBe(false);
   });
   it('静音被拒绝后复选框仍显示后端实际值', async () => {
@@ -200,42 +280,132 @@ describe('控制台', () => {
     backend.fetcher.mockImplementation((path, init) => path === '/api/v1/mute'
       ? Promise.resolve(errorResponse('NotReady', '处理器不可达', 409)) : original(path, init));
     const root = mount(); await flush();
-    const mute = section(root, '系统').querySelector<HTMLInputElement>('input[type=checkbox]')!;
+    const mute = section(root, '设备').querySelector<HTMLInputElement>('input[type=checkbox]')!;
     mute.click(); await flush();
     expect(root.textContent).toContain('NotReady：处理器不可达');
     expect(mute.checked).toBe(false); expect(backend.snapshot.mute).toBe(false);
+  });
+  it('静音后只经 HTTP 确认状态，不重拉资源列表，也不闪成未知', async () => {
+    const backend = mockBackend(); const root = mount(); await flush();
+    const services = section(root, '服务');
+    const flashes: unknown[] = [];
+    const observer = new MutationObserver(() => { flashes.push(services.textContent); });
+    observer.observe(services, { subtree: true, childList: true, characterData: true });
+    backend.fetcher.mockClear();
+    const mute = section(root, '设备').querySelector<HTMLInputElement>('input[type=checkbox]')!;
+    mute.click(); await flush(); observer.disconnect();
+    expect(backend.fetcher.mock.calls.map(([path]) => path)).toEqual(['/api/v1/mute', '/api/v1/health', '/api/v1/status']);
+    expect(mute.checked).toBe(true);
+    expect(flashes).toEqual([]);
+  });
+  it('参数写入后重读状态与预设，不重拉模型与设备列表', async () => {
+    const backend = mockBackend(); const root = mount(); await flush();
+    const input = root.querySelector<HTMLInputElement>('#param-pitch_shift')!;
+    input.value = '3'; input.dispatchEvent(new Event('input', { bubbles: true }));
+    backend.fetcher.mockClear();
+    await vi.advanceTimersByTimeAsync(250); await flush();
+    expect(backend.fetcher.mock.calls.map(([path]) => path)).toEqual(['/api/v1/config', '/api/v1/health', '/api/v1/status', '/api/v1/preset']);
+    expect(input.value).toBe('3');
+  });
+  it('写入只锁本控件：设备设置进行中，其他控件的写入照常可用', async () => {
+    const backend = mockBackend(); const original = backend.fetcher.getMockImplementation()!;
+    let finish!: () => void;
+    backend.fetcher.mockImplementation((path, init) => path === '/api/v1/config' && init?.method === 'PUT'
+      ? new Promise<Response>(resolve => { finish = () => resolve(original(path, init)); }) : original(path, init));
+    const root = mount(); await flush();
+    const select = root.querySelector<HTMLSelectElement>('#device-capture')!;
+    select.value = 'mic-b'; select.dispatchEvent(new Event('change', { bubbles: true })); await nextTick();
+    iconButton(section(root, '设备'), '设置输入设备').click(); await flush();
+    expect(section(root, '设备').querySelectorAll<HTMLButtonElement>('button:disabled')).toHaveLength(2);
+    expect(root.querySelector<HTMLSelectElement>('#device-playback')!.disabled).toBe(true);
+    const others = [button(root, '启动系统'), iconButton(root, '暂停队列'), root.querySelector<HTMLSelectElement>('#system-route')!,
+      root.querySelector<HTMLInputElement>('#param-pitch_shift')!, section(root, '设备').querySelector<HTMLInputElement>('input[type=checkbox]')!];
+    expect(others.map(item => (item as HTMLButtonElement).disabled)).toEqual([false, false, false, false, false]);
+    finish(); await flush();
+    expect(section(root, '设备').querySelectorAll('button:disabled')).toHaveLength(0);
+  });
+  it('其他控件的写入结果未知时，重新发起本控件的确认读取', async () => {
+    const backend = mockBackend(); const original = backend.fetcher.getMockImplementation()!;
+    let holdStatus = false; let finish!: (value: Response) => void;
+    backend.fetcher.mockImplementation((path, init) => {
+      if (path === '/api/v1/status' && holdStatus) { holdStatus = false; return new Promise<Response>(resolve => { finish = resolve; }); }
+      if (path === '/api/v1/mute') return Promise.resolve(errorResponse('GatewayTimeout', '网关超时', 504));
+      return original(path, init);
+    });
+    const root = mount(); await flush(); backend.fetcher.mockClear(); holdStatus = true;
+    const select = root.querySelector<HTMLSelectElement>('#device-capture')!;
+    select.value = 'mic-b'; select.dispatchEvent(new Event('change', { bubbles: true })); await nextTick();
+    iconButton(section(root, '设备'), '设置输入设备').click(); await flush();
+    section(root, '设备').querySelector<HTMLInputElement>('input[type=checkbox]')!.click(); await flush();
+    finish(jsonResponse(statusFixture())); await flush();
+    expect(backend.fetcher.mock.calls.filter(([path]) => path === '/api/v1/status')).toHaveLength(2);
+    expect(root.textContent).toContain('执行结果未知');
+  });
+  it('内容相同的状态推送不改动 DOM，数值变化只改对应文本', async () => {
+    mockBackend(); const root = mount(); await flush();
+    const source = sources.find(item => item.url.endsWith('/events/status'))!;
+    // 首个事件把推送状态从 connecting 切到 online，属于连接状态变化，不计入。
+    source.dispatchEvent(new MessageEvent('status', { data: JSON.stringify(statusFixture()) })); await nextTick();
+    // 在变动发生时记录元素与内容，便于断言“只有对应文本变化”。
+    // 整体替换状态对象的回归只会表现为表单控件被改写 value 属性，不产生文本变化，所以 valueWrites 是主要的捕获点。
+    const touched: string[] = []; const valueWrites: string[] = [];
+    const observer = new MutationObserver(items => {
+      for (const item of items) {
+        const target = item.target as Element;
+        const text = (item.target.textContent ?? '').trim().slice(0, 40);
+        if (item.type === 'attributes' && item.attributeName === 'value') valueWrites.push(target.parentElement?.id ?? target.tagName);
+        else if (item.type === 'attributes') touched.push(`${target.tagName}.${item.attributeName}`);
+        else if (item.type === 'characterData') touched.push(`${target.parentElement?.tagName}:${text}`);
+        else {
+          const text = (node: Node) => node.nodeType === 8 ? '' : (node.textContent ?? '').trim().slice(0, 40);
+          for (const node of item.addedNodes) if (text(node)) touched.push(`+${text(node)}`);
+          for (const node of item.removedNodes) if (text(node)) touched.push(`-${text(node)}`);
+        }
+      }
+    });
+    observer.observe(root, { subtree: true, attributes: true, childList: true, characterData: true });
+    const push = (value: ReturnType<typeof statusFixture>) => source.dispatchEvent(new MessageEvent('status', { data: JSON.stringify(value) }));
+    const base = statusFixture();
+    push(statusFixture()); await nextTick();
+    expect([touched, valueWrites]).toEqual([[], []]);
+    push({ ...base, hw: { ...base.hw!, cpu_percent: 99 } }); await nextTick();
+    expect(touched.splice(0)).toEqual(['+99%', '-12%']);
+    push({ ...base, hw: { ...base.hw!, cpu_percent: 99 }, rvc: { ...base.rvc!, frames_in: 7, inference_ms_p95: 12.34 } }); await nextTick();
+    observer.disconnect();
+    expect(touched).toEqual(['P:RVC model-a · idle · 7/0 帧 · 丢弃 0', '+> 推理 P95：12.3 ms']);
+    expect(valueWrites).toEqual([]);
   });
   it('daemon 停止后页面和启动操作仍在，停止不伪装成健康', async () => {
     mockBackend(); const root = mount(); await flush();
     button(root, '停止系统').click(); await flush();
     expect(root.textContent).toContain('daemon 未运行'); expect(root.textContent).toContain('API 在线');
     expect(button(root, '停止系统').disabled).toBe(true);
-    button(root, '启动系统').click(); await flush(); expect(section(root, '系统').textContent).toContain('已连接');
+    button(root, '启动系统').click(); await flush(); expect(root.querySelector('[data-service="pre"][data-state="running"]')).not.toBeNull();
   });
-  it('文件直接入队，不要求切换 file 模式，受理不显示完成', async () => {
+  it('选择文件后直接开始转换，不要求切换模式，受理不显示完成', async () => {
     const backend = mockBackend(); const root = mount(); await flush();
-    let files = section(root, '文件转换'); const input = files.querySelector<HTMLInputElement>('input[type=file]')!;
-    Object.defineProperty(input, 'files', { value: [new File(['sound'], 'sample.wav')] }); input.dispatchEvent(new Event('change', { bubbles: true })); await nextTick();
-    files.querySelector('form')!.dispatchEvent(new Event('submit', { bubbles: true, cancelable: true })); await flush();
-    files = section(root, '文件转换');
+    pickFile(section(root, '文件转换'), 'sample.wav'); await flush();
+    const files = section(root, '文件转换');
     expect(root.textContent).toContain('已受理 job-new'); expect(root.textContent).toContain('转换尚未完成');
     expect(files.textContent).toContain('排队中'); expect(files.textContent).not.toContain('已完成');
     expect(backend.fetcher.mock.calls.some(([path]) => path === '/api/v1/route')).toBe(false);
     expect(files.querySelector<HTMLInputElement>('input[type=file]')!.files!.length).toBe(0);
   });
-  it('提交断连保留文件草稿和未知结果，后台查询不能清掉错误或重发', async () => {
+  it('提交结果未知时不重复提交，核对后才可继续', async () => {
     const backend = mockBackend(); backend.failSubmit(); const root = mount(); await flush();
-    const files = section(root, '文件转换'); const input = files.querySelector<HTMLInputElement>('input[type=file]')!;
-    Object.defineProperty(input, 'files', { value: [new File(['sound'], 'sample.wav')] }); input.dispatchEvent(new Event('change')); await nextTick();
-    files.querySelector('form')!.dispatchEvent(new Event('submit', { bubbles: true, cancelable: true })); await flush();
+    const files = section(root, '文件转换');
+    pickFile(files, 'sample.wav'); await flush();
     expect(files.textContent).toContain('执行结果未知');
     await vi.advanceTimersByTimeAsync(3000); await flush();
-    expect(files.textContent).toContain('执行结果未知'); expect(input.files!.length).toBe(1);
-    button(files, '暂停队列').click(); await flush();
-    expect(files.textContent).toContain('执行结果未知'); expect(button(files, '加入队列').disabled).toBe(true);
-    files.querySelector('form')!.dispatchEvent(new Event('submit', { bubbles: true, cancelable: true })); await flush();
+    expect(files.textContent).toContain('执行结果未知');
+    expect(iconButton(files, '暂停队列').disabled).toBe(true);
+    // 结果未知期间再次选择文件不再提交
+    pickFile(files, 'second.wav'); await flush();
     expect(backend.fetcher.mock.calls.filter(([path, init]) => path === '/api/v1/files' && init?.method === 'POST')).toHaveLength(1);
-    button(files, '已核对队列').click(); await nextTick(); expect(button(files, '加入队列').disabled).toBe(false);
+    button(files, '已核对队列').click(); await nextTick();
+    expect(iconButton(files, '暂停队列').disabled).toBe(false);
+    pickFile(files, 'third.wav'); await flush();
+    expect(backend.fetcher.mock.calls.filter(([path, init]) => path === '/api/v1/files' && init?.method === 'POST')).toHaveLength(2);
   });
   it('提交未知前发出的队列查询不能解锁核对按钮', async () => {
     const backend = mockBackend(); const root = mount(); await flush();
@@ -248,48 +418,85 @@ describe('控制台', () => {
       }
       return original(path, init);
     });
-    const files = section(root, '文件转换'); const input = files.querySelector<HTMLInputElement>('input[type=file]')!;
-    Object.defineProperty(input, 'files', { value: [new File(['sound'], 'sample.wav')] }); input.dispatchEvent(new Event('change')); await nextTick();
-    button(files, '刷新').click(); await flush(); expect(finishOldRead).toBeTypeOf('function');
-    backend.failSubmit(); files.querySelector('form')!.dispatchEvent(new Event('submit', { bubbles: true, cancelable: true })); await flush();
+    const files = section(root, '文件转换');
+    iconButton(files, '刷新').click(); await flush(); expect(finishOldRead).toBeTypeOf('function');
+    backend.failSubmit(); pickFile(files, 'sample.wav'); await flush();
     expect(button(files, '已核对队列').disabled).toBe(true);
     finishOldRead(jsonResponse({ jobs: [], paused: false })); await flush();
     expect(button(files, '已核对队列').disabled).toBe(true);
     await vi.advanceTimersByTimeAsync(3000); await flush();
     expect(button(files, '已核对队列').disabled).toBe(false);
-    expect(button(files, '加入队列').disabled).toBe(true);
+    expect(iconButton(files, '暂停队列').disabled).toBe(true);
   });
-  it('参数草稿不被轮询覆盖，只提交显式点击的一项', async () => {
+  it('调节参数后自动应用，合并连点，写入在途时输入不被状态推送覆盖', async () => {
+    const backend = mockBackend(); const original = backend.fetcher.getMockImplementation()!;
+    let finish!: () => void;
+    backend.fetcher.mockImplementation((path, init) => path === '/api/v1/config' && init?.method === 'PUT'
+      ? new Promise<Response>(resolve => { finish = () => resolve(original(path, init)); }) : original(path, init));
+    const root = mount(); await flush();
+    const input = root.querySelector<HTMLInputElement>('#param-pitch_shift')!;
+    const configured = () => backend.fetcher.mock.calls.filter(([path, init]) => path === '/api/v1/config' && init?.method === 'PUT');
+    input.value = '2'; input.dispatchEvent(new Event('input', { bubbles: true }));
+    await vi.advanceTimersByTimeAsync(80);
+    input.value = '3'; input.dispatchEvent(new Event('input', { bubbles: true }));
+    await vi.advanceTimersByTimeAsync(250); await flush();
+    expect(configured()).toHaveLength(1);
+    expect(JSON.parse(configured()[0][1]!.body as string)).toEqual({ key: 'rvc.pitch_shift', value: '3' });
+    sources.find(item => item.url.endsWith('/events/status'))!.dispatchEvent(new MessageEvent('status', { data: JSON.stringify(statusFixture()) })); await nextTick();
+    expect(input.value).toBe('3');
+    finish(); await flush();
+    expect(input.value).toBe('3'); expect(backend.snapshot.rvc_params!.pitch_shift).toBe(3);
+  });
+  it('参数确认前禁用预设操作，确认后恢复可用', async () => {
     const backend = mockBackend(); const root = mount(); await flush();
+    backend.markPresetDirty(); iconButton(root, '刷新').click(); await flush();
     const input = root.querySelector<HTMLInputElement>('#param-pitch_shift')!;
     input.value = '3'; input.dispatchEvent(new Event('input', { bubbles: true })); await nextTick();
-    await vi.advanceTimersByTimeAsync(3000); await flush(); expect(input.value).toBe('3');
-    input.closest('form')!.dispatchEvent(new Event('submit', { bubbles: true, cancelable: true })); await flush();
-    const config = backend.fetcher.mock.calls.find(([path, init]) => path === '/api/v1/config' && init?.method === 'PUT');
-    expect(JSON.parse(config![1]!.body as string)).toEqual({ key: 'rvc.pitch_shift', value: '3' });
-    expect(section(root, '参数').textContent).toContain('当前：3');
-    expect(backend.fetcher.mock.calls.some(([path]) => path.includes('stream') || path.includes('mode/switch'))).toBe(false);
+    expect(iconButton(root, '保存为 default 预设').disabled).toBe(true);
+    expect(iconButton(root, '恢复 default 预设').disabled).toBe(true);
+    await vi.advanceTimersByTimeAsync(250); await flush();
+    expect(iconButton(root, '保存为 default 预设').disabled).toBe(false);
+    expect(iconButton(root, '恢复 default 预设').disabled).toBe(false);
+    expect(backend.snapshot.rvc_params!.pitch_shift).toBe(3);
   });
-  it('设备写入显示基线与实际差异，不自动重启', async () => {
+  it('参数写入被拒绝只回滚该项，不影响其他尚未提交的输入', async () => {
+    const backend = mockBackend(); const original = backend.fetcher.getMockImplementation()!;
+    backend.fetcher.mockImplementation((path, init) => path === '/api/v1/config' && init?.method === 'PUT' && String(init.body).includes('pitch_shift')
+      ? Promise.resolve(errorResponse('InvalidArgument', '音高超出范围', 400)) : original(path, init));
+    const root = mount(); await flush();
+    const pitch = root.querySelector<HTMLInputElement>('#param-pitch_shift')!;
+    const index = root.querySelector<HTMLInputElement>('#param-index_rate')!;
+    pitch.value = '99'; pitch.dispatchEvent(new Event('input', { bubbles: true }));
+    await vi.advanceTimersByTimeAsync(80);
+    index.value = '0.9'; index.dispatchEvent(new Event('input', { bubbles: true }));
+    // 只让音高那次写入发生并被拒绝；索引比例仍在挂起，错误横幅可见。
+    await vi.advanceTimersByTimeAsync(130); await flush();
+    expect(section(root, '参数').textContent).toContain('InvalidArgument：音高超出范围');
+    expect(pitch.value).toBe('0');
+    expect(index.value).toBe('0.9');
+    await vi.advanceTimersByTimeAsync(150); await flush();
+    expect(backend.snapshot.rvc_params!.index_rate).toBe(0.9);
+  });
+  it('设备写入后自动重启 pre，并显示基线与实际差异', async () => {
     const backend = mockBackend(); const root = mount(); await flush();
     const select = root.querySelector<HTMLSelectElement>('#device-capture')!;
     select.value = 'mic-b'; select.dispatchEvent(new Event('change', { bubbles: true })); await nextTick();
-    button(section(root, '设备'), '设置').click(); await flush();
+    iconButton(section(root, '设备'), '设置输入设备').click(); await flush();
     expect(section(root, '设备').textContent).toContain('实际：mic-a · 基线：mic-b');
     expect(section(root, '设备').textContent).toContain('待重启');
-    expect(backend.fetcher.mock.calls.some(([path]) => path.endsWith('/restart'))).toBe(false);
+    expect(backend.fetcher.mock.calls.some(([path]) => path === '/api/v1/services/pre/restart')).toBe(true);
   });
   it('状态推送中断立即禁止业务写入，保留查询错误', async () => {
     mockBackend(); const root = mount(); await flush();
     const source = sources.find(item => item.url.endsWith('/events/status'))!;
     source.onerror?.(new Event('error')); await nextTick();
     expect(root.querySelector<HTMLSelectElement>('#system-route')!.disabled).toBe(true);
-    expect(section(root, '系统').textContent).toContain('状态未知');
+    expect(section(root, '服务').textContent).toContain('未连接');
   });
   it('没有适配器时显示未连接，不填入模拟状态', async () => {
     vi.stubGlobal('fetch', vi.fn().mockResolvedValue(new Response('<html>Vite</html>')));
     const root = mount(); await flush(); expect(root.textContent).toContain('HTTP 适配器未连接');
-    expect(root.textContent).toContain('CPU —'); expect(root.textContent).not.toContain('已连接');
+    expect(root.textContent).toContain('CPU —'); expect(root.querySelector('[data-service="pre"]')?.getAttribute('data-state')).toBe('unknown');
   });
 });
 

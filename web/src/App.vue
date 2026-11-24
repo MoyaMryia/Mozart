@@ -2,6 +2,11 @@
 import { computed, onMounted, ref } from 'vue';
 import { client } from './api';
 import { useConsole } from './useConsole';
+import { requestSelect } from './inputs';
+import { systemActivity } from './system';
+import RefreshIcon from './components/RefreshIcon.vue';
+import ResourceStats from './components/ResourceStats.vue';
+import ConnectionLog from './components/ConnectionLog.vue';
 import SystemPanel from './components/SystemPanel.vue';
 import FilesPanel from './components/FilesPanel.vue';
 import DevicesPanel from './components/DevicesPanel.vue';
@@ -9,18 +14,30 @@ import ParamsPanel from './components/ParamsPanel.vue';
 import SpeechPanel from './components/SpeechPanel.vue';
 import SubtitlesPanel from './components/SubtitlesPanel.vue';
 import PendingResult from './components/PendingResult.vue';
+import type { Route } from './contracts';
 
 const ui = useConsole();
-const { status, health, ready, adapterOnline, busy, notice, errors, models, preset, devices, jobs, paused,
-  records, subtitleState, subtitleError, statusStreamState, statusStreamError, downloadSupported,
+const { status, health, ready, adapterOnline, busy, writing, notice, errors, models, preset, devices, jobs, paused,
+  records, subtitleState, subtitleError, subtitleStorageError, statusStreamState, statusStreamError, downloadSupported,
   uploadGeneration, baselines, filesFresh, devicesFresh, unknowns } = ui;
 const selectedModel = ref('');
 const theme = ref<'light' | 'dark'>('light');
-const stats = computed(() => ready.value ? status.value?.hw : null);
-const memory = computed(() => stats.value ? `${(stats.value.memory.used_bytes / 1024 ** 3).toFixed(1)} / ${(stats.value.memory.total_bytes / 1024 ** 3).toFixed(1)} GiB` : '—');
+const activity = computed(() => systemActivity(status.value, ready.value));
+const routeValue = computed(() => ready.value && status.value ? status.value.route.desired : '');
+const muted = computed(() => ready.value && !!status.value?.mute);
+const systemBlocked = computed(() => !ready.value || !!unknowns.value.system.length);
 const filesError = computed(() => [errors.value.files, errors.value.fileList].filter(Boolean).join('\n'));
+const subtitleProblem = computed(() => [subtitleError.value, subtitleStorageError.value].filter(Boolean).join('；'));
+// 与默认预设的差异同时看服务端标记和当前生效参数，页面外的改动也能及时反映。
+const presetDirty = computed(() => !!preset.value && !errors.value.preset &&
+  (preset.value.dirty || (status.value?.rvc_params ? JSON.stringify(preset.value.preset_values) !== JSON.stringify(status.value.rvc_params) : false)));
+function selectRoute(event: Event) { requestSelect<Route>(event, routeValue.value, value => ui.perform('route', () => client.route(value))); }
 
-function applyTheme() { document.documentElement.dataset.theme = theme.value; }
+function applyTheme() {
+  document.documentElement.dataset.theme = theme.value;
+  const bg = getComputedStyle(document.documentElement).getPropertyValue('--bg').trim();
+  if (bg) document.getElementById('meta-theme-color')?.setAttribute('content', bg);
+}
 function toggleTheme() {
   theme.value = theme.value === 'light' ? 'dark' : 'light';
   applyTheme();
@@ -44,71 +61,113 @@ onMounted(() => {
 </script>
 
 <template>
-  <a href="#content" class="skip-link">跳到控制台</a>
-  <header class="app-header">
-    <h1 class="brand">MOZART</h1>
-    <div class="header-stats">
-      <span class="chip" :class="adapterOnline ? 'chip-ok' : 'chip-warn'">API {{ adapterOnline ? '在线' : '未连接' }}</span>
-      <span class="muted mono">CPU {{ stats?.cpu_percent == null ? '—' : `${stats.cpu_percent.toFixed(0)}%` }}</span>
-      <span class="muted mono">RAM {{ memory }}</span>
-      <button type="button" class="btn" :aria-pressed="theme === 'dark'" aria-label="切换亮暗主题" @click="toggleTheme">{{ theme === 'light' ? '暗色' : '亮色' }}</button>
-    </div>
-  </header>
-  <main id="content" class="app-main">
-    <aside class="left-sidebar" aria-label="系统控制">
-      <p v-if="errors.system" class="banner banner-error" role="alert">{{ errors.system }}</p>
-      <PendingResult :messages="unknowns.system" :enabled="ui.canAcknowledge('system')" :busy="busy" @acknowledge="ui.acknowledge('system')" />
-      <SystemPanel :status="status" :connected="ready" :busy="busy" :write-blocked="!!unknowns.system.length"
-        @refresh="ui.reload()" @up="ui.perform('system', client.up)" @down="ui.perform('system', client.down)"
-        @route="value => ui.perform('system', () => client.route(value))"
-        @mute="value => ui.perform('system', () => client.mute(value))"
-        @restart="service => ui.perform('system', () => client.restart(service))" />
-      <button class="btn" :disabled="busy || !ready || !!unknowns.system.length" @click="ui.perform('system', client.saveConfig, '运行时覆盖已写入基线。')">保存运行时设置</button>
-      <label class="field">切换模型<select v-model="selectedModel" :disabled="busy || !ready || !!errors.models || !!unknowns.system.length"><option value="">选择模型</option><option v-for="item in models" :key="item.id" :value="item.id" :disabled="!item.exists">{{ item.id }}{{ item.exists ? '' : '（缺失）' }}</option></select></label>
-      <button class="btn" :disabled="busy || !ready || !selectedModel || !!errors.models || !models.some(item => item.id === selectedModel && item.exists) || unknowns.system.length > 0" @click="ui.perform('system', () => client.useModel(selectedModel), undefined, '切换模型')">使用模型</button>
-      <p v-if="errors.preset" class="banner banner-error" role="alert">{{ errors.preset }}</p>
-      <p v-if="preset && !errors.preset">模型 {{ preset.model_id }} 的 default 预设：{{ preset.dirty ? '与当前值不同' : '与当前值一致' }}</p>
-      <button class="btn" :disabled="busy || !ready || !!errors.preset || !preset || unknowns.system.length > 0" @click="ui.perform('system', client.savePreset, undefined, '保存预设')">保存 default 预设</button>
-      <button class="btn" :disabled="busy || !ready || !!errors.preset || !preset || unknowns.system.length > 0" @click="ui.perform('system', client.usePreset, undefined, '使用预设')">使用 default 预设</button>
-    </aside>
+  <a href="#content" class="sr-only focus:not-sr-only focus:absolute focus:top-2 focus:left-2 skip-link focus:px-4 focus:py-2 focus:z-50 rounded-sm text-xs font-mono shadow-md">跳到控制台</a>
 
-    <div class="workspace">
-      <p v-if="errors.connection" class="banner banner-error" role="alert">{{ errors.connection }}</p>
-      <p v-if="errors.status" class="banner banner-error" role="alert">{{ errors.status }}</p>
-      <p v-if="!adapterOnline" class="banner banner-warn">HTTP 适配器未连接。当前页面不使用模拟运行状态。</p>
-      <p v-if="notice" class="banner" role="status">{{ notice }}</p>
-      <p v-if="health?.uploads.retained" class="banner banner-warn">保留上传 {{ health.uploads.retained }} 项：{{ health.uploads.reasons.join('；') }}</p>
-      <p v-if="errors.speech" class="banner banner-error" role="alert">{{ errors.speech }}</p>
-      <PendingResult :messages="unknowns.speech" :enabled="ui.canAcknowledge('speech')" :busy="busy" @acknowledge="ui.acknowledge('speech')" />
-      <SpeechPanel :status="ready ? status : null" :ready="ready" :busy="busy || !!unknowns.speech.length"
+  <div class="app-frame md:flex-1 md:min-h-0">
+  <!-- 顶部状态导航条 -->
+  <header class="app-header flex flex-wrap md:flex-nowrap items-center justify-center gap-3 px-4 md:px-8 py-3.5 bg-app shrink-0">
+    <h1 class="text-lg font-extrabold tracking-tight text-ink" translate="no">MOZART</h1>
+
+    <div class="flex items-center min-w-0" :title="activity.stateText" :aria-label="activity.stateText" role="img">
+      <svg v-if="activity.running || activity.starting" :class="['system-state-icon', activity.stateTone]" aria-hidden="true" fill="currentColor" viewBox="0 0 48 48"><path d="M24 2a22 22 0 1 0 0 44 22 22 0 0 0 0-44Z"/><path fill="#fff" d="m20 15 14 9-14 9V15Z"/></svg>
+      <svg v-else :class="['system-state-icon', activity.stateTone]" aria-hidden="true" fill="currentColor" viewBox="0 0 48 48"><path d="M24 2a22 22 0 1 0 0 44 22 22 0 0 0 0-44Z"/><path fill="#fff" d="M16 16h16v16H16V16Z"/></svg>
+    </div>
+
+    <div class="transport-control transport-control-2 transport-compact shrink-0" role="group" aria-label="系统运行控制">
+      <button type="button" data-state="running" class="transport-button" aria-label="启动系统" title="启动业务服务组" :aria-pressed="activity.running" :class="{ 'is-active': activity.running }" :disabled="busy.lifecycle || !!unknowns.system.length" @click="ui.perform('lifecycle', client.up)">
+        <svg class="w-4 h-4" aria-hidden="true" fill="currentColor" viewBox="0 0 24 24"><path d="M8 5v14l11-7L8 5Z"/></svg>
+        <span class="text-tiny font-bold">启动系统</span>
+      </button>
+      <button type="button" data-state="stopped" class="transport-button" aria-label="停止系统" title="停止业务服务组；daemon 与页面保持在线" :aria-pressed="ready && !!status && !activity.running" :class="{ 'is-active': ready && !!status && !activity.running }" :disabled="busy.lifecycle || systemBlocked || !status" @click="ui.perform('lifecycle', client.down)">
+        <svg class="w-4 h-4" aria-hidden="true" fill="currentColor" viewBox="0 0 24 24"><path d="M6 6h12v12H6V6Z"/></svg>
+        <span class="text-tiny font-bold">停止系统</span>
+      </button>
+    </div>
+
+    <button type="button" class="icon-button shrink-0" aria-label="刷新" title="刷新状态" :disabled="writing" @click="ui.reload()">
+      <RefreshIcon />
+    </button>
+
+    <ResourceStats :online="adapterOnline" :ready="ready" :status="status" />
+
+    <button type="button" class="icon-button shrink-0" :aria-pressed="theme === 'dark'" aria-label="切换亮暗主题" :title="theme === 'dark' ? '切换到亮色主题' : '切换到暗色主题'" @click="toggleTheme">
+      <svg v-if="theme === 'dark'" class="w-4 h-4" aria-hidden="true" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" viewBox="0 0 24 24"><circle cx="12" cy="12" r="4"/><path d="M12 2v2m0 16v2M4.93 4.93l1.41 1.41m11.32 11.32 1.41 1.41M2 12h2m16 0h2M4.93 19.07l1.41-1.41M17.66 6.34l1.41-1.41"/></svg>
+      <svg v-else class="w-4 h-4" aria-hidden="true" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" viewBox="0 0 24 24"><path d="M21 12.79A9 9 0 1 1 11.21 3 7 7 0 0 0 21 12.79Z"/></svg>
+    </button>
+  </header>
+
+  <!-- 主布局：中会话与文件 / 右控制与设备 -->
+  <main id="content" class="flex-1 min-h-0 grid grid-cols-1 bg-app overflow-visible md:overflow-hidden md:grid-cols-[1fr_340px]">
+
+    <div class="workspace px-3 py-3 md:px-5 md:py-4 w-full flex flex-col flex-1 min-h-0 gap-3 overflow-visible md:overflow-y-auto md:h-full">
+      <PendingResult :messages="unknowns.speech" :enabled="ui.canAcknowledge('speech')" :busy="busy.speech" @acknowledge="ui.acknowledge('speech')" />
+      <SpeechPanel :status="ready ? status : null" :ready="ready" :busy="busy.speech || !!unknowns.speech.length" :error="errors.speech"
         @translate="enabled => ui.perform('speech', () => client.translate(enabled))"
         @speech="enabled => ui.perform('speech', () => client.speech(enabled))"
         @stop="ui.perform('speech', client.speechStop)" />
-      <p class="muted">术语表编辑和清空功能暂未提供。</p>
-      <SubtitlesPanel :records="records" :state="subtitleState" :error="subtitleError" />
-      <p v-if="errors.models" class="banner banner-error" role="alert">{{ errors.models }}</p>
-      <FilesPanel :key="uploadGeneration" :jobs="jobs" :paused="paused" :models="models" :ready="ready && filesFresh" :busy="busy"
-        :ack-ready="ui.canAcknowledge('files')" :models-error="!!errors.models" :download-supported="downloadSupported" :error="filesError" :unknowns="unknowns.files" @acknowledge="ui.acknowledge('files')"
+      <SubtitlesPanel :records="records" :state="subtitleState" />
+      <FilesPanel :key="uploadGeneration" :jobs="jobs" :paused="paused" :ready="ready && filesFresh" :busy="busy.files" :refresh-blocked="writing"
+        :ack-ready="ui.canAcknowledge('files')" :download-supported="downloadSupported" :error="filesError" :unknowns="unknowns.files" @acknowledge="ui.acknowledge('files')"
         @submit="ui.submit" @cancel="jobId => ui.perform('files', () => client.cancel(jobId))"
         @pause="value => ui.perform('files', () => client.pause(value))" @refresh="ui.reload()" @download="ui.download" />
-      <details class="card muted">
-        <summary>连接详情</summary>
-        <p>状态推送：{{ statusStreamState }}<template v-if="statusStreamError"> · {{ statusStreamError }}</template></p>
-        <p>字幕推送：{{ subtitleState }}</p>
-        <p v-if="!ready">当前业务状态未知，操作暂停。</p>
-        <p v-else-if="status?.rvc" class="mono">RVC {{ status.rvc.model_id ?? '未加载' }} · {{ status.rvc.state }} · {{ status.rvc.frames_in }}/{{ status.rvc.frames_out }} 帧 · 丢弃 {{ status.rvc.frames_dropped }}</p>
-        <p v-if="ready && status?.rvc?.inference_ms_p95 != null">推理 P95：{{ status.rvc.inference_ms_p95.toFixed(1) }} ms</p>
-      </details>
+      <ConnectionLog :status="status" :ready="ready" :status-stream-state="statusStreamState" :status-stream-error="statusStreamError" :subtitle-state="subtitleState" :subtitle-error="subtitleProblem" />
     </div>
 
-    <aside class="right-sidebar" aria-label="设备与参数">
-      <p v-if="errors.deviceList || errors.devices || errors.captureBaseline || errors.playbackBaseline" class="banner banner-error" role="alert">{{ [errors.devices, errors.deviceList, errors.captureBaseline, errors.playbackBaseline].filter(Boolean).join('\n') }}</p>
-      <PendingResult :messages="unknowns.devices" :enabled="ui.canAcknowledge('devices')" :busy="busy" @acknowledge="ui.acknowledge('devices')" />
-      <DevicesPanel :devices="devices" :status="ready ? status : null" :baselines="baselines" :ready="ready && devicesFresh" :busy="busy || !!unknowns.devices.length"
-        @set="(key, value) => ui.setConfig(key, value, 'devices')" @restart="ui.perform('devices', () => client.restart('pre'))" />
-      <p v-if="errors.params" class="banner banner-error" role="alert">{{ errors.params }}</p>
-      <PendingResult :messages="unknowns.params" :enabled="ui.canAcknowledge('params')" :busy="busy" @acknowledge="ui.acknowledge('params')" />
-      <ParamsPanel :params="ready ? status?.rvc_params ?? null : null" :model-id="ready ? status?.rvc?.model_id ?? null : null" :ready="ready" :busy="busy || !!unknowns.params.length" @set="(key, value) => ui.setConfig(key, value, 'params')" />
+    <aside class="right-sidebar p-3 md:p-4 border-l border-edge-soft bg-app flex flex-col gap-5 overflow-y-auto md:h-full" aria-label="控制与设备">
+      <PendingResult :messages="unknowns.system" :enabled="ui.canAcknowledge('system')" :busy="busy.system" @acknowledge="ui.acknowledge('system')" />
+
+      <!-- 路由切换 -->
+      <section class="card p-3" aria-label="路由切换">
+        <div class="flex items-center gap-2 mb-2 min-w-0">
+          <h2 class="text-base font-extrabold tracking-wider text-ink uppercase section-title shrink-0">路由</h2>
+          <span v-if="errors.system" class="banner banner-error text-micro min-w-0 truncate" role="alert" :title="errors.system">{{ errors.system }}</span>
+        </div>
+        <label for="system-route" class="sr-only">路由</label>
+        <select id="system-route" class="field w-full min-w-0 text-xs px-3 py-2" :value="routeValue" :disabled="busy.route || systemBlocked || !status" @change="selectRoute">
+          <option value="" disabled>未知</option><option value="direct">直出</option><option value="rvc">变声</option>
+        </select>
+        <small class="block text-micro text-ink-3 mt-1">实际：{{ ready && status ? status.route.active : '未知' }}</small>
+      </section>
+
+      <PendingResult :messages="unknowns.devices" :enabled="ui.canAcknowledge('devices')" :busy="busy.devices" @acknowledge="ui.acknowledge('devices')" />
+      <DevicesPanel :devices="devices" :status="ready ? status : null" :baselines="baselines" :ready="ready && devicesFresh" :busy="busy.devices || !!unknowns.devices.length"
+        :error="[errors.devices, errors.deviceList, errors.captureBaseline, errors.playbackBaseline].filter(Boolean).join('；')"
+        :muted="muted" :mute-blocked="busy.mute || !!unknowns.system.length"
+        @set="(key, value) => ui.setConfig(key, value, 'devices')"
+        @mute="value => ui.perform('mute', () => client.mute(value))" />
+      <!-- 变声音色：模型、default 预设与参数在同一卡片 -->
+      <section class="card p-3" aria-label="变声音色">
+        <div class="flex items-center gap-2 mb-2 min-w-0">
+          <h2 class="text-base font-extrabold tracking-wider text-ink uppercase section-title shrink-0">变声音色</h2>
+          <span v-if="errors.models" class="banner banner-error text-micro min-w-0 truncate" role="alert" :title="errors.models">{{ errors.models }}</span>
+          <span v-if="errors.preset" class="banner banner-error text-micro min-w-0 truncate" role="alert" :title="errors.preset">{{ errors.preset }}</span>
+        </div>
+        <label for="model-select" class="sr-only">切换模型</label>
+        <select id="model-select" v-model="selectedModel" class="field w-full min-w-0 text-xs px-3 py-2" autocomplete="off" :disabled="busy.model || systemBlocked || !!errors.models">
+          <option value="">选择模型</option>
+          <option v-for="item in models" :key="item.id" :value="item.id" :disabled="!item.exists">{{ item.id }}{{ item.exists ? '' : '（缺失）' }}</option>
+        </select>
+        <button class="btn btn-accent btn-sm w-full mt-2.5" :disabled="busy.model || systemBlocked || !selectedModel || !!errors.models || !models.some(item => item.id === selectedModel && item.exists)" @click="ui.perform('model', () => client.useModel(selectedModel), { context: '切换模型' })">使用模型</button>
+        <PendingResult :messages="unknowns.params" :enabled="ui.canAcknowledge('params')" :busy="busy.params" @acknowledge="ui.acknowledge('params')" />
+        <ParamsPanel embedded :params="ready ? status?.rvc_params ?? null : null" :model-id="ready ? status?.rvc?.model_id ?? null : null" :ready="ready" :blocked="!!unknowns.params.length" :error="errors.params"
+          :preset-dirty="presetDirty" :preset-busy="busy.model || busy.system || busy.params || !!unknowns.system.length || !!unknowns.params.length"
+          @set="ui.setParam"
+          @save="ui.perform('model', client.savePreset, { context: '保存预设' })"
+          @restore="ui.perform('model', client.usePreset, { context: '使用预设' })" />
+      </section>
+
+      <SystemPanel :status="status" :connected="ready" :busy="busy.system" :write-blocked="!!unknowns.system.length"
+        @restart="ui.restart" />
     </aside>
   </main>
+
+  <!-- 全局提示：悬浮在页面底部，不参与布局，避免出现/消失时推动内容。 -->
+  <div class="toast-stack" aria-live="polite">
+    <p v-if="errors.connection" class="toast toast-error" role="alert">{{ errors.connection }}</p>
+    <p v-if="errors.status" class="toast toast-error" role="alert">{{ errors.status }}</p>
+    <p v-if="!adapterOnline" class="toast toast-warn">HTTP 适配器未连接。当前页面不使用模拟运行状态。</p>
+    <p v-if="health?.uploads.retained" class="toast toast-warn">保留上传 {{ health.uploads.retained }} 项：{{ health.uploads.reasons.join('；') }}</p>
+    <p v-if="notice" class="toast" role="status">{{ notice }}</p>
+  </div>
+  </div>
 </template>

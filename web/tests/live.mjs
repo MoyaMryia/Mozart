@@ -22,7 +22,7 @@ await page.addInitScript(() => {
   };
 });
 const failures = []; page.on('pageerror', error => failures.push(error.message));
-const card = title => page.locator('section.card').filter({ has: page.getByRole('heading', { name: title, exact: true }) });
+const card = title => page.locator('section').filter({ has: page.getByRole('heading', { name: title, exact: true }) });
 async function waitFor(check, timeout = 90000) {
   const deadline = Date.now() + timeout;
   while (Date.now() < deadline) { const result = await check(); if (result) return result; await new Promise(resolve => setTimeout(resolve, 100)); }
@@ -78,25 +78,30 @@ function wav(bytes) {
 let result, observer;
 try {
   await page.goto(url);
-  await card('系统').getByText('已连接', { exact: true }).waitFor({ timeout: 30000 });
+  await page.locator('[data-service="pre"][data-state="running"]').waitFor({ timeout: 30000 });
   const initial = await api('status');
   expectedDaemonPid = initial.daemon.pid;
   assert.equal(initial.daemon.poll_interval_ms, 1000);
   assert.ok(initial.api_capabilities.includes('file_fetch_safe_errors_v1'));
   await waitFor(async () => { const state = await api('status'); return ['pre', 'rvc', 'asr', 'tts', 'bridge', 'llama'].every(name => state.processes[name].state === 'running') && state.asr && state.tts && state.bridge; });
-  const mute = card('系统').getByRole('checkbox', { name: '静音', exact: true });
+  const mute = card('设备').getByRole('checkbox', { name: '静音', exact: true });
   await mute.click(); await waitFor(() => mute.isChecked());
   await mute.click(); await waitFor(async () => !await mute.isChecked());
-  await card('文件转换').locator('select').selectOption(process.env.MOZART_WEB_LIVE_MODEL);
-  await card('文件转换').getByLabel('待转换音频').setInputFiles({ name: filename, mimeType: 'audio/wav', buffer: input });
+  // 文件任务与实时共用右侧模型：先切换并确认已加载，再提交。
+  const liveModel = process.env.MOZART_WEB_LIVE_MODEL;
+  await page.locator('#model-select').selectOption(liveModel);
+  const switched = page.waitForResponse(response => response.url().endsWith('/api/v1/model') && response.request().method() === 'PUT');
+  await page.getByRole('button', { name: '使用模型', exact: true }).click();
+  assert.equal((await switched).status(), 200);
+  await waitFor(async () => (await api('status')).rvc.model_id === liveModel);
   const submitResponse = page.waitForResponse(response => response.url().endsWith('/api/v1/files') && response.request().method() === 'POST');
-  await card('文件转换').getByRole('button', { name: '加入队列', exact: true }).click();
+  await card('文件转换').getByLabel('待转换音频').setInputFiles({ name: filename, mimeType: 'audio/wav', buffer: input });
   const accepted = await submitResponse; assert.equal(accepted.status(), 202, await accepted.text());
   const job = card('文件转换').locator('li').filter({ has: page.getByText(filename, { exact: true }) });
   await job.getByText('已完成', { exact: true }).waitFor({ timeout: 90000 });
   const jobs = await api('files'); const submitted = jobs.jobs.find(job => job.name === filename);
   assert.equal(submitted.state, 'completed');
-  assert.equal(submitted.model_id, process.env.MOZART_WEB_LIVE_MODEL);
+  assert.equal(submitted.model_id, liveModel);
   const downloadPromise = page.waitForEvent('download'); await job.getByRole('button', { name: '下载', exact: true }).click();
   const download = await downloadPromise; await download.saveAs(join(evidence, 'converted.wav'));
   const bytes = await readFile(join(evidence, 'converted.wav')); const output = wav(bytes);
@@ -145,11 +150,11 @@ try {
   await api('status');
   expectedDaemonPid = null;
   await page.getByRole('button', { name: '停止系统', exact: true }).click();
-  await waitFor(async () => !(await card('系统').getByRole('button', { name: '停止系统', exact: true }).isEnabled()));
+  await waitFor(async () => !(await page.getByRole('button', { name: '停止系统', exact: true }).isEnabled()));
   assert.equal((await api('health')).adapter, 'running');
-  await page.reload(); await card('系统').getByRole('button', { name: '启动系统', exact: true }).waitFor();
+  await page.reload(); await page.getByRole('button', { name: '启动系统', exact: true }).waitFor();
   await page.getByRole('button', { name: '启动系统', exact: true }).click();
-  await card('系统').getByText('已连接', { exact: true }).waitFor({ timeout: 60000 });
+  await page.locator('[data-service="pre"][data-state="running"]').waitFor({ timeout: 60000 });
   const restored = await api('status'); assert.notEqual(restored.daemon.pid, initial.daemon.pid);
   assert.deepEqual(failures, []);
   result = { real_api: true, real_inference: true, browser: await browser.version(), job_id: submitted.job_id, model: submitted.model_id, output,

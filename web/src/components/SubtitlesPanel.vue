@@ -1,26 +1,22 @@
 <script setup lang="ts">
 import { computed } from 'vue';
 import type { ConnectionState, SubtitleRecord } from '../contracts';
-const props = defineProps<{ records: SubtitleRecord[]; state: ConnectionState; error: string }>();
+const props = defineProps<{ records: SubtitleRecord[]; state: ConnectionState }>();
 const current = computed(() => props.records.at(-1));
-const recent = computed(() => props.records.slice(0, -1).reverse());
+// 推送在线即视为激活：SUB 变为墨色；否则保持浅灰。
+const active = computed(() => props.state === 'online');
 </script>
 
 <template>
-  <section class="card subtitles">
-    <div class="card-head"><h2>字幕</h2><span class="chip" :class="state === 'online' ? 'chip-ok' : 'chip-warn'">{{ state === 'online' ? '已连接' : state === 'connecting' ? '连接中' : '离线' }}</span></div>
-    <p v-if="error" class="banner banner-error">{{ error }}</p>
-    <div v-if="current" class="subtitle-item" :data-utterance-id="current.utterance_id" :data-revision="current.revision">
-      <p>{{ current.zh || '识别中…' }}</p><p class="subtitle-translation">{{ current.en }}</p>
-      <p v-if="current.translation_status === 'failed'" class="state-err">{{ current.translation_error || '翻译失败' }}</p>
+  <!-- 默认收起；有字幕时在两张大卡片之间弹出。 -->
+  <section v-if="current" class="subtitles px-1 py-2" aria-label="实时字幕" :data-online="active">
+    <div class="flex items-center gap-3">
+      <h2 :class="['text-lg font-extrabold tracking-tight font-mono shrink-0', active ? 'text-ink' : 'text-ink-4']" translate="no">SUB</h2>
     </div>
-    <p v-else class="muted">暂无字幕</p>
-    <details v-if="recent.length">
-      <summary>最近字幕（{{ recent.length }}）</summary>
-      <div v-for="record in recent" :key="record.utterance_id" class="subtitle-item" :data-utterance-id="record.utterance_id" :data-revision="record.revision">
-        <p>{{ record.zh }}</p><p class="subtitle-translation">{{ record.en }}</p>
-        <p v-if="record.translation_status === 'failed'" class="state-err">{{ record.translation_error || '翻译失败' }}</p>
-      </div>
-    </details>
+    <div class="subtitle-item mt-1 space-y-1 text-center" :data-utterance-id="current.utterance_id" :data-revision="current.revision">
+      <p :class="['text-xl font-bold leading-relaxed whitespace-pre-wrap break-words', active ? 'text-ink' : 'text-ink-4']">{{ current.zh || '识别中…' }}</p>
+      <p :class="['subtitle-translation text-base leading-relaxed whitespace-pre-wrap break-words', active ? 'text-ink-2' : 'text-ink-4']">{{ current.en }}</p>
+      <p v-if="current.translation_status === 'failed'" class="text-tiny state-err">{{ current.translation_error || '翻译失败' }}</p>
+    </div>
   </section>
 </template>

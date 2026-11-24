@@ -6,6 +6,9 @@ import {
 } from './contracts';
 
 export const API_ROOT = '/api/v1';
+let deviceClock: number | null = null;
+/** 最近一次响应时设备时钟的秒数，取自 Date 头；响应不带该头时为 null。 */
+export const deviceNow = () => deviceClock;
 const objectSchema = z.object({}).passthrough();
 
 export class ApiError extends Error {
@@ -54,11 +57,15 @@ async function readEnvelope(response: Response, write: boolean) {
 
 async function send(path: string, init: RequestInit) {
   const write = init.method !== undefined && init.method !== 'GET';
-  try { return await fetch(`${API_ROOT}${path}`, { ...init, cache: 'no-store' }); }
+  let response: Response;
+  try { response = await fetch(`${API_ROOT}${path}`, { ...init, cache: 'no-store' }); }
   catch (error) {
     if (!isTransportFailure(error)) throw error;
     throw new ApiError(error.name === 'AbortError' ? '请求已中断' : '无法连接 HTTP 适配器', 'NetworkUnavailable', 0, write);
   }
+  const date = Date.parse(response.headers.get('date') ?? '');
+  if (!Number.isNaN(date)) deviceClock = date / 1000;
+  return response;
 }
 
 export async function request<T>(path: string, schema: z.ZodType<T>, init: RequestInit = {}): Promise<T> {
@@ -97,7 +104,6 @@ export const client = {
   speechStop: () => request('/speech/stop', objectSchema, json('POST', {})),
   restart: (service: Service) => request(`/services/${service}/restart`, objectSchema, json('POST', {})),
   setConfig: (key: string, value: string) => request('/config', configEffectSchema, json('PUT', { key, value })),
-  saveConfig: () => request('/config/save', objectSchema, json('POST', {})),
   submit: (file: File, modelId?: string) => {
     const body = new FormData();
     body.append('file', file);

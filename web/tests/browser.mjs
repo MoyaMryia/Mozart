@@ -12,6 +12,7 @@ import { statusFixture, healthFixture, jobFixture, subtitleFixture, envelope } f
 const root = fileURLToPath(new URL('..', import.meta.url));
 const evidence = process.env.MOZART_WEB_EVIDENCE_DIR ?? await mkdtemp(join(tmpdir(), 'mozart-web-browser-'));
 const snapshot = statusFixture();
+const presetValues = { ...snapshot.rvc_params };
 const writes = [];
 let running = true;
 let jobs = [];
@@ -21,7 +22,9 @@ let subtitleReconnectGate;
 const statusStreams = new Set();
 const subtitleStreams = new Set();
 const events = new EventEmitter();
-const subtitleHistory = [{ id: 'browser-1:100', record: subtitleFixture({ en: 'Hello', revision: 1, translation_status: 'completed' }) }];
+// 新打开的页面只显示打开之后的字幕：回放记录在页面加载前就标记为刚收到。
+const live = { received_at: Date.now() / 1000 };
+const subtitleHistory = [{ id: 'browser-1:100', record: subtitleFixture({ en: 'Hello', revision: 1, translation_status: 'completed', received_at: live.received_at }) }];
 const wav = Buffer.alloc(46);
 wav.write('RIFF'); wav.writeUInt32LE(38, 4); wav.write('WAVEfmt ', 8); wav.writeUInt32LE(16, 16);
 wav.writeUInt16LE(1, 20); wav.writeUInt16LE(1, 22); wav.writeUInt32LE(48000, 24);
@@ -29,7 +32,7 @@ wav.writeUInt32LE(96000, 28); wav.writeUInt16LE(2, 32); wav.writeUInt16LE(16, 34
 
 const sendEvent = (res, name, data, id) => res.write(`${id ? `id: ${id}\n` : ''}event: ${name}\ndata: ${JSON.stringify(data)}\n\n`);
 const broadcastStatus = () => { for (const res of statusStreams) sendEvent(res, 'status', snapshot); };
-const response = (res, data, status = 200) => { res.writeHead(status, { 'Content-Type': 'application/json', 'Cache-Control': 'no-store' }); res.end(JSON.stringify(envelope(data))); };
+const response = (res, data, status = 200) => { res.writeHead(status, { 'Content-Type': 'application/json', 'Cache-Control': 'no-store', Date: new Date().toUTCString() }); res.end(JSON.stringify(envelope(data))); };
 const failure = (res, code, reason, status) => { res.writeHead(status, { 'Content-Type': 'application/json' }); res.end(JSON.stringify({ status: 'error', code, reason, data: null })); };
 
 async function handleApi(req, res) {
@@ -39,6 +42,7 @@ async function handleApi(req, res) {
     if (path === '/health') return response(res, healthFixture);
     if (path === '/status') return running ? response(res, snapshot) : failure(res, 'UpstreamUnavailable', 'daemon 未运行', 503);
     if (path === '/models') return response(res, { models: [{ id: 'model-a', exists: true, loaded: true }] });
+    if (path === '/preset') return response(res, { model_id: 'model-a', preset: 'default', preset_values: presetValues, live_values: snapshot.rvc_params, dirty: JSON.stringify(presetValues) !== JSON.stringify(snapshot.rvc_params) });
     if (path === '/devices') return response(res, { devices: [{ id: 'mic-a', label: '麦克风 A', kind: 'capture' }, { id: 'mic-b', label: '麦克风 B', kind: 'capture' }, { id: 'speaker-a', label: '扬声器 A', kind: 'playback' }] });
     if (path === '/config') return response(res, { value: url.searchParams.get('key') === 'pre.capture_device' ? baselineCapture : 'speaker-a' });
     if (path === '/files') return response(res, { jobs, paused: queuePaused });
@@ -74,8 +78,11 @@ async function handleApi(req, res) {
     return response(res, { state: 'stopped' });
   }
   if (path === '/system/up') { running = true; return response(res, { state: 'running' }); }
+  if (path === '/services/pre/restart') { snapshot.pending_restart = []; broadcastStatus(); return response(res, { service: 'pre' }); }
   if (path === '/route') { snapshot.route.desired = body.route; broadcastStatus(); return response(res, { route: body.route }); }
   if (path === '/mute') { snapshot.mute = body.mute; broadcastStatus(); return response(res, { mute: body.mute }); }
+  if (path === '/preset/save') { Object.assign(presetValues, snapshot.rvc_params); return response(res, { model_id: 'model-a', preset: 'default', values: presetValues }); }
+  if (path === '/preset/use') { Object.assign(snapshot.rvc_params, presetValues); broadcastStatus(); return response(res, { model_id: 'model-a', preset: 'default', values: presetValues }); }
   if (path === '/translate') { snapshot.bridge.translate_enabled = body.enabled; broadcastStatus(); return response(res, body); }
   if (path === '/speech') { snapshot.bridge.speech_enabled = body.enabled; broadcastStatus(); return response(res, body); }
   if (path === '/speech/stop') { snapshot.bridge.speech_enabled = false; broadcastStatus(); return response(res, {}); }
@@ -120,22 +127,21 @@ try {
   assert.equal(writes.filter(item => item.path === '/route').length, 1);
   assert.equal(writes.some(item => item.path.startsWith('/preprocessor') || item.path.includes('mode/switch')), false);
 
-  await page.getByLabel('音高', { exact: true }).fill('13'); await card('参数').getByRole('button', { name: '应用', exact: true }).first().click();
+  // 调节即应用：被拒绝后回到已确认值；有效值写入后出现保存与恢复按钮。
+  await page.getByLabel('音高增益', { exact: true }).fill('13');
   await page.getByText('InvalidArgument：音高超出范围', { exact: true }).waitFor(); assert.equal(snapshot.rvc_params.pitch_shift, 0);
-  await page.getByLabel('音高', { exact: true }).fill('3');
-  // 较新的 SSE 会合并首轮读取；等待实际发生的后台查询，不用固定睡眠代替。
-  await page.waitForResponse(response => new URL(response.url()).pathname === '/api/v1/status', { timeout: 10000 });
-  await page.waitForFunction(() => document.querySelector('#param-pitch_shift')?.disabled === false);
-  assert.equal(await page.getByLabel('音高', { exact: true }).inputValue(), '3');
-  assert.equal(snapshot.rvc_params.pitch_shift, 0);
-  await card('参数').getByRole('button', { name: '应用', exact: true }).first().click();
-  await page.getByText('当前：3', { exact: true }).waitFor();
-  await page.getByLabel('输入', { exact: true }).selectOption('mic-b'); await card('设备').getByRole('button', { name: '设置', exact: true }).first().click();
+  assert.equal(await page.getByLabel('音高增益', { exact: true }).inputValue(), '0');
+  await page.getByLabel('音高增益', { exact: true }).fill('3');
+  await page.locator('.preset-actions.is-visible').waitFor();
+  assert.equal(await page.getByLabel('音高增益', { exact: true }).inputValue(), '3');
+  assert.equal(snapshot.rvc_params.pitch_shift, 3);
+  await page.getByRole('button', { name: '保存为 default 预设', exact: true }).click();
+  await page.waitForFunction(() => !document.querySelector('.preset-actions.is-visible'));
+  await page.getByLabel('输入', { exact: true }).selectOption('mic-b'); await card('设备').getByRole('button', { name: '设置输入设备', exact: true }).click();
   await page.getByText('实际：mic-a · 基线：mic-b', { exact: true }).waitFor();
-  assert.equal(writes.some(item => item.path.endsWith('/restart')), false);
+  assert.equal(writes.some(item => item.path === '/services/pre/restart'), true);
 
   await card('文件转换').locator('input[type=file]').setInputFiles({ name: 'sample.wav', mimeType: 'audio/wav', buffer: wav });
-  await card('文件转换').getByRole('button', { name: '加入队列', exact: true }).click();
   await page.getByText('已受理 job-new · queued，转换尚未完成。', { exact: true }).waitFor();
   await card('文件转换').getByText('排队中', { exact: true }).waitFor();
   jobs[0] = jobFixture({ job_id: 'job-new', state: 'completed', result_ready: true, progress: { stage: 'publish', percent: 100, blocks_done: 1, blocks_total: 1 } });
@@ -143,22 +149,23 @@ try {
   const [download] = await Promise.all([page.waitForEvent('download'), card('文件转换').getByRole('button', { name: '下载', exact: true }).click()]);
   assert.equal(download.suggestedFilename(), 'result.wav'); assert.deepEqual(await readFile(await download.path()), wav);
 
-  subtitleHistory.push({ id: 'browser-1:200', record: subtitleFixture({ revision: 2, en: 'Updated translation', translation_status: 'completed' }) });
+  subtitleHistory.push({ id: 'browser-1:200', record: subtitleFixture({ revision: 2, en: 'Updated translation', translation_status: 'completed', received_at: live.received_at }) });
   let resumeSubtitles;
   subtitleReconnectGate = new Promise(resolve => { resumeSubtitles = resolve; });
   for (const res of subtitleStreams) { sendEvent(res, 'subtitle', subtitleHistory.at(-1).record, 'browser-1:200'); res.end(); }
   await page.getByText('Updated translation', { exact: true }).first().waitFor();
-  assert.equal(await card('字幕').locator('.subtitle-item').count(), 1);
-  subtitleHistory.push({ id: 'browser-1:300', record: subtitleFixture({ utterance_id: 'boot-a:2', seq: 2, zh: '断线期间的新句', en: 'Recovered while offline', translation_status: 'completed' }) });
+  assert.equal(await card('SUB').locator('.subtitle-item').count(), 1);
+  subtitleHistory.push({ id: 'browser-1:300', record: subtitleFixture({ utterance_id: 'boot-a:2', seq: 2, zh: '断线期间的新句', en: 'Recovered while offline', translation_status: 'completed', received_at: live.received_at }) });
   const reconnected = once(events, 'subtitle-connection', { signal: AbortSignal.timeout(5000) });
   resumeSubtitles(); subtitleReconnectGate = undefined;
   const [resume] = await reconnected; assert.equal(resume.cursor, 'browser-1:200');
   await page.getByText('Recovered while offline', { exact: true }).waitFor();
-  await card('字幕').getByText('已连接', { exact: true }).waitFor();
-  assert.equal(await card('字幕').getByText('推送连接已断开，正在重连', { exact: true }).count(), 0);
-  assert.equal(await page.getByText('Updated translation', { exact: true }).count(), 1);
-  assert.equal(await card('字幕').locator('.subtitle-item').count(), 2);
-  assert.equal(await card('字幕').getByText('Hello', { exact: true }).count(), 0);
+  await page.waitForFunction(() => document.querySelector('section[aria-label="实时字幕"]')?.getAttribute('data-online') === 'true');
+  assert.equal(await page.getByText('推送连接已断开，正在重连', { exact: true }).count(), 0);
+  assert.equal(await page.getByText('Updated translation', { exact: true }).count(), 0);
+  assert.equal(await card('SUB').locator('.subtitle-item').count(), 1);
+  assert.equal(await card('SUB').getByText('Recovered while offline', { exact: true }).count(), 1);
+  assert.equal(await card('SUB').getByText('Hello', { exact: true }).count(), 0);
   await page.screenshot({ path: join(evidence, 'desktop.png'), fullPage: true });
   assert.equal(await page.evaluate(() => document.documentElement.scrollWidth <= innerWidth), true);
   await page.setViewportSize({ width: 390, height: 844 });
@@ -169,7 +176,7 @@ try {
 
   await page.getByRole('button', { name: '停止系统', exact: true }).click(); await page.getByText('UpstreamUnavailable：daemon 未运行', { exact: true }).first().waitFor();
   assert.equal(await page.getByRole('button', { name: '停止系统', exact: true }).isDisabled(), true);
-  await page.getByRole('button', { name: '启动系统', exact: true }).click(); await card('系统').getByText('已连接', { exact: true }).waitFor();
+  await page.getByRole('button', { name: '启动系统', exact: true }).click(); await page.locator('[data-service="pre"][data-state="running"]').waitFor();
   assert.deepEqual(failures, []);
   await writeFile(join(evidence, 'result.json'), JSON.stringify({ mock_api: true, browser: await browser.version(), viewports: ['1366x900', '390x844'], checks: ['route-intent', 'config-rejection', 'draft', 'pending-restart', 'file-queue', 'download-bytes', 'subtitle-reconnect', 'layout', 'theme', 'down-up'], writes, failures }, null, 2));
   console.log(`浏览器契约检查通过；证据：${evidence}`);
