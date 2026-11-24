@@ -883,6 +883,49 @@ int main()
               "weak-signal SOLA keeps offset == 0 without jumping to noise peak");
     }
 
+    printf("test_realtime_protect_rms_mix_and_peak_limit\n");
+    {
+        // protect: 4 frames (2 voiced, 2 unvoiced), emb_dim=2, skip_head=0, index_start=0
+        const std::vector<float> base_indexed = {
+            1.0f, 1.0f,  // t=0 voiced
+            1.0f, 1.0f,  // t=1 unvoiced
+            1.0f, 1.0f,  // t=2 unvoiced
+            1.0f, 1.0f,  // t=3 voiced
+        };
+        const std::vector<float> unindexed = {
+            0.0f, 0.0f,  // src=0 (covers t=0,1)
+            0.0f, 0.0f,  // src=1 (covers t=2,3)
+        };
+        const std::vector<float> pitchf = {200.0f, 0.0f, 0.0f, 220.0f};
+
+        // protect = 0.5 -> disabled (boundary contract)
+        auto f_bypass = base_indexed;
+        RVCInferencer::apply_realtime_protect(f_bypass, unindexed, pitchf, 0, 0, 2, 2, 0.5f);
+        CHECK(f_bypass == base_indexed, "protect=0.5 leaves indexed features unchanged");
+
+        // protect = 0.3 -> unvoiced frames blend to 0.3, voiced stay 1.0
+        auto f_blend = base_indexed;
+        RVCInferencer::apply_realtime_protect(f_blend, unindexed, pitchf, 0, 0, 2, 2, 0.3f);
+        CHECK(std::fabs(f_blend[0] - 1.0f) < 1e-6f && std::fabs(f_blend[2] - 0.3f) < 1e-6f
+              && std::fabs(f_blend[4] - 0.3f) < 1e-6f && std::fabs(f_blend[6] - 1.0f) < 1e-6f,
+              "protect=0.3 blends only unvoiced frames toward unindexed features");
+
+        // rms_mix_rate = 1.0 -> bypass RMS scaling, still applies 0.99 peak limiter
+        std::vector<float> in_16k(4800, 0.1f);
+        std::vector<float> out_48k(14400, 1.5f);
+        RVCInferencer::apply_realtime_rms_mix_and_limit(
+            in_16k.data(), in_16k.size(), out_48k, 48000, 1.0f, 0.99f);
+        CHECK(std::fabs(out_48k[7200] - 0.99f) < 1e-5f,
+              "rms_mix_rate=1.0 skips RMS scaling and limits peak to 0.99");
+
+        // rms_mix_rate = 0.0 -> output matches input RMS (0.1 vs 0.4 -> scaled down near 0.1)
+        std::vector<float> out_scaled(14400, 0.4f);
+        RVCInferencer::apply_realtime_rms_mix_and_limit(
+            in_16k.data(), in_16k.size(), out_scaled, 48000, 0.0f, 0.99f);
+        CHECK(std::fabs(out_scaled[7200] - 0.1f) < 0.01f,
+              "rms_mix_rate=0.0 aligns output envelope to input RMS");
+    }
+
     if (g_fail) {
         printf("\n%d test(s) FAILED\n", g_fail);
         return 1;

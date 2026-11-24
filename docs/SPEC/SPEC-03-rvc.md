@@ -69,7 +69,7 @@
 - 文件模式的 `total_frames` 必填，类型为正整数 u32，表示本次输入帧数。C++ 收齐后开始整段推理；取消仍用 `StopStream`。`total_samples` 可选，类型为 u64，表示 16 kHz 输入的有效采样数。显式传入时须在 `1..=total_frames × 320` 内；C++ 在推理前据此裁掉尾帧补零。省略时保留全部帧样本。实时模式忽略这两个字段。
 - `StartStream` 会话参数取自 TOML `[rvc]` 会话默认值；模型切换时先由该模型的预设载入 `[rvc]`（SPEC-11），`StartStream` 仍携带五个会话参数。`config set rvc.<会话参数>` 与 `preset use` 在实时流活动期间对可热更参数下发 `SetParams`（`0x0308`）无中断生效（编排见 SPEC-04）。将来若增加不写 TOML 基线的独立运行时调参命令，其覆盖才记入 daemon 运行时状态文件。两者不混用。
 - `config set rvc.<会话参数>` 的触发、失败恢复与重试见 [SPEC-04](SPEC-04-daemon.md)。
-- [ ] `protect`、`rms_mix_rate` 在实时链路当前未应用，只对文件链路生效；已纳入下方「实时变声衔接自然度分步优化」步骤 4 待办（从 `FUTURE.md` 迁入）。
+- [x] `protect`、`rms_mix_rate` 已接入实时链路（见下方「实时变声衔接自然度分步优化」步骤 4）。
 - `filter_radius` 在旧 C++ 里只保存、未参与计算，v1 不放进 `StartStream`、不暴露死参数；保留为 FUTURE 提升项，推迟实现 F0 中值滤波，见 [FUTURE.md](../FUTURE.md)。
 - [ ] 若板端实测小缓冲扛不住抖动或时钟漂移，再把大缓冲搬到音频进程，同时把 `startup_delay_out` 设为 0 并重测首帧。条件项，未触发。
 
@@ -203,7 +203,7 @@ RMVPE 前端 mel 128 带、n_fft 1024、hop 160、30–8000 Hz、HTK Slaney（�
     2. SOLA 搜索改用双侧能量归一化互相关（`sqrt(tail_energy * cand_energy)`），且当 `tail_` 或候选段 RMS 低于静音门限时直接固定 `sola_offset = 0` 不乱跳。
   - **独立验收**：C++ 单测验证相邻两块重叠区噪声键一致、相位模 1 连续、弱音区 `sola_offset == 0`；板端实测对比修复前后块间延迟游走幅度与长元音/连续说话听感颤动。
 
-- [ ] **步骤 4：实时链路补齐清辅音保护（`protect`）、音量跟随（`rms_mix_rate`）与峰值限幅（解决字头吐字发虚与音量跳变）**
+- [x] **步骤 4：实时链路补齐清辅音保护（`protect`）、音量跟随（`rms_mix_rate`）与峰值限幅（解决字头吐字发虚与音量跳变）**
   - **问题根因**：文件链路在特征检索后按 `pitchf` 对清辅音（s / sh / t / k 等无基频帧）保留 `protect` 比例的原始未检索特征，并在输出后按原声 RMS 包络做 `rms_mix_rate` 音量对齐和 `0.99` 限幅；实时链路 `infer_realtime` 目前完全未执行这两步（`rvc/src/rvc/inferencer.cpp:719-745,837-854`），导致开启 `index_rate` 时字头清辅音被训练集特征覆盖发粘，且字尾呼吸声容易被模型放大。
   - **改动方案**：在 `infer_realtime` 中保存尾部检索前特征副本，对 `return_frames`（或送入 `front` 的新块区间）内 `pitchf <= 0` 的帧按 `protect` 混合原始特征；对 `decoder` 输出的 300 ms 音频与对应的 300 ms 输入音频做块级短窗 `rms_mix_rate` 包络对齐与 `0.99` 峰值限幅。
   - **独立验收**：C++ 单测验证实时模式下 `protect` 与 `rms_mix_rate` 改变输出且边界值（`protect=0.5`、`rms_mix_rate=1.0`）符合契约；板端实测单块推理耗时增量 < 2 ms，对比 `logmel_vs_file` / `rms_vs_file` 指标与字头吐字清晰度。

@@ -114,6 +114,24 @@ public:
         const std::vector<float>& decoder_pitchf,
         size_t shift_frames
     );
+    static void apply_realtime_protect(
+        std::vector<float>& resized_feats,
+        const std::vector<float>& unindexed_tail,
+        const std::vector<float>& pitchf,
+        size_t skip_head_frames,
+        size_t index_start_frames,
+        size_t feature_frames,
+        size_t emb_dim,
+        float protect
+    );
+    static void apply_realtime_rms_mix_and_limit(
+        const float* input_16k,
+        size_t input_samples,
+        std::vector<float>& output,
+        uint32_t output_sr,
+        float rms_mix_rate,
+        float peak_ceiling = 0.99f
+    );
     void push_realtime_pitch_cache(
         const std::vector<int64_t>& new_pitch,
         const std::vector<float>& new_pitchf,

@@ -395,6 +395,91 @@ void RVCInferencer::advance_realtime_excitation(
     realtime_frame_cursor_ += shift_frames;
 }
 
+void RVCInferencer::apply_realtime_protect(
+    std::vector<float>& resized_feats,
+    const std::vector<float>& unindexed_tail,
+    const std::vector<float>& pitchf,
+    size_t skip_head_frames,
+    size_t index_start_frames,
+    size_t feature_frames,
+    size_t emb_dim,
+    float protect
+) {
+    if (protect >= 0.5f || unindexed_tail.empty() || feature_frames == 0 || emb_dim == 0) {
+        return;
+    }
+    const size_t total_frames = std::min(resized_feats.size() / emb_dim, pitchf.size());
+    for (size_t target = skip_head_frames; target < total_frames; ++target) {
+        if (pitchf[target] > 0.0f) continue;
+        const size_t source = std::min(target / 2, feature_frames - 1);
+        if (source < index_start_frames) continue;
+        const size_t tail_off = (source - index_start_frames) * emb_dim;
+        if (tail_off + emb_dim > unindexed_tail.size()) continue;
+        const size_t dst_off = target * emb_dim;
+        for (size_t c = 0; c < emb_dim; ++c) {
+            resized_feats[dst_off + c] = resized_feats[dst_off + c] * protect
+                + unindexed_tail[tail_off + c] * (1.0f - protect);
+        }
+    }
+}
+
+void RVCInferencer::apply_realtime_rms_mix_and_limit(
+    const float* input_16k,
+    size_t input_samples,
+    std::vector<float>& output,
+    uint32_t output_sr,
+    float rms_mix_rate,
+    float peak_ceiling
+) {
+    if (rms_mix_rate < 1.0f && input_16k && input_samples > 0 && !output.empty() && output_sr >= 50) {
+        const auto rms_curve = [](const float* samples, size_t count, size_t frame_size, size_t hop_size) {
+            const size_t center_pad = frame_size / 2;
+            std::vector<float> result;
+            result.reserve(count / hop_size + 2);
+            for (size_t center = 0; center <= count; center += hop_size) {
+                const size_t start = center > center_pad ? center - center_pad : 0;
+                const size_t end = std::min(count, center + center_pad);
+                float sum = 0.0f;
+                for (size_t i = start; i < end; ++i) sum += samples[i] * samples[i];
+                result.push_back(std::sqrt(sum / static_cast<float>(frame_size)));
+            }
+            return result;
+        };
+        // 120 ms 平滑窗、30 ms 步长匹配 300 ms 实时块，吸收声码器群延迟；
+        // 静音/底噪区间不反向放大，避免抬高停顿底噪。
+        const auto in_rms = rms_curve(input_16k, input_samples, 1920, 480);
+        const auto out_rms = rms_curve(output.data(), output.size(), output_sr * 3 / 25, output_sr * 3 / 100);
+        const size_t n_grid = std::min(in_rms.size(), out_rms.size());
+        if (n_grid > 0) {
+            const float exponent = 1.0f - rms_mix_rate;
+            std::vector<float> gains(n_grid, 1.0f);
+            for (size_t g = 0; g < n_grid; ++g) {
+                const float in_lvl = std::max(in_rms[g], 1e-6f);
+                const float out_lvl = std::max(out_rms[g], 1e-6f);
+                float gain = std::min(std::pow(in_lvl / out_lvl, exponent), 4.0f);
+                if (in_rms[g] < 0.005f) {
+                    gain = std::min(gain, 1.0f);
+                }
+                gains[g] = gain;
+            }
+            for (size_t i = 0; i < output.size(); ++i) {
+                float gain = gains.front();
+                if (n_grid > 1) {
+                    const float pos = (static_cast<float>(i) + 0.5f)
+                        * static_cast<float>(n_grid) / static_cast<float>(output.size()) - 0.5f;
+                    const float clamped = std::clamp(pos, 0.0f, static_cast<float>(n_grid - 1));
+                    const size_t left = static_cast<size_t>(clamped);
+                    const size_t right = std::min(left + 1, n_grid - 1);
+                    const float frac = clamped - static_cast<float>(left);
+                    gain = gains[left] * (1.0f - frac) + gains[right] * frac;
+                }
+                output[i] *= gain;
+            }
+        }
+    }
+    limit_peak(output, peak_ceiling);
+}
+
 void RVCInferencer::push_realtime_pitch_cache(
     const std::vector<int64_t>& new_pitch,
     const std::vector<float>& new_pitchf,
@@ -807,10 +892,9 @@ std::vector<float> RVCInferencer::infer_realtime(
         throw std::runtime_error("Realtime HuBERT feature shape is invalid");
     }
     const size_t feature_frames = feats.size() / emb_dim;
+    const size_t index_start = std::min(request.skip_head_frames / 2, feature_frames);
+    std::vector<float> unindexed_tail;
     if (model_->index().loaded() && params.index_rate > 0.0f) {
-        const size_t index_start = std::min(
-            request.skip_head_frames / 2, feature_frames
-        );
         std::vector<float> tail(
             feats.begin() + static_cast<std::ptrdiff_t>(index_start * emb_dim),
             feats.end()
@@ -818,6 +902,9 @@ std::vector<float> RVCInferencer::infer_realtime(
         if (!tail.empty()) {
             model_->index().set_nprobe(static_cast<uint32_t>(params.index_nprobe));
             auto indexed = model_->index().search(tail, emb_dim, params.index_rate);
+            if (params.protect < 0.5f) {
+                unindexed_tail = std::move(tail);
+            }
             std::copy(
                 indexed.begin(), indexed.end(),
                 feats.begin() + static_cast<std::ptrdiff_t>(index_start * emb_dim)
@@ -833,6 +920,10 @@ std::vector<float> RVCInferencer::infer_realtime(
             resized_feats.begin() + static_cast<std::ptrdiff_t>(target * emb_dim)
         );
     }
+    apply_realtime_protect(
+        resized_feats, unindexed_tail, pitchf,
+        request.skip_head_frames, index_start, feature_frames, emb_dim, params.protect
+    );
     const auto profile_hubert = profile::Clock::now();
 
     const auto latent_shape = front.input_shape("latent_noise");
@@ -921,6 +1012,19 @@ std::vector<float> RVCInferencer::infer_realtime(
     auto output = front.run_chained(front_inputs, "z", decoder, decoder_inputs, "z", "audio");
     if (output.size() != request.output_samples) {
         throw std::runtime_error("Realtime decoder output shape is invalid");
+    }
+    const size_t block_input_16k = request.return_frames * kHop16k;
+    if (block_input_16k <= audio.size()) {
+        apply_realtime_rms_mix_and_limit(
+            audio.data() + (audio.size() - block_input_16k),
+            block_input_16k,
+            output,
+            model_->config().sample_rate,
+            params.rms_mix_rate,
+            0.99f
+        );
+    } else {
+        limit_peak(output, 0.99f);
     }
     if (profile::enabled()) {
         const auto profile_done = profile::Clock::now();
