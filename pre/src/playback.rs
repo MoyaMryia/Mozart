@@ -202,7 +202,9 @@ fn step_broadcast(
                 let _ = trunk.pop(Some(Duration::ZERO));
                 let tail = rvc
                     .pop(Some(Duration::ZERO))
-                    .map_or([0f32; RAW_SAMPLES], |frame| rvc_resampler.resample_to_48k(&frame));
+                    .map_or([0f32; RAW_SAMPLES], |frame| {
+                        rvc_resampler.resample_to_48k(&frame)
+                    });
                 drain_rvc_skipped(rvc, shared);
                 rvc_resampler.reset();
                 tail
@@ -282,6 +284,7 @@ pub fn run(
     tts: Arc<Ring<OutputFrame>>,
     shared: Arc<Shared>,
     stop: &'static AtomicBool,
+    mut probe: Option<crate::aec_probe::Stream>,
 ) -> Result<(), String> {
     let mut stereo = [0i16; RAW_SAMPLES * 2];
     let mut router = Router::new(Route::Direct);
@@ -293,9 +296,20 @@ pub fn run(
     let mut reported = 0u64;
     loop {
         if shared.playback_switch.has_pending() {
+            let timestamp = probe.is_some();
             shared.playback_switch.apply_pending(
-                |target| alsa_stream::open_and_verify_io("playback", target, Direction::Playback),
+                |target| {
+                    alsa_stream::open_and_verify_io(
+                        "playback",
+                        target,
+                        Direction::Playback,
+                        timestamp,
+                    )
+                },
                 |_, new_pcm| {
+                    if let Some(probe) = &mut probe {
+                        probe.discontinuity();
+                    }
                     pcm = new_pcm;
                     fade_in.trigger();
                 },
@@ -347,6 +361,7 @@ pub fn run(
             stop,
             shared.playback_switch.pending_flag(),
             &mut underruns,
+            probe.as_mut(),
         ) {
             Ok(()) => shared.add_played(1),
             Err(StreamError::Cancelled) => return Ok(()),
@@ -671,7 +686,8 @@ mod tests {
             segment_id: 0,
         };
         // 预先让 resampler 处于 40 kHz 历史（last_rate != 0）。
-        let _ = resampler.resample_to_48k(&OutputFrame::new(meta, 40000, 800, [0.9; OUTPUT_SAMPLES]));
+        let _ =
+            resampler.resample_to_48k(&OutputFrame::new(meta, 40000, 800, [0.9; OUTPUT_SAMPLES]));
         assert_eq!(resampler.last_rate, 40000);
 
         // 在播报期切路由（Direct → Rvc）：router 状态机在后台完成切换，

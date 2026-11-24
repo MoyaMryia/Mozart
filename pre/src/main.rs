@@ -16,6 +16,7 @@
 //! 停止：SIGTERM/SIGINT 置停止标志，各线程在时限内退出；启动阶段设备打开失败立即退出，
 //! 运行中支持经 `PRE_SET_DEVICE` 热替换 ALSA 句柄（失败保留旧设备），物理拔线等致命错误退出由 daemon 退避重启。
 
+mod aec_probe;
 mod ai;
 mod alsa_stream;
 mod capture;
@@ -89,6 +90,7 @@ struct Args {
     effective_dsp: Option<mozart_core::config::PreDspConfig>,
     effective_capture_device: Option<String>,
     effective_playback_device: Option<String>,
+    aec_probe: Option<PathBuf>,
 }
 
 fn parse_args() -> Result<Args, String> {
@@ -102,6 +104,7 @@ fn parse_args_from(mut args: impl Iterator<Item = String>) -> Result<Args, Strin
     let mut effective_dsp = None;
     let mut effective_capture_device = None;
     let mut effective_playback_device = None;
+    let mut aec_probe = None;
     while let Some(arg) = args.next() {
         match arg.as_str() {
             "--socket" => {
@@ -144,6 +147,11 @@ fn parse_args_from(mut args: impl Iterator<Item = String>) -> Result<Args, Strin
                     .map_err(|err| format!("--effective-playback-device: {err}"))?;
                 effective_playback_device = Some(dev);
             }
+            "--aec-probe" => {
+                aec_probe = Some(PathBuf::from(
+                    args.next().ok_or("--aec-probe needs a new directory")?,
+                ));
+            }
             other => return Err(format!("unknown argument: {other}")),
         }
     }
@@ -154,6 +162,7 @@ fn parse_args_from(mut args: impl Iterator<Item = String>) -> Result<Args, Strin
         effective_dsp,
         effective_capture_device,
         effective_playback_device,
+        aec_probe,
     })
 }
 
@@ -268,7 +277,9 @@ fn main() -> ExitCode {
         Ok(args) => args,
         Err(message) => {
             eprintln!("mozart-pre: {message}");
-            eprintln!("usage: mozart-pre --socket <path> [--config <path>]");
+            eprintln!(
+                "usage: mozart-pre --socket <path> [--config <path>] [--aec-probe <new-directory>]"
+            );
             return ExitCode::from(2);
         }
     };
@@ -305,6 +316,11 @@ fn main() -> ExitCode {
         }
     };
 
+    let probe_enabled = args.aec_probe.is_some();
+    if probe_enabled && config.pre.capture_file.is_some() {
+        eprintln!("mozart-pre: --aec-probe requires ALSA capture, not capture_file");
+        return ExitCode::FAILURE;
+    }
     install_signal_handlers();
 
     // 文件采集源时状态报告文件路径（SPEC-02），否则报告 ALSA 设备名。
@@ -385,7 +401,11 @@ fn main() -> ExitCode {
 
     // 播放设备先就绪，后拉线程；采集源二选一：测试文件（SPEC-02 文件采集源）
     // 或 ALSA 设备。文件契约在采集线程启动时入口校验，失败走致命错误传播。
-    let playback_pcm = match alsa_stream::open(&config.pre.playback_device, Direction::Playback) {
+    let playback_pcm = match alsa_stream::open(
+        &config.pre.playback_device,
+        Direction::Playback,
+        probe_enabled,
+    ) {
         Ok(pcm) => pcm,
         Err(message) => {
             eprintln!("mozart-pre: playback open: {message}");
@@ -400,6 +420,19 @@ fn main() -> ExitCode {
 
     // 采集与处理线程；播放线程持有状态机；接收线程独立收 rvc 输出帧；
     // 控制线程独立服务。
+    let (capture_probe, playback_probe, probe_writer) = match args.aec_probe {
+        Some(dir) => {
+            let status = shared.clone();
+            match aec_probe::start(&dir, move |message| status.set_last_error(message)) {
+                Ok((capture, playback, writer)) => (Some(capture), Some(playback), Some(writer)),
+                Err(error) => {
+                    eprintln!("mozart-pre: AEC probe {}: {error}", dir.display());
+                    return ExitCode::FAILURE;
+                }
+            }
+        }
+        None => (None, None, None),
+    };
     let capture_handle = if let Some(path) = config.pre.capture_file.clone() {
         let ring = capture_ring.clone();
         let shared = shared.clone();
@@ -413,7 +446,11 @@ fn main() -> ExitCode {
             Err(err) => return spawn_failure("capture", err),
         }
     } else {
-        let capture_pcm = match alsa_stream::open(&config.pre.capture_device, Direction::Capture) {
+        let capture_pcm = match alsa_stream::open(
+            &config.pre.capture_device,
+            Direction::Capture,
+            probe_enabled,
+        ) {
             Ok(pcm) => pcm,
             Err(message) => {
                 eprintln!("mozart-pre: capture open: {message}");
@@ -426,7 +463,7 @@ fn main() -> ExitCode {
         match spawn_thread("mozart-capture", move || {
             stop_on_fatal(
                 &STOP,
-                guard_panic(move || capture::run(capture_pcm, ring, shared, &STOP)),
+                guard_panic(move || capture::run(capture_pcm, ring, shared, &STOP, capture_probe)),
             )
         }) {
             Ok(handle) => handle,
@@ -498,7 +535,15 @@ fn main() -> ExitCode {
             stop_on_fatal(
                 &STOP,
                 guard_panic(move || {
-                    playback::run(playback_pcm, trunk, rvc_ring, tts_ring, shared, &STOP)
+                    playback::run(
+                        playback_pcm,
+                        trunk,
+                        rvc_ring,
+                        tts_ring,
+                        shared,
+                        &STOP,
+                        playback_probe,
+                    )
                 }),
             )
         }) {
@@ -539,7 +584,11 @@ fn main() -> ExitCode {
     if let Some(handle) = enhancement_handle {
         handles.push(("enhance", handle));
     }
-    let failure = join_threads(handles);
+    let mut failure = join_threads(handles);
+    if let Some(writer) = probe_writer {
+        let probe_failure = aec_probe::finish(writer).err();
+        failure = failure.or(probe_failure);
+    }
     match failure {
         Some(message) => {
             eprintln!("mozart-pre: {message}");
