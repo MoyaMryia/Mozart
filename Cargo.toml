@@ -6,3 +6,8 @@ members = ["core", "dsp", "pre", "daemon", "ctl", "asr", "tts", "bridge", "web-a
 version = "0.1.0"
 edition = "2021"
 license = "MIT"
+
+# 保持 debug 语义（不优化、可断点、backtrace 带行号），只减少调试信息写盘。
+# 板端 8 GB 设备编译与链接更快，产物更小（SPEC-09 部署提速）。
+[profile.dev]
+debug = "line-tables-only"

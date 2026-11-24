@@ -22,10 +22,24 @@ DIRTY=false
 [ -z "$(git -C "$REPO" status --porcelain)" ] || DIRTY=true
 SSH=(ssh -o ConnectTimeout=10 "$TARGET")
 ENVIRONMENT="MOZART_RUNTIME_DIR=$(printf %q "${MOZART_RUNTIME_DIR:-}")"
+# 阶段计时：只打印耗时，不改变部署行为。
+STAGE_START=$SECONDS
+stage() { echo "-- 耗时 $1：$((SECONDS - STAGE_START)) s"; STAGE_START=$SECONDS; }
 
 echo '== 1/5 构建网页（主机）=='
-npm --prefix "$REPO/web" ci
+# 按需 npm ci：依赖未变时跳过安装，只跑构建（SPEC-09）。
+#  stamp 记录上次安装所用的 lock 摘要；--full 或 node_modules 缺失时强制重装。
+lock_hash=$(sha256sum "$REPO/web/package-lock.json" | cut -d' ' -f1)
+stamp="$REPO/web/node_modules/.mozart-npm-ci.sha256"
+if [ "$FULL" = 1 ] || [ ! -d "$REPO/web/node_modules" ] ||
+  [ ! -f "$stamp" ] || [ "$(cat "$stamp")" != "$lock_hash" ]; then
+  npm --prefix "$REPO/web" ci
+  printf '%s\n' "$lock_hash" > "$stamp"
+else
+  echo '依赖未变，跳过 npm ci'
+fi
 npm --prefix "$REPO/web" run build
+stage "1/5 网页"
 
 # 在改动前建立事务记录。回滚脚本不依赖可能已被替换的源码。
 TRANSACTION=$("${SSH[@]}" "$ENVIRONMENT bash -s" <<'INIT'
@@ -166,6 +180,7 @@ for name in mozart-daemon mozart-pre mozart-enhance mozart-rvc mozart-asr mozart
   if pgrep -x "$name"; then echo "仍有活跃进程，停止构建：$name" >&2; exit 1; fi
 done
 STOP
+stage "2/5 同步与停栈"
 
 echo '== 3/5 构建设备程序 =='
 "${SSH[@]}" "FULL=$FULL bash -s" <<'BUILD'
@@ -176,16 +191,23 @@ assets=${MOZART_ASSETS_DIR:-$HOME/mozart-assets}
 if [ -e "$assets/lib/libsherpa-onnx-c-api.so" ]; then export SHERPA_ONNX_LIB_DIR="$assets/lib"; fi
 export LD_LIBRARY_PATH="$assets/lib:$assets/llama${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
 if [ "$FULL" = 1 ]; then cargo clean; fi
-cargo build --workspace --bins --examples --jobs 2 --locked
+t0=$SECONDS
+# 部署只安装 rvc_stub 一个桩，不编其余 examples（SPEC-09 部署提速）。
+cargo build --workspace --bins --example rvc_stub --jobs 2 --locked
+echo "-- 耗时 cargo：$((SECONDS - t0)) s"
+t1=$SECONDS
 cmake --preset jetson-release -DFETCHCONTENT_UPDATES_DISCONNECTED=ON
+# 部署不跑测试：只编运行时两个可执行目标，不随部署编测试程序。
 if [ "$FULL" = 1 ]; then
-  cmake --build --preset jetson-release --parallel 2 --clean-first
+  cmake --build --preset jetson-release --parallel 2 --clean-first --target mozart-rvc mozart-enhance
 else
-  cmake --build --preset jetson-release --parallel 2
+  cmake --build --preset jetson-release --parallel 2 --target mozart-rvc mozart-enhance
 fi
+echo "-- 耗时 cmake：$((SECONDS - t1)) s"
 cp build/jetson-release/rvc/mozart-rvc target/debug/mozart-rvc
 cp build/jetson-release/enhance/mozart-enhance target/debug/mozart-enhance
 BUILD
+stage "3/5 设备构建"
 
 echo '== 4/5 安装并启动 =='
 "${SSH[@]}" "TRANSACTION=$(printf %q "$TRANSACTION") COMMIT=$(printf %q "$COMMIT") DIRTY=$DIRTY FULL=$FULL bash -s" <<'INSTALL'
@@ -260,6 +282,7 @@ read -r lock < "$TRANSACTION/lock"
 rm -f "$lock/owner"
 rmdir "$lock"
 INSTALL
+stage "4/5 安装与启动"
 trap - EXIT INT TERM
 echo "== 5/5 部署完成（${SECONDS} s）=="
 echo "源码：~/Mozart（$COMMIT，dirty=$DIRTY）；构建期间已暂停整栈。"
