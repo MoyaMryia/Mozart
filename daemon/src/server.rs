@@ -642,7 +642,10 @@ fn model_use_reply(ctx: &Ctx, model_id: &str) -> Vec<u8> {
 fn apply_runtime_key(ctx: &Ctx, key: &str, old: &Config) -> Result<(), (String, String)> {
     lock_state_file(&ctx.state_file)
         .remove_key(key)
-        .map_err(|err| (ctl::CODE_INTERNAL.to_string(), err.to_string()))?;
+        .map_err(|err| (
+            ctl::CODE_INTERNAL.to_string(),
+            format!("TOML baseline written; clearing state override failed: {err}; retry config set"),
+        ))?;
     let mut fresh = Config::load_from(ctx.config_path.as_deref())
         .map_err(|err| (ctl::CODE_INTERNAL.to_string(), err.to_string()))?;
     let overrides = lock_state_file(&ctx.state_file).overrides().clone();
@@ -707,7 +710,11 @@ fn config_save_reply(ctx: &Ctx) -> Vec<u8> {
         Ok(saved) => {
             if let Err(err) = state_file.clear() {
                 lock_state(&ctx.state).push_degraded(format!("state file clear: {err}"));
+                return schema::error_body(ctl::CODE_INTERNAL, &format!(
+                    "TOML baseline written; state overrides not cleared: {err}; retry config save"
+                ));
             }
+            lock_state(&ctx.state).clear_degraded_prefix("state file clear:");
             schema::ok_body(json!({"saved": saved}))
         }
         Err(err) => schema::error_body(ctl::CODE_INVALID_ARGUMENT, &err.to_string()),

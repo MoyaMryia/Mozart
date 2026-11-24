@@ -42,6 +42,11 @@ impl QueueError {
     }
 }
 
+enum Edit<T> {
+    Commit(T),
+    NoChange(T),
+}
+
 #[derive(Serialize, Deserialize)]
 struct Snapshot {
     paused: bool,
@@ -152,22 +157,28 @@ impl FileQueue {
             created_unix_ms: now_unix_ms(),
         };
         self.jobs.push(job.clone());
-        self.persist().map_err(QueueError::Io)?;
+        if let Err(err) = self.persist() {
+            self.jobs.pop();
+            return Err(QueueError::Io(err));
+        }
         Ok(job)
     }
 
     pub fn pause(&mut self) -> Result<bool, QueueError> {
-        if !self.paused {
-            self.paused = true;
-            self.persist().map_err(QueueError::Io)?;
-        }
-        Ok(self.paused)
+        self.set_paused(true)
     }
 
     pub fn resume(&mut self) -> Result<bool, QueueError> {
-        if self.paused {
-            self.paused = false;
-            self.persist().map_err(QueueError::Io)?;
+        self.set_paused(false)
+    }
+
+    fn set_paused(&mut self, paused: bool) -> Result<bool, QueueError> {
+        if self.paused != paused {
+            self.paused = paused;
+            if let Err(err) = self.persist() {
+                self.paused = !paused;
+                return Err(QueueError::Io(err));
+            }
         }
         Ok(self.paused)
     }
@@ -179,36 +190,36 @@ impl FileQueue {
         storage: &Storage,
         job_id: &str,
     ) -> Result<FileJobState, QueueError> {
-        let job = self.find(job_id)?;
-        match job.state {
+        let state = self.edit_job(job_id, |job| match job.state {
             FileJobState::Queued => {
                 job.state = FileJobState::Cancelled;
-                self.persist().map_err(QueueError::Io)?;
-                storage.remove_source(job_id);
-                Ok(FileJobState::Cancelled)
+                Ok(Edit::Commit(job.state))
             }
             FileJobState::Processing => {
                 job.state = FileJobState::Cancelling;
-                self.persist().map_err(QueueError::Io)?;
-                Ok(FileJobState::Cancelling)
+                Ok(Edit::Commit(job.state))
             }
-            FileJobState::Cancelling => Ok(FileJobState::Cancelling),
+            FileJobState::Cancelling => Ok(Edit::NoChange(job.state)),
             _ => Err(QueueError::AlreadyFinished(job_id.to_string())),
+        })?;
+        if state == FileJobState::Cancelled {
+            storage.remove_source(job_id);
         }
+        Ok(state)
     }
 
     /// 协调器中止（pre 重启失接管等）：仅 processing → cancelling 并带失败
     /// 原因；其余状态让位，返回当前态。与用户 cancel 的区别在 settle：
     /// 带原因落 failed（原因可查），用户取消无原因仍落 cancelled。
     pub fn abort(&mut self, job_id: &str, reason: String) -> Result<FileJobState, QueueError> {
-        let job = self.find(job_id)?;
-        if job.state != FileJobState::Processing {
-            return Ok(job.state);
-        }
-        job.state = FileJobState::Cancelling;
-        job.error = Some(reason);
-        self.persist().map_err(QueueError::Io)?;
-        Ok(FileJobState::Cancelling)
+        self.edit_job(job_id, |job| {
+            if job.state != FileJobState::Processing {
+                return Ok(Edit::NoChange(job.state));
+            }
+            job.state = FileJobState::Cancelling;
+            job.error = Some(reason);
+            Ok(Edit::Commit(job.state))
+        })
     }
 
     pub fn status(&self, job_id: &str) -> Option<FileJob> {
@@ -257,13 +268,13 @@ impl FileQueue {
     /// 仅 queued → processing。与取消并发（任务已离开 queued）时让位，
     /// 返回 false；调用方不得再 claim GPU。
     pub fn mark_processing(&mut self, job_id: &str) -> Result<bool, QueueError> {
-        let job = self.find(job_id)?;
-        if job.state != FileJobState::Queued {
-            return Ok(false);
-        }
-        job.state = FileJobState::Processing;
-        self.persist().map_err(QueueError::Io)?;
-        Ok(true)
+        self.edit_job(job_id, |job| {
+            if job.state != FileJobState::Queued {
+                return Ok(Edit::NoChange(false));
+            }
+            job.state = FileJobState::Processing;
+            Ok(Edit::Commit(true))
+        })
     }
 
     pub fn mark_completed(
@@ -292,41 +303,58 @@ impl FileQueue {
         error: Option<String>,
         result_ready: bool,
     ) -> Result<FileJobState, QueueError> {
-        let job = self.find(job_id)?;
-        let (state, error) = if job.state == FileJobState::Cancelling {
-            match job.error.take() {
-                Some(reason) => (FileJobState::Failed, Some(reason)),
-                None => (FileJobState::Cancelled, None),
-            }
-        } else {
-            (state, error)
-        };
-        job.state = state;
-        job.error = error;
-        job.result_ready = result_ready && state == FileJobState::Completed;
-        if state == FileJobState::Completed {
-            job.progress = FileProgress {
-                stage: "publish".to_string(),
-                percent: 100,
-                blocks_done: None,
-                blocks_total: None,
+        self.edit_job(job_id, |job| {
+            let (state, error) = if job.state == FileJobState::Cancelling {
+                match job.error.take() {
+                    Some(reason) => (FileJobState::Failed, Some(reason)),
+                    None => (FileJobState::Cancelled, None),
+                }
+            } else {
+                (state, error)
             };
-        }
-        self.persist().map_err(QueueError::Io)?;
-        Ok(state)
+            job.state = state;
+            job.error = error;
+            job.result_ready = result_ready && state == FileJobState::Completed;
+            if state == FileJobState::Completed {
+                job.progress = FileProgress {
+                    stage: "publish".to_string(),
+                    percent: 100,
+                    blocks_done: None,
+                    blocks_total: None,
+                };
+            }
+            Ok(Edit::Commit(state))
+        })
     }
 
     /// worker 阶段进度更新（D5）。
     pub fn set_progress(&mut self, job_id: &str, progress: FileProgress) -> Result<(), QueueError> {
-        self.find(job_id)?.progress = progress;
-        self.persist().map_err(QueueError::Io)
+        self.edit_job(job_id, |job| {
+            job.progress = progress;
+            Ok(Edit::Commit(()))
+        })
     }
 
-    fn find(&mut self, job_id: &str) -> Result<&mut FileJob, QueueError> {
-        self.jobs
-            .iter_mut()
-            .find(|job| job.job_id == job_id)
-            .ok_or_else(|| QueueError::UnknownJob(job_id.to_string()))
+    // The caller holds the queue lock; the new state is published only after rename.
+    fn edit_job<T>(
+        &mut self,
+        job_id: &str,
+        change: impl FnOnce(&mut FileJob) -> Result<Edit<T>, QueueError>,
+    ) -> Result<T, QueueError> {
+        let index = self.jobs.iter().position(|job| job.job_id == job_id)
+            .ok_or_else(|| QueueError::UnknownJob(job_id.to_string()))?;
+        let mut next = self.jobs[index].clone();
+        match change(&mut next)? {
+            Edit::NoChange(value) => Ok(value),
+            Edit::Commit(value) => {
+                let previous = std::mem::replace(&mut self.jobs[index], next);
+                if let Err(err) = self.persist() {
+                    self.jobs[index] = previous;
+                    return Err(QueueError::Io(err));
+                }
+                Ok(value)
+            }
+        }
     }
 
     fn persist(&self) -> io::Result<()> {
@@ -364,6 +392,48 @@ mod tests {
     fn submit(queue: &mut FileQueue, name: &str) -> FileJob {
         let id = queue.reserve_job_id();
         queue.submit(id, name.to_string(), "demo".to_string()).unwrap()
+    }
+
+    #[test]
+    fn failed_writes_do_not_publish_queue_transactions() {
+        let (dir, mut queue, storage) = setup("write-fault", 2);
+        let a = submit(&mut queue, "a.wav");
+        let fault = dir.join(format!("{QUEUE_FILE}.tmp"));
+        let baseline = fs::read(dir.join(QUEUE_FILE)).unwrap();
+        fs::create_dir(&fault).unwrap();
+        let rejected = queue.reserve_job_id();
+        assert!(matches!(queue.submit(rejected.clone(), "b.wav".into(), "demo".into()), Err(QueueError::Io(_))));
+        assert!(queue.status(&rejected).is_none());
+        assert!(matches!(queue.pause(), Err(QueueError::Io(_))));
+        assert!(!queue.paused());
+        assert!(matches!(queue.cancel(&storage, &a.job_id), Err(QueueError::Io(_))));
+        assert!(matches!(queue.mark_processing(&a.job_id), Err(QueueError::Io(_))));
+        assert_eq!(queue.next_queued().as_deref(), Some(a.job_id.as_str()));
+        assert_eq!(fs::read(dir.join(QUEUE_FILE)).unwrap(), baseline);
+        fs::remove_dir(&fault).unwrap();
+        assert!(queue.pause().unwrap());
+        fs::create_dir(&fault).unwrap();
+        assert!(matches!(queue.resume(), Err(QueueError::Io(_))));
+        assert!(queue.paused());
+        fs::remove_dir(&fault).unwrap();
+        assert!(!queue.resume().unwrap());
+        assert!(queue.mark_processing(&a.job_id).unwrap());
+
+        fs::create_dir(&fault).unwrap();
+        let progress = FileProgress { stage: "infer".into(), percent: 50, blocks_done: Some(1), blocks_total: None };
+        assert!(matches!(queue.set_progress(&a.job_id, progress), Err(QueueError::Io(_))));
+        assert!(matches!(queue.abort(&a.job_id, "handoff lost".into()), Err(QueueError::Io(_))));
+        assert!(matches!(queue.mark_completed(&a.job_id, true), Err(QueueError::Io(_))));
+        let pending = queue.status(&a.job_id).unwrap();
+        assert_eq!(pending.state, FileJobState::Processing);
+        assert_eq!(pending.progress.percent, 0);
+        assert!(pending.error.is_none() && !pending.result_ready);
+        fs::remove_dir(&fault).unwrap();
+        queue.mark_completed(&a.job_id, true).unwrap();
+        let restored = FileQueue::load(&dir, 2).unwrap().status(&a.job_id).unwrap();
+        assert_eq!(restored.state, FileJobState::Completed);
+        assert!(restored.result_ready);
+        fs::remove_dir_all(dir).unwrap();
     }
 
     #[test]

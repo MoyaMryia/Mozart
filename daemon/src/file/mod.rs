@@ -139,6 +139,8 @@ fn lock_queue(queue: &Mutex<FileQueue>) -> MutexGuard<'_, FileQueue> {
         .unwrap_or_else(|poisoned| poisoned.into_inner())
 }
 
+const FINISH_QUEUE_REASON: &str = "file queue finish:";
+
 pub struct FileCoordinator {
     queue: Arc<Mutex<FileQueue>>,
     storage: Arc<Storage>,
@@ -154,6 +156,8 @@ pub struct FileCoordinator {
     submit_lock: Mutex<()>,
     /// 在跑任务的 id 与线程句柄：panic 时 finish 不会执行，reap 据 id 落终态。
     job_thread: Mutex<Option<(String, JoinHandle<()>)>>,
+    // Only one job can retire; a failed commit blocks further file scheduling.
+    pending_settlement: Mutex<Option<(String, Outcome)>>,
     /// 当前任务的文件交接标志（与 JobContext 共享）：tick 失接管检测用。
     handoff_active: Arc<AtomicBool>,
     returned_handoff: Arc<Mutex<Option<ReturnedHandoff>>>,
@@ -184,6 +188,7 @@ impl FileCoordinator {
             running,
             submit_lock: Mutex::new(()),
             job_thread: Mutex::new(None),
+            pending_settlement: Mutex::new(None),
             handoff_active: Arc::new(AtomicBool::new(false)),
             returned_handoff: Arc::new(Mutex::new(None)),
             handoff_lost_seen: AtomicBool::new(false),
@@ -204,18 +209,25 @@ impl FileCoordinator {
     pub fn tick(self: &Arc<Self>) {
         self.reap_job_thread();
         let _transition = self.services.transition();
+        if !self.running.load(Ordering::Acquire) {
+            return;
+        }
+        let settled = self.retry_settlement();
+        // finish can release the lease before its thread returns. Do not overwrite that handle.
+        let retiring = self.job_thread.lock().unwrap_or_else(|err| err.into_inner()).is_some();
         self.restore_handoff_on_pre_restart();
         let return_pending = lock_state(&self.state).file_return_pending();
         if return_pending {
             self.advance_file_return();
         }
-        let (owner, desired, active, rvc_ready, reserved) = {
+        let (owner, desired, active, rvc_ready, managed, reserved) = {
             let state = lock_state(&self.state);
             (
                 state.gpu_owner(),
                 state.route_desired(),
                 state.route_active(),
                 state.rvc_ready(),
+                state.output_mode.is_some(),
                 state.output_mode.as_ref().is_some_and(|mode| mode.requested == mozart_core::ctl::schema::OutputMode::Rvc),
             )
         };
@@ -223,9 +235,9 @@ impl FileCoordinator {
             let queue = lock_queue(&self.queue);
             (queue.paused(), queue.next_queued())
         };
-        match arbitrate::next_action(owner, paused || reserved, next.as_deref(), desired, active, rvc_ready) {
+        match arbitrate::next_action(owner, paused || reserved || !settled || retiring, next.as_deref(), desired, active, rvc_ready) {
             arbitrate::Action::StartJob(job_id) => self.start_job(&job_id),
-            arbitrate::Action::ApplyRoute(route) => {
+            arbitrate::Action::ApplyRoute(route) if !managed => {
                 if let Err((code, reason)) = services::route_set_locked(
                     &self.state,
                     &self.services,
@@ -237,7 +249,8 @@ impl FileCoordinator {
                         .push_degraded(format!("file arbiter route apply: {code}: {reason}"));
                 }
             }
-            arbitrate::Action::Idle => {}
+            // The managed state machine alone advances its route phase.
+            arbitrate::Action::ApplyRoute(_) | arbitrate::Action::Idle => {}
         }
     }
 
@@ -433,9 +446,10 @@ impl FileCoordinator {
         // 先绑定结果再匹配：match  scrutinee 的临时锁守卫会活到整个 match 结束。
         let marked = lock_queue(&self.queue).mark_processing(job_id);
         let job = match marked {
-            Ok(true) => lock_queue(&self.queue)
-                .status(job_id)
-                .expect("job just marked processing"),
+            Ok(true) => {
+                lock_state(&self.state).clear_degraded_prefix("file queue mark processing:");
+                lock_queue(&self.queue).status(job_id).expect("job just marked processing")
+            }
             Ok(false) => return,
             Err(err) => {
                 self.report_queue_error("mark processing", err);
@@ -445,7 +459,7 @@ impl FileCoordinator {
         let source = match self.storage.source_path(job_id) {
             Some(path) => path,
             None => {
-                self.settle_failed(job_id, "source copy missing".to_string());
+                self.settle_locked(job_id, Outcome::Failed("source copy missing".to_string()));
                 return;
             }
         };
@@ -486,45 +500,58 @@ impl FileCoordinator {
             }
             Err(err) => {
                 lock_state(&self.state).release_gpu_file();
-                self.settle_failed(job_id, format!("spawn file worker: {err}"));
+                self.settle_locked(job_id, Outcome::Failed(format!("spawn file worker: {err}")));
             }
         }
     }
 
-    /// worker 线程收尾：落终态、清临时、驱逐、释放 GPU（transition 锁内）。
+    /// worker 线程收尾：先尝试提交终态，归还租约独立完成。
     fn finish(&self, job_id: &str, outcome: Outcome) {
         let _transition = self.services.transition();
-        if self.running.load(Ordering::Acquire) {
-            // 与 submit 串行：快照保护集合 → 驱逐 全程持 submit_lock，
-            // 排除并发 submit 的复制/入队，杜绝新排队任务源副本被驱逐。
-            let _submit = self
-                .submit_lock
-                .lock()
-                .unwrap_or_else(|poisoned| poisoned.into_inner());
-            let result_ready =
-                matches!(outcome, Outcome::Completed) && self.storage.result_path(job_id).is_file();
-            let (settled, protected) = {
-                let mut queue = lock_queue(&self.queue);
-                let settled = match &outcome {
-                    Outcome::Completed => queue.mark_completed(job_id, result_ready),
-                    Outcome::Failed(reason) => queue.mark_failed(job_id, reason.clone()),
-                    Outcome::Cancelled => queue.mark_cancelled(job_id),
-                };
-                (settled, queue.unfinished_ids())
-            };
-            match settled {
-                // 取消意图获胜时（含 worker 结果晚到）删源副本。
-                Ok(FileJobState::Cancelled) => self.storage.remove_source(job_id),
-                Ok(_) => {}
-                Err(err) => self.report_queue_error("finish", err),
-            }
-            self.storage.cleanup_temp(job_id);
-            if let Err(err) = self.storage.evict(&protected) {
-                lock_state(&self.state).push_degraded(format!("file storage evict: {err}"));
-            }
-        }
-        // 关停时不落终态：任务保持 processing，重启读回重跑（D3）。
+        self.settle_locked(job_id, outcome);
         self.advance_file_return();
+    }
+
+    fn settle_locked(&self, job_id: &str, outcome: Outcome) {
+        if self.running.load(Ordering::Acquire) {
+            *self.pending_settlement.lock().unwrap_or_else(|err| err.into_inner()) =
+                Some((job_id.to_owned(), outcome));
+            self.retry_settlement();
+        }
+        // 关停时保留 processing 快照，由下次启动重新排队。
+    }
+
+    /// 锁序：transition → pending_settlement → submit_lock → queue。
+    /// 终态未提交时保留源文件及结果，不启动下一文件。
+    fn retry_settlement(&self) -> bool {
+        let mut pending = self.pending_settlement.lock().unwrap_or_else(|err| err.into_inner());
+        let Some((job_id, outcome)) = pending.as_ref() else { return true };
+        let _submit = self.submit_lock.lock().unwrap_or_else(|err| err.into_inner());
+        let (settled, protected) = {
+            let mut queue = lock_queue(&self.queue);
+            let settled = match outcome {
+                Outcome::Completed => queue.mark_completed(job_id, self.storage.result_path(job_id).is_file()),
+                Outcome::Failed(reason) => queue.mark_failed(job_id, reason.clone()),
+                Outcome::Cancelled => queue.mark_cancelled(job_id),
+            };
+            (settled, queue.unfinished_ids())
+        };
+        let mut state = lock_state(&self.state);
+        state.clear_degraded_prefix(FINISH_QUEUE_REASON);
+        if let Err(err) = &settled {
+            state.push_degraded(format!("{FINISH_QUEUE_REASON} {err:?}"));
+            return false;
+        }
+        drop(state);
+        if matches!(settled, Ok(FileJobState::Cancelled)) {
+            self.storage.remove_source(job_id);
+        }
+        self.storage.cleanup_temp(job_id);
+        if let Err(err) = self.storage.evict(&protected) {
+            lock_state(&self.state).push_degraded(format!("file storage evict: {err}"));
+        }
+        *pending = None;
+        true
     }
 
     /// 调用方持 transition 锁；与交接重申、起流和队列调度串行。
@@ -538,14 +565,6 @@ impl FileCoordinator {
             *slot = None;
         }
         lock_state(&self.state).release_gpu_file();
-    }
-
-    fn settle_failed(&self, job_id: &str, reason: String) {
-        match lock_queue(&self.queue).mark_failed(job_id, reason) {
-            Ok(FileJobState::Cancelled) => self.storage.remove_source(job_id),
-            Ok(_) => {}
-            Err(err) => self.report_queue_error("mark failed", err),
-        }
     }
 
     fn report_queue_error(&self, op: &str, err: QueueError) {
@@ -575,12 +594,10 @@ impl FileCoordinator {
         }
     }
 
-    /// panic 收尾：落 failed 带原因、清临时、释放 GPU。驱逐仍归 finish
-    /// （下一个任务收尾时执行），此处不复制那份逻辑。
+    /// panic 也用统一终态提交与租约归还。
     fn recover_panicked_job(&self, job_id: &str, reason: &str) {
         let _transition = self.services.transition();
-        self.settle_failed(job_id, format!("file worker panicked: {reason}"));
-        self.storage.cleanup_temp(job_id);
+        self.settle_locked(job_id, Outcome::Failed(format!("file worker panicked: {reason}")));
         self.advance_file_return();
     }
 }
@@ -988,6 +1005,55 @@ mod tests {
         assert_eq!(code, ctl::CODE_NOT_READY);
         coordinator.shutdown();
         fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn terminal_write_failure_defers_eviction_and_recovers_without_rerunning_job() {
+        let (coordinator, started, release, dir) = setup("finish-write-fault");
+        let first = enqueue(&coordinator, "a.wav");
+        let second = enqueue(&coordinator, "b.wav");
+        let source = coordinator.storage.source_path(&first).unwrap();
+        coordinator.tick();
+        assert_eq!(started.recv_timeout(Duration::from_secs(2)).unwrap(), first);
+        let fault = dir.join(format!("{}.tmp", storage::QUEUE_FILE));
+        fs::create_dir(&fault).unwrap();
+        fs::write(coordinator.storage.result_path(&first), b"result").unwrap();
+        release.send(Outcome::Completed).unwrap();
+        let retired_without_commit = || {
+            let pending = coordinator.pending_settlement.lock().unwrap().is_some();
+            pending && lock_state(&coordinator.state).gpu_owner().is_none()
+        };
+        assert!(wait_until(Duration::from_secs(2), retired_without_commit));
+        coordinator.tick();
+        assert_eq!(lock_queue(&coordinator.queue).state_of(&first), Some(FileJobState::Processing));
+        assert_eq!(lock_queue(&coordinator.queue).state_of(&second), Some(FileJobState::Queued));
+        assert!(source.is_file());
+        assert!(coordinator.storage.result_path(&first).is_file());
+        assert!(lock_state(&coordinator.state).gpu_owner().is_none());
+        fs::remove_dir(&fault).unwrap();
+        assert!(wait_until(Duration::from_secs(2), || {
+            coordinator.tick();
+            lock_queue(&coordinator.queue).state_of(&first) == Some(FileJobState::Completed)
+        }));
+        assert!(lock_queue(&coordinator.queue).status(&first).unwrap().result_ready);
+        assert!(wait_until(Duration::from_secs(2), || {
+            coordinator.tick();
+            lock_queue(&coordinator.queue).state_of(&second) == Some(FileJobState::Processing)
+        }));
+        assert_eq!(started.recv_timeout(Duration::from_secs(2)).unwrap(), second);
+
+        // If shutdown wins before retry, keep the on-disk processing record for restart.
+        fs::create_dir(&fault).unwrap();
+        release.send(Outcome::Failed("second job failed".into())).unwrap();
+        assert!(wait_until(Duration::from_secs(2), retired_without_commit));
+        coordinator.running.store(false, Ordering::Release);
+        fs::remove_dir(&fault).unwrap();
+        coordinator.tick();
+        assert_eq!(lock_queue(&coordinator.queue).state_of(&second), Some(FileJobState::Processing));
+        coordinator.shutdown();
+        let disk = FileQueue::load(&dir, 2).unwrap();
+        assert_eq!(disk.state_of(&second), Some(FileJobState::Queued));
+        fs::remove_dir_all(dir).unwrap();
     }
 
     /// 回归：worker panic 时 finish 不会执行，reap 必须落 failed 并释放 GPU。

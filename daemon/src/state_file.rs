@@ -54,32 +54,37 @@ impl StateFile {
     /// 改一个键并原子落盘。键集合由调用方保证（daemon 只写字幕开关）。
     pub fn set_key(&mut self, key: &str, value: Value) -> io::Result<()> {
         self.overrides.insert(key.to_string(), value);
-        self.save()
+        // The bridge already applied the switch; keep its live value even if saving fails.
+        self.save(&self.overrides)
     }
 
     /// 清该键的状态覆盖（config set 运行时键后调用）；不在则不动盘。
     pub fn remove_key(&mut self, key: &str) -> io::Result<()> {
-        if self.overrides.remove(key).is_some() {
-            self.save()?;
+        if self.overrides.contains_key(key) {
+            let mut next = self.overrides.clone();
+            next.remove(key);
+            self.save(&next)?;
+            self.overrides = next;
         }
         Ok(())
     }
 
     /// config save 后清空：删文件（缺失视为已清）。
     pub fn clear(&mut self) -> io::Result<()> {
-        self.overrides.clear();
         match std::fs::remove_file(&self.path) {
-            Ok(()) => Ok(()),
-            Err(err) if err.kind() == io::ErrorKind::NotFound => Ok(()),
-            Err(err) => Err(err),
+            Ok(()) => {}
+            Err(err) if err.kind() == io::ErrorKind::NotFound => {}
+            Err(err) => return Err(err),
         }
+        self.overrides.clear();
+        Ok(())
     }
 
-    fn save(&self) -> io::Result<()> {
+    fn save(&self, overrides: &BTreeMap<String, Value>) -> io::Result<()> {
         if let Some(dir) = self.path.parent() {
             std::fs::create_dir_all(dir)?;
         }
-        let text = serde_json::to_string_pretty(&self.overrides).map_err(io::Error::other)?;
+        let text = serde_json::to_string_pretty(overrides).map_err(io::Error::other)?;
         atomic_write(&self.path, &text).map_err(|err| io::Error::other(err.to_string()))
     }
 
@@ -178,6 +183,27 @@ mod tests {
         state.clear().unwrap();
         assert!(!path.exists());
         assert!(StateFile::load(path).unwrap().overrides().is_empty());
+    }
+
+    #[test]
+    fn failed_remove_and_clear_keep_override_for_retry() {
+        let path = temp_path("retry-remove");
+        let mut state = StateFile::load(path.clone()).unwrap();
+        let key = "bridge.speech_enabled";
+        state.set_key(key, json!(false)).unwrap();
+        let backup = path.with_extension("backup");
+        std::fs::rename(&path, &backup).unwrap();
+        std::fs::create_dir(&path).unwrap();
+        assert!(state.remove_key(key).is_err());
+        assert_eq!(std::fs::read_dir(path.parent().unwrap()).unwrap().count(), 2,
+            "rename failure must not strand an atomic-write temporary file");
+        assert!(state.clear().is_err());
+        assert_eq!(state.bridge_restore().speech, Some(false));
+        std::fs::remove_dir(&path).unwrap();
+        std::fs::rename(backup, &path).unwrap();
+        state.remove_key(key).unwrap();
+        assert_eq!(StateFile::load(path.clone()).unwrap().bridge_restore().speech, None);
+        std::fs::remove_dir_all(path.parent().unwrap()).unwrap();
     }
 
     #[test]
