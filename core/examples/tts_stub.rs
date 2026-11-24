@@ -22,6 +22,8 @@ fn handle(msg: &Message) -> Vec<u8> {
     }
     match msg.header.type_ {
         ctl::TTS_HELLO => ok(json!({"version": "0.1.0", "stub": true})),
+        ctl::TTS_JOB_STOP if std::env::var_os("MOZART_TTS_STUB_STOP_FAULT")
+            .is_some_and(|path| std::path::Path::new(&path).exists()) => fail(ctl::CODE_NOT_READY, "stop fault"),
         ctl::TTS_JOB_STOP => match serde_json::from_slice::<mozart_core::speech::StopFence>(&msg.body) {
             Ok(fence) => ok(json!({"stopped": true, "cutoff_ns": fence.cutoff_ns})),
             Err(_) => fail(ctl::CODE_INVALID_ARGUMENT, "missing stop fence"),

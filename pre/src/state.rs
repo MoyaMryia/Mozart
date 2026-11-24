@@ -357,6 +357,8 @@ pub struct Shared {
     speaker_state: AtomicU8,
     /// 播报帧播放累计，播放线程累加。
     tts_frames_played: AtomicU64,
+    rvc_playout_gap_frames: AtomicU64,
+    playback_underruns: AtomicU64,
     last_error: Mutex<Option<String>>,
     pub capture_switch: DeviceSwitchSlot,
     pub playback_switch: DeviceSwitchSlot,
@@ -403,6 +405,8 @@ impl Shared {
             ai_skipped: AtomicU64::new(0),
             speaker_state: AtomicU8::new(speaker_code(Speaker::Realtime)),
             tts_frames_played: AtomicU64::new(0),
+            rvc_playout_gap_frames: AtomicU64::new(0),
+            playback_underruns: AtomicU64::new(0),
             last_error: Mutex::new(None),
             capture_switch: DeviceSwitchSlot::new(capture_device),
             playback_switch: DeviceSwitchSlot::new(playback_device),
@@ -620,6 +624,14 @@ impl Shared {
     }
 
     /// 播报帧播放计数（播放线程调用）。
+    pub fn add_rvc_playout_gap(&self) {
+        self.rvc_playout_gap_frames.fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub fn set_playback_underruns(&self, underruns: u64) {
+        self.playback_underruns.store(underruns, Ordering::Relaxed);
+    }
+
     pub fn add_tts_frames_played(&self, frames: u64) {
         self.tts_frames_played.fetch_add(frames, Ordering::Relaxed);
     }
@@ -683,6 +695,8 @@ impl Shared {
             consumer_drops,
             speaker_state: speaker_name(self.speaker_state()).to_string(),
             tts_frames_played: self.tts_frames_played.load(Ordering::Relaxed),
+            rvc_playout_gap_frames: self.rvc_playout_gap_frames.load(Ordering::Relaxed),
+            playback_underruns: self.playback_underruns.load(Ordering::Relaxed),
             file_mode: self.file_mode(),
             mode_asserted: self.mode_asserted(),
             startup_id: self.startup_id.clone(),

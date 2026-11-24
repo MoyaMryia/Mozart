@@ -115,11 +115,12 @@ pub struct Mute {
 }
 
 impl Mute {
+    pub(crate) fn settled(mute: bool) -> Self {
+        Self { target: mute, gain: if mute { 0.0 } else { 1.0 } }
+    }
+
     pub fn new() -> Self {
-        Self {
-            target: false,
-            gain: 1.0,
-        }
+        Self::settled(false)
     }
 
     pub fn request(&mut self, mute: bool) {

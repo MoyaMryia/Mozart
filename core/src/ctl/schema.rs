@@ -57,6 +57,7 @@ pub enum OutputPhase {
     ConfiguringPlayout,
     Routing,
     OpeningSpeech,
+    ReattachingPlayout,
     Applied,
 }
 
@@ -191,6 +192,14 @@ pub enum PlayoutPolicy {
 
 pub const SUPERVISED_PLAYOUT_ENV: &str = "MOZART_SUPERVISED_PLAYOUT";
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PlayoutSetRequest {
+    pub policy: PlayoutPolicy,
+    pub route: Route,
+    pub mute: bool,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PreStatus {
     #[serde(default)]
@@ -216,6 +225,10 @@ pub struct PreStatus {
     /// 播报帧播放累计。旧快照缺此字段按 0 还原。
     #[serde(default)]
     pub tts_frames_played: u64,
+    #[serde(default)]
+    pub rvc_playout_gap_frames: u64,
+    #[serde(default)]
+    pub playback_underruns: u64,
     /// 文件接管状态（PRE_SET_FILE_MODE）：true 时 rvc AI 发送暂停、
     /// output_socket 已释放给 daemon。旧快照缺此字段按 false 还原。
     #[serde(default)]

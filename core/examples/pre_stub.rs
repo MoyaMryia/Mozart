@@ -258,10 +258,15 @@ fn handle(msg: &Message, state: &mut State) -> Vec<u8> {
             ok(json!({"mute": state.mute}))
         }
         ctl::PRE_SET_PLAYOUT => {
-            match serde_json::from_value(body) {
-                Ok(policy) => {
-                    state.playout_policy = policy;
-                    ok(json!({"policy": policy}))
+            match serde_json::from_value::<mozart_core::ctl::schema::PlayoutSetRequest>(body) {
+                Ok(request) => {
+                    state.playout_policy = request.policy;
+                    state.route = match request.route {
+                        mozart_core::ctl::schema::Route::Direct => "direct",
+                        mozart_core::ctl::schema::Route::Rvc => "rvc",
+                    };
+                    state.mute = request.mute;
+                    ok(json!(request))
                 }
                 Err(err) => fail(ctl::CODE_INVALID_ARGUMENT, &err.to_string()),
             }

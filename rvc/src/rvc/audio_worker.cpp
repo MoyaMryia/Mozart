@@ -144,10 +144,10 @@ void AudioWorker::process_loop() {
             output.meta = input.meta;
             output.sample_rate = streaming_->output_sample_rate();
             const size_t frame_samples = streaming_->output_frame_samples();
-            output.valid_samples = static_cast<uint32_t>(frame_samples);
             streaming_->push(input);
             const size_t got =
                 streaming_->pop_output(output.pcm, frame_samples);
+            output.valid_samples = static_cast<uint32_t>(got);
             if (got < frame_samples) {
                 std::fill(output.pcm + got, output.pcm + frame_samples, 0.0f);
             }

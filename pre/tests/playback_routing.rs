@@ -126,6 +126,34 @@ fn confirmed_speech_stop_rejects_delayed_old_frames_and_accepts_new() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+#[test]
+fn rvc_playback_survives_zero_valid_startup_frames() {
+    use mozart_core::ctl::{PRE_SET_FILE_MODE, PRE_SET_ROUTE};
+    let dir = run_dir("rvc-zero-valid");
+    let mut child = spawn_pre(&dir, &null_device_config(&dir));
+    wait_sockets(&dir);
+    let control = Seqpacket::connect(&dir.join("pre.sock")).unwrap();
+    call_ok(&control, PRE_SET_FILE_MODE, 2, br#"{"active":false}"#);
+    call_ok(&control, PRE_SET_ROUTE, 3, br#"{"route":"rvc"}"#);
+    wait_until("实时变声缺样已进入播放路径", Duration::from_secs(3), || {
+        get_status(&control)["rvc_playout_gap_frames"].as_u64().unwrap() > 0
+    });
+    let tx = FrameSocket::<OutputFrame>::connect(&dir.join("rvc-out.sock"), 8).unwrap();
+    let before = get_status(&control)["frames_played"].as_u64().unwrap();
+    for idx in 0..16 {
+        let mut frame = tts_frame(idx);
+        frame.valid_samples = 0;
+        tx.send(&frame).unwrap();
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    wait_until("播放线程可继续推进", Duration::from_secs(2), || {
+        get_status(&control)["frames_played"].as_u64().unwrap() > before + 16
+    });
+    sigterm(&child.0);
+    assert!(wait_exit(&mut child.0, Duration::from_secs(2)).success());
+    std::fs::remove_dir_all(dir).unwrap();
+}
+
 /// 锁文件防重复实例（SPEC-02）：同 run_dir 的第二实例必须立即失败退出，
 /// 错误信息指明已有实例；首实例不受影响。
 #[test]

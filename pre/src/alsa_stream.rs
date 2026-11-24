@@ -36,8 +36,7 @@ fn step<T>(context: &str, result: alsa::Result<T>) -> Result<T, String> {
 
 /// 打开并配置设备：S16_LE、2 ch、48 kHz、RW 交错、`SND_PCM_NONBLOCK`、
 /// start_threshold=1（旧 capture.c / playback.c）。
-/// 采集缓冲 = period × 4；播放缓冲 = max(period × 4, period + 960)，
-/// 后者保证一整帧 960 一次写入可容纳（旧 playback.c:74-76）。
+/// 请求采集缓冲 period × 4；播放额外容纳一整块。
 pub fn open(device: &str, dir: Direction, timestamp: bool) -> Result<PCM, String> {
     // nonblock=true 映射 SND_PCM_NONBLOCK。
     let pcm = step("open", PCM::new(device, dir, true))?;
@@ -60,7 +59,7 @@ pub fn open(device: &str, dir: Direction, timestamp: bool) -> Result<PCM, String
     )? as usize;
     let buffer = match dir {
         Direction::Capture => period * N_PERIODS,
-        Direction::Playback => (period * N_PERIODS).max(period + mozart_core::RAW_SAMPLES),
+        Direction::Playback => period * N_PERIODS + mozart_core::RAW_SAMPLES,
     };
     step(
         "set_buffer_size_near",

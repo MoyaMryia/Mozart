@@ -108,6 +108,163 @@ fn startup_enters_realtime_mode_without_a_user_command() {
     std::fs::remove_dir_all(storage).unwrap();
 }
 
+fn output_mode(conn: &Seqpacket, name: &str) {
+    let body = serde_json::json!({"mode": name}).to_string();
+    let response = call(conn, ctl::DAEMON_OUTPUT_MODE_SET, body.as_bytes());
+    assert_eq!(response.status, "ok", "{}", response.reason);
+    assert_eq!(response.data["requested"], name);
+}
+
+#[test]
+fn known_drained_realtime_modes_switch_without_tts_but_broadcast_waits() {
+    use mozart_core::ctl::schema::{OutputMode, OutputPhase};
+    let storage = std::env::temp_dir().join(format!("mozart-no-tts-file-{}", std::process::id()));
+    let daemon = DaemonProcess::start_file("drained-no-tts", &storage, "", true, &[
+        ("MOZART_STARTUP_MODE", "direct".into()),
+        ("MOZART_TTS_BIN", "/bin/false".into()),
+    ]);
+    let conn = daemon.connect();
+    let applied = |mode| status(&conn).output_mode.is_some_and(|m| m.applied == Some(mode));
+    let window = Duration::from_secs(5);
+    assert!(wait_until(window, || applied(OutputMode::Direct) && status(&conn).asr.is_some()));
+    let startup = status(&conn).asr.unwrap().startup_id;
+    output_mode(&conn, "rvc");
+    assert!(wait_until(window, || applied(OutputMode::Rvc)));
+    output_mode(&conn, "direct");
+    assert!(wait_until(window, || applied(OutputMode::Direct)));
+    output_mode(&conn, "broadcast");
+    assert!(wait_until(window, || status(&conn).output_mode.is_some_and(|m|
+        m.phase == OutputPhase::ClosingSpeech && m.applied.is_none()
+            && m.last_error.is_some_and(|error| error.contains("speech stop fence: tts"))
+    )));
+    assert!(status(&conn).bridge.is_some_and(|bridge| !bridge.speech_enabled && bridge.translate_enabled));
+    output_mode(&conn, "rvc");
+    assert!(wait_until(window, || applied(OutputMode::Rvc)), "unused broadcast fence must be withdrawable");
+    assert!(!status(&conn).degraded.iter().any(|why| why.starts_with("speech stop fence:")));
+    assert_eq!(status(&conn).asr.unwrap().startup_id, startup);
+    drop(daemon);
+    std::fs::remove_dir_all(storage).unwrap();
+}
+
+#[test]
+fn newer_mode_cancels_waiting_realtime_restart_during_unknown_stop() {
+    use mozart_core::ctl::schema::{Activity, OutputMode, Route};
+    let root = std::env::temp_dir().join(format!("mozart-supersede-{}", std::process::id()));
+    std::fs::create_dir(&root).unwrap();
+    let fault = root.join("stop-fault");
+    let log = root.join("stub.log");
+    let daemon = DaemonProcess::start_file("supersede-realtime", &root.join("files"), "", true, &[
+        ("MOZART_STARTUP_MODE", "rvc".into()),
+        ("MOZART_RVC_STUB_STOP_FAULT_FILE", fault.display().to_string()),
+        ("MOZART_STUB_LOG", log.display().to_string()),
+    ]);
+    let conn = daemon.connect();
+    let window = Duration::from_secs(5);
+    let applied = |mode| status(&conn).output_mode.is_some_and(|m| m.applied == Some(mode));
+    assert!(wait_until(window, || applied(OutputMode::Rvc)));
+    let start_prefix = format!("mozart-rvc-stub {} ", ctl::RVC_START_STREAM);
+    let starts = || std::fs::read_to_string(&log).unwrap().lines().filter(|line| line.starts_with(&start_prefix)).count();
+    assert_eq!(starts(), 1);
+    std::fs::write(&fault, "after").unwrap();
+
+    output_mode(&conn, "direct");
+    assert!(wait_until(window, || {
+        let view = status(&conn);
+        view.route.active == Route::Direct && view.arbiter.gpu.owner == Some(Activity::Realtime)
+            && view.degraded.iter().any(|why| why.starts_with("rvc realtime return:"))
+    }));
+    output_mode(&conn, "rvc");
+    assert!(wait_until(window, || status(&conn).route.desired == Route::Rvc));
+    assert_eq!(starts(), 1, "timeout must not release the old lease");
+    output_mode(&conn, "rvc");
+    assert_eq!(status(&conn).route.desired, Route::Rvc, "duplicate intent must not clear its wait slot");
+    output_mode(&conn, "direct");
+    assert_eq!(status(&conn).route.desired, Route::Direct);
+    std::fs::remove_file(fault).unwrap();
+    assert!(wait_until(window, || applied(OutputMode::Direct) && status(&conn).arbiter.gpu.owner.is_none()));
+    assert_eq!(starts(), 1, "old waiting intent must not open another stream");
+    drop(daemon);
+    std::fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn lost_broadcast_open_reply_still_requires_a_real_stop_fence() {
+    use mozart_core::ctl::schema::{OutputMode, OutputPhase};
+    let root = std::env::temp_dir().join(format!("mozart-lost-open-{}", std::process::id()));
+    std::fs::create_dir(&root).unwrap();
+    let open_fault = root.join("lost-open");
+    let stop_fault = root.join("stop-fault");
+    let daemon = DaemonProcess::start_file("mode-lost-open", &root.join("files"), "", true, &[
+        ("MOZART_STARTUP_MODE", "direct".into()),
+        ("MOZART_BRIDGE_STUB_LOST_OPEN_REPLY", open_fault.display().to_string()),
+        ("MOZART_TTS_STUB_STOP_FAULT", stop_fault.display().to_string()),
+    ]);
+    let conn = daemon.connect();
+    let window = Duration::from_secs(5);
+    let applied = |mode| status(&conn).output_mode.is_some_and(|m| m.applied == Some(mode));
+    assert!(wait_until(window, || applied(OutputMode::Direct)));
+    std::fs::write(&open_fault, "").unwrap();
+    output_mode(&conn, "broadcast");
+    assert!(wait_until(window, || {
+        let view = status(&conn);
+        view.bridge.is_some_and(|b| b.speech_enabled)
+            && view.output_mode.is_some_and(|m| m.phase == OutputPhase::OpeningSpeech
+                && m.applied.is_none() && m.last_error.is_some())
+    }), "bridge opened but daemon did not get the ACK");
+
+    std::fs::write(&stop_fault, "").unwrap();
+    output_mode(&conn, "direct");
+    assert!(wait_until(window, || {
+        let view = status(&conn);
+        view.bridge.is_some_and(|b| !b.speech_enabled)
+            && view.output_mode.is_some_and(|m| m.phase == OutputPhase::ClosingSpeech
+                && m.applied.is_none() && m.last_error.is_some_and(|err| err.contains("stop fault")))
+    }), "unknown admission must be fenced before the replacement mode applies");
+    std::fs::remove_file(stop_fault).unwrap();
+    assert!(wait_until(window, || applied(OutputMode::Direct)));
+    assert!(!status(&conn).bridge.unwrap().speech_enabled);
+    drop(daemon);
+    std::fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn restarted_pre_keeps_the_gate_closed_until_realtime_is_ready() {
+    use mozart_core::ctl::schema::{OutputMode, PlayoutPolicy, Route};
+    let root = std::env::temp_dir().join(format!("mozart-pre-gate-{}", std::process::id()));
+    std::fs::create_dir(&root).unwrap();
+    let fault = root.join("rvc-status-fault");
+    let daemon = DaemonProcess::start_file("pre-gate-restart", &root.join("files"), "", true, &[
+        ("MOZART_STARTUP_MODE", "rvc".into()),
+        ("MOZART_RVC_STUB_STATUS_FAIL_FILE", fault.display().to_string()),
+    ]);
+    let conn = daemon.connect();
+    let window = Duration::from_secs(5);
+    assert!(wait_until(window, || status(&conn).output_mode.is_some_and(|m| m.applied == Some(OutputMode::Rvc))));
+    assert_eq!(call(&conn, ctl::DAEMON_MUTE_SET, br#"{"mute":true}"#).status, "ok");
+    std::fs::write(&fault, "").unwrap();
+    assert!(wait_until(window, || status(&conn).rvc.is_none()));
+    let before = status(&conn).processes.pre.pid.unwrap();
+    // SAFETY: the PID is the supervised fixture child.
+    assert_eq!(unsafe { libc::kill(before as i32, libc::SIGKILL) }, 0);
+    assert!(wait_until(window, || {
+        let view = status(&conn);
+        view.processes.pre.pid.is_some_and(|pid| pid != before
+            && view.pre.is_some_and(|pre| pre.startup_id == format!("stub-{pid}")
+                && pre.playout_policy == PlayoutPolicy::Silent))
+            && view.output_mode.is_some_and(|mode| mode.applied.is_none()
+                && mode.phase == mozart_core::ctl::schema::OutputPhase::ReattachingPlayout)
+    }), "pre must not open its startup direct route before RVC is ready");
+    std::fs::remove_file(fault).unwrap();
+    assert!(wait_until(window, || {
+        let view = status(&conn);
+        view.output_mode.is_some_and(|mode| mode.applied == Some(OutputMode::Rvc))
+            && view.pre.is_some_and(|pre| pre.route == Route::Rvc && pre.mute
+                && pre.playout_policy == PlayoutPolicy::RealtimeOnly)
+    }));
+    drop(daemon);
+    std::fs::remove_dir_all(root).unwrap();
+}
+
 #[test]
 fn missing_tts_fence_is_not_success_and_blocks_reopening() {
     let daemon = DaemonProcess::start_full(

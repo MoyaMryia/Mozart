@@ -35,7 +35,7 @@ mod stub_common;
 use mozart_core::config::Config;
 use mozart_core::ctl::{self, Message};
 use mozart_core::dgram::FrameSocket;
-use mozart_core::{FrameMeta, InputFrame, OutputFrame, FRAME_MS, INPUT_SAMPLES, OUTPUT_SAMPLES};
+use mozart_core::{FrameMeta, InputFrame, OutputFrame, FRAME_MS, INPUT_SAMPLES, OUTPUT_SAMPLE_RATE, OUTPUT_SAMPLES};
 use serde_json::{json, Value};
 use std::io::ErrorKind;
 use std::path::PathBuf;
@@ -427,6 +427,14 @@ fn start_file_batch(state: &mut State, body: &Value) -> Result<(), Vec<u8>> {
             "total_frames must be a positive integer (u32)",
         ));
     };
+    let max_samples = total * INPUT_SAMPLES as u64;
+    let samples = match body.get("total_samples") {
+        None => max_samples,
+        Some(value) => match value.as_u64().filter(|&n| (1..=max_samples).contains(&n)) {
+            Some(n) => n,
+            None => return Err(fail(ctl::CODE_INVALID_ARGUMENT, "total_samples exceeds file frame length")),
+        },
+    };
     let rx = FrameSocket::<InputFrame>::bind(&state.input_socket, QUEUE_FRAMES)
         .map_err(|err| fail(ctl::CODE_INTERNAL, &format!("bind input socket: {err}")))?;
     let batch = Batch {
@@ -437,6 +445,7 @@ fn start_file_batch(state: &mut State, body: &Value) -> Result<(), Vec<u8>> {
         rx,
         state.output_socket.clone(),
         total as usize,
+        samples as usize,
         batch.cancel.clone(),
         batch.counters.clone(),
         state.delay,
@@ -451,6 +460,7 @@ fn spawn_batch(
     rx: FrameSocket<InputFrame>,
     output: PathBuf,
     total: usize,
+    samples: usize,
     cancel: Arc<AtomicBool>,
     counters: Arc<Counters>,
     delay: Duration,
@@ -498,15 +508,16 @@ fn spawn_batch(
             Ok(tx) => tx,
             Err(_) => return,
         };
-        for (idx, pcm) in audio.iter().enumerate() {
+        for (idx, pcm) in audio.iter().take(samples.div_ceil(INPUT_SAMPLES)).enumerate() {
             if cancel.load(Ordering::Acquire) {
                 return;
             }
             let mut upsampled = [0f32; OUTPUT_SAMPLES];
-            for (i, slot) in upsampled.iter_mut().enumerate() {
+            let valid = ((samples - idx * INPUT_SAMPLES).min(INPUT_SAMPLES)) * 3;
+            for (i, slot) in upsampled[..valid].iter_mut().enumerate() {
                 *slot = pcm[i / 3];
             }
-            let frame = OutputFrame::new_48k(
+            let frame = OutputFrame::new(
                 FrameMeta {
                     pts_ns: idx as u64 * u64::from(FRAME_MS) * 1_000_000,
                     frame_idx: idx as u32,
@@ -515,6 +526,8 @@ fn spawn_batch(
                     conf: 0,
                     segment_id: 0,
                 },
+                OUTPUT_SAMPLE_RATE,
+                valid as u32,
                 upsampled,
             );
             if tx.send_blocking(&frame).is_err() {

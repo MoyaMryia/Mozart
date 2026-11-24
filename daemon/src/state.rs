@@ -103,6 +103,9 @@ pub struct State {
     route_desired: Route,
     route_active: Route,
     pub(crate) output_mode: Option<OutputModeStatus>,
+    /// True only after supervised startup or a fully confirmed speech stop.
+    /// Cleared before any potentially successful admission request.
+    pub(crate) speech_drained: bool,
     pub(crate) playout_policy: mozart_core::ctl::schema::PlayoutPolicy,
     pub(crate) playout_startup_id: Option<String>,
     route_since_unix_ms: u64,
@@ -142,6 +145,7 @@ impl State {
             route_desired: Route::Direct,
             route_active: Route::Direct,
             output_mode: None,
+            speech_drained: false,
             playout_policy: mozart_core::ctl::schema::PlayoutPolicy::Legacy,
             playout_startup_id: None,
             route_since_unix_ms: now_unix_ms(),

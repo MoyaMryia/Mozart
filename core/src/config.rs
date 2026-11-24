@@ -1585,6 +1585,7 @@ fn write_runtime_key(
 /// 临时文件名含进程号与序号，避免并发写回撞名；rename 原子替换。
 /// 配置基线与运行时状态文件共用此原子写。
 pub fn atomic_write(path: &Path, text: &str) -> Result<(), ConfigError> {
+    use std::io::Write;
     use std::sync::atomic::{AtomicU64, Ordering};
     static SEQ: AtomicU64 = AtomicU64::new(0);
     let dir = path.parent().unwrap_or_else(|| Path::new("."));
@@ -1593,14 +1594,18 @@ pub fn atomic_write(path: &Path, text: &str) -> Result<(), ConfigError> {
         std::process::id(),
         SEQ.fetch_add(1, Ordering::Relaxed)
     ));
-    std::fs::write(&tmp, text).map_err(|source| ConfigError::Write {
-        path: tmp.clone(),
-        source,
-    })?;
-    std::fs::rename(&tmp, path).map_err(|source| ConfigError::Write {
-        path: path.to_path_buf(),
-        source,
-    })?;
+    let mut file = std::fs::OpenOptions::new().write(true).create_new(true).open(&tmp)
+        .map_err(|source| ConfigError::Write { path: tmp.clone(), source })?;
+    if let Err(source) = file.write_all(text.as_bytes()).and_then(|()| file.sync_all()) {
+        drop(file);
+        let _ = std::fs::remove_file(&tmp);
+        return Err(ConfigError::Write { path: tmp, source });
+    }
+    drop(file);
+    if let Err(source) = std::fs::rename(&tmp, path) {
+        let _ = std::fs::remove_file(&tmp);
+        return Err(ConfigError::Write { path: path.to_path_buf(), source });
+    }
     Ok(())
 }
 

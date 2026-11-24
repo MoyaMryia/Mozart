@@ -88,6 +88,35 @@ fn switch_writes_state_and_config_save_promotes_to_baseline() {
 }
 
 #[test]
+fn save_reports_partial_commit_and_retries_retained_overrides() {
+    let daemon = DaemonProcess::start_with_config(
+        "cfg-save-partial", &example("pre_stub"), &example("rvc_stub"), BASELINE,
+    );
+    let conn = daemon.connect();
+    wait_bridge_ready(&conn);
+    assert_eq!(call(&conn, ctl::DAEMON_TRANSLATE_SET, br#"{"enabled":false}"#).status, "ok");
+    let path = state_path(&daemon.dir);
+    let backup = path.with_extension("backup");
+    std::fs::rename(&path, &backup).unwrap();
+    std::fs::create_dir(&path).unwrap();
+
+    let partial = call(&conn, ctl::DAEMON_CONFIG_SAVE, b"{}");
+    assert_eq!(partial.code, ctl::CODE_INTERNAL);
+    assert!(partial.reason.contains("TOML baseline written; state overrides not cleared"));
+    assert_eq!(config_get(&conn, Some("bridge.translate_enabled")).data["value"], false);
+    assert!(path.is_dir());
+    assert!(status(&conn).degraded.iter().any(|reason| reason.starts_with("state file clear:")));
+
+    std::fs::remove_dir(&path).unwrap();
+    std::fs::rename(backup, &path).unwrap();
+    let retry = call(&conn, ctl::DAEMON_CONFIG_SAVE, b"{}");
+    assert_eq!(retry.status, "ok", "{}", retry.reason);
+    assert_eq!(retry.data["saved"], 1);
+    assert!(!path.exists());
+    assert!(!status(&conn).degraded.iter().any(|reason| reason.starts_with("state file clear:")));
+}
+
+#[test]
 fn restart_restores_switches_from_state_file() {
     let mut daemon = DaemonProcess::start_full_fresh(
         "cfg-restore",

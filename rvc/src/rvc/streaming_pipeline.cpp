@@ -204,7 +204,7 @@ bool StreamingRvc::try_process_one(RVCPipelineBase& pipeline)
 
     {
         std::unique_lock<std::mutex> lk(cv_mutex_);
-        window_gen = reset_gen_.load(std::memory_order_relaxed);
+        window_gen = reset_gen_;
 
         // 等待窗口就绪（try_process_one 语义：不等待，仅检查）
         if (cfg_.full_history) {
@@ -254,6 +254,14 @@ bool StreamingRvc::try_process_one(RVCPipelineBase& pipeline)
         have_window_base_ = true;
     }
 
+    // 对齐推理线程的尾部和模型缓存，再处理当前代次的首窗。
+    if (tail_generation_ != window_gen) {
+        tail_generation_ = window_gen;
+        tail_valid_ = false;
+        std::fill(tail_.begin(), tail_.end(), 0.0f);
+        if (cfg_.upstream_realtime) pipeline.reset_realtime();
+    }
+
     // ---- 静音窗：跳过推理，输出等长静音 ----
     if (skip_silence_.load(std::memory_order_relaxed) && !voiced) {
         static std::atomic<uint64_t> skip_logged{0};
@@ -262,8 +270,9 @@ bool StreamingRvc::try_process_one(RVCPipelineBase& pipeline)
         }
         std::fill(tail_.begin(), tail_.end(), 0.0f);
         tail_valid_ = false;
-        push_output_zeros(emit_out_);
-        stats_.skipped_blocks.fetch_add(1, std::memory_order_relaxed);
+        if (publish_output(window_gen, nullptr, emit_out_)) {
+            stats_.skipped_blocks.fetch_add(1, std::memory_order_relaxed);
+        }
         return true;
     }
 
@@ -293,7 +302,7 @@ bool StreamingRvc::try_process_one(RVCPipelineBase& pipeline)
         }
         std::fill(tail_.begin(), tail_.end(), 0.0f);
         tail_valid_ = false;
-        push_output_zeros(emit_out_);
+        publish_output(window_gen, nullptr, emit_out_);
         return true;
     }
     const auto t_pipeline_done = profile::Clock::now();
@@ -312,7 +321,7 @@ bool StreamingRvc::try_process_one(RVCPipelineBase& pipeline)
                 converted.size(), output_start + out_block_);
             std::fill(tail_.begin(), tail_.end(), 0.0f);
             tail_valid_ = false;
-            push_output_zeros(emit_out_);
+            publish_output(window_gen, nullptr, emit_out_);
             return true;
         }
         converted = std::vector<float>(
@@ -330,16 +339,8 @@ bool StreamingRvc::try_process_one(RVCPipelineBase& pipeline)
                      converted.size(), out_block_);
         std::fill(tail_.begin(), tail_.end(), 0.0f);
         tail_valid_ = false;
-        push_output_zeros(emit_out_);
+        publish_output(window_gen, nullptr, emit_out_);
         return true;
-    }
-
-    // 推理期间发生不连续重置：本块属于旧流，丢弃（重置路径已清空输出环）
-    {
-        std::lock_guard<std::mutex> lk(cv_mutex_);
-        if (reset_gen_.load(std::memory_order_relaxed) != window_gen) {
-            return true;
-        }
     }
 
     // ---- 块间对齐和拼接 ----
@@ -378,7 +379,7 @@ bool StreamingRvc::try_process_one(RVCPipelineBase& pipeline)
             spdlog::warn("realtime SOLA: output too short after offset {}", sola_offset);
             std::fill(tail_.begin(), tail_.end(), 0.0f);
             tail_valid_ = false;
-            push_output_zeros(emit_out_);
+            publish_output(window_gen, nullptr, emit_out_);
             return true;
         }
         std::copy_n(
@@ -416,7 +417,7 @@ bool StreamingRvc::try_process_one(RVCPipelineBase& pipeline)
         tail_valid_ = true;
     }
 
-    push_output(emit.data(), emit.size());
+    if (!publish_output(window_gen, emit.data(), emit.size())) return true;
     stats_.blocks.fetch_add(1, std::memory_order_relaxed);
     if (profile::enabled()) {
         const auto t_done = profile::Clock::now();
@@ -449,17 +450,9 @@ void StreamingRvc::inference_loop(RVCPipelineBase& pipeline,
         cfg_.window_samples, hop_in_, cfg_.crossfade_out, cfg_.full_history,
         cfg_.upstream_realtime, cfg_.right_context_samples, cfg_.guard_samples,
         analysis_samples_);
-    uint64_t seen_reset = reset_gen_.load();
     while (running.load(std::memory_order_relaxed)) {
         {
             std::unique_lock<std::mutex> lk(cv_mutex_);
-            if (reset_gen_.load() != seen_reset) {
-                seen_reset = reset_gen_.load();
-                std::fill(tail_.begin(), tail_.end(), 0.0f);
-                tail_valid_ = false;
-                if (cfg_.upstream_realtime) pipeline.reset_realtime();
-                continue;
-            }
             const uint64_t required = next_window_start_ + cfg_.window_samples
                 + cfg_.right_context_samples + cfg_.guard_samples;
             // full-history 超容不再让 readiness 永久为假：try_process_one
@@ -474,11 +467,6 @@ void StreamingRvc::inference_loop(RVCPipelineBase& pipeline,
                 cv_.wait_for(lk, std::chrono::milliseconds(50));
                 continue;
             }
-        }
-        if (reset_gen_.load() != seen_reset) {
-            seen_reset = reset_gen_.load();
-            if (cfg_.upstream_realtime) pipeline.reset_realtime();
-            continue;
         }
         try_process_one(pipeline);
     }
@@ -514,8 +502,11 @@ size_t StreamingRvc::output_pending() const
     return out_size_;
 }
 
-void StreamingRvc::push_output(const float* data, size_t n)
+bool StreamingRvc::publish_output(uint64_t generation, const float* data, size_t n)
 {
+    // Lock order matches reset. Check and commit are one transaction.
+    std::lock_guard<std::mutex> generation_lk(cv_mutex_);
+    if (generation != reset_gen_) return false;
     std::lock_guard<std::mutex> lk(out_mutex_);
     for (size_t i = 0; i < n; ++i) {
         if (out_size_ == kOutRingCapacity) {
@@ -523,15 +514,10 @@ void StreamingRvc::push_output(const float* data, size_t n)
             --out_size_;
             stats_.output_overruns.fetch_add(1, std::memory_order_relaxed);
         }
-        out_ring_[(out_head_ + out_size_) % kOutRingCapacity] = data[i];
+        out_ring_[(out_head_ + out_size_) % kOutRingCapacity] = data ? data[i] : 0.0f;
         ++out_size_;
     }
-}
-
-void StreamingRvc::push_output_zeros(size_t n)
-{
-    std::vector<float> zeros(n, 0.0f);
-    push_output(zeros.data(), n);
+    return true;
 }
 
 } // namespace rvc

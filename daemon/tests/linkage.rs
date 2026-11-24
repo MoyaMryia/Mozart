@@ -131,9 +131,12 @@ fn reconcile_rvc_starts_stream_before_route_after_double_restart() {
             wait_until(Duration::from_secs(10), || {
                 let status = status(&conn);
                 status.processes.rvc.pid.is_some_and(|pid| pid != rvc_pid)
-                    && status.processes.pre.pid.is_some_and(|pid| pid != pre_pid)
+                    && status.processes.pre.pid.is_some_and(|pid| pid != pre_pid
+                        && status.pre.as_ref().is_some_and(|pre|
+                            pre.startup_id == format!("stub-{pid}")
+                                && pre.route == Route::Rvc
+                                && pre.playout_policy == mozart_core::ctl::schema::PlayoutPolicy::Legacy))
                     && status.rvc.as_ref().map(|rvc| rvc.state.as_str()) == Some("streaming")
-                    && status.pre.as_ref().map(|pre| pre.route) == Some(Route::Rvc)
             }),
             "round {round}: route/stream were not reapplied after double restart"
         );
@@ -152,11 +155,12 @@ fn reconcile_rvc_starts_stream_before_route_after_double_restart() {
             "realtime",
         )
         .unwrap_or_else(|| panic!("round {round}: no realtime StartStream:\n{}", lines.join("\n")));
-        let route = command_position(&lines, "mozart-pre-stub", ctl::PRE_SET_ROUTE, "route", "rvc")
-            .unwrap_or_else(|| panic!("round {round}: no SetRoute(rvc):\n{}", lines.join("\n")));
+        let gate = command_position(&lines, "mozart-pre-stub", ctl::PRE_SET_PLAYOUT, "route", "rvc")
+            .unwrap_or_else(|| panic!("round {round}: no atomic playout restore for RVC:\n{}", lines.join("\n")));
+        let legacy_route = command_position(&lines, "mozart-pre-stub", ctl::PRE_SET_ROUTE, "route", "rvc");
         assert!(
-            start < route,
-            "round {round}: reconcile must start the stream before SetRoute(rvc):\n{}",
+            start < gate && legacy_route.is_none_or(|route| start < route),
+            "round {round}: realtime must start before either route assertion:\n{}",
             lines.join("\n")
         );
     }

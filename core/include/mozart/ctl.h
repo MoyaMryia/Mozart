@@ -92,7 +92,7 @@ enum {
     // 体 {"kind":"capture"|"playback","device":string}；运行中热替换采集/播放 ALSA 句柄（SPEC-02）：
     // 先试打开新设备再关旧句柄，失败保留旧设备；切 capture 清半帧并重置 WOLA，切 playback 首帧 10 ms 淡入。
     MOZART_CTL_PRE_SET_DEVICE = 0x0208,
-    MOZART_CTL_PRE_SET_PLAYOUT = 0x0209,  // body: playout policy string; ACK at playback boundary
+    MOZART_CTL_PRE_SET_PLAYOUT = 0x0209,  // body: {policy, route, mute}; ACK at playback boundary
 
     MOZART_CTL_RVC_HELLO        = 0x0301,
     MOZART_CTL_RVC_LOAD_MODEL   = 0x0302,

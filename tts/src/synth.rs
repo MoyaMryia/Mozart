@@ -7,7 +7,7 @@
 use crate::ffi::{self, Synthesizer};
 use crate::jobs::Job;
 use crate::output::FrameWriter;
-use crate::resample::{resample_24k_to_48k, TTS_NATIVE_SAMPLE_RATE};
+use crate::resample::{Upsample2, TTS_NATIVE_SAMPLE_RATE};
 use crate::state::Shared;
 use mozart_core::OUTPUT_SAMPLE_RATE;
 use std::path::{Path, PathBuf};
@@ -24,19 +24,20 @@ const SEG_BUFFER: usize = 4;
 
 /// 每句时长上限（沿用旧 speech_service.py:520，中文按字符）：
 /// min(45, max(4, 字符数 × 0.35 + 2)) 秒。超限拒绝计 failed。
-const DURATION_CAP_MAX_S: f64 = 45.0;
-const DURATION_CAP_MIN_S: f64 = 4.0;
-const DURATION_PER_CHAR_S: f64 = 0.35;
-const DURATION_BASE_S: f64 = 2.0;
+const DURATION_CAP_MAX_MS: usize = 45_000;
+const DURATION_CAP_MIN_MS: usize = 4_000;
+const DURATION_PER_CHAR_MS: usize = 350;
+const DURATION_BASE_MS: usize = 2_000;
 /// 引擎幅度安全上限（沿用旧 clone_worker.py:201-203）：peak > 4 拒绝。
 const PEAK_LIMIT: f32 = 4.0;
 /// 归一化目标峰值（沿用旧 clone_worker.py:204）：gain = min(1, 0.98 / peak)。
 const TARGET_PEAK: f32 = 0.98;
 
-/// 每句时长上限（秒）：按文本字符数估算，夹在 [4, 45]。
-pub fn duration_cap_s(text_chars: usize) -> f64 {
-    (text_chars as f64 * DURATION_PER_CHAR_S + DURATION_BASE_S)
-        .clamp(DURATION_CAP_MIN_S, DURATION_CAP_MAX_S)
+fn duration_cap_samples(text_chars: usize) -> usize {
+    let ms = text_chars.saturating_mul(DURATION_PER_CHAR_MS)
+        .saturating_add(DURATION_BASE_MS)
+        .clamp(DURATION_CAP_MIN_MS, DURATION_CAP_MAX_MS);
+    ms * OUTPUT_SAMPLE_RATE as usize / 1000
 }
 
 /// 合成结果安全校验与归一化（沿用旧 clone_worker.py:195-211）：
@@ -46,7 +47,7 @@ pub fn duration_cap_s(text_chars: usize) -> f64 {
 fn sanitize_segment(
     pcm: &mut [f32],
     sample_rate: u32,
-    cap_s: f64,
+    remaining: &mut usize,
     running_gain: &mut f32,
 ) -> Result<(), String> {
     if pcm.is_empty() {
@@ -55,9 +56,11 @@ fn sanitize_segment(
     if !pcm.iter().all(|v| v.is_finite()) {
         return Err("引擎返回非有限音频（NaN/Inf）".to_string());
     }
-    let duration = pcm.len() as f64 / sample_rate as f64;
-    if duration > cap_s {
-        return Err(format!("合成语音时长 {duration:.1}s 超上限 {cap_s:.1}s，拒绝"));
+    if pcm.len() > *remaining {
+        let rate = sample_rate as f64;
+        let segment = pcm.len() as f64 / rate;
+        let budget = *remaining as f64 / rate;
+        return Err(format!("合成段时长 {segment:.3}s 超上限 {budget:.3}s（本句剩余），拒绝"));
     }
     let peak = pcm.iter().fold(0.0f32, |m, v| m.max(v.abs()));
     if peak > PEAK_LIMIT {
@@ -72,6 +75,7 @@ fn sanitize_segment(
     for v in pcm.iter_mut() {
         *v *= *running_gain;
     }
+    *remaining -= pcm.len();
     Ok(())
 }
 
@@ -79,7 +83,8 @@ fn sanitize_segment(
 #[cfg(test)]
 fn sanitize(pcm: &mut [f32], sample_rate: u32, cap_s: f64) -> Result<(), String> {
     let mut running_gain = 1.0;
-    sanitize_segment(pcm, sample_rate, cap_s, &mut running_gain)
+    let mut remaining = (cap_s * sample_rate as f64) as usize;
+    sanitize_segment(pcm, sample_rate, &mut remaining, &mut running_gain)
 }
 
 /// 句尾闭引号/括号：标点归一化时允许终标点出现在它们之前（沿用旧实现）。
@@ -194,15 +199,6 @@ fn parse_wav(bytes: &[u8]) -> Result<ReferenceAudio, String> {
     })
 }
 
-/// 原生采样率 → 48 kHz 播放采样率。24 kHz 线性插值升采样；48 kHz 直通；其余拒绝。
-fn to_48k(samples: Vec<f32>, rate: u32) -> Result<Vec<f32>, String> {
-    match rate {
-        OUTPUT_SAMPLE_RATE => Ok(samples),
-        TTS_NATIVE_SAMPLE_RATE => Ok(resample_24k_to_48k(&samples)),
-        _ => Err(format!("不支持的 TTS 采样率 {rate} Hz")),
-    }
-}
-
 /// 工作线程入口：加载引擎（失败致命）后进入服务循环。
 /// stop 为进程级 static 标志：真实 FFI 的生成回调跨 C 边界持有它。
 pub fn run(
@@ -250,45 +246,57 @@ pub fn run_with(
         if abort.aborted() { shared.add_stopped(1); continue; }
         shared.set_synthesizing(true);
         let text = precondition(&job.text);
-        let cap_s = duration_cap_s(job.text.chars().count());
+        let budget = duration_cap_samples(job.text.chars().count());
         let rate = engine.sample_rate();
+        let upsample = match rate {
+            OUTPUT_SAMPLE_RATE => false,
+            TTS_NATIVE_SAMPLE_RATE => true,
+            _ => {
+                shared.add_failed(1);
+                shared.set_last_error(&format!("{}: 不支持的 TTS 采样率 {rate} Hz", job.utterance_id));
+                shared.set_synthesizing(false);
+                continue;
+            }
+        };
 
         // 流式：synth 线程经生成回调逐段交付，sink 重采样 + 安全校验后送有界通道；
         //  scoped 输出线程独占 writer 按节拍发帧。通道满时 sink 阻塞反压引擎解码。
         let (seg_tx, seg_rx) = mpsc::sync_channel::<Vec<f32>>(SEG_BUFFER);
-        // 时长上限按累计样本核算：sanitize_segment 逐段以「剩余配额」为上限，段时长
-        // 超剩余等价于累计超整句上限。句内增益单调不增，防止跨段音量跳升。
-        let mut remaining_s = cap_s;
+        // 用累计样本核算时长，包括句末插值样本。句内增益单调不增。
+        let mut remaining_samples = budget;
         let mut running_gain = 1.0f32;
         let mut total_samples = 0usize;
         let mut stream_err: Option<String> = None;
 
         let result = std::thread::scope(|scope| {
             let output = scope.spawn(|| crate::output::write_stream(seg_rx, writer, &abort));
+            let mut resampler = Upsample2::default();
             let result = {
-                let mut sink = |segment: &[f32]| -> bool {
-                    let mut pcm = match to_48k(segment.to_vec(), rate) {
-                        Ok(pcm) => pcm,
-                        Err(reason) => {
-                            stream_err = Some(reason);
-                            return false;
+                let mut submit = |mut pcm: Vec<f32>| -> Result<(), String> {
+                    sanitize_segment(&mut pcm, OUTPUT_SAMPLE_RATE, &mut remaining_samples, &mut running_gain)?;
+                    total_samples += pcm.len();
+                    seg_tx.send(pcm).map_err(|_| "播报输出已停止".to_string())
+                };
+                let result = {
+                    let mut sink = |segment: &[f32]| -> bool {
+                        // The FFI callback only delivers non-empty segments.
+                        let pcm = if upsample { resampler.push(segment) } else { segment.to_vec() };
+                        match submit(pcm) {
+                            Ok(()) => true,
+                            Err(reason) => {
+                                stream_err = Some(reason);
+                                false
+                            }
                         }
                     };
-                    let seg_s = pcm.len() as f64 / OUTPUT_SAMPLE_RATE as f64;
-                    if let Err(reason) = sanitize_segment(
-                        &mut pcm,
-                        OUTPUT_SAMPLE_RATE,
-                        remaining_s,
-                        &mut running_gain,
-                    ) {
-                        stream_err = Some(reason);
-                        return false;
-                    }
-                    remaining_s -= seg_s;
-                    total_samples += pcm.len();
-                    seg_tx.send(pcm).is_ok()
+                    engine.synthesize(&text, ref_samples, ref_rate, &abort, &mut sink)
                 };
-                engine.synthesize(&text, ref_samples, ref_rate, &abort, &mut sink)
+                if result.is_ok() && stream_err.is_none() && !abort.aborted() {
+                    if let Some(tail) = resampler.finish() {
+                        stream_err = submit(vec![tail]).err();
+                    }
+                }
+                result
             };
             // sink 按引用借用 seg_tx（send 取 &self），析构不关闭通道；显式 drop
             // 关闭通道，输出线程排空后退出，再回收 writer 供下一句复用。
@@ -322,7 +330,6 @@ mod tests {
     use super::*;
     use crate::state::Abort;
     use mozart_core::dgram::FrameSocket;
-    use mozart_core::OutputFrame;
     use std::sync::mpsc;
     use std::sync::Arc;
 
@@ -353,10 +360,26 @@ mod tests {
 
     #[test]
     fn duration_cap_clamps_to_bounds() {
-        assert_eq!(duration_cap_s(0), 4.0); // max(4, 2)
-        assert_eq!(duration_cap_s(10), 5.5); // 3.5 + 2
-        assert_eq!(duration_cap_s(100), 37.0); // 35 + 2
-        assert_eq!(duration_cap_s(200), 45.0); // 72 → 夹到 45
+        assert_eq!(duration_cap_samples(0), 192_000);
+        assert_eq!(duration_cap_samples(10), 264_000);
+        assert_eq!(duration_cap_samples(100), 1_776_000);
+        assert_eq!(duration_cap_samples(200), 2_160_000);
+    }
+
+    #[test]
+    fn sample_budget_accepts_the_exact_tail_and_rejects_one_beyond_it() {
+        let mut remaining = 4;
+        let mut gain = 1.0;
+        let mut resampler = Upsample2::default();
+        for mut segment in [resampler.push(&[0.4]), resampler.push(&[0.6])] {
+            sanitize_segment(&mut segment, OUTPUT_SAMPLE_RATE, &mut remaining, &mut gain).unwrap();
+        }
+        assert_eq!(remaining, 1);
+        let mut tail = [resampler.finish().unwrap()];
+        sanitize_segment(&mut tail, OUTPUT_SAMPLE_RATE, &mut remaining, &mut gain).unwrap();
+        assert_eq!(tail, [0.6]);
+        assert_eq!(remaining, 0);
+        assert!(sanitize_segment(&mut [0.1], OUTPUT_SAMPLE_RATE, &mut remaining, &mut gain).is_err());
     }
 
     #[test]

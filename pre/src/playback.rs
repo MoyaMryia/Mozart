@@ -10,20 +10,18 @@ use crate::alsa_stream::{self, Op, StreamError};
 use crate::route::{FadeIn, Mute, Router, FADE_SAMPLES};
 use crate::state::{Shared, Speaker};
 use alsa::Direction;
-use mozart_core::ctl::schema::{PlayoutPolicy, Route};
+use mozart_core::ctl::schema::{PlayoutPolicy, PlayoutSetRequest, Route};
 use mozart_core::ring::Ring;
 use mozart_core::{OutputFrame, RawFrame, OUTPUT_SAMPLES, RAW_SAMPLES, RAW_SAMPLE_RATE};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-/// 帧源等待预算：一个 20 ms 帧周期（主干与 AI 接收环共用）；超时补零续流，
-/// 吸收采集与播放两硬件时钟的漂移。
-const FRAME_WAIT: Duration = Duration::from_millis(20);
+/// 直通由采集定拍；变声和播报由播放硬件定拍。
+const TRUNK_WAIT: Duration = Duration::from_millis(20);
 
-/// 播报连续发帧期的微抖动等待：仅在刚收到过播报帧、尚未进入 holdoff 空窗时使用，
-/// 既可吸收 TTS 跨进程唤醒抖动，又远低于 ALSA 播放缓冲余量（~20 ms），防止周期性欠载。
-const BROADCAST_JITTER_WAIT: Duration = Duration::from_millis(4);
+/// 变声或连续播报只短暂等待跨进程帧，不等待整个播放帧周期。
+const PLAYBACK_JITTER_WAIT: Duration = Duration::from_millis(4);
 
 /// 播报空窗保持时长：TTS 环空后等待后续播报帧的窗口，期间静音实时；
 /// 窗口耗尽恢复实时（SPEC-05 播报投递「播完恢复」）。
@@ -49,7 +47,7 @@ impl SpeakerScheduler {
     /// 实时态与 holdoff 空窗期零等待，由 ALSA 阻塞写独自定拍。
     fn poll_wait(&self) -> Duration {
         if self.state == Speaker::Broadcast && self.holdoff_until.is_none() {
-            BROADCAST_JITTER_WAIT
+            PLAYBACK_JITTER_WAIT
         } else {
             Duration::ZERO
         }
@@ -100,6 +98,8 @@ fn drain_rvc_skipped(rvc: &Ring<OutputFrame>, shared: &Shared) {
 struct BoundaryResampler {
     last_sample: f32,
     last_rate: u32,
+    playout_tail: f32,
+    gap: bool,
 }
 
 impl BoundaryResampler {
@@ -107,34 +107,38 @@ impl BoundaryResampler {
         Self {
             last_sample: 0.0,
             last_rate: 0,
+            playout_tail: 0.0,
+            gap: false,
         }
     }
 
     fn reset(&mut self) {
-        self.last_sample = 0.0;
-        self.last_rate = 0;
+        *self = Self::new();
     }
 
-    fn resample_to_48k(&mut self, frame: &OutputFrame) -> [f32; RAW_SAMPLES] {
+    fn resample_to_48k(&mut self, frame: &OutputFrame) -> ([f32; RAW_SAMPLES], usize) {
         let rate = frame.sample_rate;
         let valid = (frame.valid_samples as usize).min(OUTPUT_SAMPLES);
-        let pcm = frame.pcm;
-        if rate == RAW_SAMPLE_RATE && valid == RAW_SAMPLES {
-            self.last_sample = pcm[RAW_SAMPLES - 1];
-            self.last_rate = rate;
-            return pcm;
-        }
         if valid == 0 || rate == 0 {
-            self.reset();
-            return [0f32; RAW_SAMPLES];
+            self.last_rate = 0;
+            return ([0.0; RAW_SAMPLES], 0);
+        }
+        let mut pcm = frame.pcm;
+        if rate == RAW_SAMPLE_RATE {
+            self.last_sample = pcm[valid - 1];
+            self.last_rate = rate;
+            pcm[valid..].fill(0.0);
+            return (pcm, valid);
         }
         if self.last_rate != rate {
             self.last_sample = pcm[0];
             self.last_rate = rate;
         }
         let mut out = [0f32; RAW_SAMPLES];
-        let step = valid as f64 / RAW_SAMPLES as f64;
-        for (j, slot) in out.iter_mut().enumerate() {
+        // A short native frame covers less than 20 ms; do not stretch it.
+        let count = (valid * RAW_SAMPLE_RATE as usize / rate as usize).min(RAW_SAMPLES);
+        let step = rate as f64 / RAW_SAMPLE_RATE as f64;
+        for (j, slot) in out.iter_mut().take(count).enumerate() {
             let pos = (j as f64) * step - 1.0;
             if pos < 0.0 {
                 let frac = (pos + 1.0) as f32;
@@ -147,7 +151,40 @@ impl BoundaryResampler {
             }
         }
         self.last_sample = pcm[valid - 1];
-        out
+        (out, count)
+    }
+
+    fn render_rvc(&mut self, frame: Option<&OutputFrame>) -> ([f32; RAW_SAMPLES], bool) {
+        let (mut pcm, count) = frame
+            .map(|frame| self.resample_to_48k(frame))
+            .unwrap_or(([0.0; RAW_SAMPLES], 0));
+        if count == 0 {
+            pcm[..FADE_SAMPLES].fill(self.playout_tail);
+            fade_out(&mut pcm[..FADE_SAMPLES]);
+        } else {
+            if self.gap {
+                let len = count.min(FADE_SAMPLES);
+                for (i, sample) in pcm[..len].iter_mut().enumerate() {
+                    *sample *= (i + 1) as f32 / len as f32;
+                }
+            }
+            if count < RAW_SAMPLES {
+                fade_out(&mut pcm[count.saturating_sub(FADE_SAMPLES)..count]);
+            }
+        }
+        self.gap = count < RAW_SAMPLES;
+        if self.gap {
+            self.last_rate = 0;
+        }
+        self.playout_tail = pcm[RAW_SAMPLES - 1];
+        (pcm, self.gap)
+    }
+}
+
+fn fade_out(samples: &mut [f32]) {
+    let len = samples.len() as f32;
+    for (i, sample) in samples.iter_mut().enumerate() {
+        *sample *= 1.0 - (i + 1) as f32 / len;
     }
 }
 
@@ -204,7 +241,7 @@ fn step_broadcast(
                 let tail = rvc
                     .pop(Some(Duration::ZERO))
                     .map_or([0f32; RAW_SAMPLES], |frame| {
-                        rvc_resampler.resample_to_48k(&frame)
+                        rvc_resampler.render_rvc(Some(&frame)).0
                     });
                 drain_rvc_skipped(rvc, shared);
                 rvc_resampler.reset();
@@ -236,7 +273,7 @@ fn select_speech(tagged: mozart_core::SpeechFrame, cutoff: u64) -> Option<Output
     (tagged.issued_ns >= cutoff).then_some(tagged.frame)
 }
 
-/// 避免与 tts.pop(FRAME_WAIT) 叠加成两帧等待。
+/// 播报刚结束时跳过实时取帧等待。
 fn step_realtime(
     prev: Speaker,
     trunk: &Ring<RawFrame>,
@@ -245,14 +282,11 @@ fn step_realtime(
     router: &mut Router,
     rvc_resampler: &mut BoundaryResampler,
 ) -> [f32; RAW_SAMPLES] {
-    let wait = if prev == Speaker::Broadcast {
-        Duration::ZERO
-    } else {
-        FRAME_WAIT
-    };
+    let resumed = prev == Speaker::Broadcast;
     let mut mono = match router.route() {
         Route::Direct => {
             // packed 字段按值整块搬出，不取引用。
+            let wait = if resumed { Duration::ZERO } else { TRUNK_WAIT };
             let pcm = match trunk.pop(Some(wait)) {
                 Some(frame) => frame.pcm,
                 // 主干欠载：补零续流。属两时钟漂移吸收，不计为丢弃。
@@ -266,19 +300,42 @@ fn step_realtime(
         Route::Rvc => {
             // rvc 路由不消费主干；逐帧排空防积压。
             let _ = trunk.pop(Some(Duration::ZERO));
-            // AI 接收环缺帧补零续流（大缓冲与欠载补零归 C++ 侧，SPEC-03）。
-            match rvc.pop(Some(wait)) {
-                Some(frame) => rvc_resampler.resample_to_48k(&frame),
-                None => {
-                    rvc_resampler.reset();
-                    [0f32; RAW_SAMPLES]
-                }
+            let wait = if resumed { Duration::ZERO } else { PLAYBACK_JITTER_WAIT };
+            let frame = rvc.pop(Some(wait));
+            let (pcm, gap) = rvc_resampler.render_rvc(frame.as_ref());
+            if gap {
+                shared.add_rvc_playout_gap();
             }
+            pcm
         }
     };
     router.apply(&mut mono);
     apply_speaker_fade(prev, Speaker::Realtime, &mut mono, &[0f32; RAW_SAMPLES]);
     mono
+}
+
+/// Apply a route before acknowledging a real-time gate. From silence no old
+/// source needs fading out, and a restored mute takes effect before any PCM.
+fn configure_at_boundary(
+    router: &mut Router,
+    mute: &mut Mute,
+    fade_in: &mut FadeIn,
+    previous: PlayoutPolicy,
+    request: PlayoutSetRequest,
+) -> bool {
+    let opening_from_silence = previous == PlayoutPolicy::Silent
+        && request.policy != PlayoutPolicy::Silent;
+    let resuming_realtime = previous == PlayoutPolicy::BroadcastOnly
+        && request.policy == PlayoutPolicy::RealtimeOnly;
+    if opening_from_silence || resuming_realtime {
+        *router = Router::new(request.route);
+        *mute = Mute::settled(request.mute);
+        fade_in.trigger();
+    } else {
+        router.request(request.route);
+        mute.request(request.mute);
+    }
+    request.policy != PlayoutPolicy::RealtimeOnly || router.route() == request.route
 }
 
 /// 播放线程主体。返回 Err 表示致命流错误；主线程据此退出进程。
@@ -297,15 +354,13 @@ pub fn run(
     let mut fade_in = FadeIn::new();
     let mut speaker = SpeakerScheduler::new();
     let mut previous_speaker = Speaker::Realtime;
+    let mut previous_policy = PlayoutPolicy::Silent;
     let mut rvc_resampler = BoundaryResampler::new();
     let mut underruns = 0u64;
     let mut reported = 0u64;
     loop {
         // This boundary follows the previous ALSA write. Acknowledgement here
         // precedes selection using the installed cutoff.
-        let request = shared.playback_request.load(Ordering::SeqCst);
-        let policy = shared.playout_policy();
-        shared.playback_ack.store(request, Ordering::SeqCst);
         if shared.playback_switch.has_pending() {
             let timestamp = probe.is_some();
             shared.playback_switch.apply_pending(
@@ -331,9 +386,15 @@ pub fn run(
             shared.set_last_error(&message);
             message
         })?;
-        // 命令目标在帧边界读入状态机；不持任何锁（原子读）。
-        router.request(shared.route_target());
-        mute.request(shared.mute_target());
+        // Read the request before its fields so a new command cannot get a
+        // playback ACK based on an older route snapshot.
+        let request_id = shared.playback_request.load(Ordering::SeqCst);
+        let policy = shared.playout_policy();
+        let request = PlayoutSetRequest { policy, route: shared.route_target(), mute: shared.mute_target() };
+        if configure_at_boundary(&mut router, &mut mute, &mut fade_in, previous_policy, request) {
+            shared.playback_ack.store(request_id, Ordering::SeqCst);
+        }
+        previous_policy = policy;
 
         // 播报优先：仅播报连续发帧期给微抖动等待，holdoff 空窗期与实时态零等待。
         let tts_allowed = matches!(policy, PlayoutPolicy::Legacy | PlayoutPolicy::BroadcastOnly);
@@ -401,6 +462,7 @@ pub fn run(
         }
         if underruns > reported {
             reported = underruns;
+            shared.set_playback_underruns(underruns);
             let message = format!("playback underrun recovered (total {underruns})");
             shared.set_last_error(&message);
             eprintln!("mozart-pre: {message}");
@@ -478,7 +540,7 @@ mod tests {
     fn frame_wait_matches_frame_period() {
         // 等待预算等于一个契约帧周期（frame.h：960 样本 @ 48 kHz）。
         let frame_ms = RAW_SAMPLES as u64 * 1000 / mozart_core::RAW_SAMPLE_RATE as u64;
-        assert_eq!(FRAME_WAIT, Duration::from_millis(frame_ms));
+        assert_eq!(TRUNK_WAIT, Duration::from_millis(frame_ms));
     }
 
     #[test]
@@ -598,7 +660,7 @@ mod tests {
         assert_eq!(scheduler.poll_wait(), Duration::ZERO);
 
         assert_eq!(scheduler.advance(true, t0), Speaker::Broadcast);
-        assert_eq!(scheduler.poll_wait(), BROADCAST_JITTER_WAIT);
+        assert_eq!(scheduler.poll_wait(), PLAYBACK_JITTER_WAIT);
 
         // 进入 holdoff 空窗后立刻退回零等待，避免空等叠加 ALSA 阻塞写导致 underrun。
         assert_eq!(
@@ -612,7 +674,7 @@ mod tests {
             scheduler.advance(true, t0 + Duration::from_millis(40)),
             Speaker::Broadcast
         );
-        assert_eq!(scheduler.poll_wait(), BROADCAST_JITTER_WAIT);
+        assert_eq!(scheduler.poll_wait(), PLAYBACK_JITTER_WAIT);
         assert_eq!(
             scheduler.advance(false, t0 + Duration::from_millis(60)),
             Speaker::Broadcast
@@ -638,7 +700,7 @@ mod tests {
         let mut pcm48 = [0.0f32; OUTPUT_SAMPLES];
         pcm48[0] = 0.25;
         pcm48[959] = -0.5;
-        let out48 = resampler.resample_to_48k(&OutputFrame::new_48k(meta, pcm48));
+        let out48 = resampler.resample_to_48k(&OutputFrame::new_48k(meta, pcm48)).0;
         assert_eq!(out48[0], 0.25);
         assert_eq!(out48[959], -0.5);
 
@@ -646,7 +708,7 @@ mod tests {
         for i in 0..800 {
             pcm40[i] = i as f32 / 800.0;
         }
-        let out40 = resampler.resample_to_48k(&OutputFrame::new(meta, 40000, 800, pcm40));
+        let out40 = resampler.resample_to_48k(&OutputFrame::new(meta, 40000, 800, pcm40)).0;
         assert_eq!(out40.len(), RAW_SAMPLES);
         assert!(out40.iter().all(|v| v.is_finite()));
         assert!((out40[0] - 0.0).abs() < 1e-6);
@@ -674,7 +736,7 @@ mod tests {
         for slot in pcm32[640..].iter_mut() {
             *slot = 99.0;
         }
-        let out = resampler.resample_to_48k(&OutputFrame::new(meta, 32000, 640, pcm32));
+        let out = resampler.resample_to_48k(&OutputFrame::new(meta, 32000, 640, pcm32)).0;
         assert_eq!(out.len(), RAW_SAMPLES);
         assert!(out.iter().all(|v| v.is_finite()));
         assert!(
@@ -694,14 +756,14 @@ mod tests {
         for (i, slot) in pcm40.iter_mut().enumerate().take(800) {
             *slot = 0.5 + i as f32 / 1600.0;
         }
-        let out40 = resampler.resample_to_48k(&OutputFrame::new(meta, 40000, 800, pcm40));
+        let out40 = resampler.resample_to_48k(&OutputFrame::new(meta, 40000, 800, pcm40)).0;
         assert!(
             (out40[0] - 0.5).abs() < 1e-6,
             "换率首帧必须从新率首样本起插值"
         );
 
         // valid_samples = 0：输出静音并重置历史。
-        let silent = resampler.resample_to_48k(&OutputFrame::new(meta, 32000, 0, pcm32));
+        let silent = resampler.resample_to_48k(&OutputFrame::new(meta, 32000, 0, pcm32)).0;
         assert!(silent.iter().all(|v| *v == 0.0));
     }
 
@@ -723,6 +785,69 @@ mod tests {
         assert!((back[0] - 0.8 / FADE_SAMPLES as f32).abs() < 1e-6);
         assert_eq!(back[FADE_SAMPLES - 1], 0.8);
         assert_eq!(back[RAW_SAMPLES - 1], 0.8);
+    }
+
+    #[test]
+    fn entering_realtime_from_silent_or_broadcast_does_not_open_the_old_route() {
+        for previous in [PlayoutPolicy::Silent, PlayoutPolicy::BroadcastOnly] {
+            let mut router = Router::new(Route::Direct);
+            let mut mute = Mute::new();
+            let mut fade = FadeIn::new();
+            assert!(configure_at_boundary(&mut router, &mut mute, &mut fade, previous,
+                PlayoutSetRequest { policy: PlayoutPolicy::RealtimeOnly, route: Route::Rvc, mute: true }));
+            assert_eq!(router.route(), Route::Rvc);
+            let mut pcm = [0.8; RAW_SAMPLES];
+            mute.apply(&mut pcm);
+            assert!(pcm.iter().all(|&sample| sample == 0.0));
+        }
+    }
+
+    #[test]
+    fn realtime_gate_waits_for_an_audible_old_route_to_fade() {
+        let mut router = Router::new(Route::Direct);
+        let mut mute = Mute::new();
+        let mut fade = FadeIn::new();
+        let request = PlayoutSetRequest { policy: PlayoutPolicy::RealtimeOnly, route: Route::Rvc, mute: false };
+        assert!(!configure_at_boundary(&mut router, &mut mute, &mut fade, PlayoutPolicy::RealtimeOnly, request));
+        let mut pcm = [0.8; RAW_SAMPLES];
+        router.apply(&mut pcm);
+        assert_eq!(pcm[RAW_SAMPLES - 1], 0.0);
+        assert!(configure_at_boundary(&mut router, &mut mute, &mut fade, PlayoutPolicy::RealtimeOnly, request));
+        assert_eq!(router.route(), Route::Rvc);
+    }
+
+    #[test]
+    fn rvc_playout_fades_over_missing_and_resumed_frames() {
+        let mut rvc = BoundaryResampler::new();
+        let meta = FrameMeta { pts_ns: 0, frame_idx: 0, vad_flag: 1, energy_db: 0, conf: 0, segment_id: 0 };
+        let full = OutputFrame::new_48k(meta, [0.75; OUTPUT_SAMPLES]);
+        assert!(!rvc.render_rvc(Some(&full)).1);
+        let zero_valid = OutputFrame::new(meta, RAW_SAMPLE_RATE, 0, [0.8; OUTPUT_SAMPLES]);
+        let (gap, short) = rvc.render_rvc(Some(&zero_valid));
+        assert!(short);
+        assert!(gap[0] > 0.74);
+        assert_eq!(gap[FADE_SAMPLES - 1], 0.0);
+        assert!(gap.windows(2).all(|w| (w[1] - w[0]).abs() < 0.002));
+        let (still_missing, short) = rvc.render_rvc(None);
+        assert!(short && still_missing.iter().all(|&sample| sample == 0.0));
+        let (resumed, short) = rvc.render_rvc(Some(&full));
+        assert!(!short);
+        assert!(resumed[0] < 0.002);
+        assert_eq!(resumed[FADE_SAMPLES - 1], 0.75);
+        assert!(resumed.windows(2).all(|w| (w[1] - w[0]).abs() < 0.002));
+
+        let short = OutputFrame::new(meta, 40000, 600, [0.75; OUTPUT_SAMPLES]);
+        let (partial, gap) = rvc.render_rvc(Some(&short));
+        assert!(gap);
+        assert_eq!(partial[0], 0.75);
+        assert!(partial[718] > 0.0);
+        assert!(partial[719..].iter().all(|&sample| sample == 0.0));
+
+        let short_48k = OutputFrame::new(meta, RAW_SAMPLE_RATE, 100, [0.75; OUTPUT_SAMPLES]);
+        let (raw, count) = rvc.resample_to_48k(&short_48k);
+        assert_eq!(count, 100);
+        assert_eq!(raw[99], 0.75);
+        assert!(raw[100..].iter().all(|&sample| sample == 0.0));
     }
 
     #[test]

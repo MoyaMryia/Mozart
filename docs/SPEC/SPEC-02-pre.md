@@ -85,11 +85,18 @@
 
 ## 改进点
 
-- 淡变逻辑加重入保护，参数做边界校验。（`pre/src/route.rs:72-75`）
-- 实时原生多采样率（播放端）：播放采样率固定 48 kHz，不按流协商。`BoundaryResampler` 在播放线程入口把模型原生帧重采样到 48 kHz，只取 `valid_samples` 有效段；`sample_rate` 48000 且 `valid_samples` 960 时直通。覆盖 32k/40k/48k 与运行中切率。主条见 SPEC-03。（`pre/src/playback.rs:85-137,198-209`，单测 `:400-478`）
-- `BoundaryResampler` 实时线程约束：栈数组进出，无锁、无阻塞、无分配，播放循环前预创建。采样率变化时以新帧首样本重置插值历史；缺帧与切回 direct 时 reset 清零。（`pre/src/playback.rs:103-136,155,195,205`）
-- 播放设备必须给到 48 kHz：`set_rate_near` 返回值不等于 48000 即报错退出，由 daemon 退避重启。设备不支持 48 kHz 时不在播放侧改率。（`pre/src/alsa_stream.rs:46-51`）
-- 播报分时取帧与切换淡变：`Speaker::Broadcast` 连续发帧期以 4 ms 微抖动等待吸收 TTS 跨进程唤醒抖动，进入 `holdoff` 空窗与实时态立即退回零等待，由 ALSA 写定拍以防抽干硬件缓冲；`Realtime ↔ Broadcast` 切换做 10 ms（`FADE_SAMPLES`）线性淡变；播报期隔离 `Router` 淡变并重置 `BoundaryResampler` 插值历史。（`pre/src/playback.rs`）
-- 音频设备热切换（`PRE_SET_DEVICE` `0x0208`）：采集与播放线程在循环边界支持热替换 ALSA PCM 句柄，先试打开新设备再关旧句柄，失败保留旧设备继续运行并回错；切 `capture` 时清空半帧采集缓冲、触发处理线程重置 WOLA 降噪状态（UL-UNAS 同步随 `capture_epoch` 重置）并拒绝 `capture_file` 模式；切 `playback` 时首帧执行 10 ms 线性淡入消杂音；支持 `--effective-capture-device` / `--effective-playback-device` 供崩溃自愈沿用临时设备；物理拔线仍按 `Fatal` 退出。（`pre/src/state.rs`、`pre/src/control.rs`、`pre/src/capture.rs`、`pre/src/playback.rs`、`pre/tests/set_device.rs`；板端通过 `snd-aloop` 跨子设备通音及 USB 麦打开验证，真实扬声器切口主观听感未验证——阻塞原因：无物理扬声器实听环境，解除条件：接物理扬声器热切 `playback` 并人工试听切口有无爆音）
-- 扬声器主模式门控：`PRE_SET_PLAYOUT` 在播放帧边界确认策略。托管播报模式只输出 TTS，空窗补零；托管实时变声与直出模式不播放 TTS。pre 受监管重启时静音待断言，旧命令退出托管后恢复原分时。
-- [ ] 实时播放缓冲余量与欠载平滑（衔接 SPEC-03 实时衔接步骤 2）：当前播放 ALSA 硬件缓冲为 `max(period × 4, period + 960) = 1024` 样本（`21.3 ms`），仅比单帧 `960` 样本（`20 ms`）多 `64` 样本（`1.33 ms`）；当 RVC 接收环等待或调度微抖动时极易触发硬件 `EPIPE` underrun（实测 30 s 出现 6 次），且 `rvc.pop` 超时直接写入 20 ms 全零并重置重采样器会产生方波缺口咔嗒声。优化：适度增大播放侧 ALSA 硬件缓冲周期余量（避免单帧写完仅剩 1.33 ms），并在 RVC 接收环短时欠载时对上一帧末尾做短淡出归零，恢复来帧时短淡入。验收：单测覆盖欠载过渡无单样本满幅阶跃；板端 30 s 实时变声 `pre.log` 播放 underrun 计数为 0。
+- [x] 受监管 pre 静音启动，重接 `PRE_SET_PLAYOUT` 在同一请求携带路由、静音和播放策略。实时播放确认前选定正确路由；后台未就绪时保持静音，daemon 报告 `reattaching_playout`。
+- [x] 零有效样本的 48 kHz 帧进入欠载淡出，不索引 PCM。 见[本机回归](../../reports/postprocessing-stability-20261124/RESULTS.md)。
+
+- [x] 播放连续性：按有效样本数区别后端补零，缺样淡出、恢复淡入；短帧保持原采样率比例。变声取帧等待上限 4 ms；播放缓冲请求 `period × 4 + 960` 样本。`rvc_playout_gap_frames` 与 ALSA 的 `playback_underruns` 分开报告。单测覆盖完整缺帧、恢复和短帧。
+
+- [x] 禁用降噪时跳过全部计算。（`dsp/src/lib.rs:88-93`）
+- [x] 淡变逻辑加重入保护，参数做边界校验。（`pre/src/route.rs:72-75`）
+- [x] 拆开旧单体主程序。（pre 与 dsp 分 crate）
+- [x] 实时原生多采样率（播放端）：播放采样率固定 48 kHz，不按流协商。`BoundaryResampler` 在播放线程入口把模型原生帧重采样到 48 kHz，只取 `valid_samples` 有效段；`sample_rate` 48000 且 `valid_samples` 960 时直通。覆盖 32k/40k/48k 与运行中切率。主条见 SPEC-03。（`pre/src/playback.rs:85-137,198-209`，单测 `:400-478`）
+- [x] `BoundaryResampler` 实时线程约束：栈数组进出，无锁、无阻塞、无分配，播放循环前预创建。采样率变化时以新帧首样本重置插值历史；缺帧与切回 direct 时 reset 清零。（`pre/src/playback.rs:103-136,155,195,205`）
+- [x] 播放设备必须给到 48 kHz：`set_rate_near` 返回值不等于 48000 即报错退出，由 daemon 退避重启。设备不支持 48 kHz 时不在播放侧改率。（`pre/src/alsa_stream.rs:46-51`）
+- [x] 播报分时取帧与切换淡变：`Speaker::Broadcast` 连续发帧期以 4 ms 微抖动等待吸收 TTS 跨进程唤醒抖动，进入 `holdoff` 空窗与实时态立即退回零等待，由 ALSA 写定拍以防抽干硬件缓冲；`Realtime ↔ Broadcast` 切换做 10 ms（`FADE_SAMPLES`）线性淡变；播报期隔离 `Router` 淡变并重置 `BoundaryResampler` 插值历史。（`pre/src/playback.rs`）
+- [x] 音频设备热切换（`PRE_SET_DEVICE` `0x0208`）：采集与播放线程在循环边界支持热替换 ALSA PCM 句柄，先试打开新设备再关旧句柄，失败保留旧设备继续运行并回错；切 `capture` 时清空半帧采集缓冲、触发处理线程重置 WOLA 降噪状态（UL-UNAS 同步随 `capture_epoch` 重置）并拒绝 `capture_file` 模式；切 `playback` 时首帧执行 10 ms 线性淡入消杂音；支持 `--effective-capture-device` / `--effective-playback-device` 供崩溃自愈沿用临时设备；物理拔线仍按 `Fatal` 退出。（`pre/src/state.rs`、`pre/src/control.rs`、`pre/src/capture.rs`、`pre/src/playback.rs`、`pre/tests/set_device.rs`；板端通过 `snd-aloop` 跨子设备通音及 USB 麦打开验证，真实扬声器切口主观听感未验证——阻塞原因：无物理扬声器实听环境，解除条件：接物理扬声器热切 `playback` 并人工试听切口有无爆音）
+- [x] 扬声器主模式门控：`PRE_SET_PLAYOUT` 在播放帧边界确认策略。托管播报模式只输出 TTS，空窗补零；托管实时变声与直出模式不播放 TTS。pre 受监管重启时静音待断言，旧命令退出托管后恢复原分时。
+- [ ] 板端验收播放缓冲余量（衔接 SPEC-03 实时衔接步骤 2）：旧配置的 30 s 实时变声记录有 6 次 ALSA 播放欠载。需要 Jetson 采播设备窗口，使用同一输入重测；验收仍为 30 s 内 ALSA 播放欠载为 0。另记录 RVC 后端欠载和播放缺帧，不能用短淡变掩盖计数。

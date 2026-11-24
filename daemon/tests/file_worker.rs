@@ -115,6 +115,23 @@ impl Drop for Harness {
 }
 
 #[test]
+fn file_wav_preserves_a_partial_last_frame() {
+    let h = Harness::new("worker-partial-tail", "", &[]);
+    let source = h.daemon.dir.join("partial.wav");
+    let pcm = write_wav_samples(&source, 16017, 16000);
+    let reply = submit_file(&h.conn, &source, Some("demo"));
+    assert_eq!(reply.status, "ok", "{}", reply.reason);
+    let job_id = reply.data["job_id"].as_str().unwrap();
+    wait_job_state(&h.conn, job_id, FileJobState::Completed, JOB_TIMEOUT);
+    let wav = read_wav(&h.result(job_id));
+    assert_eq!(wav.sample_rate, 48000);
+    assert_eq!(wav.samples.len(), 48051, "do not publish transport padding");
+    assert!(pcm[16016] != 0);
+    assert!((wav.samples[48050] - f32::from(pcm[16016]) / 32768.0).abs() < 1e-6);
+    h.assert_gpu_free();
+}
+
+#[test]
 fn plain_job_publishes_wav_with_converted_audio() {
     let h = Harness::new("worker-plain", "", &[]);
     // 1 s 16 kHz：解码不重采样，样本值可逐一对拍。
@@ -582,7 +599,10 @@ fn pre_restart_during_file_job_recovers_and_completes() {
 
 /// 生成 PCM16 单声道正弦 WAV（测试源，留在临时目录不入库），返回样本值。
 fn write_wav(path: &Path, seconds: u32, sample_rate: u32) -> Vec<i16> {
-    let count = (seconds * sample_rate) as usize;
+    write_wav_samples(path, (seconds * sample_rate) as usize, sample_rate)
+}
+
+fn write_wav_samples(path: &Path, count: usize, sample_rate: u32) -> Vec<i16> {
     let samples: Vec<i16> = (0..count)
         .map(|i| {
             let t = i as f32 / sample_rate as f32;
