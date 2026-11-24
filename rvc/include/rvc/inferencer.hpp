@@ -67,6 +67,7 @@ public:
         const RvcRealtimeRequest& request
     );
     void reset_realtime();
+    void advance_realtime_silence(size_t shift_frames);
 
     struct SessionParams {
         std::string f0_method;

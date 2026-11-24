@@ -306,6 +306,11 @@ void RVCInferencer::reset_realtime() {
     realtime_random_.seed(114514);
 }
 
+void RVCInferencer::advance_realtime_silence(size_t shift_frames) {
+    if (shift_frames == 0) return;
+    push_realtime_pitch_cache({}, {}, shift_frames);
+}
+
 void RVCInferencer::push_realtime_pitch_cache(
     const std::vector<int64_t>& new_pitch,
     const std::vector<float>& new_pitchf,

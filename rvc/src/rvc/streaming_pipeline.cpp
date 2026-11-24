@@ -262,15 +262,34 @@ bool StreamingRvc::try_process_one(RVCPipelineBase& pipeline)
         if (cfg_.upstream_realtime) pipeline.reset_realtime();
     }
 
-    // ---- 静音窗：跳过推理，输出等长静音 ----
+    // ---- 静音窗：跳过推理，淡出残留尾音并推进历史音高缓存 ----
     if (skip_silence_.load(std::memory_order_relaxed) && !voiced) {
         static std::atomic<uint64_t> skip_logged{0};
         if (skip_logged.fetch_add(1) < 3) {
             spdlog::warn("[stream] window skipped as silent (pushed={})", pushed_at_window);
         }
-        std::fill(tail_.begin(), tail_.end(), 0.0f);
-        tail_valid_ = false;
-        if (publish_output(window_gen, nullptr, emit_out_)) {
+        if (cfg_.upstream_realtime) {
+            pipeline.advance_realtime_silence(hop_in_ / kModelFrame16k);
+        }
+        bool published = false;
+        if (tail_valid_ && !tail_.empty()) {
+            std::vector<float> emit(emit_out_, 0.0f);
+            const size_t fade_len = std::min(tail_.size(), emit_out_);
+            for (size_t i = 0; i < fade_len; ++i) {
+                const float position = fade_len > 1
+                    ? static_cast<float>(i) / static_cast<float>(fade_len - 1) : 1.0f;
+                const float fade_out = std::cos(0.5f * kPi * position);
+                emit[i] = tail_[i] * (fade_out * fade_out);
+            }
+            std::fill(tail_.begin(), tail_.end(), 0.0f);
+            tail_valid_ = false;
+            published = publish_output(window_gen, emit.data(), emit.size());
+        } else {
+            std::fill(tail_.begin(), tail_.end(), 0.0f);
+            tail_valid_ = false;
+            published = publish_output(window_gen, nullptr, emit_out_);
+        }
+        if (published) {
             stats_.skipped_blocks.fetch_add(1, std::memory_order_relaxed);
         }
         return true;

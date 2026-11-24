@@ -296,6 +296,11 @@ void RealRVCPipeline::reset_realtime() {
     if (inferencer) inferencer->reset_realtime();
 }
 
+void RealRVCPipeline::advance_realtime_silence(size_t hop_frames) {
+    const auto inferencer = current_inferencer();
+    if (inferencer) inferencer->advance_realtime_silence(hop_frames);
+}
+
 uint64_t RealRVCPipeline::offline_window_count() const {
     const auto inferencer = current_inferencer();
     return inferencer ? inferencer->generator_window_count() : 0;

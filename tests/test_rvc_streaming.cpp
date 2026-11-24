@@ -710,6 +710,79 @@ int main()
               "re-enabled skip_silence skips next silent block with zero resets");
     }
 
+    printf("test_skip_silence_fades_tail_and_advances_pitch_cache\n");
+    {
+        struct SilenceTrackPipeline : public RVCPipelineBase {
+            std::vector<float> process(const std::vector<float>& audio) override {
+                return std::vector<float>(audio.size() * 3, 0.8f);
+            }
+            std::vector<float> process_realtime(
+                const std::vector<float>&, const RvcRealtimeRequest& request) override {
+                return std::vector<float>(request.output_samples, 0.8f);
+            }
+            void advance_realtime_silence(size_t hop_frames) override {
+                silence_advances.push_back(hop_frames);
+            }
+            std::vector<size_t> silence_advances;
+        } pipe;
+
+        StreamingRvc::Config cfg = realtime_config();
+        cfg.skip_silence = true;
+        StreamingRvc s(cfg);
+        uint32_t idx = 1;
+        // 1) Voiced block: emits 11520 samples ending at 0.8, saves tail_ = 0.8
+        for (size_t i = 0; i < 12; ++i) s.push(make_frame(idx++, 1, 0.2f));
+        CHECK(s.try_process_one(pipe), "voiced block succeeds");
+        const auto b1 = drain(s);
+        CHECK(b1.size() == 11520 && std::fabs(b1.back() - 0.8f) < 1e-6f, "voiced block ends at 0.8");
+
+        // 2) Silent block: fades tail_ from 0.8 -> 0 over 2400 samples, advances pitch cache by 24
+        for (size_t i = 0; i < 12; ++i) s.push(make_frame(idx++, 0, 0.0f));
+        CHECK(s.try_process_one(pipe), "silent skip succeeds");
+        CHECK(pipe.silence_advances.size() == 1 && pipe.silence_advances[0] == 24,
+              "silence skip advances realtime pitch cache by 24 hop frames");
+        const auto b2 = drain(s);
+        CHECK(b2.size() == 11520, "silent skip emits full block length");
+        CHECK(std::fabs(b2.front() - 0.8f) < 1e-5f, "silent block starts smoothly from tail_ without cliff");
+        CHECK(std::fabs(b2[2399]) < 1e-6f && std::fabs(b2[2400]) < 1e-6f && std::fabs(b2.back()) < 1e-6f,
+              "silent block reaches zero at crossfade end and stays zero");
+        float max_step_b2 = std::fabs(b2.front() - b1.back());
+        for (size_t i = 1; i < b2.size(); ++i) {
+            max_step_b2 = std::max(max_step_b2, std::fabs(b2[i] - b2[i - 1]));
+        }
+        CHECK(max_step_b2 < 0.002f, "voiced->silent transition has no hard step");
+
+        // 3) Resumed voiced block: smoothly fades in from 0 -> 0.8 over 2400 samples
+        for (size_t i = 0; i < 12; ++i) s.push(make_frame(idx++, 1, 0.2f));
+        CHECK(s.try_process_one(pipe), "resumed voiced block succeeds");
+        const auto b3 = drain(s);
+        CHECK(b3.size() == 11520 && std::fabs(b3.front()) < 1e-5f && std::fabs(b3.back() - 0.8f) < 1e-6f,
+              "silent->voiced block fades in cleanly from 0 to 0.8");
+        float max_step_b3 = std::fabs(b3.front() - b2.back());
+        for (size_t i = 1; i < b3.size(); ++i) {
+            max_step_b3 = std::max(max_step_b3, std::fabs(b3[i] - b3[i - 1]));
+        }
+        CHECK(max_step_b3 < 0.002f, "silent->voiced transition has no hard step");
+
+        // 4) Direct RVCInferencer pitch cache advance test
+        RVCInferencer inf(nullptr, nullptr);
+        std::vector<int64_t> p(30, 120);
+        std::vector<float> pf(30, 220.0f);
+        inf.push_realtime_pitch_cache(p, pf, 24);
+        const auto before = inf.realtime_state_snapshot();
+        CHECK(before.pitch_cache.back() == 120 && std::fabs(before.pitchf_cache.back() - 220.0f) < 1e-5f,
+              "pitch cache populated before silence advance");
+        inf.advance_realtime_silence(24);
+        const auto after = inf.realtime_state_snapshot();
+        CHECK(after.pitch_cache.size() == before.pitch_cache.size(), "pitch cache size preserved");
+        bool trailing_zero = true;
+        for (size_t i = after.pitch_cache.size() - 24; i < after.pitch_cache.size(); ++i) {
+            trailing_zero = trailing_zero && after.pitch_cache[i] == 0 && after.pitchf_cache[i] == 0.0f;
+        }
+        CHECK(trailing_zero && after.pitch_cache[after.pitch_cache.size() - 25] == 120,
+              "advance_realtime_silence shifts pitch cache by exact 24 frames");
+    }
+
     if (g_fail) {
         printf("\n%d test(s) FAILED\n", g_fail);
         return 1;
