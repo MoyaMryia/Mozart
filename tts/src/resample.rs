@@ -2,29 +2,42 @@
 //! TTS 声码器原生输出 24 kHz 单声道 f32。v1 不走变声：重采样到播放采样率
 //! 48 kHz 直接喂 pre 播放；经变声输出（FUTURE）时重采样到 16 kHz 契约帧喂 RVC。
 
-use mozart_core::{INPUT_SAMPLE_RATE, OUTPUT_SAMPLE_RATE};
+use mozart_core::INPUT_SAMPLE_RATE;
 
 /// PocketTTS 声码器原生采样率。
 pub const TTS_NATIVE_SAMPLE_RATE: u32 = 24_000;
 
-/// 线性插值升采样 24 kHz → 48 kHz（比率 1:2）。空输入返回空。
-/// v1 播报路径：偶数位精确落在输入采样点，奇数位是相邻两输入点的均值。
-pub fn resample_24k_to_48k(input: &[f32]) -> Vec<f32> {
-    if input.is_empty() {
-        return Vec::new();
+/// 24 kHz → 48 kHz 线性插值。句内回调之间保留尚未收到右邻点的半个采样间隔。
+#[derive(Default)]
+pub struct Upsample2 {
+    last: Option<f32>,
+}
+
+impl Upsample2 {
+    pub fn push(&mut self, input: &[f32]) -> Vec<f32> {
+        let mut output = Vec::with_capacity(input.len() * 2);
+        for &sample in input {
+            if let Some(last) = self.last {
+                output.push(last + (sample - last) * 0.5);
+            }
+            output.push(sample);
+            self.last = Some(sample);
+        }
+        output
     }
-    let ratio = TTS_NATIVE_SAMPLE_RATE as f64 / OUTPUT_SAMPLE_RATE as f64;
-    let out_len = (input.len() as f64 / ratio) as usize;
-    (0..out_len)
-        .map(|i| {
-            let pos = i as f64 * ratio;
-            let idx = pos as usize;
-            let frac = (pos - idx as f64) as f32;
-            let a = input[idx.min(input.len() - 1)];
-            let b = input[(idx + 1).min(input.len() - 1)];
-            a + (b - a) * frac
-        })
-        .collect()
+
+    /// 只在整句结束时重复最后一个样本，保留精确的 2:1 输出时长。
+    pub fn finish(&mut self) -> Option<f32> {
+        self.last.take()
+    }
+}
+
+#[cfg(test)]
+fn resample_24k_to_48k(input: &[f32]) -> Vec<f32> {
+    let mut resampler = Upsample2::default();
+    let mut pcm = resampler.push(input);
+    pcm.extend(resampler.finish());
+    pcm
 }
 
 /// 线性插值降采样 24 kHz → 16 kHz（比率 3:2）。空输入返回空。
@@ -51,6 +64,30 @@ pub fn resample_24k_to_16k(input: &[f32]) -> Vec<f32> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn interpolates_across_chunk_boundaries_and_only_extends_the_utterance_end() {
+        let mut resampler = Upsample2::default();
+        assert_eq!(resampler.push(&[0.0]), [0.0]);
+        assert!(resampler.push(&[]).is_empty());
+        assert_eq!(resampler.push(&[1.0, -1.0]), [0.5, 1.0, 0.0, -1.0]);
+        assert_eq!(resampler.finish(), Some(-1.0));
+        assert_eq!(resampler.finish(), None);
+    }
+
+    #[test]
+    fn split_sine_matches_the_independent_midpoint_reference() {
+        let wave: Vec<f32> = (0..1037).map(|i| (i as f32 * 0.27).sin()).collect();
+        let expected: Vec<f32> = wave.windows(2).flat_map(|w| [w[0], (w[0] + w[1]) / 2.0])
+            .chain([wave[1036]; 2]).collect();
+        for size in [1, 2, 17, 480, 1037] {
+            let mut resampler = Upsample2::default();
+            let mut actual: Vec<f32> = wave.chunks(size).flat_map(|p| resampler.push(p)).collect();
+            actual.extend(resampler.finish());
+            assert_eq!(actual.len(), expected.len());
+            assert!(actual.iter().zip(&expected).all(|(a, b)| (a - b).abs() < 1e-6));
+        }
+    }
 
     /// 已知 24 kHz 正弦（440 Hz，0.1 s）：长度收缩 3:2，偶数位精确落在输入采样点，
     /// 奇数位是相邻两输入点的均值。

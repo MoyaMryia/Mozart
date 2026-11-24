@@ -12,6 +12,8 @@ use std::collections::HashMap;
 pub const MAX_LENGTH_RATIO: f64 = 5.0;
 /// 译文/原文字符数比下限（含）以下视为异常（v1 补充规则）。
 pub const MIN_LENGTH_RATIO: f64 = 0.1;
+// 允许单字符原文译成短词组，不放行长句。
+const MIN_SOURCE_CHARS_FOR_UPPER_RATIO: usize = 2;
 /// 同一词出现次数超过该值视为过度重复（v1 补充规则）。
 pub const MAX_WORD_REPEATS: usize = 5;
 
@@ -31,8 +33,11 @@ pub fn check(
     if trimmed == source {
         return Err("translation identical to source".to_string());
     }
-    let ratio = trimmed.chars().count() as f64 / source.chars().count() as f64;
-    if ratio > MAX_LENGTH_RATIO || ratio < MIN_LENGTH_RATIO {
+    let source_chars = source.chars().filter(|c| c.is_alphanumeric()).count();
+    let translated_chars = trimmed.chars().filter(|c| c.is_alphanumeric()).count() as f64;
+    let upper_base = source_chars.max(MIN_SOURCE_CHARS_FOR_UPPER_RATIO) as f64;
+    let ratio = translated_chars / source_chars.max(1) as f64;
+    if translated_chars > MAX_LENGTH_RATIO * upper_base || ratio < MIN_LENGTH_RATIO {
         return Err(format!("length ratio {ratio:.2} out of range"));
     }
     let mut counts: HashMap<&str, usize> = HashMap::new();
@@ -129,6 +134,14 @@ mod tests {
         // 残留中文（非整句相同）由旧全套拦截。
         let err = check_ok("这个叫跑分", "This is called 跑分.").unwrap_err();
         assert!(err.contains("untranslated Chinese"), "{err}");
+    }
+
+    #[test]
+    fn short_phrase_expansion_is_independent_of_punctuation() {
+        assert!(check_ok("谢", "Thanks.").is_ok());
+        assert!(check_ok("谢。", "Thanks.").is_ok());
+        assert!(check_ok("谢", "Thank you.").is_ok());
+        assert!(check_ok("谢", "This is completely unrelated.").unwrap_err().contains("length ratio"));
     }
 
     #[test]
