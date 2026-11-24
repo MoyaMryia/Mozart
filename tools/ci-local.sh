@@ -10,7 +10,7 @@ MAX_TRACKED_BYTES=$((5 * 1024 * 1024))
 
 # 阶段名与触发路径（扩展正则，匹配暂存文件路径）。
 NATIVE_PATHS='^(core|pre|enhance|rvc|daemon|api|tests)/|^CMakeLists\.txt$|^CMakePresets\.json$|^cmake/'
-RUST_PATHS='^(core|dsp|pre|daemon|ctl|asr|tts|bridge|web-adapter)/|^Cargo\.toml$|^Cargo\.lock$|^tools/(ci-local|deploy-jetson|web-service)\.sh$'
+RUST_PATHS='^(core|dsp|pre|daemon|ctl|asr|tts|bridge|web-adapter)/|^Cargo\.toml$|^Cargo\.lock$|^tools/(ci-local|deploy-jetson)\.sh$'
 WEB_PATHS='^web/'
 
 skip() { echo "跳过 $1：$2" >&2; }
@@ -66,11 +66,11 @@ stage_native() {
 }
 
 check_runtime_scripts() {
-    bash -n tools/deploy-jetson.sh tools/web-service.sh
+    bash -n tools/deploy-jetson.sh
 }
 
 build_adapter_fixtures() {
-    cargo build -p mozart-daemon -p mozart-ctl --bins
+    cargo build -p mozart-daemon -p mozart-ctl -p mozart-web-adapter --bins
     cargo build -p mozart-core --examples
 }
 

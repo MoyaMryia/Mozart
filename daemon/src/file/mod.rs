@@ -306,6 +306,10 @@ impl FileCoordinator {
             .submit_lock
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
+        // 停服期拒收新任务（SPEC-04）：已有排队任务保留，恢复服务后按原仲裁继续。
+        // 这里只入队不起流（起流由 poller 的 tick 在 transition 锁内驱动），故不取
+        // transition：与 services stop 竞态最坏是多一条排队任务，不会打到已停的 rvc。
+        lock_state(&self.state).ensure_services_active()?;
         let model_id = self.resolve_model(request.model_id)?;
         let source = Path::new(&request.path);
         let name = source

@@ -15,9 +15,22 @@ pub enum Role {
     Tts,
     Bridge,
     Llama,
+    Web,
 }
 
 impl Role {
+    /// 全部受监管角色。业务边界只由 `is_business` 给出，别处不再手列进程字段。
+    pub const ALL: [Role; 8] = [
+        Role::Enhance,
+        Role::Pre,
+        Role::Rvc,
+        Role::Asr,
+        Role::Tts,
+        Role::Bridge,
+        Role::Llama,
+        Role::Web,
+    ];
+
     pub fn name(self) -> &'static str {
         match self {
             Role::Enhance => "enhance",
@@ -27,7 +40,12 @@ impl Role {
             Role::Tts => "tts",
             Role::Bridge => "bridge",
             Role::Llama => "llama",
+            Role::Web => "web",
         }
+    }
+
+    pub fn is_business(self) -> bool {
+        !matches!(self, Role::Web)
     }
 
     /// 控制面服务名 → Role；未知名返回 None，由入口拒绝（InvalidArgument）。
@@ -40,6 +58,7 @@ impl Role {
             "tts" => Some(Role::Tts),
             "bridge" => Some(Role::Bridge),
             "llama" => Some(Role::Llama),
+            "web" => Some(Role::Web),
             _ => None,
         }
     }
@@ -62,6 +81,22 @@ enum RvcLease {
 
 const REALTIME_RETURN_REASON: &str = "rvc realtime return:";
 const FILE_RETURN_REASON: &str = "rvc file return:";
+/// 停服等待超时的持久降级原因；业务进程全停后由收尾清除。
+pub(crate) const SERVICES_STOP_TIMEOUT_REASON: &str = "timed out waiting for business services to stop";
+/// 停服期拒绝原因：各控制入口共用一份措辞。
+pub(crate) const SERVICES_STOPPED_REASON: &str = "business services are stopped";
+/// RVC 会话参数编排的持久降级前缀。
+pub(crate) const RVC_SESSION_REASON: &str = "rvc session params";
+
+/// 停服收尾要清的持久降级前缀：都属已停的业务生命周期。租约与播报屏障复位后
+/// 不再有事件来清它们，留着会让 status 长期挂着已不存在的失败。
+const BUSINESS_LIFECYCLE_REASONS: [&str; 5] = [
+    SERVICES_STOP_TIMEOUT_REASON,
+    REALTIME_RETURN_REASON,
+    FILE_RETURN_REASON,
+    crate::services::SPEECH_STOP_REASON,
+    RVC_SESSION_REASON,
+];
 
 pub struct State {
     started: Instant,
@@ -96,6 +131,7 @@ pub struct State {
     /// 靠这份映射标出该值尚未生效（服务级集合看不出是哪个键）。
     /// 一个键影响多个服务时，全部服务都重启后才算生效。
     pending_restart_keys: std::collections::BTreeMap<String, std::collections::BTreeSet<String>>,
+    services_active: bool,
     shutting_down: bool,
 }
 
@@ -120,6 +156,7 @@ impl State {
                 tts: ProcessInfo::stopped(),
                 bridge: ProcessInfo::stopped(),
                 llama: ProcessInfo::stopped(),
+                web: ProcessInfo::stopped(),
             },
             enhance: None,
             pre: None,
@@ -132,12 +169,14 @@ impl State {
             degraded_persistent: Vec::new(),
             pending_restart: std::collections::BTreeSet::new(),
             pending_restart_keys: std::collections::BTreeMap::new(),
+            services_active: true,
             shutting_down: false,
         }
     }
 
     pub fn status(&self) -> Status {
         Status {
+            services_active: self.services_active,
             daemon: DaemonInfo {
                 pid: std::process::id(),
                 version: env!("CARGO_PKG_VERSION").to_string(),
@@ -327,6 +366,70 @@ impl State {
         self.hw = hw;
     }
 
+    pub fn services_active(&self) -> bool {
+        self.services_active
+    }
+
+    pub fn set_services_active(&mut self, active: bool) {
+        self.services_active = active;
+    }
+
+    /// 停服期准入（SPEC-04）：读锁内权威标志，不用进程外的原子副本。
+    /// 调用方须已持 transition 锁，否则与 `services stop` 竞态后会放行到已停的子服务；
+    /// 只入队不起流的路径（文件提交）可持自身串行锁调用，竞态最坏只是多一条排队任务。
+    pub fn ensure_services_active(&self) -> Result<(), (String, String)> {
+        if self.services_active {
+            Ok(())
+        } else {
+            Err((
+                mozart_core::ctl::CODE_NOT_READY.to_string(),
+                SERVICES_STOPPED_REASON.to_string(),
+            ))
+        }
+    }
+
+    pub fn all_business_stopped(&self) -> bool {
+        Role::ALL
+            .iter()
+            .filter(|role| role.is_business())
+            .all(|role| self.process(*role).state == ProcessState::Stopped)
+    }
+
+    /// 停服等待超时后业务进程才停完：收尾还没做，旧快照与超时原因仍留在 status。
+    pub fn stop_finalize_pending(&self) -> bool {
+        !self.services_active
+            && self
+                .degraded_persistent
+                .iter()
+                .any(|reason| reason.starts_with(SERVICES_STOP_TIMEOUT_REASON))
+    }
+
+    /// 停服收尾：清业务生命周期留下的持久降级原因与运行时快照。
+    /// 调用方须已确认业务进程全停（或正在重新起服务）。
+    pub fn finalize_services_stopped(&mut self) {
+        for prefix in BUSINESS_LIFECYCLE_REASONS {
+            self.clear_degraded_prefix(prefix);
+        }
+        self.clear_business_runtime();
+    }
+
+    pub fn clear_business_runtime(&mut self) {
+        self.enhance = None;
+        self.pre = None;
+        self.pre_startup_id = None;
+        self.playout_startup_id = None;
+        self.rvc = None;
+        self.asr = None;
+        self.tts = None;
+        self.bridge = None;
+        self.rvc_lease = RvcLease::Idle;
+        self.route_active = Route::Direct;
+        self.route_desired = Route::Direct;
+        self.output_mode = None;
+        self.playout_policy = mozart_core::ctl::schema::PlayoutPolicy::Legacy;
+        self.degraded.clear();
+    }
+
     pub fn begin_shutdown(&mut self) {
         self.shutting_down = true;
     }
@@ -410,6 +513,19 @@ impl State {
         info.pid = None;
     }
 
+    fn process(&self, role: Role) -> &ProcessInfo {
+        match role {
+            Role::Enhance => &self.processes.enhance,
+            Role::Pre => &self.processes.pre,
+            Role::Rvc => &self.processes.rvc,
+            Role::Asr => &self.processes.asr,
+            Role::Tts => &self.processes.tts,
+            Role::Bridge => &self.processes.bridge,
+            Role::Llama => &self.processes.llama,
+            Role::Web => &self.processes.web,
+        }
+    }
+
     fn process_mut(&mut self, role: Role) -> &mut ProcessInfo {
         match role {
             Role::Enhance => &mut self.processes.enhance,
@@ -419,6 +535,7 @@ impl State {
             Role::Tts => &mut self.processes.tts,
             Role::Bridge => &mut self.processes.bridge,
             Role::Llama => &mut self.processes.llama,
+            Role::Web => &mut self.processes.web,
         }
     }
 }
@@ -474,6 +591,62 @@ mod tests {
             "空轮询不得抹掉持久原因：{degraded:?}"
         );
         assert!(!degraded.iter().any(|reason| reason.contains("pre status")));
+    }
+
+    /// 停服超时收尾（SPEC-04）：业务进程晚于截止时间停完后，超时原因与旧运行时
+    /// 快照必须一并清掉，否则 status 长期停在超时原因与已停服务的旧快照上。
+    #[test]
+    fn stop_timeout_finalize_clears_reason_and_runtime() {
+        let mut state = State::new();
+        state.set_services_active(false);
+        state.push_degraded(SERVICES_STOP_TIMEOUT_REASON.to_string());
+        state.push_degraded(format!("{REALTIME_RETURN_REASON} stop stream unconfirmed"));
+        state.push_degraded(format!(
+            "{} bridge: timed out",
+            crate::services::SPEECH_STOP_REASON
+        ));
+        state.push_degraded("file stop stream: Busy".to_string());
+        state.set_pre_status(Some(pre_status(false)));
+        state.set_route_desired(Route::Rvc);
+        assert!(state.stop_finalize_pending());
+
+        state.finalize_services_stopped();
+        assert!(!state.stop_finalize_pending());
+        let status = state.status();
+        assert!(
+            !status
+                .degraded
+                .iter()
+                .any(|reason| reason.contains("timed out waiting")),
+            "{:?}",
+            status.degraded
+        );
+        // 租约与播报屏障已复位，它们留下的原因不会再有事件来清，收尾必须一并清掉。
+        assert!(
+            !status
+                .degraded
+                .iter()
+                .any(|reason| reason.contains("rvc realtime return")
+                    || reason.contains("speech stop fence")),
+            "{:?}",
+            status.degraded
+        );
+        assert!(
+            status
+                .degraded
+                .iter()
+                .any(|reason| reason.contains("file stop stream")),
+            "无关持久原因不受收尾影响：{:?}",
+            status.degraded
+        );
+        assert!(status.pre.is_none());
+        assert_eq!(status.route.desired, Route::Direct);
+        assert_eq!(status.route.active, Route::Direct);
+
+        // 恢复服务后不再有待收尾，即使残留同名原因也不重复收尾。
+        state.set_services_active(true);
+        state.push_degraded(SERVICES_STOP_TIMEOUT_REASON.to_string());
+        assert!(!state.stop_finalize_pending());
     }
 
     #[test]

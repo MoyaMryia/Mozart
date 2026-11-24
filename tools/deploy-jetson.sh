@@ -57,7 +57,6 @@ read -r lock < "$transaction/lock"
 read -r owner < "$lock/owner"
 [ "$owner" = "$transaction" ] || { echo '部署锁不属于本事务，拒绝回滚' >&2; exit 1; }
 if [ -f "$transaction/installing" ]; then
-  if [ -x "$web" ]; then "$web" "$root" stop; fi
   stop_ctl=$ctl
   if [ -x "$transaction/ctl-before" ]; then stop_ctl="$transaction/ctl-before"; fi
   if [ -x "$stop_ctl" ]; then
@@ -99,8 +98,8 @@ fi
 if [ -f "$transaction/stopped" ] && [ -f "$transaction/was-running" ]; then
   "$ctl" --config "$cfg" up
 fi
-if [ -f "$transaction/web-stopped" ] && [ -f "$transaction/web-was-running" ]; then
-  "$root/bin/mozart-web-service" "$root" start
+if [ -x "$web" ] && [ -f "$transaction/web-stopped" ] && [ -f "$transaction/web-was-running" ]; then
+  "$web" "$root" start
 fi
 if [ -f "$transaction/deploy-before.json" ]; then cp -a "$transaction/deploy-before.json" "$root/deploy.json";
 elif [ -f "$transaction/installing" ]; then rm -f "$root/deploy.json"; fi
@@ -162,8 +161,8 @@ if [ -x "$ctl" ] && "$ctl" --config "$root/mozart.toml" status --json > "$TRANSA
   touch "$TRANSACTION/was-running" "$TRANSACTION/stopped"
   "$ctl" --config "$root/mozart.toml" down
 fi
-# 只检查实际进程名，不匹配包含命令文本的 ssh/bash 进程。
-for name in mozart-daemon mozart-pre mozart-enhance mozart-rvc mozart-asr mozart-tts mozart-bridge llama-server; do
+# 只检查实际进程名，不匹配包含命令文本的 ssh/bash 进程；Linux comm 限 15 字节，mozart-web-adapter 截断为 mozart-web-adap。
+for name in mozart-daemon mozart-pre mozart-enhance mozart-rvc mozart-asr mozart-tts mozart-bridge mozart-web-adap llama-server; do
   if pgrep -x "$name"; then echo "仍有活跃进程，停止构建：$name" >&2; exit 1; fi
 done
 STOP
@@ -198,8 +197,11 @@ for name in ctl daemon pre enhance rvc asr tts bridge web-adapter; do
 done
 [ -x target/debug/examples/rvc_stub ]
 [ -f web/dist/index.html ]
+[ "$(id -u)" -ne 0 ] || { echo '请以运行目录所有者而非 root 运行部署' >&2; exit 1; }
 # 安装只管理 SETUP 定义的资源目录，不覆盖任意配置路径。
 description=$(target/debug/mozart-web-adapter --config "$root/mozart.toml" --print-config)
+[ "$(jq -er '.configured' <<< "$description")" = true ] || { echo '部署需要 mozart.toml 配置 [web] 段（由 daemon 监管 web-adapter）' >&2; exit 1; }
+port=$(jq -er '.port' <<< "$description")
 static=$(jq -er '.static_dir' <<< "$description")
 [ "$(realpath -m "$static")" = "$(realpath -m "$root/web/dist")" ] || { echo '部署仅管理 runtime/web/dist；请设置相应 web.static_dir' >&2; exit 1; }
 mkdir -p "$root/bin" "$root/web"
@@ -221,15 +223,21 @@ for name in ctl daemon pre enhance rvc asr tts bridge web-adapter; do
 done
 mkdir -p "$root/bin/examples" "$root/web/dist"
 install_binary target/debug/examples/rvc_stub "$root/bin/examples/rvc_stub"
-install_binary tools/web-service.sh "$root/bin/mozart-web-service"
+rm -f "$root/bin/mozart-web-service"
 rsync -a --checksum --delete web/dist/ "$root/web/dist/"
-"$root/bin/mozart-web-service" "$root" prepare
+if [ "$port" -gt 0 ] && [ "$port" -lt 1024 ]; then
+  if ! getcap "$root/bin/mozart-web-adapter" | grep -q 'cap_net_bind_service=ep'; then
+    command -v sudo >/dev/null || { echo 'low HTTP port requires cap_net_bind_service or a configured high port' >&2; exit 1; }
+    sudo -n setcap cap_net_bind_service=ep "$root/bin/mozart-web-adapter" || { echo 'grant cap_net_bind_service, or configure a high web.listen port' >&2; exit 1; }
+  fi
+fi
 "$root/bin/mozart-ctl" --config "$root/mozart.toml" up
 # 包括原本正常的可选服务；不把部署前已降级的服务冒充本次部署失败。
 healthy=0
 for attempt in $(seq 1 90); do
   if "$root/bin/mozart-ctl" --config "$root/mozart.toml" status --json > "$TRANSACTION/status-after.json"; then
     if jq -e --slurpfile previous "$TRANSACTION/status-before.json" '
+      (.processes.web.state == "running") and
       (.pre != null) and (.rvc == null or (.rvc.state | length > 0)) and
       (if .pre.denoise_backend == "ulunas" then
         .enhance.backend == "ulunas" and
@@ -243,10 +251,9 @@ for attempt in $(seq 1 90); do
   sleep 1
 done
 [ "$healthy" = 1 ] || { echo '运行时健康检查失败' >&2; exit 1; }
-"$root/bin/mozart-web-service" "$root" start
 mode=full
 jq -n --arg commit "$COMMIT" --argjson dirty "$DIRTY" --arg time "$(date -u +%Y-%m-%dT%H:%M:%SZ)" --arg mode "$mode" \
-  '{commit:$commit,dirty:$dirty,time:$time,preset:"jetson-release",mode:$mode,restarted:"all web-adapter"}' > "$root/deploy.json.new"
+  '{commit:$commit,dirty:$dirty,time:$time,preset:"jetson-release",mode:$mode,restarted:"all"}' > "$root/deploy.json.new"
 mv "$root/deploy.json.new" "$root/deploy.json"
 touch "$TRANSACTION/completed"
 read -r lock < "$TRANSACTION/lock"

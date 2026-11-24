@@ -56,7 +56,8 @@
 - [ ] 可追溯：每次部署记录提交、时间、预设和结果。`deploy.json` 已记录提交、dirty、时间与预设。
 - [x] 配置外置：设备地址、模型路径和密钥不写进仓库。
 - [x] 运行期环境变量统一源：部署启动运行时不再额外导出 shell `LD_LIBRARY_PATH`，运行期共享库等子进程环境变量统一以 `mozart.toml` 的 `[process.env]` 为唯一来源（编译期仍保留资产库环境变量）；已在 Jetson 实机验证部署与全栈拉起通过。（`tools/deploy-jetson.sh`）
-- [ ] 合并运行时启停入口（方案 1）：`mozart-web-adapter` 迁入 `daemon` 监管后，移除 `tools/deploy-jetson.sh` 中独立的 `mozart-web-service` 安装、准备与启停步骤，部署与回滚统一经 `mozart-ctl down` / `up` 管理单一运行时生命周期（前置：SPEC-04 与 SPEC-06 方案 1 落地）。
+- [x] 合并运行时启停入口（方案 1）：`mozart-web-adapter` 迁入 `daemon` 监管后，已移除 `tools/deploy-jetson.sh` 中独立的 `mozart-web-service` 安装、准备与启停步骤，安装前校验 `[web]` 已配置、健康检查核验 `processes.web` 运行且低端口直接对 `mozart-web-adapter` 做 `setcap` 兼容；部署与回滚统一经 `mozart-ctl down` / `up` 管理单一运行时生命周期，同时保留旧版 `mozart-web-service` 的单次停服/回滚迁移兼容。本机证据限于 `bash -n` 与适配器集成测试，板端实测见下条。（`tools/deploy-jetson.sh`、`tools/ci-local.sh`、`docs/SETUP.md`）
+- [ ] 方案 1 部署流板端实测：新部署流未在 Jetson 上跑过，`ci-local.sh` 只做语法检查，健康检查读 `processes.web` 也不代表 TCP 已监听（见下条）。解除条件：板端跑一次完整 `deploy-jetson.sh` 与一次回滚，核对 `processes.web`、页面可达与 `bin.prev` 恢复结果，证据落 `reports/`。
 - [ ] 部署锁自动释放与回滚缓存保护：将 `tools/deploy-jetson.sh` 的目录锁 `~/.mozart-deploy.lock` 改为绑定会话生命周期的文件锁（`flock`），确保 SSH 断连或进程异常退出时自动释放不留死锁；回滚仅在源码确实发生回退且构建产物失效时清理缓存，取消无条件 `cargo clean` 与 `ninja -t clean`。
 - [ ] 部署构建与健康检查加固：板端 Rust 构建改为 `cargo build --release`；收紧部署健康检查（等配置模型时的 `rvc` 或 `output_mode` 离开过渡态，并核验 `web` 运行且 `/api/v1/health` 返回 `200`）；部署末尾按当前 SSH 目标 IP 与端口核对 `[web].allowed_origins`，缺失时明文告警提示而不擅改配置。
 - [ ] 部署工程卫生与停栈收割加固：本机仅在 `web/node_modules` 缺失、`package-lock.json` 变更或显式 `--full` 时运行 `npm ci`；部署成功后按上限（保留最近 `3` 份）自动清理历史 `~/.mozart-source-backup.*` 与 `/tmp/mozart-deploy.*` 快照；`deploy.json` 按实际构型写入 `mode`（`full` / `incremental`）与 Rust `release` 标识；停栈后 `pgrep` 残留检查增加短暂重试缓冲（如最多 `3 s`），避免进程收割竞态误报失败。

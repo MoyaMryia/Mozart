@@ -74,6 +74,10 @@ pub const DAEMON_MODEL_USE: u16 = 0x0120;
 pub const DAEMON_DEVICE_USE: u16 = 0x0121;
 /// 体：{"mode":"direct"|"rvc"|"broadcast"}，返回输出模式转换快照。
 pub const DAEMON_OUTPUT_MODE_SET: u16 = 0x0122;
+/// 体：{}（空），恢复启动业务子服务组，data {"state":"running"|"already-running"}。
+pub const DAEMON_SERVICES_START: u16 = 0x0123;
+/// 体：{}（空），停止业务子服务组（daemon 与 web 在线），data {"state":"stopped"|"not-running"}。
+pub const DAEMON_SERVICES_STOP: u16 = 0x0124;
 
 /// Budget for operations involving up to six serial RPCs.
 pub fn config_set_timeout_ms(rpc_timeout_ms: u64) -> u64 {
@@ -83,7 +87,8 @@ pub fn config_set_timeout_ms(rpc_timeout_ms: u64) -> u64 {
 pub fn request_timeout_ms(rpc_timeout_ms: u64, command: u16) -> u64 {
     match command {
         DAEMON_CONFIG_SET | DAEMON_PRESET_SAVE | DAEMON_PRESET_USE | DAEMON_PRESET_LIST
-        | DAEMON_SPEECH_SET | DAEMON_SPEECH_STOP | DAEMON_OUTPUT_MODE_SET => {
+        | DAEMON_SPEECH_SET | DAEMON_SPEECH_STOP | DAEMON_OUTPUT_MODE_SET
+        | DAEMON_SERVICES_START | DAEMON_SERVICES_STOP => {
             config_set_timeout_ms(rpc_timeout_ms)
         }
         _ => rpc_timeout_ms,
@@ -680,6 +685,8 @@ mod tests {
         assert_eq!(DAEMON_MODEL_USE, 0x0120);
         assert_eq!(DAEMON_DEVICE_USE, 0x0121);
         assert_eq!(DAEMON_OUTPUT_MODE_SET, 0x0122);
+        assert_eq!(DAEMON_SERVICES_START, 0x0123);
+        assert_eq!(DAEMON_SERVICES_STOP, 0x0124);
         assert_eq!(RVC_LIST_MODELS, 0x0307);
         assert_eq!(RVC_SET_PARAMS, 0x0308);
         assert_eq!(PRE_SET_FILE_MODE, 0x0206);
@@ -719,6 +726,8 @@ mod tests {
         ("DAEMON_MODEL_USE", DAEMON_MODEL_USE),
         ("DAEMON_DEVICE_USE", DAEMON_DEVICE_USE),
         ("DAEMON_OUTPUT_MODE_SET", DAEMON_OUTPUT_MODE_SET),
+        ("DAEMON_SERVICES_START", DAEMON_SERVICES_START),
+        ("DAEMON_SERVICES_STOP", DAEMON_SERVICES_STOP),
         ("PRE_HELLO", PRE_HELLO),
         ("PRE_SET_ROUTE", PRE_SET_ROUTE),
         ("PRE_SET_MUTE", PRE_SET_MUTE),
@@ -1001,5 +1010,12 @@ mod tests {
         drop(listener);
         std::fs::remove_file(&path).unwrap();
         let _ = std::fs::remove_dir(&dir);
+    }
+
+    #[test]
+    fn services_lifecycle_commands_use_extended_timeout() {
+        assert_eq!(request_timeout_ms(2000, DAEMON_SERVICES_START), 15_000);
+        assert_eq!(request_timeout_ms(2000, DAEMON_SERVICES_STOP), 15_000);
+        assert_eq!(request_timeout_ms(3000, DAEMON_SERVICES_STOP), 18_000);
     }
 }

@@ -334,6 +334,66 @@ fn cancel_interrupts_feed_when_peer_hangs() {
     );
 }
 
+#[test]
+fn services_stop_rejected_while_file_job_active() {
+    let h = Harness::new(
+        "worker-services-busy",
+        "",
+        &[("MOZART_RVC_STUB_FILE_HANG", "1".to_string())],
+    );
+    let (job_id, _pcm) = h.submit("tone.wav", 2, 16000);
+    h.assert_feed_stalled(&job_id);
+
+    let reply = call(&h.conn, ctl::DAEMON_SERVICES_STOP, b"{}");
+    assert_eq!(reply.code, "Busy", "{reply:?}");
+    assert!(status(&h.conn).services_active);
+
+    let body = json!({"job_id": job_id});
+    let cancel = call(&h.conn, ctl::DAEMON_FILE_CANCEL, body.to_string().as_bytes());
+    assert_eq!(cancel.status, "ok", "cancel: {}", cancel.reason);
+    wait_job_state(&h.conn, &job_id, FileJobState::Cancelled, CANCEL_SETTLE_TIMEOUT);
+    h.assert_gpu_free();
+}
+
+/// 停服边界（SPEC-04）：只有正在跑的任务才让停服回 Busy；排队任务保留，
+/// 停服期间新提交统一 NotReady（带与不带 model_id 一致），恢复服务后继续。
+#[test]
+fn services_stop_keeps_queued_jobs_and_rejects_new_submits() {
+    let h = Harness::new("worker-services-queue", "", &[]);
+    let pause = call(&h.conn, ctl::DAEMON_FILE_PAUSE, b"{}");
+    assert_eq!(pause.status, "ok", "pause: {}", pause.reason);
+
+    let queued_source = h.daemon.dir.join("queued.wav");
+    write_wav(&queued_source, 1, 16000);
+    let queued = submit_file(&h.conn, &queued_source, Some("demo"));
+    assert_eq!(queued.status, "ok", "submit: {}", queued.reason);
+    let job_id = queued.data["job_id"].as_str().unwrap().to_string();
+    assert_eq!(file_job(&h.conn, &job_id).state, FileJobState::Queued);
+
+    let stop = call(&h.conn, ctl::DAEMON_SERVICES_STOP, b"{}");
+    assert_eq!(stop.status, "ok", "stop: {}", stop.reason);
+    assert_eq!(stop.data["state"], "stopped");
+
+    let rejected_source = h.daemon.dir.join("rejected.wav");
+    write_wav(&rejected_source, 1, 16000);
+    for model in [Some("demo"), None] {
+        let reply = submit_file(&h.conn, &rejected_source, model);
+        assert_eq!(reply.code, "NotReady", "model {model:?}: {reply:?}");
+    }
+    assert_eq!(
+        file_job(&h.conn, &job_id).state,
+        FileJobState::Queued,
+        "停服不得动排队任务"
+    );
+
+    let start = call(&h.conn, ctl::DAEMON_SERVICES_START, b"{}");
+    assert_eq!(start.status, "ok", "start: {}", start.reason);
+    let resume = call(&h.conn, ctl::DAEMON_FILE_RESUME, b"{}");
+    assert_eq!(resume.status, "ok", "resume: {}", resume.reason);
+    wait_job_state(&h.conn, &job_id, FileJobState::Completed, JOB_TIMEOUT);
+    h.assert_gpu_free();
+}
+
 /// 回归（长文件数据面死锁）：pre 恒发实时帧到 rvc-in.sock（SPEC-02「AI 路径
 /// 永不停」）。SPEC-03 复用帧数据面 + 状态门控交接：文件任务起流前 daemon 经
 /// PRE_SET_FILE_MODE{active:true} 让 pre 暂停 rvc 发送并释放输出 socket，实时帧

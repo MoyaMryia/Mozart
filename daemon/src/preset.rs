@@ -201,6 +201,7 @@ impl PresetManager {
     /// `preset use`：用当前模型的 default.toml 重置 live 参数，丢弃未保存调参。
     pub fn use_default(&self) -> Result<PresetApplyData, (String, String)> {
         let _transition = self.services.transition();
+        lock_state(&self.state).ensure_services_active()?;
         let mut applied = self.lock_applied();
         let model_id = self.current_model()?;
         let old = self.config.snapshot();
@@ -217,6 +218,7 @@ impl PresetManager {
     /// `preset save`：当前 live 五参数原子写当前模型 default.toml，不改 TOML 基线。
     pub fn save_current(&self) -> Result<PresetApplyData, (String, String)> {
         let _transition = self.services.transition();
+        lock_state(&self.state).ensure_services_active()?;
         let applied = self.lock_applied();
         let model_id = self.current_model()?;
         let config = self.config.snapshot();
@@ -258,6 +260,7 @@ impl PresetManager {
     /// 预设缺失明确报错，不补建（补建只发生在载入路径）。
     pub fn list(&self) -> Result<PresetListData, (String, String)> {
         let _transition = self.services.transition();
+        lock_state(&self.state).ensure_services_active()?;
         let _applied = self.lock_applied();
         let model_id = self.current_model()?;
         let config = self.config.snapshot();

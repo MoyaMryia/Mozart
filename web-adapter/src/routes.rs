@@ -1,9 +1,8 @@
-use std::{path::{PathBuf, Component}, sync::Arc, time::Duration};
+use std::{path::{PathBuf, Component}, sync::Arc};
 use axum::{body::{Body, to_bytes}, extract::{DefaultBodyLimit, Request, State as AxumState}, http::{header, HeaderMap, HeaderValue, Method}, response::{IntoResponse, Response}, routing::any, Router};
 use mozart_core::{config::WebAdapterConfig, ctl::{self, schema}};
 use serde::de::DeserializeOwned;
 use serde_json::{json, Value};
-use tokio::io::AsyncReadExt;
 use tokio_util::io::ReaderStream;
 use futures_util::TryStreamExt;
 use crate::{error::{ApiError, control, ok}, rpc::RpcClient, streams::Streams, uploads::UploadStore};
@@ -11,13 +10,10 @@ use crate::{error::{ApiError, control, ok}, rpc::RpcClient, streams::Streams, up
 #[derive(Clone)]
 pub struct State {
     pub config: WebAdapterConfig,
-    pub config_path: Option<PathBuf>,
-    pub ctl_bin: PathBuf,
     pub rpc: RpcClient,
     pub streams: Streams,
     pub uploads: Arc<UploadStore>,
     pub origins: Vec<url::Url>,
-    pub lifecycle: Arc<tokio::sync::Mutex<()>>,
 }
 
 fn bad(reason: impl Into<String>) -> ApiError { ApiError::code("BadRequest", reason) }
@@ -125,9 +121,10 @@ async fn serve(s: &State, req: Request, api: bool) -> Result<Response, ApiError>
         }
         (Method::POST, ["files"]) => s.uploads.clone().handle(req).await,
         (Method::GET, ["files", id, "result"]) => download(s, id).await,
-        (Method::POST, ["system", action]) => { body::<Empty>(req).await?; lifecycle(s, action).await },
         (method, path) => {
             let (cmd, data) = match (method, path) {
+                (Method::POST, ["system", "up"]) => { body::<Empty>(req).await?; (ctl::DAEMON_SERVICES_START, json!({})) },
+                (Method::POST, ["system", "down"]) => { body::<Empty>(req).await?; (ctl::DAEMON_SERVICES_STOP, json!({})) },
                 (Method::GET, ["status"]) => (ctl::DAEMON_GET_STATUS, json!({})),
                 (Method::GET, ["models"]) => (ctl::DAEMON_MODEL_LIST, json!({})),
                 (Method::GET, ["preset"]) => (ctl::DAEMON_PRESET_LIST, json!({})),
@@ -216,54 +213,4 @@ fn open_beneath(root: &std::fs::File, path: &std::path::Path) -> std::io::Result
 #[cfg(not(target_os = "linux"))]
 fn open_beneath(_: &std::fs::File, _: &std::path::Path) -> std::io::Result<std::fs::File> {
     Err(std::io::ErrorKind::Unsupported.into())
-}
-
-async fn lifecycle(s: &State, action: &str) -> Result<Response, ApiError> {
-    let state = s.clone();
-    let action = action.to_owned();
-    tokio::spawn(async move { run_lifecycle(&state, &action).await }).await
-        .map_err(|_| ApiError::code("Internal", "lifecycle task failed; execution result unknown, query status"))?
-}
-
-async fn run_lifecycle(s: &State, action: &str) -> Result<Response, ApiError> {
-    let _lock = s.lifecycle.lock().await;
-    let config = match &s.config_path {
-        Some(path) => WebAdapterConfig::load_from(Some(path)).map_err(|e| ApiError::code("Internal", format!("cannot load lifecycle configuration: {e}")))?,
-        None => s.config.clone(),
-    };
-    let mut cmd = tokio::process::Command::new(&s.ctl_bin);
-    if let Some(path) = &s.config_path { cmd.arg("--config").arg(path); }
-    cmd.arg(action).arg("--json").stdout(std::process::Stdio::piped()).stderr(std::process::Stdio::piped()).kill_on_drop(true);
-    let mut child = cmd.spawn().map_err(|e| ApiError::code("Internal", format!("cannot start lifecycle command: {e}; execution result unknown, query status")))?;
-    let stdout = child.stdout.take().unwrap(); let stderr = child.stderr.take().unwrap();
-    async fn read_limited(r: impl tokio::io::AsyncRead + Unpin) -> std::io::Result<Vec<u8>> { let mut v = Vec::new(); r.take((ctl::MAX_BODY_BYTES + 1) as u64).read_to_end(&mut v).await?; Ok(v) }
-    let budget = config.daemon.start_timeout_ms.saturating_add(ctl::config_set_timeout_ms(config.daemon.rpc_timeout_ms));
-    let result = tokio::time::timeout(Duration::from_millis(budget), async { tokio::try_join!(child.wait(), read_limited(stdout), read_limited(stderr)) }).await;
-    let (status, out, err) = match result {
-        Ok(Ok(v)) => v,
-        other => {
-            // Keep the lock until the CLI has exited, even on timeout or pipe failure.
-            let _ = child.kill().await;
-            match other {
-                Ok(Err(e)) => return Err(ApiError::code("Internal", format!("lifecycle I/O error: {e}; execution result unknown, query status"))),
-                Err(_) => return Err(ApiError::code("GatewayTimeout", "lifecycle timed out; execution result unknown, query status")),
-                Ok(Ok(_)) => unreachable!(),
-            }
-        }
-    };
-    if out.len() > ctl::MAX_BODY_BYTES || err.len() > ctl::MAX_BODY_BYTES { return Err(ApiError::code("BadGateway", "lifecycle output too large; execution result unknown, query status")); }
-    if !status.success() {
-        let code = match status.code() { Some(2) => "InvalidArgument", Some(3) => "UpstreamUnavailable", Some(4) => "Rejected", Some(5) => "GatewayTimeout", _ => "Internal" };
-        let reason = String::from_utf8_lossy(&err); let reason = if reason.trim().is_empty() { "lifecycle command failed" } else { reason.trim() };
-        return Err(ApiError::code(code, if code == "InvalidArgument" { reason.to_owned() } else { format!("{reason}; execution result unknown, query status") }));
-    }
-    let data: Value = serde_json::from_slice(&out).map_err(|_| ApiError::code("BadGateway", "invalid lifecycle output; execution result unknown, query status"))?;
-    let valid = data.as_object().is_some_and(|object| {
-        object.len() == 1 && match (action, object.get("state").and_then(Value::as_str)) {
-            ("up", Some("running" | "already-running")) | ("down", Some("stopped" | "not-running")) => true,
-            _ => false,
-        }
-    });
-    if !valid { return Err(ApiError::code("BadGateway", "invalid lifecycle output; execution result unknown, query status")); }
-    Ok(ok(data))
 }

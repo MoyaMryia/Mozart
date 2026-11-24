@@ -88,6 +88,11 @@ enum Action {
         #[arg(value_enum)]
         service: ServiceArg,
     },
+    /// 启停音频与 AI 业务子服务组（保持 daemon 与 web 在线）
+    Services {
+        #[command(subcommand)]
+        action: ServicesAction,
+    },
     /// 音频设备
     Device {
         #[command(subcommand)]
@@ -202,6 +207,15 @@ enum ServiceArg {
     Tts,
     Bridge,
     Llama,
+    Web,
+}
+
+#[derive(Subcommand)]
+enum ServicesAction {
+    /// 启动业务子服务组
+    Start,
+    /// 停止业务子服务组（保持 daemon 与 web 在线）
+    Stop,
 }
 
 #[derive(Clone, Copy, ValueEnum)]
@@ -315,6 +329,7 @@ fn run(cli: Cli) -> Result<(), CliError> {
             ModelAction::Use { id } => model_use(&config, cli.json, &id),
         },
         Action::Restart { service } => restart(&config, service, cli.json),
+        Action::Services { action } => services_control(&config, action, cli.json),
         Action::Device { action } => match action {
             DeviceAction::List { all } => device_list(&config, cli.json, all),
             DeviceAction::Use { kind, device } => device_use(&config, cli.json, kind, &device),
@@ -737,7 +752,31 @@ fn service_name(service: ServiceArg) -> &'static str {
         ServiceArg::Tts => "tts",
         ServiceArg::Bridge => "bridge",
         ServiceArg::Llama => "llama",
+        ServiceArg::Web => "web",
     }
+}
+
+fn services_control(
+    config: &Config,
+    action: ServicesAction,
+    json_output: bool,
+) -> Result<(), CliError> {
+    let command = match action {
+        ServicesAction::Start => ctl::DAEMON_SERVICES_START,
+        ServicesAction::Stop => ctl::DAEMON_SERVICES_STOP,
+    };
+    let data = call_with_timeout(
+        config,
+        command,
+        b"{}",
+        ctl::request_timeout_ms(config.daemon.rpc_timeout_ms, command),
+    )?;
+    if json_output {
+        println!("{data}");
+    } else {
+        println!("services: {}", text_field(&data, "state")?);
+    }
+    Ok(())
 }
 
 fn device_list(config: &Config, json_output: bool, all: bool) -> Result<(), CliError> {
@@ -1242,6 +1281,9 @@ fn print_status(status: &Status) {
         "daemon   running pid={} version={} uptime={}s",
         status.daemon.pid, status.daemon.version, status.daemon.uptime_s
     );
+    if !status.services_active {
+        println!("services stopped (daemon/web online)");
+    }
     println!(
         "route    {} (desired {}, gpu {})",
         route_name(status.route.active),
@@ -1257,6 +1299,7 @@ fn print_status(status: &Status) {
         ("tts", &status.processes.tts),
         ("bridge", &status.processes.bridge),
         ("llama", &status.processes.llama),
+        ("web", &status.processes.web),
     ] {
         let pid = info
             .pid
@@ -1623,10 +1666,36 @@ mod tests {
                 service: ServiceArg::Llama
             }
         ));
+        assert!(matches!(
+            parse(&["restart", "web"]).unwrap().command,
+            Action::Restart {
+                service: ServiceArg::Web
+            }
+        ));
         assert!(parse(&["restart", "bogus"]).is_err());
         assert!(parse(&["restart"]).is_err());
         let cli = parse(&["restart", "rvc", "--json"]).unwrap();
         assert!(cli.json);
+    }
+
+    #[test]
+    fn services_parses_start_and_stop() {
+        assert!(matches!(
+            parse(&["services", "start"]).unwrap().command,
+            Action::Services {
+                action: ServicesAction::Start
+            }
+        ));
+        let cli = parse(&["--json", "services", "stop"]).unwrap();
+        assert!(cli.json);
+        assert!(matches!(
+            cli.command,
+            Action::Services {
+                action: ServicesAction::Stop
+            }
+        ));
+        assert!(parse(&["services"]).is_err());
+        assert!(parse(&["services", "bogus"]).is_err());
     }
 
     #[test]

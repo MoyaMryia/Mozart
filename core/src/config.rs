@@ -12,7 +12,7 @@ use std::path::{Path, PathBuf};
 #[serde(default, deny_unknown_fields)]
 pub struct Config {
     pub daemon: DaemonConfig,
-    pub web: WebConfig,
+    pub web: Option<WebConfig>,
     pub process: ProcessConfig,
     pub pre: PreConfig,
     pub enhance: Option<EnhanceConfig>,
@@ -132,6 +132,7 @@ impl WebConfig {
 pub struct WebAdapterConfig {
     pub daemon: DaemonConfig,
     pub web: WebConfig,
+    pub web_configured: bool,
     pub subtitles_path: PathBuf,
 }
 
@@ -139,7 +140,7 @@ pub struct WebAdapterConfig {
 #[serde(default)]
 struct AdapterDocument {
     daemon: DaemonConfig,
-    web: WebConfig,
+    web: Option<WebConfig>,
     bridge: AdapterBridge,
 }
 
@@ -174,11 +175,14 @@ impl WebAdapterConfig {
         doc.daemon.apply_env()?;
         doc.daemon.validate()?;
         let home = std::env::var_os("HOME").map(PathBuf::from);
-        doc.web.prepare(path, home.as_deref())?;
-        doc.web.validate()?;
+        let web_configured = doc.web.is_some();
+        let mut web = doc.web.unwrap_or_default();
+        web.prepare(path, home.as_deref())?;
+        web.validate()?;
         Ok(Self {
             daemon: doc.daemon,
-            web: doc.web,
+            web,
+            web_configured,
             subtitles_path: expand_tilde(&doc.bridge.subtitles_path, home.as_deref()),
         })
     }
@@ -197,6 +201,7 @@ pub struct ProcessConfig {
     pub tts_bin: PathBuf,
     pub bridge_bin: PathBuf,
     pub llama_bin: PathBuf,
+    pub web_bin: PathBuf,
     pub env: HashMap<String, String>,
 }
 
@@ -455,6 +460,7 @@ impl Default for ProcessConfig {
             tts_bin: PathBuf::from("mozart-tts"),
             bridge_bin: PathBuf::from("mozart-bridge"),
             llama_bin: PathBuf::from("llama-server"),
+            web_bin: PathBuf::from("mozart-web-adapter"),
             env: HashMap::new(),
         }
     }
@@ -620,7 +626,7 @@ impl Default for Config {
     fn default() -> Self {
         Self {
             daemon: DaemonConfig::default(),
-            web: WebConfig::default(),
+            web: None,
             process: ProcessConfig::default(),
             pre: PreConfig::default(),
             enhance: None,
@@ -761,7 +767,9 @@ impl Config {
             config.bridge.corrections_path = Some(expand_tilde(path, home.as_deref()));
         }
         config.file.storage_dir = expand_tilde(&config.file.storage_dir, home.as_deref());
-        config.web.prepare(path, home.as_deref())?;
+        if let Some(web) = &mut config.web {
+            web.prepare(path, home.as_deref())?;
+        }
         config.validate()?;
         if let Some(enhance) = &mut config.enhance {
             if enhance.model.is_relative() {
@@ -874,33 +882,28 @@ impl Config {
 
     fn apply_env(&mut self) -> Result<(), ConfigError> {
         self.daemon.apply_env()?;
-        if let Some(bin) = std::env::var_os("MOZART_ENHANCE_BIN") {
-            self.process.enhance_bin = PathBuf::from(bin);
-        }
-        if let Some(bin) = std::env::var_os("MOZART_PRE_BIN") {
-            self.process.pre_bin = PathBuf::from(bin);
-        }
-        if let Some(bin) = std::env::var_os("MOZART_RVC_BIN") {
-            self.process.rvc_bin = PathBuf::from(bin);
-        }
-        if let Some(bin) = std::env::var_os("MOZART_ASR_BIN") {
-            self.process.asr_bin = PathBuf::from(bin);
-        }
-        if let Some(bin) = std::env::var_os("MOZART_TTS_BIN") {
-            self.process.tts_bin = PathBuf::from(bin);
-        }
-        if let Some(bin) = std::env::var_os("MOZART_BRIDGE_BIN") {
-            self.process.bridge_bin = PathBuf::from(bin);
-        }
-        if let Some(bin) = std::env::var_os("MOZART_LLAMA_BIN") {
-            self.process.llama_bin = PathBuf::from(bin);
+        for (var, slot) in [
+            ("MOZART_ENHANCE_BIN", &mut self.process.enhance_bin),
+            ("MOZART_PRE_BIN", &mut self.process.pre_bin),
+            ("MOZART_RVC_BIN", &mut self.process.rvc_bin),
+            ("MOZART_ASR_BIN", &mut self.process.asr_bin),
+            ("MOZART_TTS_BIN", &mut self.process.tts_bin),
+            ("MOZART_BRIDGE_BIN", &mut self.process.bridge_bin),
+            ("MOZART_LLAMA_BIN", &mut self.process.llama_bin),
+            ("MOZART_WEB_BIN", &mut self.process.web_bin),
+        ] {
+            if let Some(bin) = std::env::var_os(var) {
+                *slot = PathBuf::from(bin);
+            }
         }
         Ok(())
     }
 
     fn validate(&self) -> Result<(), ConfigError> {
         self.daemon.validate()?;
-        self.web.validate()?;
+        if let Some(web) = &self.web {
+            web.validate()?;
+        }
         validate_socket_name(&self.pre.socket, "pre.socket")?;
         validate_device_name(&self.pre.capture_device, "pre.capture_device")?;
         validate_device_name(&self.pre.playback_device, "pre.playback_device")?;
@@ -1054,40 +1057,19 @@ impl Config {
                 "file.ffmpeg_timeout_ms must be greater than zero".to_string(),
             ));
         }
-        if self.process.pre_bin.as_os_str().is_empty() {
-            return Err(ConfigError::Invalid(
-                "process.pre_bin must not be empty".to_string(),
-            ));
-        }
-        if self.process.rvc_bin.as_os_str().is_empty() {
-            return Err(ConfigError::Invalid(
-                "process.rvc_bin must not be empty".to_string(),
-            ));
-        }
-        if self.process.asr_bin.as_os_str().is_empty() {
-            return Err(ConfigError::Invalid(
-                "process.asr_bin must not be empty".to_string(),
-            ));
-        }
-        if self.process.tts_bin.as_os_str().is_empty() {
-            return Err(ConfigError::Invalid(
-                "process.tts_bin must not be empty".to_string(),
-            ));
-        }
-        if self.process.bridge_bin.as_os_str().is_empty() {
-            return Err(ConfigError::Invalid(
-                "process.bridge_bin must not be empty".to_string(),
-            ));
-        }
-        if self.process.llama_bin.as_os_str().is_empty() {
-            return Err(ConfigError::Invalid(
-                "process.llama_bin must not be empty".to_string(),
-            ));
-        }
-        if self.process.enhance_bin.as_os_str().is_empty() {
-            return Err(ConfigError::Invalid(
-                "process.enhance_bin must not be empty".to_string(),
-            ));
+        for (bin, field) in [
+            (&self.process.pre_bin, "process.pre_bin"),
+            (&self.process.rvc_bin, "process.rvc_bin"),
+            (&self.process.asr_bin, "process.asr_bin"),
+            (&self.process.tts_bin, "process.tts_bin"),
+            (&self.process.bridge_bin, "process.bridge_bin"),
+            (&self.process.llama_bin, "process.llama_bin"),
+            (&self.process.enhance_bin, "process.enhance_bin"),
+            (&self.process.web_bin, "process.web_bin"),
+        ] {
+            if bin.as_os_str().is_empty() {
+                return Err(ConfigError::Invalid(format!("{field} must not be empty")));
+            }
         }
         self.validate_enhance(self.enhance.as_ref())?;
         let mut seen = std::collections::HashSet::new();
@@ -2428,6 +2410,31 @@ mod tests {
                 "http://[::1]:8080",
             ]
         );
+        let default_cfg = Config::default();
+        assert!(default_cfg.web.is_none());
+        assert_eq!(
+            default_cfg.process.web_bin,
+            PathBuf::from("mozart-web-adapter")
+        );
+        let with_web: Config = toml::from_str("[web]\n").unwrap();
+        assert_eq!(
+            with_web.web.as_ref().unwrap().listen,
+            "0.0.0.0:8080".parse::<SocketAddr>().unwrap()
+        );
+        let empty_web_bin: Config = toml::from_str("[process]\nweb_bin = \"\"\n").unwrap();
+        assert!(empty_web_bin.validate().is_err());
+        let dir = temp_config_dir("web_configured");
+        let without_path = dir.join("no_web.toml");
+        std::fs::write(&without_path, "").unwrap();
+        assert!(!WebAdapterConfig::load_from(Some(&without_path))
+            .unwrap()
+            .web_configured);
+        let with_path = dir.join("with_web.toml");
+        std::fs::write(&with_path, "[web]\n").unwrap();
+        assert!(WebAdapterConfig::load_from(Some(&with_path))
+            .unwrap()
+            .web_configured);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

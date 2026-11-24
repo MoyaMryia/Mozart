@@ -27,7 +27,12 @@
 mozart-ctl up                 # 启动（幂等）
 mozart-ctl status             # 查看状态；--json 输出稳定机器契约
 mozart-ctl down               # 关停
+mozart-ctl services stop      # 只停音频与 AI 业务服务，daemon 与网页保持在线
+mozart-ctl services start     # 恢复业务服务
 ```
+
+`services stop` 释放 GPU 与内存，网页仍可访问并显示停机状态；文件任务正在跑时拒绝，排队任务保留，恢复服务后继续。
+停服期间新的文件提交被拒绝。整机关停用 `down`。
 
 ## 三、设备选择
 
@@ -98,7 +103,7 @@ mozart-ctl preset list                              # 查看当前模型预设�
 mozart-ctl preset save                              # 把当前调参保存为该模型的 default 预设
 mozart-ctl preset use                               # 重新载入当前模型的 default 预设
 mozart-ctl config get <键>                          # 读取配置基线
-mozart-ctl restart <pre|rvc|asr|tts|bridge|llama>  # 重启单个服务
+mozart-ctl restart <pre|enhance|rvc|asr|tts|bridge|llama|web>  # 重启单个服务
 ```
 
 `config get` 读基线值。键尚未重启生效时，值后追加一行 `pending` 提示，重启对应服务后消失。

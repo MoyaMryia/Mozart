@@ -48,6 +48,7 @@ impl Supervisor {
         config_path: Option<PathBuf>,
         state: Arc<Mutex<State>>,
         running: Arc<AtomicBool>,
+        services_active: Arc<AtomicBool>,
     ) -> io::Result<Self> {
         let (tx, restart_rx) = mpsc::channel();
         let handle = thread::Builder::new()
@@ -59,6 +60,7 @@ impl Supervisor {
                     config_path.as_deref(),
                     &state,
                     &running,
+                    &services_active,
                     &restart_rx,
                 )
             })?;
@@ -83,6 +85,7 @@ fn supervise(
     config_path: Option<&Path>,
     state: &Mutex<State>,
     running: &AtomicBool,
+    services_active: &AtomicBool,
     restart_rx: &mpsc::Receiver<Arc<Config>>,
 ) {
     // spawn 配置是快照：只在显式重启时重读（重启类键不动运行进程）。
@@ -95,11 +98,18 @@ fn supervise(
         let base = Duration::from_millis(tuning.daemon.restart_backoff_ms);
         let max = Duration::from_millis(tuning.daemon.restart_backoff_max_ms);
         let stable = Duration::from_millis(tuning.daemon.restart_stable_ms);
-        if role == Role::Enhance && config.enhance.is_none() {
+        let unconfigured =
+            (role == Role::Enhance && config.enhance.is_none()) || (role == Role::Web && config.web.is_none());
+        if unconfigured || (role.is_business() && !services_active.load(Ordering::Acquire)) {
             lock_state(state).process_stopped(role);
-            match backoff_wait(POLL, running, restart_rx) {
+            let wake_on_active = (role.is_business() && !unconfigured).then_some(true);
+            match backoff_wait(POLL, running, restart_rx, wake_on_active, services_active) {
                 Backoff::Stopped => break,
-                Backoff::Restart(new) => config = new,
+                Backoff::Restart(new) => {
+                    config = new;
+                    backoff = base;
+                }
+                Backoff::ServiceToggle => backoff = base,
                 Backoff::Elapsed => {}
             }
             continue;
@@ -112,45 +122,62 @@ fn supervise(
             Role::Tts => &config.process.tts_bin,
             Role::Bridge => &config.process.bridge_bin,
             Role::Llama => &config.process.llama_bin,
+            Role::Web => &config.process.web_bin,
         };
         let socket = match role {
-            Role::Enhance => config.enhance_socket(),
-            Role::Pre => config.pre_socket(),
-            Role::Rvc => config.rvc_socket(),
-            Role::Asr => config.asr_socket(),
-            Role::Tts => config.tts_socket(),
-            Role::Bridge => config.bridge_socket(),
-            Role::Llama => config.llama_socket(),
+            Role::Enhance => Some(config.enhance_socket()),
+            Role::Pre => Some(config.pre_socket()),
+            Role::Rvc => Some(config.rvc_socket()),
+            Role::Asr => Some(config.asr_socket()),
+            Role::Tts => Some(config.tts_socket()),
+            Role::Bridge => Some(config.bridge_socket()),
+            Role::Llama => Some(config.llama_socket()),
+            Role::Web => None,
         };
         let log_path = config.log_dir().join(format!("{}.log", role.name()));
 
         lock_state(state).process_starting(role);
-        let mut child =
-            match start_child(role, bin, &socket, &config, &shared, config_path, &log_path) {
-                Ok(child) => child,
-                Err(err) => {
-                    lock_state(state).process_failed(role, format!("spawn: {err}"));
-                    match backoff_wait(backoff, running, restart_rx) {
-                        Backoff::Stopped => break,
-                        Backoff::Restart(new) => {
-                            config = new;
-                            backoff = base;
-                        }
-                        Backoff::Elapsed => backoff = next_backoff(backoff, max),
+        let mut child = match start_child(
+            role,
+            bin,
+            socket.as_deref(),
+            &config,
+            &shared,
+            config_path,
+            &log_path,
+        ) {
+            Ok(child) => child,
+            Err(err) => {
+                lock_state(state).process_failed(role, format!("spawn: {err}"));
+                let wake_on_active = role.is_business().then_some(false);
+                match backoff_wait(backoff, running, restart_rx, wake_on_active, services_active) {
+                    Backoff::Stopped => break,
+                    Backoff::Restart(new) => {
+                        config = new;
+                        backoff = base;
                     }
-                    continue;
+                    Backoff::ServiceToggle => backoff = base,
+                    Backoff::Elapsed => backoff = next_backoff(backoff, max),
                 }
-            };
+                continue;
+            }
+        };
 
         let pid = child.id();
         let started = Instant::now();
         lock_state(state).process_running(role, pid);
 
         let mut restart_now = false;
+        let mut paused_now = false;
         let exit = loop {
             if !running.load(Ordering::Acquire) {
                 terminate(&mut child, state, role);
                 return;
+            }
+            if role.is_business() && !services_active.load(Ordering::Acquire) {
+                terminate(&mut child, state, role);
+                paused_now = true;
+                break None;
             }
             if let Some(new_config) = take_restart(restart_rx) {
                 // 显式重启：停子进程后立即以新配置重起，不计崩溃退避。
@@ -171,7 +198,7 @@ fn supervise(
             }
         };
 
-        if restart_now {
+        if restart_now || paused_now {
             backoff = base;
             continue;
         }
@@ -181,34 +208,42 @@ fn supervise(
         if started.elapsed() >= stable {
             backoff = base;
         }
-        match backoff_wait(backoff, running, restart_rx) {
+        let wake_on_active = role.is_business().then_some(false);
+        match backoff_wait(backoff, running, restart_rx, wake_on_active, services_active) {
             Backoff::Stopped => break,
             Backoff::Restart(new) => {
                 config = new;
                 backoff = base;
             }
+            Backoff::ServiceToggle => backoff = base,
             Backoff::Elapsed => backoff = next_backoff(backoff, max),
         }
     }
     lock_state(state).process_stopped(role);
 }
 
-/// 退避等待的结果：停止监管 / 睡满时长 / 被重启请求打断。
+/// 退避等待的结果：停止监管 / 业务组暂停或恢复切换 / 睡满时长 / 被重启请求打断。
 enum Backoff {
     Stopped,
+    ServiceToggle,
     Elapsed,
     Restart(Arc<Config>),
 }
 
-/// 退避等待：每 POLL 检查 running 与重启请求，重启不被退避拖延。
+/// 退避等待：每 POLL 检查 running、业务启停信号与重启请求，重启不被退避拖延。
 fn backoff_wait(
     mut remaining: Duration,
     running: &AtomicBool,
     restart_rx: &mpsc::Receiver<Arc<Config>>,
+    wake_on_active: Option<bool>,
+    services_active: &AtomicBool,
 ) -> Backoff {
     while !remaining.is_zero() {
         if !running.load(Ordering::Acquire) {
             return Backoff::Stopped;
+        }
+        if wake_on_active.is_some_and(|target| services_active.load(Ordering::Acquire) == target) {
+            return Backoff::ServiceToggle;
         }
         if let Some(config) = take_restart(restart_rx) {
             return Backoff::Restart(config);
@@ -217,10 +252,12 @@ fn backoff_wait(
         thread::sleep(step);
         remaining -= step;
     }
-    if running.load(Ordering::Acquire) {
-        Backoff::Elapsed
-    } else {
+    if !running.load(Ordering::Acquire) {
         Backoff::Stopped
+    } else if wake_on_active.is_some_and(|target| services_active.load(Ordering::Acquire) == target) {
+        Backoff::ServiceToggle
+    } else {
+        Backoff::Elapsed
     }
 }
 
@@ -236,7 +273,7 @@ fn take_restart(restart_rx: &mpsc::Receiver<Arc<Config>>) -> Option<Arc<Config>>
 fn start_child(
     role: Role,
     bin: &Path,
-    socket: &Path,
+    socket: Option<&Path>,
     config: &Config,
     shared: &SharedConfig,
     config_path: Option<&Path>,
@@ -249,6 +286,7 @@ fn start_child(
     let stderr = log.try_clone()?;
     let mut command = Command::new(resolve_bin(bin));
     if role == Role::Llama {
+        let socket = socket.expect("llama socket configured");
         // llama-server 不说控制协议（SPEC-05）：无 --socket/--config 契约，
         // --host 直接填 Unix socket 路径；启动参数沿用旧实现。
         // 第三方进程不会自清陈旧 socket 文件，daemon 重启后残留文件会让其
@@ -277,6 +315,7 @@ fn start_child(
             .arg(socket)
             .arg("--jinja");
     } else if role == Role::Enhance {
+        let socket = socket.expect("enhance socket configured");
         let enhance = config
             .enhance
             .as_ref()
@@ -288,7 +327,12 @@ fn start_child(
             .arg(config.enhance_audio_socket())
             .arg("--model")
             .arg(&enhance.model);
+    } else if role == Role::Web {
+        if let Some(config_path) = config_path {
+            command.arg("--config").arg(config_path);
+        }
     } else {
+        let socket = socket.expect("service socket configured");
         command.arg("--socket").arg(socket);
         if role == Role::Pre {
             let effective = shared.snapshot();

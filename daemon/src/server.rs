@@ -4,7 +4,7 @@ use crate::poller::Poller;
 use crate::preset::PresetManager;
 use crate::runtime::SharedConfig;
 use crate::services::{self, Services};
-use crate::state::{lock_state, Role, State};
+use crate::state::{lock_state, Role, State, SERVICES_STOP_TIMEOUT_REASON};
 use crate::state_file::{self, BridgeRestore, StateFile};
 use crate::supervisor::{RestartHandle, Supervisor};
 use mozart_core::config::{
@@ -12,9 +12,9 @@ use mozart_core::config::{
     set_key, state_file_path, validate_device_name, Config,
 };
 use mozart_core::ctl::schema::{
-    self, ConfigGetRequest, ConfigSetRequest, DeviceKind, DeviceListRequest, DeviceUseRequest,
-    FileCancelRequest, FileFetchRequest, FileStatusRequest, FileSubmitRequest, MuteSetRequest,
-    RestartRequest, RouteSetRequest, RvcParams, SwitchSetRequest,
+    self, Activity, ConfigGetRequest, ConfigSetRequest, DeviceKind, DeviceListRequest,
+    DeviceUseRequest, FileCancelRequest, FileFetchRequest, FileStatusRequest, FileSubmitRequest,
+    MuteSetRequest, RestartRequest, RouteSetRequest, RvcParams, SwitchSetRequest,
 };
 use mozart_core::ctl::{self, Message, Seqpacket};
 use serde_json::json;
@@ -25,9 +25,10 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 const IDLE_TIMEOUT: Duration = Duration::from_secs(30);
+const SERVICES_STOP_TIMEOUT: Duration = Duration::from_secs(4);
 
 /// 控制面共享上下文：每条控制连接持一份克隆。
 #[derive(Clone)]
@@ -44,6 +45,7 @@ struct Ctx {
     /// TOML 写回串行锁：config set / config save 的读改写不得交错。
     toml_lock: Arc<Mutex<()>>,
     running: Arc<AtomicBool>,
+    services_active: Arc<AtomicBool>,
 }
 
 pub fn serve(config: &Config, config_path: Option<&Path>) -> io::Result<()> {
@@ -77,6 +79,7 @@ pub fn serve(config: &Config, config_path: Option<&Path>) -> io::Result<()> {
     let state = Arc::new(Mutex::new(initial_state));
     let services = Arc::new(Services::new(&shared));
     let running = Arc::new(AtomicBool::new(true));
+    let services_active = Arc::new(AtomicBool::new(true));
     // 预设载入与 config set/save 共用 TOML 串行锁与 transition 锁。
     let toml_lock = Arc::new(Mutex::new(()));
     let presets = Arc::new(PresetManager::new(
@@ -102,23 +105,16 @@ pub fn serve(config: &Config, config_path: Option<&Path>) -> io::Result<()> {
             signal_running.store(false, Ordering::Release);
         }
     });
-    let supervisors = [
-        Role::Enhance,
-        Role::Pre,
-        Role::Rvc,
-        Role::Asr,
-        Role::Tts,
-        Role::Bridge,
-        Role::Llama,
-    ]
-    .into_iter()
-    .map(|role| {
+    let supervisors = Role::ALL
+        .into_iter()
+        .map(|role| {
         Supervisor::spawn(
             role,
             shared.clone(),
             config_path.clone(),
             state.clone(),
             running.clone(),
+            services_active.clone(),
         )
     })
     .collect::<io::Result<Vec<_>>>()?;
@@ -146,6 +142,7 @@ pub fn serve(config: &Config, config_path: Option<&Path>) -> io::Result<()> {
         bridge_restore.clone(),
         state_file.clone(),
         running.clone(),
+        services_active.clone(),
     )?;
 
     let ctx = Ctx {
@@ -160,6 +157,7 @@ pub fn serve(config: &Config, config_path: Option<&Path>) -> io::Result<()> {
         restarts,
         toml_lock,
         running,
+        services_active,
     };
     let outcome = accept_loop(&listener, &ctx);
     ctx.running.store(false, Ordering::Release);
@@ -293,6 +291,9 @@ fn handle_request(ctx: &Ctx, msg: &Message) -> (Vec<u8>, bool) {
         ctl::DAEMON_OUTPUT_MODE_SET => match parse_body::<schema::OutputModeSetRequest>(&msg.body) {
             Ok(request) => {
                 let _transition = ctx.services.transition();
+                if let Err(reply) = ensure_services_active(ctx) {
+                    return (reply, false);
+                }
                 let mut restore = lock_bridge_restore(&ctx.bridge_restore);
                 restore.speech = None;
                 let mode = crate::mode::request(&mut lock_state(&ctx.state), request.mode);
@@ -300,9 +301,14 @@ fn handle_request(ctx: &Ctx, msg: &Message) -> (Vec<u8>, bool) {
             }
             Err(reply) => (reply, false),
         },
+        ctl::DAEMON_SERVICES_START => (services_start_reply(ctx, &msg.body), false),
+        ctl::DAEMON_SERVICES_STOP => (services_stop_reply(ctx, &msg.body), false),
         ctl::DAEMON_ROUTE_SET => match parse_body::<RouteSetRequest>(&msg.body) {
             Ok(request) => {
                 let _transition = ctx.services.transition();
+                if let Err(reply) = ensure_services_active(ctx) {
+                    return (reply, false);
+                }
                 crate::mode::unmanage(&mut lock_state(&ctx.state));
                 let config = ctx.config.snapshot();
                 match services::route_set_locked(
@@ -326,12 +332,18 @@ fn handle_request(ctx: &Ctx, msg: &Message) -> (Vec<u8>, bool) {
             Err(reply) => (reply, false),
         },
         ctl::DAEMON_TRANSLATE_SET => match parse_body::<SwitchSetRequest>(&msg.body) {
-            Ok(request) => apply_bridge_switch(
-                ctx,
-                "bridge.translate_enabled",
-                request.enabled,
-                || services::translate_set(&ctx.services, request.enabled),
-            ),
+            Ok(request) => {
+                let _transition = ctx.services.transition();
+                if let Err(reply) = ensure_services_active(ctx) {
+                    return (reply, false);
+                }
+                apply_bridge_switch(
+                    ctx,
+                    "bridge.translate_enabled",
+                    request.enabled,
+                    || services::translate_set(&ctx.services, request.enabled),
+                )
+            }
             Err(reply) => (reply, false),
         },
         ctl::DAEMON_SPEECH_SET => match parse_body::<SwitchSetRequest>(&msg.body) {
@@ -359,6 +371,10 @@ fn handle_request(ctx: &Ctx, msg: &Message) -> (Vec<u8>, bool) {
         },
         ctl::DAEMON_FILE_LIST => file_reply(ctx.file.list()),
         ctl::DAEMON_MODEL_LIST => {
+            let _transition = ctx.services.transition();
+            if let Err(reply) = ensure_services_active(ctx) {
+                return (reply, false);
+            }
             file_reply(services::list_models(&ctx.services).map(|models| json!({"models": models})))
         }
         ctl::DAEMON_MODEL_USE => match parse_body::<schema::ModelUseRequest>(&msg.body) {
@@ -407,6 +423,89 @@ fn handle_request(ctx: &Ctx, msg: &Message) -> (Vec<u8>, bool) {
     }
 }
 
+/// 停服期准入。调用方须已持 transition 锁：锁外校验会与 `services stop` 竞态，
+/// 放行后报的是子服务 socket 错误而不是 NotReady。
+fn ensure_services_active(ctx: &Ctx) -> Result<(), Vec<u8>> {
+    lock_state(&ctx.state)
+        .ensure_services_active()
+        .map_err(|(code, reason)| schema::error_body(&code, &reason))
+}
+
+fn parse_empty_body(body: &[u8], reason: &str) -> Result<(), Vec<u8>> {
+    if !body.is_empty()
+        && !serde_json::from_slice::<serde_json::Map<String, serde_json::Value>>(body)
+            .is_ok_and(|value| value.is_empty())
+    {
+        return Err(schema::error_body(ctl::CODE_INVALID_ARGUMENT, reason));
+    }
+    Ok(())
+}
+
+/// 在保持 daemon 与 web 在线前提下恢复启动音频与 AI 业务子服务组（SPEC-04 方案 1）。
+fn services_start_reply(ctx: &Ctx, body: &[u8]) -> Vec<u8> {
+    if let Err(reply) = parse_empty_body(body, "services start body must be an empty object") {
+        return reply;
+    }
+    let _transition = ctx.services.transition();
+    if ctx.services_active.load(Ordering::Acquire) {
+        return schema::ok_body(json!({"state": "already-running"}));
+    }
+    let effective = ctx.config.snapshot();
+    {
+        let mut restore = lock_bridge_restore(&ctx.bridge_restore);
+        let mut state = lock_state(&ctx.state);
+        state.finalize_services_stopped();
+        crate::mode::initialize(&mut state, &effective);
+        if state.output_mode.is_some() {
+            restore.speech = None;
+        }
+        // 上一轮的播报停止屏障不得打到新起的服务。
+        restore.speech_stop = None;
+        state.set_services_active(true);
+    }
+    ctx.services_active.store(true, Ordering::Release);
+    schema::ok_body(json!({"state": "running"}))
+}
+
+/// 在保持 daemon 与 web 在线前提下停止全部音频与 AI 业务子服务组以释放资源（SPEC-04 方案 1）。
+fn services_stop_reply(ctx: &Ctx, body: &[u8]) -> Vec<u8> {
+    if let Err(reply) = parse_empty_body(body, "services stop body must be an empty object") {
+        return reply;
+    }
+    let _transition = ctx.services.transition();
+    {
+        let mut restore = lock_bridge_restore(&ctx.bridge_restore);
+        let mut state = lock_state(&ctx.state);
+        if !ctx.services_active.load(Ordering::Acquire) && state.all_business_stopped() {
+            // 超时后进程才停完：重试路径同样收尾，不让旧快照与超时原因长留 status。
+            state.finalize_services_stopped();
+            restore.speech_stop = None;
+            return schema::ok_body(json!({"state": "not-running"}));
+        }
+        if state.gpu_owner() == Some(Activity::File) || state.file_return_pending() {
+            return schema::error_body(
+                ctl::CODE_BUSY,
+                "cannot stop business services while file job is active",
+            );
+        }
+    }
+    ctx.services_active.store(false, Ordering::Release);
+    lock_state(&ctx.state).set_services_active(false);
+    let deadline = Instant::now() + SERVICES_STOP_TIMEOUT;
+    loop {
+        if lock_state(&ctx.state).all_business_stopped() {
+            lock_state(&ctx.state).finalize_services_stopped();
+            return schema::ok_body(json!({"state": "stopped"}));
+        }
+        if Instant::now() >= deadline {
+            let reason = SERVICES_STOP_TIMEOUT_REASON.to_string();
+            lock_state(&ctx.state).push_degraded(reason.clone());
+            return schema::error_body(ctl::CODE_INTERNAL, &reason);
+        }
+        thread::sleep(Duration::from_millis(25));
+    }
+}
+
 /// 字幕开关转发与存档在 bridge_restore 锁内串行执行，避免与 Poller 的
 /// 重载/恢复逻辑交错覆写（锁序：bridge_restore → state_file / services.bridge）。
 /// 落盘失败只记降级：开关已在桥生效且内存 overrides 已更新供桥重启恢复，
@@ -438,6 +537,9 @@ fn save_bridge_switch(ctx: &Ctx, restore: &mut BridgeRestore, key: &str, enabled
 
 fn speech_set_reply(ctx: &Ctx, enabled: bool) -> Vec<u8> {
     let _transition = ctx.services.transition();
+    if let Err(reply) = ensure_services_active(ctx) {
+        return reply;
+    }
     crate::mode::unmanage(&mut lock_state(&ctx.state));
     let mut restore = lock_bridge_restore(&ctx.bridge_restore);
     if enabled && restore.speech_stop.is_some() {
@@ -455,10 +557,13 @@ fn speech_set_reply(ctx: &Ctx, enabled: bool) -> Vec<u8> {
 }
 
 fn speech_stop_reply(ctx: &Ctx, body: &[u8]) -> Vec<u8> {
-    if !body.is_empty() && !serde_json::from_slice::<serde_json::Map<String, serde_json::Value>>(body).is_ok_and(|value| value.is_empty()) {
-        return schema::error_body(ctl::CODE_INVALID_ARGUMENT, "speech stop body must be an empty object");
+    if let Err(reply) = parse_empty_body(body, "speech stop body must be an empty object") {
+        return reply;
     }
     let _transition = ctx.services.transition();
+    if let Err(reply) = ensure_services_active(ctx) {
+        return reply;
+    }
     crate::mode::unmanage(&mut lock_state(&ctx.state));
     let mut restore = lock_bridge_restore(&ctx.bridge_restore);
     match services::advance_speech_stop(&ctx.state, &ctx.services, &ctx.state_file, &mut restore) {
@@ -481,6 +586,9 @@ fn restart_service(ctx: &Ctx, service: &str) -> Vec<u8> {
             &format!("unknown service: {service}"),
         );
     };
+    if role.is_business() && !ctx.services_active.load(Ordering::Acquire) {
+        return schema::error_body(ctl::CODE_BUSY, "business services are stopped");
+    }
     let config = match Config::load_from(ctx.config_path.as_deref()) {
         Ok(config) => config,
         Err(err) => return schema::error_body(ctl::CODE_INVALID_ARGUMENT, &err.to_string()),
@@ -564,6 +672,9 @@ fn device_use_reply(ctx: &Ctx, request: &DeviceUseRequest) -> Vec<u8> {
         return schema::error_body(&code, &reason);
     }
     let _transition = ctx.services.transition();
+    if let Err(reply) = ensure_services_active(ctx) {
+        return reply;
+    }
     match ctx.services.set_device(request) {
         Ok(data) => {
             let mut live = (*ctx.config.snapshot()).clone();
@@ -622,6 +733,9 @@ fn config_set_reply(ctx: &Ctx, request: &ConfigSetRequest) -> Vec<u8> {
 /// 一律用切换前的生效配置（旧模型 + 旧参数），不套用目标预设。
 fn model_use_reply(ctx: &Ctx, model_id: &str) -> Vec<u8> {
     let _transition = ctx.services.transition();
+    if let Err(reply) = ensure_services_active(ctx) {
+        return reply;
+    }
     let old = ctx.config.snapshot();
     match services::switch_rvc_model_locked(&ctx.state, &ctx.services, &ctx.presets, &old, model_id)
     {
@@ -662,10 +776,12 @@ fn apply_runtime_key(ctx: &Ctx, key: &str, old: &Config) -> Result<(), (String, 
                 ))
             }
         }
-        ctx.services.set_dsp(&fresh.pre.dsp).map_err(|(code, reason)| (
-            code,
-            format!("pre SetDsp: {reason}; effective DSP unchanged; TOML baseline kept; retry config set for the same key or restart daemon to apply"),
-        ))?;
+        if ctx.services_active.load(Ordering::Acquire) {
+            ctx.services.set_dsp(&fresh.pre.dsp).map_err(|(code, reason)| (
+                code,
+                format!("pre SetDsp: {reason}; effective DSP unchanged; TOML baseline kept; retry config set for the same key or restart daemon to apply"),
+            ))?;
+        }
     }
     if runtime_key_owner(key) == Some("rvc") {
         // 未生效的 rvc 基线（如失败恢复留下的 pitch）不得混入生效配置，

@@ -26,7 +26,7 @@
 
 ~/mozart-runtime/             # 运行时根；同一时间只跑这一份
 ├── mozart.toml               # 运行配置（唯一手改入口）
-├── bin/                      # 9 个程序、mozart-web-service 和 examples/rvc_stub
+├── bin/                      # 9 个程序和 examples/rvc_stub
 ├── bin.prev/                 # 上一次部署的二进制（保留文件 capability）
 ├── web.prev/                 # 上一次部署的静态资源
 ├── run/                      # socket、daemon.lock、logs/
@@ -59,7 +59,7 @@
 
 - `~/Mozart` 由部署脚本管理，不在设备上手改源码。
 - `~/mozart-runtime` 是唯一运行实例；配置只改 `mozart.toml`。
-- 9 个程序为 `mozart-daemon`、`mozart-ctl`、`mozart-pre`、`mozart-enhance`、`mozart-rvc`、`mozart-asr`、`mozart-tts`、`mozart-bridge` 和 `mozart-web-adapter`。独立启动脚本为 `bin/mozart-web-service`。
+- 9 个程序为 `mozart-daemon`、`mozart-ctl`、`mozart-pre`、`mozart-enhance`、`mozart-rvc`、`mozart-asr`、`mozart-tts`、`mozart-bridge` 和 `mozart-web-adapter`（由 `daemon` 统一监管，无独立启动脚本）。
 - `~/mozart-assets` 只读；例外是各 RVC 模型目录内的 `presets/`，由 daemon 写入模型预设（SPEC-11）。其余测试只写 `/tmp/mozart-*` 与 `~/mozart-runtime/{run,state,out}`。
 - 历史实验目录只放 `~/mozart-archive/legacy/`；旧报告中的路径视为历史记录。
 
@@ -112,13 +112,13 @@ MOZART_JETSON=<SSH目标> uv run tools/jetson-audio.py
 2. rsync 本机仓库到 `~/Mozart`，排除 `target/`、`build/`、`.git/`。默认按内容同步（`--checksum --no-times`）：变更文件落传输时刻的 mtime，未变更文件保持原 mtime，构建缓存保留。`--full` 时前拨全部源码 mtime 并删除 workspace 成员的 cargo 指纹，强制全量重编。
 3. 构建 Rust 全部二进制与示例；构建 `jetson-release` C++ 产物；rvc 对齐到 `target/debug`。增量时 cargo/ninja 只重编受影响部分。
 4. 构建前停止整栈，释放共享内存；保持停机至安装完成。
-5. 备份 `~/mozart-runtime/bin` 到 `bin.prev`；安装 9 个程序、Web 服务脚本、静态资源与 `examples/rvc_stub`。安装用临时文件加原子替换，不打断运行中的进程。
-6. 用 `mozart.toml` 整栈启动，等待 pre、RVC、配置中的增强链路及原本正常的服务恢复，再启动独立 Web 服务。
+5. 备份 `~/mozart-runtime/bin` 到 `bin.prev` 与 `web.prev`；安装 9 个程序、静态资源与 `examples/rvc_stub`，并清理旧 `bin/mozart-web-service`。安装用临时文件加原子替换，不打断运行中的进程；若配置低端口（`< 1024`）则对 `mozart-web-adapter` 授予 `cap_net_bind_service`。
+6. 用 `mozart.toml` 经 `mozart-ctl up` 整栈启动，等待 `web`、pre、RVC、配置中的增强链路及原本正常的服务恢复。
 7. 写 `~/mozart-runtime/deploy.json`。
 
-失败时执行事务内的 `rollback.sh`。它恢复独立源码快照，清理失效构建缓存，并恢复原先运行的服务。安装开始后还恢复 `bin.prev` 与 `web.prev`；回滚失败时保留锁和事务记录，不假报成功。
+失败时执行事务内的 `rollback.sh`。它恢复独立源码快照，清理失效构建缓存，并恢复原先运行的服务（从旧版迁移失败回滚至 `bin.prev` 时保留旧独立服务恢复兼容）。安装开始后还恢复 `bin.prev` 与 `web.prev`；回滚失败时保留锁和事务记录，不假报成功。
 
-适配器不加入 daemon 子进程表。`system/down` 不停止页面。使用 `bin/mozart-web-service <运行目录> start|stop|restart|status` 管理它；启动脚本检查 PID、启动时间、可执行文件和配置参数，并等待绑定完成的原生确认。
+部署要求 `mozart.toml` 已配置 `[web]` 段。`mozart-web-adapter` 由 `daemon` 统一监管（日志位于 `run/logs/web.log`）；网页 `system/down` 或 `mozart-ctl services stop` 仅停业务子服务，`daemon` 与页面保持在线。整机停机走 `mozart-ctl down`，单独重启适配器走 `mozart-ctl restart web`。
 
 默认配置监听 `8080` 高端口，无需 `cap_net_bind_service` 或免密 `sudo` 即可启动。若手动配置低端口（`< 1024`），脚本才通过 `sudo -n setcap` 授予 `cap_net_bind_service`；没有该权限时请保持高端口配置。服务以运行目录所有者启动，不以 root 运行；绑定后、创建工作线程前清除进程 capability。设备需提供 `jq` 和 libcap 工具。
 
@@ -206,7 +206,7 @@ static_dir = "web/dist"
 upload_dir = "state/web-uploads"
 ```
 
-按实际访问地址配置 `allowed_origins`。适配器以同一运行用户独立运行，高端口默认配置与低端口权限见[部署行为](#部署行为)，网络访问控制由部署提供。运行期子进程环境变量（如 `LD_LIBRARY_PATH`）统一以 [process.env](config.md#processenv) 为唯一来源。
+按实际访问地址配置 `allowed_origins`。适配器由 daemon 以同一运行用户拉起，高端口默认配置与低端口权限见[部署行为](#部署行为)，网络访问控制由部署提供。运行期子进程环境变量（如 `LD_LIBRARY_PATH`）统一以 [process.env](config.md#processenv) 为唯一来源。
 手动文件变声 harness：`~/mozart-runtime/run-remote.sh`，执行 `ctl up → file submit → file fetch`。
 
 当前运行配置只启用 pre、rvc 与文件转换。未配置 `[process.env]`、`[asr]`、`[tts]`、`[bridge]` 时，`status` 显示 asr/tts/llama 降级属预期；语言链由 e2e 的临时配置验证。

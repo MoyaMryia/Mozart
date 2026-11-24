@@ -175,6 +175,8 @@ pub struct Processes {
     /// llama-server 无控制协议，只监管进程存活；状态快照不含其业务字段。
     #[serde(default = "ProcessInfo::stopped")]
     pub llama: ProcessInfo,
+    #[serde(default = "ProcessInfo::stopped")]
+    pub web: ProcessInfo,
 }
 
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -313,8 +315,14 @@ pub struct HardwareStatus {
     pub gpu: GpuInfo,
 }
 
+fn default_services_active() -> bool {
+    true
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Status {
+    #[serde(default = "default_services_active")]
+    pub services_active: bool,
     #[serde(default)]
     pub enhance: Option<EnhanceStatus>,
     pub daemon: DaemonInfo,
@@ -699,7 +707,7 @@ pub struct ConfigGetRequest {
     pub key: Option<String>,
 }
 
-/// DAEMON_RESTART 请求体；service 取进程名（pre/rvc/asr/tts/bridge/llama）。
+/// DAEMON_RESTART 请求体；service 取进程名（pre/enhance/rvc/asr/tts/bridge/llama/web）。
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct RestartRequest {
@@ -866,6 +874,7 @@ mod tests {
         assert_eq!(processes.tts.state, ProcessState::Stopped);
         assert_eq!(processes.bridge.state, ProcessState::Stopped);
         assert_eq!(processes.llama.state, ProcessState::Stopped);
+        assert_eq!(processes.web.state, ProcessState::Stopped);
     }
 
     fn status_json() -> Value {
@@ -885,6 +894,7 @@ mod tests {
     #[test]
     fn status_language_snapshots_default_to_none() {
         let status: Status = serde_json::from_value(status_json()).unwrap();
+        assert!(status.services_active);
         assert!(status.asr.is_none());
         assert!(status.tts.is_none());
         assert!(status.bridge.is_none());

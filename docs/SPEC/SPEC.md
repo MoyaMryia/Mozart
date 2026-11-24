@@ -55,7 +55,7 @@
 
 1. **播报链路文档残留**（已实现）：SPEC-03 边界已指向 SPEC-05 扬声器分时直播，文档与实现一致。
 2. **运行时状态归属**（已实现）：daemon 统一管运行时状态文件 `state.json`，桥不再自写 `bridge-state.json`。
-3. **对外控制面**（已定）：Rust 独立适配器进程，全包静态文件 + REST + SSE + 文件上传下载。进程生命周期按方案 1 归 `daemon` 监管（与业务子进程同级，待实现），控制面角色与 `mozart-ctl` 同级——一切控制读写均经 `daemon.sock` 单一权威，不直控业务子进程（仅字幕流只读 `subtitles.jsonl`）。循环等待已破。
+3. **对外控制面**（已定）：Rust 独立适配器进程，全包静态文件 + REST + SSE + 文件上传下载。进程生命周期已按方案 1 归 `daemon` 监管（与业务子进程同级），控制面角色与 `mozart-ctl` 同级——一切控制读写均经 `daemon.sock` 单一权威，不直控业务子进程（仅字幕流只读 `subtitles.jsonl`）。循环等待已破。
 4. **部署布局**（已定）：固定运行位 `~/mozart-runtime/bin` 为唯一部署目录，子进程同目录解析不变。releases 版本目录 + 原子切换为后续增强（SPEC-09 待办），不破坏同目录前提。
 5. **pre 分发消费者**（已定）：配置化，允许多支路，按统一规范声明消费者。待实现。
 6. **控制信封对齐**（已实现）：TTS 任务应答改标准信封，type 回显请求号、体 `status`/`code`/`reason`/`data`，`utterance_id` 放 `data`。
@@ -74,9 +74,12 @@
 
 ## 变更记录
 
+- 2026-11-24：落地停服审查修复：停服超时后由 `poller` 补做收尾（清运行时快照与业务生命周期留下的持久降级原因），`services start` 走同一收尾并重置播报停止屏障；停服校验统一读 `transition` 锁内的权威标志，文件提交在停服期统一回 `NotReady`、排队任务保留；业务角色集合改由 `Role::ALL` + `is_business` 单一来源；删除适配器测试里的恒真断言。同步 GUIDE、架构图与 `RestartRequest` 注释到方案 1（监管 8 角色、`services start|stop`、`restart web`）；SPEC-09 拆出方案 1 部署流的板端实测待办，低端口孤儿保护缺口记入 SPEC-06（SPEC-04、SPEC-06、SPEC-09）。
+
+- 2026-11-24：确认停服与文件任务的边界并登记审查修复待办：`services stop` 只在文件任务正在跑或 GPU 归还中时拒绝（`Busy`），排队任务保留并在恢复服务后继续；停服期间拒绝新的文件提交（`NotReady`），消除带与不带 `model_id` 的两种结果；登记停服超时收尾、停服校验移入 `transition` 锁内、业务角色集合单一来源三项修复。删除 SPEC-04 中「生命周期操作调用可信 CLI」的过期措辞，Web 生命周期以方案 1 为准。低端口（`< 1024`）不做专门适配，默认 `8080`，孤儿保护限制记入文档（SPEC-04、SPEC-06、SPEC-09）。
 - 2026-11-24：补齐部署稳定化与停机加固待办（待实现）：板端 Rust 构建改用 `--release`，收紧部署健康检查并核对 `[web].allowed_origins` 缺失告警；本机按需运行 `npm ci`、部署后清理历史备份快照（保留最近 `3` 份）、修正 `deploy.json` 的增量/全量记录；停栈 `pgrep` 增重试缓冲，`poller` 关停快速退出并放宽 `mozart-ctl down` 停机时限（SPEC-04、SPEC-09）。
 - 2026-11-24：登记部署与运行侧锁机制、断网恢复及接口收口待办（待实现）：部署锁改为绑定会话自动释放的 `flock` 且仅源码回退必要时清缓存；`core` 长超时表补齐 `DAEMON_MODEL_USE` 与 `DAEMON_FILE_SUBMIT`、`daemon.sock` 队列扩至 `64`；Web 侧补齐 `mode`/`device use` 映射、配置缓存与前端按需刷新；修复前端写锁 SSE 竞态并将幂等写操作改为刷新后自动解锁、SSE 改指数退避、`accept()` 去 `panic!`、字幕优化回放并补齐上传超时额度回收路径（SPEC-04、SPEC-06、SPEC-09）。
-- 2026-11-24：确认 Web 生命周期收口方向与边界（方案 1，待实现）：将 `mozart-web-adapter` 纳入 `daemon` `Supervisor` 统一监管并淘汰独立 `tools/web-service.sh`，网页启停改为经 daemon 控制命令启停音频与 AI 业务子服务（保持 `daemon` 与网页在线），整机完全关停保留给 `mozart-ctl down`；明确监管与控制权分离——进程监管归 `daemon`，控制面与 `mozart-ctl` 同级只经 `daemon.sock` 不直控业务子进程（仅字幕只读 `subtitles.jsonl`）（SPEC-04、SPEC-06、SPEC-09）。
+- 2026-11-24：按方案 1 落地 Web 生命周期收口：`mozart-web-adapter` 已纳入 `daemon` `Supervisor`（`Role::Web`）统一监管并移除独立 `tools/web-service.sh`，新增 `DAEMON_SERVICES_START` / `DAEMON_SERVICES_STOP`（`0x0123` / `0x0124`）控制音频与 AI 业务子服务组启停（保持 `daemon` 与网页在线），整机完全关停保留给 `mozart-ctl down`；`web-adapter` 同步移除 `--ctl-bin` / `--ready-file` 与 `mozart-ctl` 子进程调起，`deploy-jetson.sh` 合入单一 `ctl down`/`up` 部署流（SPEC-04、SPEC-06、SPEC-09）。
 - 2026-11-24：Web 默认监听改为 `0.0.0.0:8080`（默认 `allowed_origins` 同步带 `:8080`），保留手动低端口 `cap_net_bind_service` 兼容；部署启动运行时不再额外注入 shell `LD_LIBRARY_PATH`，运行期环境变量收口至 `[process.env]`；`run_dir/logs` 由 `ctl` 与 `daemon` 统一收敛为 `0700`；`upload_dir` 首次创建规范为 `0700`，拒绝不安全现有目录时报错打印具体路径与权限/原因（SPEC-04、SPEC-06、SPEC-09）。
 
 - 2026-11-23：将已下发直通与实时 RVC 租约归还分开；实时停流未确认时保留租约。新增统一输出模式命令、播报停止屏障与 ASR 复核有界收尾；本机证据见输出模式转移表。文件终态与租约归还分开，pre 按模式独占选源；配置了模型时默认启动实时变声。

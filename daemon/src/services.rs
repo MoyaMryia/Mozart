@@ -4,7 +4,7 @@
 
 use crate::preset::PresetManager;
 use crate::runtime::SharedConfig;
-use crate::state::{lock_state, State};
+use crate::state::{lock_state, State, RVC_SESSION_REASON};
 use crate::state_file::{BridgeRestore, SpeechStop, StateFile};
 use mozart_core::config::{Config, RvcConfig};
 use mozart_core::ctl::schema::{
@@ -450,6 +450,7 @@ pub fn mute_set(
     mute: bool,
 ) -> Result<bool, (String, String)> {
     let _transition = services.transition();
+    lock_state(state).ensure_services_active()?;
     set_pre_mute(services, mute).map_err(CallError::into_rejection)?;
     lock_state(state).commit_mute(mute);
     Ok(mute)
@@ -476,7 +477,7 @@ pub fn speech_set(services: &Services, enabled: bool) -> Result<Value, (String, 
     Ok(response.data)
 }
 
-const SPEECH_STOP_REASON: &str = "speech stop fence:";
+pub(crate) const SPEECH_STOP_REASON: &str = "speech stop fence:";
 
 fn begin_speech_stop(
     services: &Services,
@@ -759,6 +760,9 @@ pub fn poll(
         }
     };
     if let Some(_transition) = transition {
+        if !lock_state(state).services_active() {
+            return;
+        }
         reconcile_pre_mode(
             state,
             services,
@@ -777,6 +781,9 @@ pub fn poll(
     }
 
     let mut state = lock_state(state);
+    if !state.services_active() {
+        return;
+    }
     state.set_enhance_status(enhance_status);
     state.set_pre_status(pre_status);
     state.set_rvc_status(rvc_status);
@@ -1093,7 +1100,7 @@ pub(crate) fn merge_session_key(
         other => {
             return Err((
                 ctl::CODE_INTERNAL.to_string(),
-                format!("rvc session params: no orchestration for key {other}"),
+                format!("{RVC_SESSION_REASON}: no orchestration for key {other}"),
             ));
         }
     }
@@ -1126,17 +1133,19 @@ pub(crate) fn apply_rvc_session_params_locked(
     }
     // 文件任务只在 Direct 下启动（GPU 归文件期间 route set 只写 desired），
     // 且 rvc 在跑 file 流时下面的 stream_kind 也不匹配：route 与 kind 已覆盖，
-    // 无需再看 gpu_owner。
-    if lock_state(state).route_active() != Route::Rvc {
-        return Ok(());
+    // 无需再看 gpu_owner。停服期间实时流已停或正在停，同样只更新生效配置。
+    {
+        let current = lock_state(state);
+        if !current.services_active() || current.route_active() != Route::Rvc {
+            return Ok(());
+        }
     }
     let Ok(status) = services.rvc_status() else {
         // rvc 不可达时无法确认实时流：不打断，下一次建流用新快照。
         // 生效配置仍更新，但无法验证在跑流，留可查询降级原因。
-        lock_state(state).push_degraded(
-            "rvc session params: rvc status unavailable; config updated, stream not verified"
-                .to_string(),
-        );
+        lock_state(state).push_degraded(format!(
+            "{RVC_SESSION_REASON}: rvc status unavailable; config updated, stream not verified"
+        ));
         return Ok(());
     };
     if status.state != "streaming" || status.stream_kind.as_deref() != Some("realtime") {
@@ -1157,7 +1166,7 @@ pub(crate) fn apply_rvc_session_params_locked(
             Ok(_) => Err((code, original)),
             Err(restore) => Err(restore_failure(
                 state,
-                "rvc session params",
+                RVC_SESSION_REASON,
                 code,
                 original,
                 restore,
@@ -1175,9 +1184,9 @@ pub(crate) fn apply_rvc_session_params_locked(
                 Ok(StartOutcome::Running) => {
                     // 旧参恢复遇 Busy：流仍在跑，但 rvc 不回报其参数，
                     // 记录持久降级原因供 status 查询。
-                    lock_state(state).push_degraded(
-                        "rvc session params: recovery busy; running params unknown".to_string(),
-                    );
+                    lock_state(state).push_degraded(format!(
+                        "{RVC_SESSION_REASON}: recovery busy; running params unknown"
+                    ));
                     Err((
                         code,
                         format!("{original}; restore busy, running params unknown"),
@@ -1185,7 +1194,7 @@ pub(crate) fn apply_rvc_session_params_locked(
                 }
                 Err(restore) => Err(restore_failure(
                     state,
-                    "rvc session params",
+                    RVC_SESSION_REASON,
                     code,
                     original,
                     restore,

@@ -83,7 +83,7 @@ border:1px solid var(--line);border-radius:5px;padding:1px 6px;margin:2px 3px 2p
 <div class="wrap">
 <h1>Mozart 新架构 · 数据流洋葱拆解</h1>
 <p class="sub">Rust 运行时 + C++ 推理，控制面单一权威（daemon）。图上每个节点就是一个模块；
-图中展示音频与语言栈；外部 Vue 控制台经独立的 mozart-web-adapter（HTTP/SSE）连接 daemon，down 不停止网页。<br><b>点节点</b>弹出锚定该节点的悬浮窗，窗内点组件/接口再展开字段级细节——逐层剥洋葱。✕ 或 Esc 收起。</p>
+图中展示音频与语言栈；外部 Vue 控制台经 mozart-web-adapter（HTTP/SSE）连接 daemon，适配器由 daemon 监管，services stop 只停业务服务、网页保持在线，down 才整机关停。<br><b>点节点</b>弹出锚定该节点的悬浮窗，窗内点组件/接口再展开字段级细节——逐层剥洋葱。✕ 或 Esc 收起。</p>
 
 <div class="stage">
   <div class="canvas"><svg id="svg" viewBox="0 0 1020 560" role="img" aria-label="Mozart 新架构数据流"></svg></div>
@@ -178,11 +178,11 @@ var D={
  ctl:{bin:'mozart-ctl',desc:'所有整机操作入口。连 daemon 发命令、渲染状态；自身无权威状态。退出码 0/1/2/3/4/5。',pts:[
   ['proto','命令集','v1','<p>经 daemon.sock 转发，<code>--json</code> 稳定输出。</p><span class="pill">up</span><span class="pill">down</span><span class="pill">status</span><span class="pill">route set</span><span class="pill">mute</span><span class="pill">translate on|off</span><span class="pill">speech on|off|stop</span><span class="pill">config get|set|save</span><span class="pill">restart</span><span class="pill">file …</span><span class="pill">model list</span><span class="pill">model use</span><span class="pill">preset save|use|list</span>'],
   ['sock','daemon.sock','connect','<p>SEQPACKET 控制信封（见 daemon proto 层）。request_id 固定 1，超时 rpc_timeout_ms。</p>']]},
- daemon:{bin:'mozart-daemon',desc:'唯一权威。监管业务子进程与可选增强进程，轮询状态汇总派生读模型；不碰音频数据面。',pts:[
-  ['thread','server','控制连接','<p>bind daemon.sock，listen(8)，每连接独立线程，空闲 30s 断开。</p><table class="kv"><tr><td>0x0101</td><td>Hello</td></tr><tr><td>0x0102</td><td>GetStatus</td></tr><tr><td>0x0103/04</td><td>RouteSet / MuteSet</td></tr><tr><td>0x0105</td><td>Shutdown</td></tr><tr><td>0x0106/07/08</td><td>Translate/SpeechSet/Stop → 转发桥</td></tr><tr><td>0x0120</td><td>ModelUse → 断流换模型 + 预设提交</td></tr></table>'],
-  ['thread','supervisor ×6','生命周期','<p>退避 500ms 倍增上限 10s，稳定 30s 重置；SIGTERM 2s 后 SIGKILL。llama 启动前清陈旧 socket。</p><table class="kv"><tr><td>mozart 子进程</td><td>--socket --config，各读自己段</td></tr><tr><td>llama-server</td><td>-m gguf -c 2048 -ngl 99 -np 1 -t 2 --host llama.sock --jinja</td></tr></table>'],
+ daemon:{bin:'mozart-daemon',desc:'唯一权威。监管业务子进程、可选增强进程与网页适配器，轮询状态汇总派生读模型；不碰音频数据面。',pts:[
+  ['thread','server','控制连接','<p>bind daemon.sock，listen(8)，每连接独立线程，空闲 30s 断开。</p><table class="kv"><tr><td>0x0101</td><td>Hello</td></tr><tr><td>0x0102</td><td>GetStatus</td></tr><tr><td>0x0103/04</td><td>RouteSet / MuteSet</td></tr><tr><td>0x0105</td><td>Shutdown</td></tr><tr><td>0x0106/07/08</td><td>Translate/SpeechSet/Stop → 转发桥</td></tr><tr><td>0x0120</td><td>ModelUse → 断流换模型 + 预设提交</td></tr><tr><td>0x0123/24</td><td>ServicesStart/Stop → 只启停业务服务组</td></tr></table>'],
+  ['thread','supervisor ×8','生命周期','<p>退避 500ms 倍增上限 10s，稳定 30s 重置；SIGTERM 2s 后 SIGKILL。llama 启动前清陈旧 socket。业务角色随 services stop/start 停起，web 不受影响。</p><table class="kv"><tr><td>mozart 子进程</td><td>--socket --config，各读自己段</td></tr><tr><td>llama-server</td><td>-m gguf -c 2048 -ngl 99 -np 1 -t 2 --host llama.sock --jinja</td></tr><tr><td>web 适配器</td><td>--config，自读 [web] 监听</td></tr></table>'],
   ['thread','services+poller','轮询','<p>ServiceLink 惰性 connect+Hello；每秒 poll 五服务 GetStatus。llama 不轮询，可达性由桥带报。</p>'],
-  ['thread','state+arbiter','权威','<p>Processes 6 角色 + 各 Option&lt;Status&gt; + 降级列表。RVC 实时／文件租约互斥；扬声器分时。托管输出模式编排停播、切路由和播放准入，不重启 ASR；播报空窗静音。</p>'],
+  ['thread','state+arbiter','权威','<p>Processes 8 角色 + 各 Option&lt;Status&gt; + 降级列表。RVC 实时／文件租约互斥；扬声器分时。托管输出模式编排停播、切路由和播放准入，不重启 ASR；播报空窗静音。</p>'],
   ['thread','model use','断流换模型','<p>0x0120：resolve 读校验目标预设 → StopStream → LoadModel → 提交（同一把 toml 锁内写 model_id 基线 + 五键基线 + applied）→ StartStream 复用 handle 只起一次。全程持 transition 锁，避免 8GB 设备双引擎驻留 OOM，支持跨采样率重建 StreamingRvc。</p><p class="note">失败一律用旧模型 + 旧参数恢复流；起流失败先按 SwitchUndo 整体回退基线、生效配置与 applied。文件任务占 GPU 回 Busy。model_id 只由本命令写回基线，config set 拒绝。</p>'],
   ['proto','控制信封','SEQPACKET','<pre>magic u32 \'MCTL\'=0x4C54434D\nversion u16=1 | type u16 | request_id u32 | body_len u32\nbody JSON ≤64KiB → {status,code,reason,data}</pre><table class="kv"><tr><td>0x01xx</td><td>daemon</td></tr><tr><td>0x02xx</td><td>pre</td></tr><tr><td>0x03xx</td><td>rvc</td></tr><tr><td>0x04xx</td><td>asr</td></tr><tr><td>0x05xx</td><td>bridge</td></tr><tr><td>0x06xx</td><td>tts</td></tr></table>']]},
  enhance:{bin:'mozart-enhance (C++)',desc:'可选 CPU 增强后端，权重只读引用。pre 普通线程经有界队列调用，不改变 48 kHz 直通。',pts:[['proto','流式增强','16 kHz','<p>周期 Hann 512／256；320 样本重打包，积攒两帧。源 frame_idx 与 pts_ns 保留；重新连接重置状态。禁用不调用网络，错误不静默回退原声。</p>'],['sock','enhance.sock','0x07xx','<p>Hello 0x0701、GetStatus 0x0702。音频另走 enhance-audio.sock 的 SEQPACKET 会话；启动、重启与状态汇总归 daemon。</p>']]},
@@ -215,7 +215,7 @@ var D={
   ['sock','bridge.sock','bind 0x05xx','<table class="kv"><tr><td>0x0501</td><td>Hello</td></tr><tr><td>0x0502</td><td>GetStatus(四组)</td></tr><tr><td>0x0503/04/05</td><td>Translate/SpeechSet/Stop</td></tr></table>'],
   ['proto','字幕记录','jsonl','<pre>{seq, utterance_id:"启动号:句号", zh, en,\n final:bool, translation_status:pending|recognizing|\n completed|failed|skipped, revision, received_at, ts,\n asr_engine, online_text, homophone_fixes,\n refinement_status, asr_numeric_audit}</pre>'],
   ['file','状态持久化','开关','<p>TOML 基线 + 运行时覆盖由 daemon 写 ~/.local/state/mozart/state.json，启动与桥重启时恢复，不回落基线。</p>']]},
- llama:{bin:'llama-server (C++)',desc:'第三方翻译推理。内部 HTTP 使用 Unix socket；对外网页控制面由独立 mozart-web-adapter 提供。daemon 只管存活。',pts:[
+ llama:{bin:'llama-server (C++)',desc:'第三方翻译推理。内部 HTTP 使用 Unix socket；对外网页控制面由 daemon 监管的 mozart-web-adapter 提供。daemon 只管存活。',pts:[
   ['proto','HTTP 接口','llama.sock','<pre>POST /v1/chat/completions\n{model, messages[system,user], max_tokens:128,\n temperature:0,\n chat_template_kwargs:{enable_thinking:false}}\n→ choices[0].message.content + finish_reason</pre><p class="note">Qwen3.5 思考模型必须关 thinking，否则译文为空。</p>'],
   ['proto','模型参数','沿用旧','<p>Qwen3.5-0.8B Q4_K_M。-c 2048 -b 256 -ub 128 --cache-ram 128 -ngl 99 -np 1 -t 2 -tb 2 --host .sock --jinja。板端已确认支持。</p>']]},
  tts:{bin:'mozart-tts',desc:'Rust 独立进程 sherpa TTS。参考音色合成，v1 不走变声、48k 直喂 pre。',pts:[

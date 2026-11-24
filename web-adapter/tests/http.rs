@@ -5,7 +5,7 @@ use mozart_core::ctl::{self, Seqpacket};
 use serde_json::{json, Value};
 use std::time::Duration;
 
-async fn setup(dir: &tempfile::TempDir, ctl: std::path::PathBuf) -> mozart_web_adapter::Application {
+async fn setup(dir: &tempfile::TempDir) -> mozart_web_adapter::Application {
     std::fs::write(dir.path().join("config.toml"), format!("[daemon]\nrun_dir = {:?}\nsocket = \"test.sock\"\n", dir.path().to_str().unwrap())).unwrap();
     let mut cfg = WebAdapterConfig::load_from(Some(&dir.path().join("config.toml"))).unwrap();
     cfg.web.static_dir = dir.path().join("static");
@@ -13,7 +13,7 @@ async fn setup(dir: &tempfile::TempDir, ctl: std::path::PathBuf) -> mozart_web_a
     cfg.web.allowed_origins = vec!["http://localhost:8080".into()];
     std::fs::create_dir_all(&cfg.web.static_dir).unwrap();
     std::fs::write(cfg.web.static_dir.join("index.html"), "page").unwrap();
-    mozart_web_adapter::build(cfg, Some(dir.path().join("config.toml")), ctl).await.unwrap()
+    mozart_web_adapter::build(cfg, Some(dir.path().join("config.toml"))).await.unwrap()
 }
 fn request(method: &str, uri: &str, host: &str, body: &'static str) -> Request<Body> {
     Request::builder().method(method).uri(uri).header(header::HOST, host).body(Body::from(body)).unwrap()
@@ -22,7 +22,7 @@ fn request(method: &str, uri: &str, host: &str, body: &'static str) -> Request<B
 #[tokio::test]
 async fn boundary_routes_and_static() {
     let dir = tempfile::tempdir().unwrap();
-    let app = setup(&dir, "/nonexistent".into()).await;
+    let app = setup(&dir).await;
     let router = app.router;
     let denied = router.clone().oneshot(request("GET", "/api/v1/health", "attacker", "")).await.unwrap();
     assert_eq!(denied.status(), StatusCode::FORBIDDEN);
@@ -98,7 +98,7 @@ fn multipart(size: usize, duplicate: bool) -> Vec<u8> {
 #[tokio::test]
 async fn multipart_uses_daemon_limit_not_axum_limit() {
     let dir = tempfile::tempdir().unwrap();
-    let app = setup(&dir, "/nonexistent".into()).await;
+    let app = setup(&dir).await;
     let size = 2 * 1024 * 1024 + 1024;
     let status = |limit| (ctl::DAEMON_GET_STATUS, json!({"file_limits":{"max_upload_bytes":limit}}));
     let server = mock(&dir, vec![vec![status(size - 1)], vec![status(size)],
@@ -117,7 +117,7 @@ async fn multipart_uses_daemon_limit_not_axum_limit() {
 #[tokio::test]
 async fn download_requires_capability_and_streams_regular_file() {
     let dir = tempfile::tempdir().unwrap();
-    let app = setup(&dir, "/nonexistent".into()).await;
+    let app = setup(&dir).await;
     let path = dir.path().join("result.wav");
     std::fs::write(&path, b"RIFFtestWAVE").unwrap();
     let cap = || (ctl::DAEMON_GET_STATUS, json!({"api_capabilities":["file_fetch_safe_errors_v1"]}));
@@ -152,7 +152,7 @@ async fn download_requires_capability_and_streams_regular_file() {
 #[tokio::test]
 async fn model_preset_and_output_mode_routes_relay_and_validate() {
     let dir = tempfile::tempdir().unwrap();
-    let app = setup(&dir, "/nonexistent".into()).await;
+    let app = setup(&dir).await;
     let listener = Seqpacket::bind(&dir.path().join("test.sock")).unwrap();
     listener.listen(8).unwrap();
     let server = std::thread::spawn(move || {
@@ -214,7 +214,7 @@ async fn model_and_preset_writes_are_not_retried_after_disconnect() {
         ("POST", "/api/v1/preset/use", "{}", ctl::DAEMON_PRESET_USE, json!({})),
     ] {
         let dir = tempfile::tempdir().unwrap();
-        let app = setup(&dir, "/nonexistent".into()).await;
+        let app = setup(&dir).await;
         let listener = Seqpacket::bind(&dir.path().join("test.sock")).unwrap();
         listener.listen(8).unwrap();
         let server = std::thread::spawn(move || {
@@ -235,25 +235,31 @@ async fn model_and_preset_writes_are_not_retried_after_disconnect() {
     }
 }
 
-#[cfg(unix)]
 #[tokio::test]
-async fn lifecycle_uses_fixed_arguments() {
-    use std::os::unix::fs::PermissionsExt;
+async fn system_up_and_down_relay_to_daemon() {
     let dir = tempfile::tempdir().unwrap();
-    let script = dir.path().join("ctl");
-    let args = dir.path().join("arguments");
-    std::fs::write(&script, format!("#!/bin/sh\nprintf '%s\\n' \"$@\" > '{}'\nprintf '{{\"state\":\"running\"}}'\n", args.display())).unwrap();
-    std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o700)).unwrap();
-    let app = setup(&dir, script).await;
-    let req = Request::builder().method("POST").uri("/api/v1/system/up").header(header::HOST, "localhost:8080").header(header::CONTENT_TYPE, "application/json").body(Body::from("{}")).unwrap();
-    assert_eq!(app.router.clone().oneshot(req).await.unwrap().status(), StatusCode::OK);
-    assert_eq!(std::fs::read_to_string(args).unwrap(), format!("--config\n{}\nup\n--json\n", dir.path().join("config.toml").display()));
-    for output in [r#"{"state":"stopped"}"#, r#"{"state":"running","extra":1}"#, r#"{"state":1}"#] {
-        std::fs::write(dir.path().join("ctl"), format!("#!/bin/sh\nprintf '%s' '{output}'\n")).unwrap();
-        let req = web_request("POST", "/api/v1/system/up", "application/json", b"{}".to_vec());
-        let response = app.router.clone().oneshot(req).await.unwrap();
-        assert_eq!(response.status(), StatusCode::BAD_GATEWAY);
-        let body = to_bytes(response.into_body(), 4096).await.unwrap();
-        assert!(String::from_utf8_lossy(&body).contains("execution result unknown"));
+    let app = setup(&dir).await;
+    let server = mock(&dir, vec![
+        vec![(ctl::DAEMON_SERVICES_START, json!({"state":"running"}))],
+        vec![(ctl::DAEMON_SERVICES_STOP, json!({"state":"stopped"}))],
+    ]);
+    for (path, expected) in [
+        ("/api/v1/system/up", json!({"status":"ok","code":"Ok","reason":"","data":{"state":"running"}})),
+        ("/api/v1/system/down", json!({"status":"ok","code":"Ok","reason":"","data":{"state":"stopped"}})),
+    ] {
+        let response = app.router.clone().oneshot(web_request("POST", path, "application/json", b"{}".to_vec())).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK, "{path}");
+        let actual: Value = serde_json::from_slice(&to_bytes(response.into_body(), 4096).await.unwrap()).unwrap();
+        assert_eq!(actual, expected);
+    }
+    server.join().unwrap();
+    for (method, path, body, status) in [
+        ("GET", "/api/v1/system/up", "", StatusCode::METHOD_NOT_ALLOWED),
+        ("GET", "/api/v1/system/down", "", StatusCode::METHOD_NOT_ALLOWED),
+        ("POST", "/api/v1/system/up", r#"{"extra":1}"#, StatusCode::BAD_REQUEST),
+        ("POST", "/api/v1/system/down", "[]", StatusCode::BAD_REQUEST),
+    ] {
+        let response = app.router.clone().oneshot(web_request(method, path, "application/json", body.as_bytes().to_vec())).await.unwrap();
+        assert_eq!(response.status(), status, "{method} {path} {body}");
     }
 }

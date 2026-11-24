@@ -73,6 +73,8 @@ enum {
     MOZART_CTL_DAEMON_MODEL_USE   = 0x0120,  // 体 {"model_id"}，data {"model_id","previous_model_id"}；实时/空闲切换模型
     MOZART_CTL_DAEMON_DEVICE_USE  = 0x0121,  // 体 {"kind","device"}，data {"kind","device","previous_device"}；临时热切换音频设备（不写回 TOML）
     MOZART_CTL_DAEMON_OUTPUT_MODE_SET = 0x0122, // {"mode":"direct"|"rvc"|"broadcast"}
+    MOZART_CTL_DAEMON_SERVICES_START  = 0x0123, // 体 {}（空），恢复启动业务子服务组，data {"state":"running"|"already-running"}
+    MOZART_CTL_DAEMON_SERVICES_STOP   = 0x0124, // 体 {}（空），停止业务子服务组（daemon 与 web 在线），data {"state":"stopped"|"not-running"}
 
     MOZART_CTL_PRE_HELLO      = 0x0201,
     MOZART_CTL_PRE_SET_ROUTE  = 0x0202,

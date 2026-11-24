@@ -302,3 +302,101 @@ fn config_set_accepts_rvc_session_key() {
     assert_eq!(reply.status, "ok", "reason: {}", reply.reason);
     assert_eq!(reply.data["value"], 3);
 }
+
+#[test]
+fn services_stop_and_start_toggle_business_while_keeping_web_alive() {
+    let web_script = std::env::temp_dir().join(format!("mozart-web-dummy-{}.sh", std::process::id()));
+    std::fs::write(&web_script, "#!/bin/sh\ntrap 'exit 0' TERM INT\nwhile true; do sleep 1; done\n").unwrap();
+    let mut perms = std::fs::metadata(&web_script).unwrap().permissions();
+    perms.set_mode(0o755);
+    std::fs::set_permissions(&web_script, perms).unwrap();
+
+    let cfg = format!(
+        "[daemon]\nrpc_timeout_ms = 300\n\n[rvc]\nmodel_id = \"demo\"\n\n[web]\n\n[process]\nweb_bin = {:?}\n",
+        web_script.to_string_lossy()
+    );
+    let daemon = DaemonProcess::start_with_config(
+        "services-toggle",
+        &example("pre_stub"),
+        &example("rvc_stub"),
+        &cfg,
+    );
+    let conn = daemon.connect();
+    let before = wait_all_running(&conn);
+    assert!(
+        wait_until(Duration::from_secs(5), || {
+            let s = status(&conn);
+            s.processes.web.state == ProcessState::Running && s.processes.web.pid.is_some()
+        }),
+        "web process did not start"
+    );
+    let web_pid = status(&conn).processes.web.pid.unwrap();
+    let pre_pid = before.processes.pre.pid.unwrap();
+    let rvc_pid = before.processes.rvc.pid.unwrap();
+
+    let stop = call(&conn, ctl::DAEMON_SERVICES_STOP, b"{}");
+    assert_eq!(stop.status, "ok", "reason: {}", stop.reason);
+    assert_eq!(stop.data["state"], "stopped");
+
+    let stop_again = call(&conn, ctl::DAEMON_SERVICES_STOP, b"{}");
+    assert_eq!(stop_again.status, "ok", "reason: {}", stop_again.reason);
+    assert_eq!(stop_again.data["state"], "not-running");
+
+    let stopped = status(&conn);
+    assert!(!stopped.services_active);
+    assert_eq!(stopped.processes.pre.state, ProcessState::Stopped);
+    assert_eq!(stopped.processes.rvc.state, ProcessState::Stopped);
+    assert_eq!(stopped.processes.asr.state, ProcessState::Stopped);
+    assert_eq!(stopped.processes.tts.state, ProcessState::Stopped);
+    assert_eq!(stopped.processes.bridge.state, ProcessState::Stopped);
+    assert_eq!(stopped.processes.llama.state, ProcessState::Stopped);
+    assert_eq!(stopped.processes.web.state, ProcessState::Running);
+    assert_eq!(stopped.processes.web.pid, Some(web_pid));
+    assert!(!pid_alive(pre_pid) && !pid_alive(rvc_pid));
+    assert!(pid_alive(web_pid));
+
+    for (cmd, body) in [
+        (ctl::DAEMON_ROUTE_SET, br#"{"route":"rvc"}"#.as_slice()),
+        (ctl::DAEMON_OUTPUT_MODE_SET, br#"{"mode":"rvc"}"#.as_slice()),
+        (ctl::DAEMON_MUTE_SET, br#"{"mute":true}"#.as_slice()),
+        (ctl::DAEMON_TRANSLATE_SET, br#"{"enabled":false}"#.as_slice()),
+        (ctl::DAEMON_MODEL_LIST, b"{}".as_slice()),
+        (ctl::DAEMON_PRESET_LIST, b"{}".as_slice()),
+        (ctl::DAEMON_PRESET_SAVE, b"{}".as_slice()),
+        (ctl::DAEMON_PRESET_USE, b"{}".as_slice()),
+        (ctl::DAEMON_SPEECH_SET, br#"{"enabled":true}"#.as_slice()),
+    ] {
+        let reply = call(&conn, cmd, body);
+        assert_eq!(reply.code, "NotReady", "cmd 0x{cmd:04x}: {:?}", reply);
+    }
+
+    let restart_pre = call(&conn, ctl::DAEMON_RESTART, br#"{"service":"pre"}"#);
+    assert_eq!(restart_pre.code, "Busy");
+
+    let restart_web = call(&conn, ctl::DAEMON_RESTART, br#"{"service":"web"}"#);
+    assert_eq!(restart_web.status, "ok", "reason: {}", restart_web.reason);
+    assert!(
+        wait_until(Duration::from_secs(5), || {
+            let s = status(&conn);
+            s.processes.web.state == ProcessState::Running
+                && s.processes.web.pid.is_some_and(|pid| pid != web_pid)
+        }),
+        "web should still restart while business services are stopped"
+    );
+
+    let start = call(&conn, ctl::DAEMON_SERVICES_START, b"{}");
+    assert_eq!(start.status, "ok", "reason: {}", start.reason);
+    assert_eq!(start.data["state"], "running");
+
+    let start_again = call(&conn, ctl::DAEMON_SERVICES_START, b"{}");
+    assert_eq!(start_again.status, "ok", "reason: {}", start_again.reason);
+    assert_eq!(start_again.data["state"], "already-running");
+
+    let resumed = wait_all_running(&conn);
+    assert!(resumed.services_active);
+    assert_eq!(resumed.processes.web.state, ProcessState::Running);
+
+    drop(conn);
+    drop(daemon);
+    let _ = std::fs::remove_file(&web_script);
+}

@@ -13,7 +13,7 @@
 - Rust crate `mozart-web-adapter` 位于 `web-adapter/`，二进制同名。
 - 适配器同时托管静态文件、REST API、服务器发送事件（SSE）和文件上传下载。
 - 适配器复用 `mozart-core` 的控制协议，连接 daemon；daemon 自身不起 HTTP。
-- 生命周期与控制权分离：进程监管按方案 1 归 `daemon`（与业务子进程同级，待实现）；控制面角色与 `mozart-ctl` 同级，一切控制读写均经 `daemon.sock` 由 `daemon` 仲裁并下发，不直连 `pre`、`enhance`、`rvc`、`asr`、`bridge`、`tts` 控制 socket（仅字幕 SSE 只读 `subtitles.jsonl` 为例外，清空等写动作仍须经 `daemon`）。
+- 生命周期与控制权分离：进程监管按方案 1 归 `daemon`（与业务子进程同级，见 [SPEC-04](SPEC-04-daemon.md)）；控制面角色与 `mozart-ctl` 同级，一切控制读写均经 `daemon.sock` 由 `daemon` 仲裁并下发，不直连 `pre`、`enhance`、`rvc`、`asr`、`bridge`、`tts` 控制 socket（仅字幕 SSE 只读 `subtitles.jsonl` 为例外，清空等写动作仍须经 `daemon`）。
 - 音频帧继续走已有数据面；本文不定义网络音频上传流、WebSocket 或远程麦克风协议。
 - llama-server 的 `/v1/chat/completions` 是内部翻译接口，不转发为公共端点。
 
@@ -30,13 +30,14 @@ CLI／本机程序集成 ─────────→ daemon.sock
 音频采集／推理／播放 ─────→ 独立音频数据面
 ```
 
-目标部署方式为由 `daemon` 统一监管适配器进程（方案 1，待实现，见 [SPEC-04](SPEC-04-daemon.md#改进点) 与下文待办）；迁移完成前暂由部署入口及独立脚本管理。
-迁移后网页启停改为控制音频与 AI 业务子服务启停，停机期间 `daemon` 与适配器保持在线、页面仍可访问；整机完全关停保留给 `mozart-ctl down`。
+部署与运行方式已按方案 1 收口，由 `daemon` 按同一 `mozart.toml` 统一监管适配器进程（配置 `[web]` 时拉起，`Role::Web`，见 [SPEC-04](SPEC-04-daemon.md)）。
+网页启停直接调用 daemon 业务子服务组启停命令，停机期间 `daemon` 与适配器保持在线、页面仍可访问；整机完全关停保留给 `mozart-ctl down`。
 默认接入方式为设备热点，保留局域网访问；热点配置归 [SPEC-09](SPEC-09-pipeline.md)。
 监听地址与静态资源位置等新增配置见 [config.md 的 web 段](../config.md#web)。
 适配器与 daemon 使用同一运行用户、同一 TOML 和同一运行目录，不放宽 socket 目录权限。
-独立进程支持 `--config` 和 `--ctl-bin`；main 使用 `Transport` 连接句柄关闭缓冲溢出的 TCP 客户端。
+进程支持 `--config` 与 `--print-config`（已移除 `--ctl-bin` 与 `--ready-file`）；main 使用 `Transport` 连接句柄关闭缓冲溢出的 TCP 客户端。
 默认监听高端口 `0.0.0.0:8080`，不以 root 身份运行整套系统；手动配置低端口时的部署权限见 [SETUP](../SETUP.md#部署行为)。
+低端口是已知的孤儿保护缺口，不做专门适配：授予 `cap_net_bind_service` 后内核按 `AT_SECURE` 处理 `execve`，会清掉 `PDEATHSIG`，daemon 被 `SIGKILL` 时适配器可能残留。正常 `mozart-ctl down` 与 `SIGTERM` 仍由监管终止适配器；默认 `8080` 不受影响。
 
 ## 二、HTTP 通用契约
 
@@ -99,8 +100,8 @@ RPC 截止时间复用 CLI 的普通请求、配置写入及启动停止预算�
 | 方法与路径 | 请求 | 下游操作／成功 data |
 | --- | --- | --- |
 | `GET /health` | 无 | 适配器自身状态与上传保留原因，见下文；不表示推理服务健康 |
-| `POST /system/up` | `{}` | 固定参数调用 `mozart-ctl up --json`；`{"state":"running"}` 或 `already-running` |
-| `POST /system/down` | `{}` | 固定参数调用 `mozart-ctl down --json`；`{"state":"stopped"}` 或 `not-running` |
+| `POST /system/up` | `{}` | `DAEMON_SERVICES_START`（`0x0123`）；`{"state":"running"}` 或 `already-running` |
+| `POST /system/down` | `{}` | `DAEMON_SERVICES_STOP`（`0x0124`）；`{"state":"stopped"}` 或 `not-running` |
 | `GET /status` | 无 | `DAEMON_GET_STATUS`，整机快照 |
 | `PUT /route` | `{"route":"direct"}` 或 `{"route":"rvc"}` | `DAEMON_ROUTE_SET`；退出托管输出模式 |
 | `PUT /mode` | `{"mode":"direct"}`、`{"mode":"rvc"}` 或 `{"mode":"broadcast"}` | `DAEMON_OUTPUT_MODE_SET`；应答表示受理，按 `GET /status` 的 `output_mode` 查询转换 |
@@ -132,18 +133,11 @@ retained 是提交结果未知而保留的数量；reasons 列出保留原因，
 `restart_required`、`affected` 与 `status.pending_restart` 原样展示，不自动重启。
 设置路由后展示 `route.desired` 与 `route.active`，不把等待切换显示为已经切换。
 
-### 启动与停止的例外
+### 业务子服务启停
 
-只有 `system/up` 与 `system/down` 调用 CLI，复用现有进程启动、探测和等待流程。
-命令使用配置中的可信程序路径和启动时确定的 `--config`，以参数数组执行，不经 shell。
-HTTP 调用方不能指定程序路径、配置路径或额外命令参数。
-成功时把 CLI 的 JSON stdout 包入四字段信封的 `data`。
-失败按 CLI 退出码映射：2 → `InvalidArgument`，3 → `UpstreamUnavailable`，
-4 → `Rejected`（409），5 → `GatewayTimeout`，1 或其他异常退出 → `Internal`；stderr 作为原因。
-CLI 退出码不能区分发送前后；除明确的参数校验拒绝外，生命周期失败一律附加“执行结果未知，请查询状态”。
-CLI 成功退出但 stdout 损坏，也按 `BadGateway` 报结果未知，不重发命令。
-`up` 成功只表示 daemon 控制面可达；各服务是否就绪仍查 `/status`。
-启动停止调用串行化；CLI 幂等语义保持不变。
+`POST /system/up` 与 `POST /system/down` 通过 `daemon.sock` 透传 `DAEMON_SERVICES_START` / `DAEMON_SERVICES_STOP`（经 `core::ctl::request_timeout_ms` 共用扩展预算），不再由适配器拉起 `mozart-ctl` 子进程。
+操作仅启停音频与 AI 业务子服务组，`daemon` 与 `mozart-web-adapter` 保持在线；整机停机走 `mozart-ctl down`。
+成功沿用 `{"state":"running"|"already-running"}` 与 `{"state":"stopped"|"not-running"}` 幂等语义；文件任务正在执行或 GPU 归还中时停止返回 `Busy`（409），排队任务保留不动、恢复服务后按原仲裁继续。停服期间新的 `POST /files` 返回 `NotReady`（409）。`system/up` 成功只表示业务服务启动流程已触发，各服务就绪仍以 `/status` 为准。
 
 ## 四、文件上传与下载
 
@@ -260,9 +254,9 @@ v1 沿用本地设备／自有热点无认证的决定，不提供公网部署�
 
 ## 七、实现与验收待办
 
-- [x] 默认监听地址改为 `0.0.0.0:8080`，默认 `allowed_origins` 同步带 `:8080`；保留手动配置低端口（`< 1024`）时的 `cap_net_bind_service` 兼容路径。（`core/src/config.rs`、`tools/web-service.sh`）
+- [x] 默认监听地址改为 `0.0.0.0:8080`，默认 `allowed_origins` 同步带 `:8080`；保留手动配置低端口（`< 1024`）时的 `cap_net_bind_service` 兼容路径。（`core/src/config.rs`、`tools/deploy-jetson.sh`）
 - [x] 上传目录首次不存在时由适配器创建并规范叶目录为 `0700`；已存在且不安全（符号链接、非目录、属主不符或权限宽于 `0700`）时仍拒绝且不修改其权限，并在启动报错中打印具体目录路径与实际权限/原因。（`web-adapter/src/uploads.rs`）
-- [ ] 迁入 `daemon` 统一监管并收敛启停入口（方案 1）：移除独立 `tools/web-service.sh`，改为由 `daemon` 按同一 `mozart.toml` 拉起和监管 `mozart-web-adapter`；网页启停接口改为调用 `daemon` 业务子服务组启停命令，不再由适配器子进程调用 `mozart-ctl`（前置：SPEC-04 `web` 监管与业务子服务组启停命令）。
+- [x] 迁入 `daemon` 统一监管并收敛启停入口（方案 1）：移除独立 `tools/web-service.sh`，改为由 `daemon` 按同一 `mozart.toml` 拉起和监管 `mozart-web-adapter`；`POST /system/up` 与 `POST /system/down` 改为透传 `DAEMON_SERVICES_START` / `DAEMON_SERVICES_STOP`，移除 `--ctl-bin` 与 `--ready-file` 及子进程 CLI 调起路径。（`web-adapter/src/{main,lib,routes}.rs`、`web-adapter/tests/{http,daemon}.rs`、`tools/ci-local.sh`）
 - [ ] 接口与前端收口：保持适配器为 `daemon.sock` 瘦透传层，补齐已有命令映射（前端接入 `PUT /api/v1/mode`，适配器与前端补齐 `DAEMON_DEVICE_USE`）；适配器缓存已加载配置，不再每次 RPC 重读磁盘 TOML；前端改为按需刷新，避免每次写入后并发重拉 ALSA 设备列表与模型列表。
 - [ ] 前端写锁与 SSE 断连加固：解耦 HTTP 状态主动查询版本号与 SSE 推送版本号，消除 `statusReadFresh` 被 SSE 抢跑打断的竞态与刷新闪烁；幂等写操作在拉回最新状态后自动解除未知结果锁，仅不可幂等的文件提交保留人工确认；前端 SSE 改用指数退避重连（`1 s` 起至上限 `10 s`），持久数据错误单独降级提示。
 - [ ] 适配器网络异常、字幕回放与上传额度回收加固：将 `transport.rs` 中 `accept()` 未覆盖错误码由 `panic!` 改为记错退避；优化字幕文件增量核验与近期窗口/游标回放，避免历史文件增大导致回放撑爆 `sse_buffer_bytes`；为文件提交超时保留目录补齐可确认回收路径（确认任务状态后释放上传并发额度，不再只能等待重启 daemon）。
@@ -279,8 +273,8 @@ v1 沿用本地设备／自有热点无认证的决定，不提供公网部署�
 - [x] 将已保存的 Web 后端与部署改动迁移到当前主线，保留增强和 ASR 修复，并验证未知写入不重试。
 
 勾选项以代码和所列测试为依据；设备部署和产品验收单独保留。
-`tools/ci-local.sh adapter` 的两个 daemon 集成测试使用真实 daemon、真实 ctl 与协议桩，不执行实际 RVC 推理（`web-adapter/tests/daemon.rs`）。
-该测试覆盖 HTTP 生命周期、配置、文件提交与下载，以及无模型时的路由拒绝。
+`tools/ci-local.sh adapter` 的两个 daemon 集成测试使用真实 daemon（拉起真实 `mozart-web-adapter`）、真实 ctl 与协议桩，不执行实际 RVC 推理（`web-adapter/tests/daemon.rs`）。
+该测试覆盖 HTTP 业务启停（`system/down`/`system/up`）、`ctl down` 全栈停机、配置、文件提交与下载，以及无模型时的路由拒绝。
 上传恢复、字幕游标和 HTTP 边界另有单元及集成测试；下列复合验收保留完整门槛。
 
 - [x] 创建 `web/` Vue 工程，拆分展示组件，接入新 REST/SSE 客户端和本机检查入口。

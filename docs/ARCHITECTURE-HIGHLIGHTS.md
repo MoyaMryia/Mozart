@@ -38,7 +38,7 @@ daemon 负责生命周期和控制命令，但不碰音频数据路径。它通�
 
 daemon 的[输出模式状态机](MODE-TRANSITIONS.md)编排停播、路由和播报许可。模式切换保留 ASR 和翻译字幕；复核与逐句恢复由语言链处理。
 
-独立的 `mozart-web-adapter` 托管 Vue、HTTP 和 SSE，通过同一个 daemon 协议操作。停止 daemon 不停止页面；上传保留与字幕恢复由适配器管理，不让浏览器直接编排推理和播放。
+`mozart-web-adapter` 托管 Vue、HTTP 和 SSE，进程由 `daemon` 统一监管，控制面通过同一个 daemon 协议操作。停业务服务（`system/down`）只停音频与 AI 子进程、不停 `daemon` 与页面；上传保留与字幕恢复由适配器管理，不让浏览器直接编排推理和播放。
 
 推理放在独立 C++ 进程中。可选的 `mozart-enhance` 增强 RVC／ASR 共用的 16 kHz 输入，daemon 管生命周期，pre 的普通线程经有界队列调用。48 kHz 直通不经过该模型。它崩了，采集和播放不会一起消失。推理这层也能独立替换实现，比如换 ONNX Runtime 或 TensorRT，不需要动 Rust 运行时。
 

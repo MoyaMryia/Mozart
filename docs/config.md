@@ -41,7 +41,7 @@
 
 | 键 | 类型 | 默认 | 范围 | 类别 |
 | --- | --- | --- | --- | --- |
-| pre_bin / enhance_bin / rvc_bin / asr_bin / tts_bin / bridge_bin / llama_bin | path | 各裸名 | 非空 | S |
+| pre_bin / enhance_bin / rvc_bin / asr_bin / tts_bin / bridge_bin / llama_bin / web_bin | path | 各裸名 | 非空 | S |
 
 ### [process.env]
 
@@ -224,10 +224,9 @@ path = "<资产根>/models/asr/<模型id>"
 
 文件数据面复用 `[rvc].input_socket` / `[rvc].output_socket`（SPEC-03 状态门控交接），`[file]` 不再有独立 socket 键。
 
-### [web]
+### [web]（可选）
 
-core 接受此段；适配器与 daemon 读取同一 TOML。
-适配器采用已有的配置文件选择顺序，HTTP 请求不能改变配置来源。
+省略此段时，daemon 不拉起 `mozart-web-adapter`（`processes.web` 保持 `stopped`）；配置此段后，由 daemon 统一监管适配器进程，日志落 `run_dir/logs/web.log`。适配器与 daemon 读取同一 TOML，采用同一配置文件选择顺序，HTTP 请求不能改变配置来源。
 
 | 键 | 类型 | 默认 | 范围 | 类别 |
 | --- | --- | --- | --- | --- |
@@ -240,7 +239,7 @@ core 接受此段；适配器与 daemon 读取同一 TOML。
 | sse_heartbeat_ms | int | 15000 | >0 | S |
 | sse_buffer_bytes | int | 1048576 | >0，每客户端待发送事件的编码字节总量 | S |
 
-这些 S 类键通过重启适配器生效，不加入当前 `restart <service>` 的业务服务列表。
+这些 S 类键通过 `restart web` 重启适配器生效（不中断其他服务）；新增或移除 `[web]` 段需重启 daemon。
 相对路径按 TOML 所在目录解析；使用内置默认且无配置文件时按工作目录解析，支持开头的 `~`。
 部署时向 `allowed_origins` 加入设备热点和局域网的实际访问地址。
 文件字节限额只引用 daemon 的生效 `file.max_upload_bytes`，不在 web 段另设限额。
