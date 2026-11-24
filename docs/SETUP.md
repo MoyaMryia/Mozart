@@ -82,6 +82,9 @@ tools/ci-local.sh all
 # 部署：同步 → 构建 → 安装 → 重启；不跑测试
 MOZART_JETSON=<SSH目标> tools/deploy-jetson.sh
 
+# 仅前端部署：构建 web → 替换运行位 web/dist；不编后端、不停栈、不重启
+MOZART_JETSON=<SSH目标> tools/deploy-web.sh
+
 # 部署后测试：设备端单测 + 功能测试，按套件可选
 MOZART_JETSON=<SSH目标> tools/jetson-e2e.sh
 
@@ -123,6 +126,10 @@ MOZART_JETSON=<SSH目标> uv run tools/jetson-audio.py
 默认配置监听 `8080` 高端口，无需 `cap_net_bind_service` 或免密 `sudo` 即可启动。若手动配置低端口（`< 1024`），脚本才通过 `sudo -n setcap` 授予 `cap_net_bind_service`；没有该权限时请保持高端口配置。服务以运行目录所有者启动，不以 root 运行；绑定后、创建工作线程前清除进程 capability。设备需提供 `jq` 和 libcap 工具。
 
 `deploy.json` 记录提交号、dirty 标记、时间、构建预设和构建模式；部署期间整栈重启。当前实测范围及标准整链部署阻塞见[适配器报告](../reports/web-adapter-20261117/RESULTS.md#适用范围)。
+
+### 仅前端部署
+
+`tools/deploy-web.sh` 只更新静态资源：主机构建 web（按需 `npm ci`）→ 备份设备 `web/dist` 到 `web.prev` → `rsync --checksum --delete` 替换运行位 `web/dist`。适配器按请求读盘，替换后下一个请求即生效，不编后端、不停栈、不重启。适用于只改 `web/` 且不动接口的情形；改了适配器路由或 daemon 控制面 schema 仍须走 `deploy-jetson.sh`。SSH 目标由参数或 `MOZART_JETSON` 提供，`MOZART_RUNTIME_DIR` 覆盖运行目录。手动替换不走全栈部署的事务回滚，失败时可用 `web.prev` 手动恢复。
 
 ### 部署后测试
 

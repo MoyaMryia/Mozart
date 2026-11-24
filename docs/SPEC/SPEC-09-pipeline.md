@@ -40,6 +40,7 @@
 | --- | --- | --- |
 | `tools/ci-local.sh all` | 本机全量测试：仓库卫生、文档、C++/CTest、Rust、web | 已实现 |
 | `tools/deploy-jetson.sh <SSH目标>` | 同步、构建、安装、重启；不跑测试 | 已实现 |
+| `tools/deploy-web.sh <SSH目标>` | 仅前端：构建 web、备份并替换运行位 `web/dist`；不编后端、不停栈、不重启 | 已实现 |
 | `tools/jetson-e2e.sh <SSH目标> [套件]` | 部署后测试：unit / smoke / file / language / measure | 已实现 |
 | `tools/jetson-audio.py <SSH目标> [选项]` | 本机↔Jetson 跨平台 SSH 音频桥接（听板端输出、送本机麦、双向全双工、录 WAV） | 已实现 |
 
@@ -74,6 +75,7 @@
 - [ ] 部署锁自动释放与回滚缓存保护：将 `tools/deploy-jetson.sh` 的目录锁 `~/.mozart-deploy.lock` 改为绑定会话生命周期的文件锁（`flock`），确保 SSH 断连或进程异常退出时自动释放不留死锁；回滚仅在源码确实发生回退且构建产物失效时清理缓存，取消无条件 `cargo clean` 与 `ninja -t clean`。
 - [ ] 部署构建与健康检查加固：收紧部署健康检查（等配置模型时的 `rvc` 或 `output_mode` 离开过渡态，并核验 `web` 运行且 `/api/v1/health` 返回 `200`）；部署末尾按当前 SSH 目标 IP 与端口核对 `[web].allowed_origins`，缺失时明文告警提示而不擅改配置。板端 Rust 构建保持 debug（用户决定：release 全量与增量编译在 8 GB 设备上过慢），不改 `--release`。
 - [ ] 部署工程卫生与停栈收割加固：部署成功后按上限（保留最近 `3` 份）自动清理历史 `~/.mozart-source-backup.*` 与 `/tmp/mozart-deploy.*` 快照；`deploy.json` 按实际构型写入 `mode`（`full` / `incremental`）；停栈后 `pgrep` 残留检查增加短暂重试缓冲（如最多 `3 s`），避免进程收割竞态误报失败。
+- [x] 轻量前端部署 `tools/deploy-web.sh`：纯前端改动不必走全栈部署。主机构建 web（按需 `npm ci`，复用 lock stamp）→ 备份设备 `web/dist` 到 `web.prev` → `rsync --checksum --delete` 替换运行位 `web/dist`；不编后端、不停栈、不重启（适配器按请求读盘，立即生效）。SSH 目标由参数或 `MOZART_JETSON` 提供，`MOZART_RUNTIME_DIR` 覆盖运行目录。接口（适配器路由或 daemon schema）变更仍须走 `deploy-jetson.sh`。板端实测：构建 628 ms，替换后适配器立即提供新哈希资源，web/daemon 进程号不变。
 
 ## 待讨论
 
