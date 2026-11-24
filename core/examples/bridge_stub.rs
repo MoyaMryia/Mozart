@@ -6,7 +6,7 @@ mod stub_common;
 use mozart_core::ctl::schema::BridgeStatus;
 use mozart_core::ctl::{self, Message};
 use serde_json::json;
-use stub_common::{body, expect_known, fail, ok, parse_args, serve};
+use stub_common::{body, expect_known, fail, ok, parse_args, serve_optional_reply};
 
 struct State {
     translate_enabled: bool,
@@ -20,7 +20,16 @@ fn main() {
         speech_enabled: std::env::var_os(mozart_core::speech::SUPERVISED_BRIDGE_BOOT_ENV)
             .as_deref() != Some(std::ffi::OsStr::new("1")),
     };
-    serve(args, move |msg| handle(msg, &mut state));
+    let lost_open_reply = std::env::var_os("MOZART_BRIDGE_STUB_LOST_OPEN_REPLY").map(std::path::PathBuf::from);
+    serve_optional_reply(args, move |msg| {
+        let reply = handle(msg, &mut state);
+        if msg.header.type_ == ctl::BRIDGE_SPEECH_SET && state.speech_enabled
+            && lost_open_reply.as_ref().is_some_and(|path| path.exists()) {
+            None
+        } else {
+            Some(reply)
+        }
+    });
 }
 
 fn handle(msg: &Message, state: &mut State) -> Vec<u8> {

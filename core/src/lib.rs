@@ -47,6 +47,7 @@ pub struct InputFrame {
 pub struct OutputFrame {
     pub meta: FrameMeta,
     pub sample_rate: u32,
+    /// Samples before PCM padding, including zero for a real-time underrun.
     pub valid_samples: u32,
     pub pcm: [f32; OUTPUT_SAMPLES],
 }

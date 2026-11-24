@@ -59,6 +59,8 @@
 
 - [x] 投递队列为有界内存队列，不落盘；队满丢最旧并计数，容量为新增参数、板端实测后定。桥里在途队列（待翻译、待播报）均放内存，落盘的是字幕存档与运行时状态文件（见 SPEC-04）。桥崩溃重启丢失在途播报，不补播旧句；译文存档不受影响（见字幕桥，先于投递写入 subtitles.jsonl）。（`bridge/tests/process.rs:572`）
 - [x] 播报 TTS 为独立 Rust 进程，链 sherpa-onnx 的 TTS 库（C/C++ 接口），不链进桥，以隔离崩溃域、解耦构建；由 daemon 监管，跟随 SPEC-04。桥把合格译文发给 TTS 进程，TTS 用参考音色合成，流式喂给 pre 播放（合成一段播一段，沿用旧低延迟路径），不走变声。播报经变声用同一目标音色见 FUTURE。进程形态、不走变声与流式直播均已落地：生成回调每解码一段 PCM 即经有界通道交输出线程按固定单调网格推进 20 ms 节拍发帧（`tts/src/synth.rs`、`tts/src/ffi.rs`、`tts/src/output.rs`），流式合成句内跨段保持单调不增的归一化增益以消除段间音量跳升。首段音频仍须等整句 LM 阶段完成（PocketTTS v1.13.6：LM 整句批处理、解码逐段回调），解码阶段与播放重叠。
+- [x] TTS 逐段重采样保留跨回调插值状态，只有整句结束才延展最后一采样；整句时长按整数样本计。该契约针对重采样，不改变句内增益策略。
+- [x] 翻译质检按字母与数字计字符比，单字符原文允许短词组扩展。测试同时覆盖正常短句、标点变化和过长拒绝；其余质检不变。
 - [x] 播报音频采样率：v1 不走变声，TTS 合成后重采样到播放采样率直接喂 pre 播；经变声输出（FUTURE）时在 TTS 进程内重采样到 16 kHz 契约帧喂 RVC，RVC 输入统一 16 kHz。重采样为纯算术、逐块进行，延迟可忽略；算法沿用旧实现。（v1 路径 24k→48k；16 kHz 分支为 FUTURE 死代码 `tts/src/resample.rs:32-33`）
 - [x] 桥到 TTS 接口走 Unix socket + 自有协议（定长头 + JSON），不用 HTTP：TTS 为自有 Rust 进程，区别于第三方 llama-server。任务通道默认 `tts-jobs.sock`（run_dir 下），TTS 绑定、桥连接。命令号 0x06xx（任务 0x0610/停止 0x0612）。应答已改标准信封：type 回显请求号、体 status/code/reason/data、utterance_id 放 data（见 SPEC-01）。
 - [ ] 桥发参考音色参数：桥只发 text + utterance_id（`bridge/src/speech.rs:119-123`）；`voice_params` 仅校验不生效（`tts/src/jobs.rs:6`），音色走配置 reference_wav。注：按句切换音色取决于 TTS 模型能力（当前 sherpa-onnx 固定参考音频），非纯接线问题；v1 单音色不受影响，通道预留待模型支持时接通。

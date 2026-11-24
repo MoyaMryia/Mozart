@@ -213,7 +213,7 @@ private:
     uint64_t next_window_start_ = 0;
     bool have_window_base_ = false;
     bool window_voiced_ = false; // 自上次取窗以来出现过 VAD
-    std::atomic<uint64_t> reset_gen_{0};     // 重置代数（push 侧递增，推理侧对齐）
+    uint64_t reset_gen_ = 0;     // 由 cv_mutex_ 保护；提交块时核对
 
     // 不连续检测基准（push 侧独占）
     bool have_last_meta_ = false;
@@ -229,7 +229,8 @@ private:
     bool output_started_ = false;
     size_t startup_delay_remaining_ = 0;
 
-    // 块间淡化尾（crossfade_out 样本），cv_mutex_ 保护（仅推理线程读写）
+    // 块间淡化尾及其代次，仅推理线程读写。
+    uint64_t tail_generation_ = 0;
     std::vector<float> tail_;
     bool tail_valid_ = false;    // false = 下一块直接输出不混合
 
@@ -243,8 +244,8 @@ private:
     void reset_full_history_locked();   // 需持 cv_mutex_
     void read_last_window(size_t count, std::vector<float>& dst);
     bool read_prefix(size_t count, std::vector<float>& dst);
-    void push_output(const float* data, size_t n);
-    void push_output_zeros(size_t n);
+    /// nullptr 表示发布等长静音；旧代一律拒绝。
+    bool publish_output(uint64_t generation, const float* data, size_t n);
 };
 
 } // namespace rvc

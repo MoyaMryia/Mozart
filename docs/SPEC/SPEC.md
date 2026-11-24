@@ -74,6 +74,7 @@
 
 ## 变更记录
 
+- 2026-11-24：输出帧固定尺寸不变，显式区分有效样本与补零。实时 RVC 欠载由 pre 淡变，文件末帧不发布填充样本；旧推理代次不能再提交音频或静音。
 - 2026-11-24：补齐部署稳定化与停机加固待办（待实现）：板端 Rust 构建改用 `--release`，收紧部署健康检查并核对 `[web].allowed_origins` 缺失告警；本机按需运行 `npm ci`、部署后清理历史备份快照（保留最近 `3` 份）、修正 `deploy.json` 的增量/全量记录；停栈 `pgrep` 增重试缓冲，`poller` 关停快速退出并放宽 `mozart-ctl down` 停机时限（SPEC-04、SPEC-09）。
 - 2026-11-24：登记部署与运行侧锁机制、断网恢复及接口收口待办（待实现）：部署锁改为绑定会话自动释放的 `flock` 且仅源码回退必要时清缓存；`core` 长超时表补齐 `DAEMON_MODEL_USE` 与 `DAEMON_FILE_SUBMIT`、`daemon.sock` 队列扩至 `64`；Web 侧补齐 `mode`/`device use` 映射、配置缓存与前端按需刷新；修复前端写锁 SSE 竞态并将幂等写操作改为刷新后自动解锁、SSE 改指数退避、`accept()` 去 `panic!`、字幕优化回放并补齐上传超时额度回收路径（SPEC-04、SPEC-06、SPEC-09）。
 - 2026-11-24：确认 Web 生命周期收口方向与边界（方案 1，待实现）：将 `mozart-web-adapter` 纳入 `daemon` `Supervisor` 统一监管并淘汰独立 `tools/web-service.sh`，网页启停改为经 daemon 控制命令启停音频与 AI 业务子服务（保持 `daemon` 与网页在线），整机完全关停保留给 `mozart-ctl down`；明确监管与控制权分离——进程监管归 `daemon`，控制面与 `mozart-ctl` 同级只经 `daemon.sock` 不直控业务子进程（仅字幕只读 `subtitles.jsonl`）（SPEC-04、SPEC-06、SPEC-09）。

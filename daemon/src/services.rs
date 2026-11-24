@@ -181,11 +181,11 @@ impl Services {
             .map_err(CallError::into_rejection)
     }
 
-    pub(crate) fn assert_playout(&self, policy: mozart_core::ctl::schema::PlayoutPolicy) -> Result<(), (String, String)> {
-        let body = json!(policy);
+    pub(crate) fn assert_playout(&self, request: mozart_core::ctl::schema::PlayoutSetRequest) -> Result<(), (String, String)> {
+        let body = json!(request);
         let reply = self.pre().call_ok(ctl::PRE_SET_PLAYOUT, body.to_string().as_bytes())
             .map_err(CallError::into_rejection)?;
-        if reply.data["policy"] == body {
+        if reply.data == body {
             Ok(())
         } else {
             Err((ctl::CODE_INTERNAL.into(), "pre did not confirm playout policy".into()))
@@ -476,7 +476,7 @@ pub fn speech_set(services: &Services, enabled: bool) -> Result<Value, (String, 
     Ok(response.data)
 }
 
-const SPEECH_STOP_REASON: &str = "speech stop fence:";
+pub(crate) const SPEECH_STOP_REASON: &str = "speech stop fence:";
 
 fn begin_speech_stop(
     services: &Services,
@@ -951,7 +951,7 @@ fn reconcile(
     rvc_status: Option<&RvcStatus>,
     degraded: &mut Vec<String>,
 ) {
-    let (active, mute, gpu_owner, returning_realtime, playout) = {
+    let (active, mute, gpu_owner, returning_realtime, playout, reattaching) = {
         let mut state = lock_state(state);
         if let Some(pre) = pre_status {
             crate::mode::observe_pre_playout(&mut state, pre);
@@ -962,6 +962,7 @@ fn reconcile(
             state.gpu_owner(),
             state.realtime_return_pending(),
             state.playout_policy,
+            state.output_mode.as_ref().is_some_and(|mode| mode.phase == mozart_core::ctl::schema::OutputPhase::ReattachingPlayout),
         )
     };
 
@@ -979,19 +980,34 @@ fn reconcile(
     };
 
     if let Some(status) = pre_status {
-        if status.playout_policy != playout {
-            if let Err((code, reason)) = services.assert_playout(playout) {
-                degraded.push(format!("pre playout: {code}: {reason}"));
+        // Do not open a restarted pre until the intended real-time source is ready.
+        // The gate RPC asserts its route and mute together, including on reconnect.
+        let opens_realtime = matches!(playout,
+            mozart_core::ctl::schema::PlayoutPolicy::Legacy | mozart_core::ctl::schema::PlayoutPolicy::RealtimeOnly);
+        let playout_ready = !opens_realtime || rvc_route_ready;
+        if reattaching || (status.playout_policy != playout && playout_ready) {
+            let result = if playout_ready {
+                let request = mozart_core::ctl::schema::PlayoutSetRequest { policy: playout, route: active, mute };
+                services.assert_playout(request).map_err(|(code, reason)| format!("pre playout: {code}: {reason}"))
+            } else {
+                Err("waiting for RVC before restoring pre playout".into())
+            };
+            if let Err(reason) = &result {
+                degraded.push(reason.clone());
             }
-        }
-        if status.route != active && rvc_route_ready {
-            if let Err(err) = set_pre_route(services, active) {
-                degraded.push(format!("pre route apply: {}", err.describe()));
+            if reattaching {
+                crate::mode::finish_pre_reattach(&mut lock_state(state), result);
             }
-        }
-        if status.mute != mute {
-            if let Err(err) = set_pre_mute(services, mute) {
-                degraded.push(format!("pre mute apply: {}", err.describe()));
+        } else {
+            if status.route != active && rvc_route_ready {
+                if let Err(err) = set_pre_route(services, active) {
+                    degraded.push(format!("pre route apply: {}", err.describe()));
+                }
+            }
+            if status.mute != mute {
+                if let Err(err) = set_pre_mute(services, mute) {
+                    degraded.push(format!("pre mute apply: {}", err.describe()));
+                }
             }
         }
     }

@@ -5,7 +5,9 @@ use crate::services::{self, Services};
 use crate::state::{lock_state, State};
 use crate::state_file::{BridgeRestore, StateFile};
 use mozart_core::config::{Config, StartupMode};
-use mozart_core::ctl::schema::{OutputMode, OutputModeStatus, OutputPhase, PlayoutPolicy, Route};
+use mozart_core::ctl::schema::{
+    OutputMode, OutputModeStatus, OutputPhase, PlayoutPolicy, PlayoutSetRequest, Route,
+};
 use std::sync::{Mutex, TryLockError};
 
 pub fn initialize(state: &mut State, config: &Config) {
@@ -16,6 +18,7 @@ pub fn initialize(state: &mut State, config: &Config) {
         StartupMode::Broadcast => OutputMode::Broadcast,
     };
     state.playout_policy = PlayoutPolicy::Silent;
+    state.speech_drained = true;
     // A fresh supervised bridge has no prior admission. Direct and RVC can
     // start without waiting for bridge or TTS; the pre gate rejects TTS.
     let phase = if requested == OutputMode::Broadcast {
@@ -52,6 +55,7 @@ pub fn unmanage(state: &mut State) {
     if state.output_mode.take().is_some() {
         state.set_route_desired(state.route_active());
         state.playout_policy = PlayoutPolicy::Legacy;
+        state.speech_drained = false;
     }
 }
 
@@ -80,13 +84,23 @@ pub fn tick(
     let broadcast = current.requested == OutputMode::Broadcast;
     let phase = match current.phase {
         OutputPhase::ClosingSpeech => {
-            services::advance_speech_stop(state, services, state_file, &mut bridge).map(|_| {
-                Some(if broadcast {
-                    OutputPhase::ConfiguringPlayout
-                } else {
-                    OutputPhase::Routing
+            let drained = lock_state(state).speech_drained;
+            if !broadcast && drained {
+                // A superseded broadcast request may have started a redundant
+                // fence, but never opened admission. Do not wait on that probe.
+                bridge.speech_stop = None;
+                lock_state(state).clear_degraded_prefix(services::SPEECH_STOP_REASON);
+                Ok(Some(OutputPhase::Routing))
+            } else {
+                services::advance_speech_stop(state, services, state_file, &mut bridge).map(|_| {
+                    lock_state(state).speech_drained = true;
+                    Some(if broadcast {
+                        OutputPhase::ConfiguringPlayout
+                    } else {
+                        OutputPhase::Routing
+                    })
                 })
-            })
+            }
         }
         OutputPhase::ConfiguringPlayout => {
             let policy = if broadcast {
@@ -95,8 +109,16 @@ pub fn tick(
                 PlayoutPolicy::RealtimeOnly
             };
             // A lost reply may have changed pre already. Reassert the same policy on restart.
-            lock_state(state).playout_policy = policy;
-            services.assert_playout(policy).map(|_| {
+            let request = {
+                let mut state = lock_state(state);
+                state.playout_policy = policy;
+                PlayoutSetRequest {
+                    policy,
+                    route: state.route_active(),
+                    mute: state.mute(),
+                }
+            };
+            services.assert_playout(request).map(|_| {
                 Some(if broadcast {
                     OutputPhase::Routing
                 } else {
@@ -123,7 +145,10 @@ pub fn tick(
         }
         OutputPhase::OpeningSpeech => services
             .tts_ready()
-            .and_then(|()| services::speech_set(services, true))
+            .and_then(|()| {
+                lock_state(state).speech_drained = false;
+                services::speech_set(services, true)
+            })
             .and_then(|data| {
                 if data["speech_enabled"] == true {
                     bridge.speech = None; // The selected mode, not a legacy override, owns this setting.
@@ -135,7 +160,8 @@ pub fn tick(
                     ))
                 }
             }),
-        OutputPhase::Applied => return,
+        // Pre reconciliation owns reconnecting the current route and gate.
+        OutputPhase::ReattachingPlayout | OutputPhase::Applied => return,
     };
     match phase {
         Ok(next) => {
@@ -158,15 +184,33 @@ pub fn observe_pre_playout(state: &mut State, pre: &mozart_core::ctl::schema::Pr
         return;
     }
     state.playout_startup_id = Some(pre.startup_id.clone());
-    if state.playout_policy != PlayoutPolicy::BroadcastOnly {
-        return;
-    }
-    state.playout_policy = PlayoutPolicy::Silent;
-    if let Some(mode) = state.output_mode.as_mut() {
-        if mode.requested == OutputMode::Broadcast {
-            mode.phase = OutputPhase::ClosingSpeech;
+    if state.playout_policy == PlayoutPolicy::BroadcastOnly {
+        state.playout_policy = PlayoutPolicy::Silent;
+        if let Some(mode) = state.output_mode.as_mut() {
+            if mode.requested == OutputMode::Broadcast {
+                mode.phase = OutputPhase::ClosingSpeech;
+                mode.applied = None;
+            }
+        }
+    } else if let Some(mode) = state.output_mode.as_mut() {
+        if mode.phase == OutputPhase::Applied {
+            mode.phase = OutputPhase::ReattachingPlayout;
             mode.applied = None;
         }
+    }
+}
+
+pub(crate) fn finish_pre_reattach(state: &mut State, result: Result<(), String>) {
+    let Some(mode) = state.output_mode.as_mut() else {
+        return;
+    };
+    if mode.phase != OutputPhase::ReattachingPlayout {
+        return;
+    }
+    mode.last_error = result.err();
+    if mode.last_error.is_none() {
+        mode.phase = OutputPhase::Applied;
+        mode.applied = Some(mode.requested);
     }
 }
 

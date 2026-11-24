@@ -77,7 +77,7 @@ MOZART_STATIC_ASSERT(sizeof(mozart_input_frame_t) == 16 + 320 * 4,
 typedef struct {
     mozart_frame_meta_t meta;
     uint32_t            sample_rate;    // 模型/输出采样率，如 32000 / 40000 / 48000
-    uint32_t            valid_samples;  // pcm 中有效样本数，1..=MOZART_OUTPUT_SAMPLES
+    uint32_t            valid_samples;  // pcm 有效样本数；实时欠载可为 0，文件尾帧可短
     float               pcm[MOZART_OUTPUT_SAMPLES];
 } mozart_output_frame_t;
 #pragma pack(pop)

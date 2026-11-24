@@ -135,6 +135,10 @@ RMVPE 前端 mel 128 带、n_fft 1024、hop 160、30–8000 Hz、HTK Slaney（�
 
 ## 改进点
 
+- [x] 数据面 socket 初始化任何失败均释放已取得的描述符；连接失败不留下新输入绑定。 见[本机回归](../../reports/postprocessing-stability-20261124/RESULTS.md)。
+- [x] 正常块、跳静音和失败补零均在发布临界区核对代次。重置后的首个推理窗会清掉旧淡化尾和缓存；回归覆盖成功、短输出、异常和并发跳静音。
+- [x] 文件结果末帧携带有效样本数；daemon 校验回帧的序号、采样率和有效长度，再发布准确采样长度的 WAV。本机协议桩覆盖有信号的非整帧尾样本。
+
 - [ ] 模型主导参数动态化（多模型适配，总方向）：凡由模型决定的参数（采样率、帧率、hop、特征维度、上采样比、合成帧数 T、音高量化）从模型动态读取，据此推导分窗几何、推理模式（整段/动态/分窗）与重采样，不写死常量。实时形状已改为按 JSON 几何常量加模型采样率与 emb 通道推导，门控不再写字面量（`rvc/src/rvc/pipeline.cpp:211-241`）；`W`/`P` 仍是单 profile 自由参数，未由模型能力推导。前置的跨模型实测已覆盖 40k/48k 共 10 个模型（文件链路）。
 - [x] 实时原生多采样率（内部动态采样率）：实时链路内部按模型原生采样率工作（32k/40k/48k）。窗、hop、交叉淡化、SOLA、启动缓冲与输出帧长都由采样率推导，40 kHz 模型不再逐块重采样。播放侧不协商采样率：固定 48 kHz，由 pre 在播放边界重采样（SPEC-02）。帧契约扩 `sample_rate`/`valid_samples`（SPEC-01）。（`rvc/include/rvc/realtime_geometry.hpp:119-201`、`rvc/src/rvc/audio_worker.cpp:64-73,137-139`、`rvc/src/rvc/streaming_pipeline.cpp:31-42`）板端验收见下方板端条目。
 - [x] 采样率生态与原生多采样率方案调研：公开资料调研 RVC 常见采样率（32k/40k/48k）、上游实时推理假设、导出与 front/decoder 形状、ALSA/USB 播放采样率约束，结论与实现边界入 `reports/realtime-sample-rate-20261116/RESULTS.md`。

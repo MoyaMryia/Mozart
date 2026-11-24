@@ -17,7 +17,7 @@
 - [x] 响应契约统一：响应 type 回显、体固定 `status` / `code` / `reason` / `data`。TTS 任务应答已对齐：type 回显请求号（SUBMIT→0x0610、STOP→0x0612），`utterance_id` 放 `data`，受理三态映射 ok/Ok（submitted）、error/Busy（队满 skipped）、error（failed）。（`tts/src/jobs.rs`、`bridge/src/speech.rs`）
 - [x] 识别事件流（识别服务 → 字幕桥）：Unix `SOCK_SEQPACKET`，一条消息一个 JSON 事件，无定长头；socket 默认 `asr-events.sock`（run_dir 下）；事件契约见 SPEC-05。（`core/src/ctl.rs:426-462`、`core/src/config.rs:207,464-466`）
 - [x] 线包：4 B 魔数 + 16 B 元数据 + PCM。输入 1300 B；输出 3868 B，元数据后插两个 u32 字段。（`core/include/mozart/frame.h:86-91`、`core/src/lib.rs:83-84` 编译期断言）
-- [x] 输出帧新增字段：`sample_rate` 为模型原生采样率（32000 / 40000 / 48000），`valid_samples` 为 pcm 有效样本数（采样率 / 50，即 640 / 800 / 960），其后 pcm 为补零。结构体内偏移 16 与 20，线包偏移 20 与 24（前置 4 B 魔数）。（`frame.h:74-84`、`core/src/lib.rs:94-97`）
+- [x] 输出帧新增字段：`sample_rate` 为模型原生采样率（32000 / 40000 / 48000），`valid_samples` 为有效样本数。完整帧为采样率 / 50（640／800／960）；实时欠载允许为 0 或短帧，文件末帧标记实际有效样本数。有效段之后补零，结构大小不变。结构体内偏移 16 与 20，线包偏移 20 与 24（前置 4 B 魔数）。（`frame.h:74-84`、`core/src/lib.rs:94-97`）
 - [x] 帧契约以 C 头文件为单一来源；Rust 用 `#[repr(C)]` 镜像，加编译期大小与偏移断言。（`core/src/lib.rs:79-99`）
 - [x] 帧契约偏移断言：`offset_of!` 逐字段钉住元数据、输入帧、输出帧与 RAW 帧；控制头同口径。（`core/src/lib.rs:86-99`、`core/src/ctl.rs:169-174`）
 - [x] 新旧进程混跑守卫：数据面无版本协商。接收长度不等于契约线包长即丢帧，热路径只加原子计数（Rust `recv_size_mismatch`、C++ `recv_size_mismatch_`）。控制线程首次出现时记可查询原因，文案要求同代重建 pre/rvc/tts/daemon。结果是全部丢帧，不会错帧。（`core/src/dgram.rs:145-147,391-397`、`rvc/transport/unix_dgram_stream.cpp:230-236,330-338`、`rvc/control/stream_session.cpp:443,484`、`pre/src/control.rs:75-91`）

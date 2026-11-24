@@ -14,6 +14,8 @@
 
 #include <cmath>
 #include <cstdio>
+#include <future>
+#include <stdexcept>
 #include <vector>
 
 using namespace rvc;
@@ -67,6 +69,59 @@ mozart_input_frame_t make_frame(uint32_t idx, uint8_t vad, float value,
     f.meta.pts_ns = pts_ns;
     for (int i = 0; i < MOZART_INPUT_SAMPLES; ++i) f.pcm[i] = value;
     return f;
+}
+
+// Inject the reset from inside process_realtime, at the same boundary where
+// the inference thread runs without the generation lock.
+class ResetDuringInference : public Upsample3Pipeline {
+public:
+    ResetDuringInference(StreamingRvc& stream, int outcome)
+        : stream_(stream), outcome_(outcome) {}
+
+    std::vector<float> process_realtime(
+        const std::vector<float>&, const RvcRealtimeRequest& request
+    ) override {
+        if (outcome_ >= 0) {
+            stream_.push(make_frame(1000, 1, 0.25f));
+            const int outcome = outcome_;
+            outcome_ = -1;
+            if (outcome == 0) throw std::runtime_error("old-inference test failure");
+            if (outcome == 1) return {0.5f};
+        }
+        return std::vector<float>(request.output_samples, 0.75f);
+    }
+
+    void reset_realtime() override { ++model_resets; }
+    unsigned model_resets = 0;
+
+private:
+    StreamingRvc& stream_;
+    int outcome_;
+};
+
+class SynchronizedReset : public Upsample3Pipeline {
+public:
+    explicit SynchronizedReset(std::future<void> proceed) : proceed_(std::move(proceed)) {}
+
+    void reset_realtime() override {
+        resetting.set_value();
+        proceed_.wait();
+    }
+
+    std::promise<void> resetting;
+
+private:
+    std::future<void> proceed_;
+};
+
+StreamingRvc::Config realtime_config() {
+    StreamingRvc::Config cfg;
+    cfg.window_samples = 3840;
+    cfg.crossfade_out = 2400;
+    cfg.upstream_realtime = true;
+    cfg.past_context_samples = 40000;
+    cfg.sola_search_out = 480;
+    return cfg;
 }
 
 std::vector<float> drain(StreamingRvc& s)
@@ -171,6 +226,39 @@ int main()
         CHECK(s.stats().blocks.load() == 2, "stream recovers after reset");
         const std::vector<float> out = drain(s);
         CHECK(out.size() == 93120, "post-reset output present");
+    }
+
+    printf("test_reset_rejects_old_success_short_and_failed_blocks\n");
+    for (const int outcome : {0, 1, 2}) {
+        StreamingRvc stream(realtime_config());
+        ResetDuringInference pipe(stream, outcome);
+        for (unsigned i = 0; i < 12; ++i) stream.push(make_frame(i, 1, 0.25f));
+        CHECK(stream.try_process_one(pipe), "old block finishes after reset");
+        CHECK(stream.stats().resets.load() == 1, "inference actually crossed reset");
+        CHECK(stream.output_pending() == 0, "no old PCM or fallback silence reaches new queue");
+        for (unsigned i = 1001; i < 1012; ++i) stream.push(make_frame(i, 1, 0.25f));
+        CHECK(stream.try_process_one(pipe), "new block is processed");
+        CHECK(pipe.model_resets == 1, "new inference starts after resetting model history");
+        CHECK(stream.output_pending() == 11520, "new generation emits one full block");
+    }
+
+    printf("test_reset_rejects_a_concurrent_silence_skip\n");
+    {
+        StreamingRvc stream(realtime_config());
+        std::promise<void> proceed;
+        SynchronizedReset pipe(proceed.get_future());
+        auto resetting = pipe.resetting.get_future();
+        stream.reset(); // Force model cache reset before this generation's first block.
+        for (unsigned i = 0; i < 12; ++i) stream.push(make_frame(i, 0, 0.0f));
+        auto work = std::async(std::launch::async, [&] { return stream.try_process_one(pipe); });
+        const bool parked = resetting.wait_for(std::chrono::seconds(2)) == std::future_status::ready;
+        CHECK(parked, "inference picked the silent block before the next reset");
+        if (parked) stream.push(make_frame(1000, 0, 0.0f));
+        proceed.set_value();
+        CHECK(work.get(), "inference worker returns");
+        CHECK(stream.stats().resets.load() == 2, "input worker reset while inference was paused");
+        CHECK(stream.output_pending() == 0, "stale skip cannot publish zeros after reset");
+        CHECK(stream.stats().skipped_blocks.load() == 0, "stale skip does not count as a published block");
     }
 
     // ---- 用例 5：Golden full-history + lookahead 调度和 target crop ----

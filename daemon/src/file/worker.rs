@@ -13,7 +13,7 @@ use super::decode::{self, ContractFrame};
 use super::{encode, JobContext, Outcome, ReturnedHandoff, StepError, Worker, FRAME_NS};
 use mozart_core::ctl::schema::FileProgress;
 use mozart_core::dgram::FrameSocket;
-use mozart_core::{FrameMeta, InputFrame, OutputFrame, OUTPUT_SAMPLES};
+use mozart_core::{FrameMeta, InputFrame, OutputFrame, INPUT_SAMPLE_RATE, OUTPUT_SAMPLE_RATE, OUTPUT_SAMPLES};
 use std::io;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::Ordering;
@@ -117,8 +117,9 @@ fn process(ctx: &JobContext) -> Result<(), StepError> {
         .map_err(|(code, reason)| StepError::Failed(format!("start file stream: {code}: {reason}")))?;
 
     let input_path = config.rvc_input_socket();
+    let output_samples = total_samples as usize * (OUTPUT_SAMPLE_RATE / INPUT_SAMPLE_RATE) as usize;
     let exchanged = feed(&frames, &input_path, &mut progress, &cancel)
-        .and_then(|()| receive(ctx, handoff.output(), total, &mut progress, &cancel));
+        .and_then(|()| receive(ctx, handoff.output(), output_samples, &mut progress, &cancel));
     // 把交接交还给协调器。文件发布不等待控制面归还应答。
     drop(handoff);
     let samples = exchanged?;
@@ -185,11 +186,12 @@ fn feed(
 fn receive(
     ctx: &JobContext,
     output: &FrameSocket<OutputFrame>,
-    total: usize,
+    sample_count: usize,
     progress: &mut Reporter<'_>,
     cancel: &dyn Fn() -> bool,
 ) -> Result<Vec<f32>, StepError> {
-    let mut samples = Vec::with_capacity(total * OUTPUT_SAMPLES);
+    let total = sample_count.div_ceil(OUTPUT_SAMPLES);
+    let mut samples = Vec::with_capacity(sample_count);
     let mut deadline = Instant::now() + FIRST_FRAME_TIMEOUT;
     let mut status_poll = Instant::now();
     let mut received = 0usize;
@@ -200,9 +202,16 @@ fn receive(
         }
         match output.recv(Some(RECV_POLL)) {
             Ok(frame) => {
-                // packed 字段按值搬出，不取引用。
+                // 校验跨进程回帧与本次任务的长度和顺序一致。
+                let expected = (sample_count - samples.len()).min(OUTPUT_SAMPLES);
+                let (index, rate, valid) = (frame.meta.frame_idx, frame.sample_rate, frame.valid_samples);
+                if index as usize != received || rate != OUTPUT_SAMPLE_RATE || valid as usize != expected {
+                    return Err(StepError::Failed(format!(
+                        "invalid file RVC frame {received}: index={index}, rate={rate}, valid_samples={valid}; expected rate={OUTPUT_SAMPLE_RATE}, valid_samples={expected}"
+                    )));
+                }
                 let pcm = frame.pcm;
-                samples.extend_from_slice(&pcm);
+                samples.extend_from_slice(&pcm[..expected]);
                 received += 1;
                 deadline = Instant::now() + FRAME_GAP_TIMEOUT;
                 progress.throttled(

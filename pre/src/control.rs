@@ -8,7 +8,7 @@ use crate::state::{DspSwitches, QueueReadout, Shared, VERSION};
 use mozart_core::config::validate_device_name;
 use mozart_core::ctl::schema::{
     error_body, ok_body, DeviceUseRequest, DspSetRequest, FileModeSetRequest, MuteSetRequest,
-    PlayoutPolicy, RouteSetRequest,
+    PlayoutSetRequest, RouteSetRequest,
 };
 use mozart_core::ctl::{self, Message, Seqpacket, ACCEPT_POLL, IDLE_TIMEOUT, RECV_POLL};
 use mozart_core::dgram::FRAME_SIZE_MISMATCH_REASON;
@@ -281,11 +281,13 @@ fn dispatch_with_stop(
             }
             Err(err) => error_body(ctl::CODE_INVALID_ARGUMENT, &err.to_string()),
         },
-        ctl::PRE_SET_PLAYOUT => match serde_json::from_value::<PlayoutPolicy>(body) {
-            Ok(policy) => {
-                shared.set_playout_policy(policy);
+        ctl::PRE_SET_PLAYOUT => match serde_json::from_value::<PlayoutSetRequest>(body) {
+            Ok(request) => {
+                shared.set_route_target(request.route);
+                shared.set_mute_target(request.mute);
+                shared.set_playout_policy(request.policy);
                 if wait_playback_boundary(shared, stop) {
-                    ok_body(json!({"policy": policy}))
+                    ok_body(json!(request))
                 } else {
                     error_body(ctl::CODE_NOT_READY, "playout acknowledgement timed out")
                 }
