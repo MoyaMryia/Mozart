@@ -14,6 +14,7 @@ pub struct State {
     pub streams: Streams,
     pub uploads: Arc<UploadStore>,
     pub origins: Vec<url::Url>,
+    pub logs_dir: Option<PathBuf>,
 }
 
 fn bad(reason: impl Into<String>) -> ApiError { ApiError::code("BadRequest", reason) }
@@ -104,13 +105,14 @@ async fn serve(s: &State, req: Request, api: bool) -> Result<Response, ApiError>
     let allow = match p.as_slice() {
         ["preset", "save" | "use"] | ["system", "up" | "down"] | ["speech", "stop"] | ["config", "save"] | ["services", _, "restart"] | ["files", "pause" | "resume"] | ["files", _, "cancel"] => "POST",
         ["health" | "status" | "models" | "devices" | "preset"] | ["events", "status" | "subtitles"] | ["files", _, "result"] | ["files", _] => "GET",
+        ["logs"] => "GET",
         ["route" | "mute" | "translate" | "speech" | "model" | "mode"] => "PUT",
         ["config"] => "GET, PUT",
         ["files"] => "GET, POST",
         _ => return Err(ApiError::code("NotFound", "API route not found")),
     };
     if !allow.split(", ").any(|x| x == m.as_str()) { return Ok(method(allow)); }
-    let keys: &[&str] = match p.as_slice() { ["devices"] => &["all"], ["config"] if m == Method::GET => &["key"], ["events", "subtitles"] => &["cursor"], _ => &[] };
+    let keys: &[&str] = match p.as_slice() { ["devices"] => &["all"], ["config"] if m == Method::GET => &["key"], ["events", "subtitles"] => &["cursor"], ["logs"] => &["name"], _ => &[] };
     let q = query(req.uri().query(), keys)?;
     match (m, p.as_slice()) {
         (Method::GET, ["health"]) => Ok(ok(json!({"adapter":"running", "uploads":s.uploads.health(), "transport":crate::transport::health()}))),
@@ -121,6 +123,7 @@ async fn serve(s: &State, req: Request, api: bool) -> Result<Response, ApiError>
         }
         (Method::POST, ["files"]) => s.uploads.clone().handle(req).await,
         (Method::GET, ["files", id, "result"]) => download(s, id).await,
+        (Method::GET, ["logs"]) => read_log(s, q.get("name").map(String::as_str)).await,
         (method, path) => {
             let (cmd, data) = match (method, path) {
                 (Method::POST, ["system", "up"]) => { body::<Empty>(req).await?; (ctl::DAEMON_SERVICES_START, json!({})) },
@@ -171,6 +174,30 @@ async fn download(s: &State, id: &str) -> Result<Response, ApiError> {
     let encoded = percent_encoding::utf8_percent_encode(name, percent_encoding::NON_ALPHANUMERIC).to_string();
     let stream = ReaderStream::new(file).inspect_err(|e| eprintln!("result read error: {e}"));
     Response::builder().header(header::CONTENT_TYPE, "audio/wav").header(header::CONTENT_LENGTH, len).header(header::CONTENT_DISPOSITION, format!("attachment; filename*=UTF-8''{encoded}")).body(Body::from_stream(stream)).map_err(|e| ApiError::code("Internal", e.to_string()))
+}
+
+const LOG_SERVICES: [&str; 8] = ["asr", "bridge", "daemon", "llama", "pre", "rvc", "tts", "web"];
+const LOG_TAIL_BYTES: u64 = 16 * 1024;
+
+// 只读日志尾随：白名单服务名，返回日志末尾片段；从中间开始时丢掉首行残缺内容。
+async fn read_log(s: &State, name: Option<&str>) -> Result<Response, ApiError> {
+    let name = name.ok_or_else(|| bad("missing log name"))?;
+    if !LOG_SERVICES.contains(&name) { return Err(bad("unknown log service")); }
+    let dir = s.logs_dir.as_ref().ok_or_else(|| ApiError::code("Unavailable", "log directory is not configured"))?;
+    let root = tokio::fs::canonicalize(dir).await.map_err(|_| ApiError::code("NotFound", "log directory unavailable"))?;
+    let path = tokio::fs::canonicalize(root.join(format!("{name}.log"))).await.map_err(|_| ApiError::code("NotFound", "log file not found"))?;
+    if !path.starts_with(&root) { return Err(ApiError::code("NotFound", "log file not found")); }
+    let meta = tokio::fs::metadata(&path).await.map_err(|_| ApiError::code("NotFound", "log file not found"))?;
+    if !meta.is_file() { return Err(ApiError::code("NotFound", "log file not found")); }
+    let start = meta.len().saturating_sub(LOG_TAIL_BYTES);
+    let mut file = tokio::fs::File::open(&path).await.map_err(|_| ApiError::code("NotFound", "log file not found"))?;
+    use tokio::io::{AsyncReadExt, AsyncSeekExt};
+    file.seek(std::io::SeekFrom::Start(start)).await.map_err(|_| ApiError::code("NotFound", "log file not found"))?;
+    let mut buf = Vec::with_capacity(LOG_TAIL_BYTES as usize);
+    file.take(LOG_TAIL_BYTES).read_to_end(&mut buf).await.map_err(|_| ApiError::code("NotFound", "log file not found"))?;
+    let text = String::from_utf8_lossy(&buf);
+    let tail = if start == 0 { text.as_ref() } else { text.split_once('\n').map_or("", |(_, rest)| rest) };
+    Ok(ok(json!({ "name": name, "tail": tail })))
 }
 
 async fn static_file(s: &State, req: Request) -> Result<Response, ApiError> {

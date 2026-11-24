@@ -131,7 +131,7 @@ retained 是提交结果未知而保留的数量；reasons 列出保留原因，
 `service` 取值复用 `RestartRequest` 的服务范围。未知查询参数、重复单值参数和非法布尔值返回 `BadRequest`。
 `models` 不按 `exists` 过滤；前端可按该字段筛选，但不得把 `exists=true` 显示为推理已就绪。
 `config set` 的支持键和生效成本归 daemon；不得因为配置表列了某键，就假定写回已经接通。
-`restart_required`、`affected` 与 `status.pending_restart` 原样展示，不自动重启。
+设备键写入成功后，前端按 `restart_required`/`affected` 自动调用 `POST /services/{service}/restart` 使基线生效；其余重启类提示与 `status.pending_restart` 原样展示。
 设置路由后展示 `route.desired` 与 `route.active`，不把等待切换显示为已经切换。
 
 ### 业务子服务启停
@@ -273,6 +273,7 @@ v1 沿用本地设备／自有热点无认证的决定，不提供公网部署�
 - [ ] 接口与前端收口：保持适配器为 `daemon.sock` 瘦透传层，补齐已有命令映射（前端接入 `PUT /api/v1/mode`，适配器与前端补齐 `DAEMON_DEVICE_USE`）；适配器缓存已加载配置，不再每次 RPC 重读磁盘 TOML；前端改为按需刷新，避免每次写入后并发重拉 ALSA 设备列表与模型列表。
 - [ ] 前端写锁与 SSE 断连加固：解耦 HTTP 状态主动查询版本号与 SSE 推送版本号，消除 `statusReadFresh` 被 SSE 抢跑打断的竞态与刷新闪烁；幂等写操作在拉回最新状态后自动解除未知结果锁，仅不可幂等的文件提交保留人工确认；前端 SSE 改用指数退避重连（`1 s` 起至上限 `10 s`），持久数据错误单独降级提示。
 - [ ] 适配器网络异常、字幕回放与上传额度回收加固：将 `transport.rs` 中 `accept()` 未覆盖错误码由 `panic!` 改为记错退避；优化字幕文件增量核验与近期窗口/游标回放，避免历史文件增大导致回放撑爆 `sse_buffer_bytes`；为文件提交超时保留目录补齐可确认回收路径（确认任务状态后释放上传并发额度，不再只能等待重启 daemon）。
+- [ ] 日志尾随接口：适配器提供 `GET /api/v1/logs?name=<服务>`，只读返回 `run/logs` 下该服务日志的末尾片段（白名单、定长）；前端在 INFO 面板内查看并每 2 秒刷新，不写文件、不新增 daemon 命令。
 
 - 非文件写入结果未知后，确认须等待未被新状态覆盖的后续 HTTP 状态查询成功；SSE 不得替代查询。
 

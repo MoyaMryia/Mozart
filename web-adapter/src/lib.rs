@@ -27,12 +27,13 @@ pub fn config_description(config: &WebAdapterConfig) -> Result<serde_json::Value
 }
 
 pub async fn build(config: WebAdapterConfig, config_path: Option<PathBuf>) -> Result<Application, ApiError> {
+    let logs_dir = config_path.as_ref().and_then(|path| path.parent()).map(|root| root.join("run/logs"));
     let rpc = rpc::RpcClient::new(config_path, config.clone());
     let streams = Streams::new(rpc.clone(), config.clone());
     let origins = routes::origins(&config.web.allowed_origins)?;
     let uploads = UploadStore::new(&config, rpc.clone())?;
     let state = routes::State {
-        config, rpc, streams: streams.clone(), uploads: uploads.clone(), origins,
+        config, rpc, streams: streams.clone(), uploads: uploads.clone(), origins, logs_dir,
     };
     Ok(Application { router: routes::router(state), streams, uploads })
 }
