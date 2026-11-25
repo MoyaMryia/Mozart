@@ -157,6 +157,14 @@ bool TrtEngine::load(const std::filesystem::path& engine_path) {
                 return false;
             }
             t.capacity_bytes = t.bytes;
+            if (cudaMallocHost(&t.host_pinned, t.bytes) != cudaSuccess) {
+                spdlog::error("cudaMallocHost {} bytes failed for {}", t.bytes, name);
+                cudaFree(t.dev);
+                t.dev = nullptr;
+                unload();
+                return false;
+            }
+            t.host_capacity_bytes = t.bytes;
         }
         if (t.is_input) {
             input_types_[t.name] = t.dtype == 8 ? OnnxInput::Type::Int64
@@ -235,6 +243,17 @@ size_t checked_elements(const std::vector<int64_t>& shape) {
 
 } // namespace
 
+void TrtEngine::ensure_host_pinned(Tensor& tensor, size_t bytes) {
+    if (bytes == 0 || bytes <= tensor.host_capacity_bytes) return;
+    void* fresh = nullptr;
+    if (cudaMallocHost(&fresh, bytes) != cudaSuccess) {
+        throw std::runtime_error("TRT pinned host allocation failed: " + tensor.name);
+    }
+    if (tensor.host_pinned) cudaFreeHost(tensor.host_pinned);
+    tensor.host_pinned = fresh;
+    tensor.host_capacity_bytes = bytes;
+}
+
 TrtEngine::Tensor& TrtEngine::enqueue(
     const std::vector<OnnxInput>& inputs, const char* output_name,
     void* execution_stream, const char* linked_name, const Tensor* linked) {
@@ -303,11 +322,13 @@ TrtEngine::Tensor& TrtEngine::enqueue(
         if (tensor.bytes > tensor.capacity_bytes) {
             if (tensor.dev) cudaFree(tensor.dev);
             tensor.dev = nullptr;
+            tensor.capacity_bytes = 0;
             if (cudaMalloc(&tensor.dev, tensor.bytes) != cudaSuccess) {
                 throw std::runtime_error("TRT tensor allocation failed: " + tensor.name);
             }
             tensor.capacity_bytes = tensor.bytes;
         }
+        ensure_host_pinned(tensor, tensor.bytes);
         if (!context->setTensorAddress(tensor.name.c_str(), tensor.dev)) {
             throw std::runtime_error("TRT tensor binding failed: " + tensor.name);
         }
@@ -316,34 +337,39 @@ TrtEngine::Tensor& TrtEngine::enqueue(
     for (const auto& input : inputs) {
         Tensor* tensor = find_tensor(input.name);
         if (linked && linked_name && tensor->name == linked_name) continue;
-        const void* host = nullptr;
+        ensure_host_pinned(*tensor, tensor->bytes);
         if (tensor->dtype == 8) {
             if (input.type != OnnxInput::Type::Int64 || input.int64s.size() != tensor->elems) {
                 throw std::invalid_argument("TRT int64 input mismatch: " + tensor->name);
             }
-            host = input.int64s.data();
+            if (tensor->bytes > 0) {
+                std::memcpy(tensor->host_pinned, input.int64s.data(), tensor->bytes);
+            }
         } else if (tensor->dtype == 3) {
             const size_t count = input.type == OnnxInput::Type::Int64 ? input.int64s.size() : input.floats.size();
             if (count != tensor->elems) throw std::invalid_argument("TRT int32 input mismatch: " + tensor->name);
-            tensor->int32_staging.resize(count);
+            auto* dst = static_cast<int32_t*>(tensor->host_pinned);
             for (size_t i = 0; i < count; ++i) {
                 const double value = input.type == OnnxInput::Type::Int64
                     ? static_cast<double>(input.int64s[i]) : static_cast<double>(input.floats[i]);
                 if (!(value >= INT32_MIN && value <= INT32_MAX)) {
                     throw std::invalid_argument("TRT int32 input is out of range: " + tensor->name);
                 }
-                tensor->int32_staging[i] = static_cast<int32_t>(value);
+                dst[i] = static_cast<int32_t>(value);
             }
-            host = tensor->int32_staging.data();
         } else if (tensor->dtype == 0) {
             if (input.type != OnnxInput::Type::Float || input.floats.size() != tensor->elems) {
                 throw std::invalid_argument("TRT float input mismatch: " + tensor->name);
             }
-            host = input.floats.data();
+            if (tensor->bytes > 0) {
+                std::memcpy(tensor->host_pinned, input.floats.data(), tensor->bytes);
+            }
         } else {
             throw std::invalid_argument("TRT input dtype is unsupported: " + tensor->name);
         }
-        if (cudaMemcpyAsync(tensor->dev, host, tensor->bytes, cudaMemcpyHostToDevice, stream) != cudaSuccess) {
+        if (tensor->bytes > 0
+            && cudaMemcpyAsync(tensor->dev, tensor->host_pinned, tensor->bytes,
+                               cudaMemcpyHostToDevice, stream) != cudaSuccess) {
             throw std::runtime_error("TRT input copy failed: " + tensor->name);
         }
     }
@@ -351,16 +377,20 @@ TrtEngine::Tensor& TrtEngine::enqueue(
     return *output;
 }
 
-std::vector<float> TrtEngine::read_output(const Tensor& output, void* execution_stream) {
+std::vector<float> TrtEngine::read_output(Tensor& output, void* execution_stream) {
     auto stream = static_cast<cudaStream_t>(execution_stream);
     std::vector<float> result(output.elems);
-    // 局部输出缓冲区须比排队的 D2H 工作存活更久。
+    if (output.bytes == 0) return result;
+    ensure_host_pinned(output, output.bytes);
+    // 锁页缓冲随 Tensor 存活，StreamDrain 保证异常退出前流已排干。
     StreamDrain drain(execution_stream);
-    if (cudaMemcpyAsync(result.data(), output.dev, output.bytes, cudaMemcpyDeviceToHost, stream) != cudaSuccess
+    if (cudaMemcpyAsync(output.host_pinned, output.dev, output.bytes,
+                        cudaMemcpyDeviceToHost, stream) != cudaSuccess
         || cudaStreamSynchronize(stream) != cudaSuccess) {
         throw std::runtime_error("TRT output copy or synchronization failed");
     }
     drain.release();
+    std::memcpy(result.data(), output.host_pinned, output.bytes);
     return result;
 }
 
@@ -430,6 +460,7 @@ void TrtEngine::unload() {
     if (stream_) cudaStreamDestroy(static_cast<cudaStream_t>(stream_));
     for (auto& t : tensors_) {
         if (t.dev) cudaFree(t.dev);
+        if (t.host_pinned) cudaFreeHost(t.host_pinned);
     }
     tensors_.clear();
     if (context_) delete static_cast<nvinfer1::IExecutionContext*>(context_);
