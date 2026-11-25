@@ -163,11 +163,23 @@ PY
   return 1
 }
 
+SYSTEMD_MANAGED=0
+systemd_matches_runtime() {
+  local sctl wd
+  sctl=$(command -v systemctl || true)
+  [ -n "$sctl" ] || return 1
+  wd=$("$sctl" show -p WorkingDirectory --value mozart.service 2>/dev/null || true)
+  [ -n "$wd" ] && [ "$(realpath -m "$wd")" = "$(realpath -m "$RUNTIME_DIR")" ]
+}
+
 restore() {
   rc=$?
   set +e
   if [ "$STOPPED" -eq 1 ]; then
-    if [ -x "$CTL" ] && [ -f "$CFG" ]; then
+    if [ "$SYSTEMD_MANAGED" -eq 1 ]; then
+      sctl=$(command -v systemctl || true)
+      [ -n "$sctl" ] && sudo -n "$sctl" stop mozart.service >/dev/null 2>&1
+    elif [ -x "$CTL" ] && [ -f "$CFG" ]; then
       "$CTL" --config "$CFG" down >/dev/null 2>&1
     fi
     pkill -f mozart-daemon 2>/dev/null
@@ -177,7 +189,15 @@ restore() {
     pkill -f 'mozart-tts --socket' 2>/dev/null
     pkill -f 'mozart-bridge --socket' 2>/dev/null
     sleep 0.3
-    if [ -x "$CTL" ] && [ -f "$CFG" ]; then
+    if [ "$SYSTEMD_MANAGED" -eq 1 ]; then
+      sctl=$(command -v systemctl || true)
+      if [ -n "$sctl" ] && sudo -n "$sctl" start mozart.service >/dev/null 2>&1 && health; then
+        echo '运行时已恢复（systemd）'
+      else
+        echo '运行时恢复失败（systemd），请手动检查' >&2
+        rc=1
+      fi
+    elif [ -x "$CTL" ] && [ -f "$CFG" ]; then
       if "$CTL" --config "$CFG" up >/dev/null 2>&1 && health; then
         echo '运行时已恢复'
       else
@@ -210,7 +230,23 @@ fi
 if [ "$NEED_STOP" -eq 1 ]; then
   echo '== 停止运行时 =='
   STOPPED=1
-  "$CTL" --config "$CFG" down >/dev/null 2>&1 || true
+  sctl=$(command -v systemctl || true)
+  svc_state=""
+  if [ -n "$sctl" ] && systemd_matches_runtime; then
+    svc_state=$("$sctl" is-active mozart.service 2>/dev/null || true)
+    if "$sctl" is-enabled --quiet mozart.service 2>/dev/null; then
+      SYSTEMD_MANAGED=1
+    fi
+  fi
+  case "$svc_state" in
+    active|activating|reloading|deactivating)
+      SYSTEMD_MANAGED=1
+      sudo -n "$sctl" stop mozart.service || fail '无法经 systemd 停止 mozart.service'
+      ;;
+    *)
+      "$CTL" --config "$CFG" down >/dev/null 2>&1 || true
+      ;;
+  esac
   for _ in $(seq 1 30); do
     pgrep -f 'mozart-(daemon|pre|rvc|asr|tts|bridge)' >/dev/null || break
     sleep 0.3

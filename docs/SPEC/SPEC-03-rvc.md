@@ -16,7 +16,7 @@
 | 链路 | 目标 | 资产 | 几何与约束 |
 | --- | --- | --- | --- |
 | 文件 | 质量优先 | 整段、大窗或动态生成器；可用文件专用 profile | 无实时节拍；优先大窗，小窗只作回退 |
-| 实时 | 延迟优先 | 必须实时 front/decoder 与实时 HuBERT/RMVPE；模型可与文件链路不同 | 固定 240 ms 块、2.5 s 过去上下文；淡化 50 ms 与 SOLA 10 ms 为定值，启动 400 ms 可调；输出采样率随模型，块几何由采样率推导 |
+| 实时 | 延迟优先 | 必须实时 front/decoder 与实时 HuBERT/RMVPE；模型可与文件链路不同 | 固定 240 ms 块、2.5 s 过去上下文；淡化 50 ms 与 SOLA 10 ms 为定值，启动 340 ms 可调；输出采样率随模型，块几何由采样率推导 |
 
 - 同一模型可以同时具备文件和实时能力；缺实时资产时只提供文件能力，不静默降级。
 - 文件链路的大窗/小窗策略不能直接搬到实时链路；实时链路已有的 SOLA、淡化与启动缓冲按实时约束单独优化。
@@ -38,7 +38,7 @@
 - C++ 进程只保留推理：`StreamSession` 封装 `StreamingRvc` 和 `RVCInferencer`；`RealtimeRvcWorker` 与 `AudioWorker` 的外层传输、队列、模式、统计归 Rust。
 - 静音和旁路归音频进程；C++ 不实现这两个概念。
 - 初始参数随 `StartStream` 下发，实时流活动期间 `pitch_shift`、`index_rate`、`f0_method` 与 `[rvc.realtime].skip_silence` 经 `SetParams`（`0x0308`）在下一推理块边界无中断生效（保留 `StreamingRvc` 缓冲与 `RVCInferencer` 音高缓存/随机状态）；`startup_delay_ms` 仍走 `StopStream`→`StartStream`（见 [SPEC-04](SPEC-04-daemon.md)）；模型切换时 `[rvc]` 会话参数由该模型的预设载入（见 [SPEC-11](SPEC-11-preset.md)），`StartStream` 契约不变。实时换模型由 daemon `model use` 断流编排（SPEC-04），rvc 不新增命令。
-- 输出节拍由输入帧驱动：C++ 每收到一帧输入就回一帧输出，输出环不足时补零。启动缓冲留在 `StreamingRvc.startup_delay_out`（默认 400 ms，`startup_delay_ms` 旋钮），音频进程只保留小缓冲吸收送达抖动。大缓冲只有一个主人。
+- 输出节拍由输入帧驱动：C++ 每收到一帧输入就回一帧输出，输出环不足时补零。启动缓冲留在 `StreamingRvc.startup_delay_out`（默认 340 ms，`startup_delay_ms` 旋钮），音频进程只保留小缓冲吸收送达抖动。大缓冲只有一个主人。
 - [ ] 1:1 泵假设采集与播放时钟同源；使用不同声卡时，长期漂移会导致周期性欠载或缓冲增长，需时钟漂移补偿（见 [FUTURE.md](../FUTURE.md)）。推迟项，未实现。
 
 ## 接口约束
@@ -63,13 +63,13 @@
 | `StartStream` | Rust 控制命令 | `kind`、`model_handle`、`pitch_shift`、`index_rate`、`rms_mix_rate`、`protect`、`f0_method`；实时模式另带四个 `[rvc.realtime]` 旋钮（可选，缺省用 JSON 默认）；文件模式另带 `total_frames`、可选 `total_samples`，见下文 |
 | `SetParams` | Rust 控制命令 | `pitch_shift`、`index_rate`、`rms_mix_rate`、`protect`、`f0_method`、可选 `skip_silence`；实时流活动时在下一推理块边界无中断生效 |
 | C++ 内部 preset | C++ | `StreamingRvc` 的分块、历史、淡化、SOLA 和启动缓冲参数 |
-| Rust / 音频进程 | Rust | 播放侧小缓冲、静音 / 旁路、数据面队列；400 ms 启动缓冲留在 C++，不重复设大缓冲 |
+| Rust / 音频进程 | Rust | 播放侧小缓冲、静音 / 旁路、数据面队列；340 ms 启动缓冲留在 C++，不重复设大缓冲 |
 
 - `kind` 只分 `realtime` 和 `file`。C++ 按模型能力选择实时资产或 quality / full-history preset；缺实时资产时拒绝实时，不静默降级。
 - 文件模式的 `total_frames` 必填，类型为正整数 u32，表示本次输入帧数。C++ 收齐后开始整段推理；取消仍用 `StopStream`。`total_samples` 可选，类型为 u64，表示 16 kHz 输入的有效采样数。显式传入时须在 `1..=total_frames × 320` 内；C++ 在推理前据此裁掉尾帧补零。省略时保留全部帧样本。实时模式忽略这两个字段。
 - `StartStream` 会话参数取自 TOML `[rvc]` 会话默认值；模型切换时先由该模型的预设载入 `[rvc]`（SPEC-11），`StartStream` 仍携带五个会话参数。`config set rvc.<会话参数>` 与 `preset use` 在实时流活动期间对可热更参数下发 `SetParams`（`0x0308`）无中断生效（编排见 SPEC-04）。将来若增加不写 TOML 基线的独立运行时调参命令，其覆盖才记入 daemon 运行时状态文件。两者不混用。
 - `config set rvc.<会话参数>` 的触发、失败恢复与重试见 [SPEC-04](SPEC-04-daemon.md)。
-- [ ] `protect`、`rms_mix_rate` 在实时链路当前未应用，只对文件链路生效；已纳入下方「实时变声衔接自然度分步优化」步骤 4 待办（从 `FUTURE.md` 迁入）。
+- [x] `protect`、`rms_mix_rate` 已接入实时链路（见下方「实时变声衔接自然度分步优化」步骤 4）。
 - `filter_radius` 在旧 C++ 里只保存、未参与计算，v1 不放进 `StartStream`、不暴露死参数；保留为 FUTURE 提升项，推迟实现 F0 中值滤波，见 [FUTURE.md](../FUTURE.md)。
 - [ ] 若板端实测小缓冲扛不住抖动或时钟漂移，再把大缓冲搬到音频进程，同时把 `startup_delay_out` 设为 0 并重测首帧。条件项，未触发。
 
@@ -130,7 +130,7 @@ RMVPE 前端 mel 128 带、n_fft 1024、hop 160、30–8000 Hz、HTK Slaney（�
 | --- | --- | --- | --- |
 | `crossfade_ms` | 50 | 定值 50，偏离拒绝 | StartStream |
 | `sola_search_ms` | 10 | 定值 10，偏离拒绝 | StartStream |
-| `startup_delay_ms` | 400 | 0..=15000，且 % 20 == 0 | StartStream |
+| `startup_delay_ms` | 340 | 0..=15000，且 % 20 == 0 | StartStream |
 | `skip_silence` | true | bool | StartStream / SetParams |
 
 `crossfade_ms + sola_search_ms` 锁为定值 60 ms（50 + 10），等于最大 overlap。入口按「各自 ≤ 上限且和 == 60」判定，等价于两键各锁定值，任何偏离都拒绝；拒绝原因写明「引擎形状按最大 overlap 固定，可调 overlap 尚未实现」。定值按 48 kHz 契约换算：`crossfade_max_out 2400 / 48 = 50`、`sola_search_max_out 480 / 48 = 10`、两者之和 `2880 / 48 = 60`；各采样率的 max_out 同比缩放，故 ms 边界与采样率无关。ms 按模型输出采样率换算样本。`startup_delay_ms` 与 `skip_silence` 不参与块几何，保持可调；前者上限 15000 来自 C++ 输出环 16 s @48 kHz 留 1 s 余量（`rvc/src/rvc/streaming_pipeline.cpp:24`）。
@@ -153,7 +153,7 @@ RMVPE 前端 mel 128 带、n_fft 1024、hop 160、30–8000 Hz、HTK Slaney（�
 - [ ] 文件分窗几何动态化：398 只作默认参考；窗长、hop、pad 和超 profile 分块由引擎 min/opt/max、T、采样率与输入时长推导；拟增 `[file].chunk_frames`。验收：10/30/120 s 的 F0、log-mel、内存和延迟，22 s 内整段结果不变。（`rvc/src/rvc/inferencer.cpp:26,262-266,336-346`）
 - [ ] 文件链路优先大窗资产：编译时为文件链路提供覆盖目标时长的大窗或动态大 profile；加载器区分实时/文件资产，长文件不默认 T=200。验收：同输入的窗数、F0、log-mel、显存和延迟。
 - [ ] 文件小窗质量方向：必须小窗时，先做互相关/SOLA 对齐，再用等功率淡化；评估真实前后文、跨窗 F0 平滑、窗级增益匹配和噪声/相位连续性。验收看 F0 P90、log-mel、边界阶跃、显存与延迟。
-- [ ] 实时链路单独优化：实时模型可与文件不同，能力区分仅文件/仅实时/两者；按 240 ms 块、overlap 定值 60 ms、400 ms 启动单独调优；40 kHz 见上方实时原生多采样率条。几何与旋钮契约见实时几何与资产参数节。验收：48 kHz 无回归，具备实时资产的新模型起流、延迟 P95 与连续性。
+- [ ] 实时链路单独优化：实时模型可与文件不同，能力区分仅文件/仅实时/两者；按 240 ms 块、overlap 定值 60 ms、340 ms 启动单独调优；40 kHz 见上方实时原生多采样率条。几何与旋钮契约见实时几何与资产参数节。验收：48 kHz 无回归，具备实时资产的新模型起流、延迟 P95 与连续性。
 - [ ] 淡化与 SOLA 真正可调（解耦分析窗与淡化量）：分析窗恒按引擎形状喂帧（16 kHz 侧 280 帧，与采样率无关，`margin_16k` 按最大 overlap 算），实际 `crossfade_ms`/`sola_search_ms` 只用于 overlap-add 与 SOLA 搜索，不再决定分析窗长度（耦合点 `rvc/src/rvc/streaming_pipeline.cpp:40-43`，拼接点同文件 `349-360`）。解耦后入口才放开两键范围；现状锁为定值 60 ms，原因见实时几何与资产参数节。现在不做：引擎形状按最大 overlap 固定，解耦要同时改取窗与拼接两处，且淡化量变化的音质与接缝收益须板端声学对拍才有意义，单独开一轮。解除条件：完成解耦，并通过板端 32k/40k/48k 声学对拍与接缝听感验证（按 [RVC-FILE-BENCHMARK](../RVC-FILE-BENCHMARK.md) 四层适配实时），再放开范围校验、恢复 overlap 的 10 ms 整除校验（锁定期间作为不可达守卫已移除），并扫淡化/SOLA 定值。
 - [ ] 板端剩余未验证：延迟 P95/连续性/长跑稳定性、`model use` 与 `SetParams` 在线调参（变调/调检索比/切换 `skip_silence`）期间的接缝声学听感与音质主观评价。阻塞原因：现有套件仅对 Loopback 静音流置 `skip_silence=false` 驱动推理并断言日志计数、块递增、帧守恒与 `last_error=None`，不测延迟 P95 也不做带人声输出的听感评价。解除条件：在 Jetson 上向 Loopback 播放测试人声同时执行在线调参与 `model use`，录制输出音频并按 `reports/` 测量流程做声学波形与主观听感验收。32 kHz 实时冒烟已由上条覆盖。
 - 板端已实测（2026-11-18，接入 `SetParams` 后）：`tools/jetson-e2e.sh --unit --smoke --preset --realtime-mm --file` 全部通过（设备端 `cargo test` 30 套 647 项、`ctest` 10/10 全部通过；三进程冒烟与 `--file` 通过；`--preset` 8 场景含实时 `preset use` 通过；`--realtime-mm` 10 场景全过，含新增 `SetParams 在线调参不断流` 场景：6 次调参均落入 `rvc.log`、`StartStream` 计数未增、`frames_in` 与 `blocks` 单调递增、`帧守恒=94`、`last_error=None`）。
@@ -176,7 +176,7 @@ RMVPE 前端 mel 128 带、n_fft 1024、hop 160、30–8000 Hz、HTK Slaney（�
 
 ### 衔接自然度四步待办（按步推进、每步独立验收）
 
-- [ ] **步骤 1：修复静音跳过（`skip_silence`）硬切尾巴与历史音调记忆错位（解决停顿处咔嗒声与再开口怪音）**
+- [x] **步骤 1：修复静音跳过（`skip_silence`）硬切尾巴与历史音调记忆错位（解决停顿处咔嗒声与再开口怪音）**
   - **问题根因**：
     1. **停顿硬砍尾巴**：当 240 ms 块内无语音活动（VAD=0，如换气或字间停顿）触发 `skip_silence` 时，代码直接把上一个字留下的 50 ms `tail_` 清零丢弃并输出纯 0（`rvc/src/rvc/streaming_pipeline.cpp:258-268`），波形从有幅值突然阶跃到 0，产生咔嗒声；停顿结束再开口的首块也直接硬起无淡入。
     2. **历史音调记忆未随静音推进**：模型内部用 `realtime_pitch_cache_`（1024 帧）记住过去 2.5 s 的音高曲线。静音块跳过推理时，没有向该缓存推进这 240 ms（24 帧）的静音零音高（`rvc/src/rvc/inferencer.cpp:697-708`）。导致停顿后再开口时，过去 2.5 s 历史音频已滑过静音区，但配对的历史音高还停留在停顿前的旧字上，音画错位引发字头跑调或突发爆音（实测 `gkw30` 在 `21.46 s` 静音过渡处出现 19 倍跳变峰值）。
@@ -185,7 +185,7 @@ RMVPE 前端 mel 128 带、n_fft 1024、hop 160、30–8000 Hz、HTK Slaney（�
     2. 静音跳过块同步通知 `pipeline` 向 `realtime_pitch_cache_` 推进 `hop`（24 帧）无声帧，保持历史音高缓存与输入音频环的时间轴严格对齐。
   - **独立验收**：C++ 单测验证静音跳过前后 `realtime_pitch_cache_` 帧偏移守恒、有声↔静音边界无单样本阶跃；板端复跑 `gkw30` 并人工试听停顿/起音，确认消除停顿咔嗒声与 `21.46 s` 类过渡爆音。
 
-- [ ] **步骤 2：放宽时间戳抖动误重置与加固播放缓冲（解决偶发断音咔嗒声与吞字，跨 SPEC-02）**
+- [x] **步骤 2：放宽时间戳抖动误重置与加固播放缓冲（解决偶发断音咔嗒声与吞字，跨 SPEC-02）**
   - **问题根因**：
     1. **网络/调度抖动误触发全量清空**：`StreamingRvc::push` 检查相邻两包采集时间戳 `pts_ns` 差值 > 200 ms 即判定断流（`rvc/src/rvc/streaming_pipeline.cpp:124-133`）。在 `jetson-audio.py` SSH 桥接或系统调度偶发抖动时，哪怕包序号 `frame_idx` 完全连续、一包没丢，只要单次送达间隔超 200 ms 就会触发 `handle_discontinuity()` 清空 2.5 s 历史、清空输出环并重新沉默等待 **400 ms 启动缓冲 + 240 ms 攒块**，说话中途被硬生生吞掉 0.64 s。
     2. **声卡播放缓冲仅留 1.33 ms 余量**：`pre` 播放侧详见 [SPEC-02 实时播放缓冲余量与欠载平滑](SPEC-02-pre.md#改进点)。
@@ -194,19 +194,22 @@ RMVPE 前端 mel 128 带、n_fft 1024、hop 160、30–8000 Hz、HTK Slaney（�
     2. 配合 SPEC-02 加大播放 ALSA 缓冲余量并平滑接收环短时欠载。
   - **独立验收**：C++ 单测验证 `frame_idx` 连续但 `pts_ns` 间隔 > 200 ms 时 `resets` 计数保持 0、输出连续；板端运行 30 s 实时流与 `jetson-audio.py` 对讲，`resets == 0`、`pre.log` 播放 underrun 为 0。
 
-- [ ] **步骤 3：跨块声带初相/气流噪声连续化与 SOLA 弱音防抖（解决持续说话字间轻微颤动）**
-  - **问题根因**：
-    1. **每 240 ms 随机重置声带初相与气流底噪**：生成器解码波形时，需要声带震动初相 `source_phase`、声码器激励噪声 `source_noise` 和潜变量纹理噪声 `latent_noise`。当前 `infer_realtime` 每 240 ms 块都将基波初相归零、谐波初相和两路噪声重新随机抽取（`rvc/src/rvc/inferencer.cpp:756-757,804-810`）。相邻两块在 60 ms 重叠区内对同一个字使用了两套不相干的噪声与初相，50 ms 交叉淡化混音时产生周期性相位干涉（每隔一个字出现一下轻微颤动/金属感）。
-    2. **弱音区 SOLA 对齐被底噪欺骗乱跳**：SOLA 互相关目前仅除以候选段单侧能量 `sqrt(energy)`，下界 `1e-8`（`rvc/src/rvc/streaming_pipeline.cpp:358-371`）。在字尾弱音或轻辅音过渡区，微弱噪声被极小分母放大拿到虚高分数，导致 `sola_offset` 在 `0..10 ms` 间乱跳，字间节奏发飘（实测 `gkw30` 块间包络延迟在 `+9 ms ~ +61 ms` 游走）。
-  - **改动方案**：
-    1. 将文件链路 `B/C/A` 已验证的**绝对时间网格激励对齐**（`rvc/src/rvc/inferencer.cpp:1037-1071`）引入 `infer_realtime`：维护实时流累计帧计数与累计 F0 周期，`latent_noise` 与 `source_noise` 按绝对帧/样本序号确定性生成（相邻块重叠区天然同键同噪声），`source_phase` 按累计 F0 周期接续，`reset_realtime()` 时归零。
-    2. SOLA 搜索改用双侧能量归一化互相关（`sqrt(tail_energy * cand_energy)`），且当 `tail_` 或候选段 RMS 低于静音门限时直接固定 `sola_offset = 0` 不乱跳。
-  - **独立验收**：C++ 单测验证相邻两块重叠区噪声键一致、相位模 1 连续、弱音区 `sola_offset == 0`；板端实测对比修复前后块间延迟游走幅度与长元音/连续说话听感颤动。
+- [ ] **步骤 3：跨块声带初相/气流噪声连续化与 SOLA 弱音防抖（实验后已回滚）**
+  - **回滚实测依据（2026-11-25 四相位锁死直驱消融）**：在固定块网格相位（`0/60/120/180 ms` 均值）下，原实时绝对网格初相/噪声与 `3e-3` SOLA 门限均造成真实退化：
+    1. 强行向 RVC v2 实时解码器传入非零累计 `source_phase[0]`（训练期基波初相恒 0，且累计周期未耦合 SOLA 偏移）反而破坏 SOLA 对齐（`sola_span 10.94 → 13.61 ms`、`seam_wav 0.7147 → 0.7226`）；
+    2. 逐块计算 2.4 万次 `splitmix64 + Box-Muller` 噪声额外增加约 `+4.9 ms` CPU 耗时且 `logmel_l1` 略退 `0.07 dB`；
+    3. `3e-3`（-50 dBFS）SOLA 门限误拦可听轻辅音/字尾对齐（`logmel_l1 +0.08 dB`），降至 `1e-3` 亦无净收益。
+  - **当前策略**：实时路径保持轻量 `realtime_random_`（基波初相 0）与原 SOLA 归一化相关；后续仅在引入带 SOLA 偏移反馈或独立听感验证的新方案后再重启。
 
-- [ ] **步骤 4：实时链路补齐清辅音保护（`protect`）、音量跟随（`rms_mix_rate`）与峰值限幅（解决字头吐字发虚与音量跳变）**
+- [x] **步骤 4：实时链路补齐清辅音保护（`protect`）、音量跟随（`rms_mix_rate`）与峰值限幅（解决字头吐字发虚与音量跳变）**
   - **问题根因**：文件链路在特征检索后按 `pitchf` 对清辅音（s / sh / t / k 等无基频帧）保留 `protect` 比例的原始未检索特征，并在输出后按原声 RMS 包络做 `rms_mix_rate` 音量对齐和 `0.99` 限幅；实时链路 `infer_realtime` 目前完全未执行这两步（`rvc/src/rvc/inferencer.cpp:719-745,837-854`），导致开启 `index_rate` 时字头清辅音被训练集特征覆盖发粘，且字尾呼吸声容易被模型放大。
   - **改动方案**：在 `infer_realtime` 中保存尾部检索前特征副本，对 `return_frames`（或送入 `front` 的新块区间）内 `pitchf <= 0` 的帧按 `protect` 混合原始特征；对 `decoder` 输出的 300 ms 音频与对应的 300 ms 输入音频做块级短窗 `rms_mix_rate` 包络对齐与 `0.99` 峰值限幅。
   - **独立验收**：C++ 单测验证实时模式下 `protect` 与 `rms_mix_rate` 改变输出且边界值（`protect=0.5`、`rms_mix_rate=1.0`）符合契约；板端实测单块推理耗时增量 < 2 ms，对比 `logmel_vs_file` / `rms_vs_file` 指标与字头吐字清晰度。
+
+- [x] **步骤 5：实时音高关闭无声插值（恢复声码器清浊音开关与 `protect` 生效，减轻电音感）**
+  - **问题根因**：`f0_to_pitch` 将 RMVPE 检出的无基频帧（`f0 <= 0`）全部线性插值覆盖并同时写入 `pitch` 与 `pitchf`，导致声码器 NSF 激励源在清辅音与停顿帧仍持续注入正弦谐波（产生电音），同时 `apply_realtime_protect` 因 `pitchf > 0` 几乎无法在清辅音触发。
+  - **改动方案**：`RVCInferencer::f0_to_pitch` 增加 `interpolate_unvoiced` 开关；实时链路 `infer_realtime` 传入 `false`，保留无基频帧为 `pitch = 1` 且 `pitchf = 0.0f`；离线文件链路 `infer` 保持 `true` 以维持离线对拍口径不变。
+  - **独立验收**：C++ 单测验证 `f0_to_pitch(..., false)` 在混合清浊音序列中保持无声帧 `pitch=1 / pitchf=0`、有声帧正常移调；板端四起点三档对照（`interp` / `pitchf0` / `native`）显示 `native` 静音底噪降 22.5%（`0.0071 → 0.0055`）、人声/背景信噪比升 `+0.95 dB`、停顿跳变降 21%、SOLA 标准差从 `3.62` 降至 `3.39 ms`，实听电音明显减轻。
 
 ---
 
@@ -223,6 +226,7 @@ RMVPE 前端 mel 128 带、n_fft 1024、hop 160、30–8000 Hz、HTK Slaney（�
 
 #### 降延迟三步待办（按成本从低到高推进）
 
-- [ ] **降延迟步骤 A（零代码/配置级验证，目标 500 ms → ~380 ms）**：在板端固定现有几何，通过 `config set rvc.realtime.startup_delay_ms` 扫描 `360 / 320 / 280 / 260 ms`（须为 20 ms 倍数，且 ≥ `240 ms 块长 + 87 ms 推理 P95 - 240 ms = 87 ms` 的安全水位），测量物理回录净延迟与 60 s 长跑 `output_underruns`，找到零欠载下的最小启动缓冲默认值并更新 `realtime_chain_params.json`。
-- [ ] **降延迟步骤 B（同机 FP16 重编实时引擎，目标推理 81 ms → ~50 ms、总延迟 → ~320 ms）**：在 Jetson 本机用 `tools/model/build_realtime_engines.py --fp16` 重建 `hubert-realtime`、`rmvpe-realtime` 与目标模型的 `front` / `decoder` 引擎（同时消除跨设备 plan 警告），实测对比 FP16 与 FP32 的单块推理耗时（last/avg/p95）、F0/log-mel 误差与主观音质，再将 `startup_delay_ms` 随推理提速进一步下探。
-- [ ] **降延迟步骤 C（短块 profile 实验：240 ms → 160 ms，目标总延迟 → ~220–250 ms）**：在步骤 B 确认单块推理 P95 ≤ 60 ms 后，试验 `window_samples = 2560`（160 ms 块，整除 160 契约网格）导出并编译一套短块实时资产，评估 160 ms 块下的接缝频率（每秒 6.25 缝 vs 4.17 缝）、GPU 占空比与端到端物理回录延迟。
+- [x] **降延迟步骤 A（配置级 `startup_delay_ms` 扫描与下界验证）**：实测验证流式块化启动延迟硬下界满足 $D_{\min} = W + T_{\text{infer,max}}$。原始 FP32 引擎下（大索引 `bocchi-v2-48k` 单块 177 ms，含 88.6 ms 标量索引检索），下调 `startup_delay_ms` 至 `320/280/240/200 ms` 不会降低净延迟（维持 ~582 ms），反而导致 `pre_gap_frames` 线性增至 `6~10`；在完成 `IndexSearch` NEON 向量化 + 质心分块 + 多线程并行优化（单块 177 ms → 101 ms）后，既有 48k/40k FP32 资产在 `startup_delay_ms = 340 ms` 均达零缺帧（净延迟 ~479 ms，较基线降 ~103 ms），已将默认 `startup_delay_ms` 同步更新为 `340`。
+- [x] **降延迟步骤 B（同机 `--fp16` 重编实时引擎与索引加速）**：在 Jetson 本机使用 `build_realtime_engines.py --fp16` 重建四引擎并消除跨设备 plan 警告；配合 `IndexSearch` 加速（88.6 ms → 6.0 ms），`bocchi-v2-48k`（`index_rate=0.8`，3561 质心 / 138915 向量）单块推理从 `176.7 ms` 降至 `58.6 ms`（P95 `63.8 ms`，3.0× 提速），声学近无损（vs 文件参考 Log-Mel L1 `4.864` vs FP32 `4.742 dB`，RMS L1 `2.691` vs `2.529 dB`）；`startup_delay_ms = 320 ms` 实测物理回录净延迟 `460.2 ms`（`-122.2 ms`），60 s 连续长跑 253 块零欠载、零缺帧、零重置。已将 `realtime_chain_params.json` 的 `compile.fp16` 默认设为 `true`。
+- [x] **降延迟步骤 C（短块 profile 实验：240 ms → 160 ms）**：在隔离目录完成 `window_samples = 2560`（160 ms 块，`front=272`、`decoder=22`、`hubert=43520`、`rmvpe=32`）全套 FP16 资产导出与板端实测：单块推理 `51.3~52.4 ms`（P95 `56.9~62.7 ms`，GPU 占空比 32.8%），`startup_delay_ms = 240 / 220 ms` 均通过 60 s 长跑（378 块零欠载、零缺帧、零重置），物理回录净延迟压至 **`385.6 / 365.6 ms`**（相对 `direct` 纯 RVC 滞后 `292 / 266 ms`，较基线降 **`216.8 ms` / `-37.2%`**）。但 160 ms 块相对 240 ms 存在轻微声学代价（Log-Mel L1 `+0.11~0.23 dB`、RMS L1 `+0.21~0.35 dB`、接缝频率 6.25 vs 4.17 缝/s）且破坏既有 240 ms 资产形状兼容，故**暂不切换主干默认块长**，完整数据归档于 [realtime-quality-latency-20261125/RESULTS.md](../../reports/realtime-quality-latency-20261125/RESULTS.md)。
+- [x] **降延迟步骤 D（板端定频 + `TrtEngine` CUDA 锁页缓冲并行）**：板端启用 `jetson_clocks` 锁定 CPU/GPU/EMC 最高频，消除 240 ms 块间隙空闲降频（`1020 → 306 MHz`），单块 FP16 推理从 `56.8 ms` 降至 `32.2 ms`（P95 `32.4 ms`）；随后在 `TrtEngine`（`rvc/include/rvc/trt_engine.hpp`、`rvc/src/rvc/trt_engine.cpp`）为每个张量引入复用 CUDA 锁页缓冲（`cudaMallocHost` / `cudaFreeHost`）消除非锁页 `cudaMemcpyAsync` 的隐式同步，单块推理进一步降至 **`29.89 ms`**（P95 `30.05 ms`，逐位误差 `0.0000000`），240 ms 切块在 `startup_delay_ms = 260 ms` 下零缺帧达成 **`398~405 ms`** 净延迟（较基线降 `~184 ms`）。后续补充锁页缓冲长跑与动态尺寸切换压测，并将开机定频与 `mozart` 启动纳入受控 `systemd` 单元及部署适配。

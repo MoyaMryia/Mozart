@@ -25,7 +25,7 @@
 - 失败恢复：构建失败不动运行时；安装失败恢复 `bin.prev`。
 - 配置外置：设备地址、模型路径和密钥不写进仓库；删除类操作要求显式参数，默认不覆盖资产。
 - 运行期环境变量以 `mozart.toml` 的 `[process.env]` 为唯一来源；部署启动不再导出 shell `LD_LIBRARY_PATH`，编译期资产库环境变量保留。
-- 部署与回滚统一经 `mozart-ctl down` / `up` 管理单一运行时生命周期（方案 1）：已移除独立 web-service 安装与启停步骤，安装前校验 `[web]` 已配置、健康检查核验 `processes.web`、低端口对适配器做 `setcap` 兼容；旧版 `mozart-web-service` 保留单次停服/回滚迁移兼容。
+- 部署与回滚统一管理单一运行时生命周期（方案 1）：未装 `systemd` 时经 `mozart-ctl down` / `up`，设备已启用 `mozart.service` 且 `WorkingDirectory` 匹配目标运行目录时自动改走 `systemctl stop` / `start`；已移除独立 web-service 安装与启停步骤，安装前校验 `[web]` 已配置、健康检查核验 `processes.web`、低端口对适配器做 `setcap` 兼容；旧版 `mozart-web-service` 保留单次停服/回滚迁移兼容。
 - 部署提速：C++ 只编 `mozart-rvc` 与 `mozart-enhance`，Rust 用 `--example rvc_stub`，`[profile.dev] debug = "line-tables-only"`，分段计时；板端增量部署实测 36 s → 29 s。
 - 按需 `npm ci`：以 `web/package-lock.json` 的 sha256 stamp 判定，lock 未变且 `node_modules` 存在时跳过，`--full` 强制重装。
 - 可观测：状态接口、结构化日志；部署记录为 `deploy.json`。
@@ -40,6 +40,7 @@
 | --- | --- | --- |
 | `tools/ci-local.sh all` | 本机全量测试：仓库卫生、文档、C++/CTest、Rust、web | 已实现 |
 | `tools/deploy-jetson.sh <SSH目标>` | 同步、构建、安装、重启；不跑测试 | 已实现 |
+| `tools/install-jetson-systemd.sh <SSH目标>` | 安装/更新/卸载 Jetson 开机定频与 `mozart.service` 自启单元 | 已实现 |
 | `tools/deploy-web.sh <SSH目标>` | 仅前端：构建 web、备份并替换运行位 `web/dist`；不编后端、不停栈、不重启 | 已实现 |
 | `tools/jetson-e2e.sh <SSH目标> [套件]` | 部署后测试：unit / smoke / file / language / measure | 已实现 |
 | `tools/jetson-audio.py <SSH目标> [选项]` | 本机↔Jetson 跨平台 SSH 音频桥接（听板端输出、送本机麦、双向全双工、录 WAV） | 已实现 |
@@ -74,14 +75,15 @@
 - [ ] 方案 1 部署流板端实测：新部署流未在 Jetson 上跑过，`ci-local.sh` 只做语法检查，健康检查读 `processes.web` 也不代表 TCP 已监听（见下条）。解除条件：板端跑一次完整 `deploy-jetson.sh` 与一次回滚，核对 `processes.web`、页面可达与 `bin.prev` 恢复结果，证据落 `reports/`。
 - [ ] 部署锁自动释放与回滚缓存保护：将 `tools/deploy-jetson.sh` 的目录锁 `~/.mozart-deploy.lock` 改为绑定会话生命周期的文件锁（`flock`），确保 SSH 断连或进程异常退出时自动释放不留死锁；回滚仅在源码确实发生回退且构建产物失效时清理缓存，取消无条件 `cargo clean` 与 `ninja -t clean`。
 - [ ] 部署构建与健康检查加固：收紧部署健康检查（等配置模型时的 `rvc` 或 `output_mode` 离开过渡态，并核验 `web` 运行且 `/api/v1/health` 返回 `200`）；部署末尾按当前 SSH 目标 IP 与端口核对 `[web].allowed_origins`，缺失时明文告警提示而不擅改配置。板端 Rust 构建保持 debug（用户决定：release 全量与增量编译在 8 GB 设备上过慢），不改 `--release`。
-- [ ] 部署工程卫生与停栈收割加固：部署成功后按上限（保留最近 `3` 份）自动清理历史 `~/.mozart-source-backup.*` 与 `/tmp/mozart-deploy.*` 快照；`deploy.json` 按实际构型写入 `mode`（`full` / `incremental`）；停栈后 `pgrep` 残留检查增加短暂重试缓冲（如最多 `3 s`），避免进程收割竞态误报失败。
+- [ ] 部署工程卫生加固：部署成功后按上限（保留最近 `3` 份）自动清理历史 `~/.mozart-source-backup.*` 与 `/tmp/mozart-deploy.*` 快照；`deploy.json` 按实际构型写入 `mode`（`full` / `incremental`）。（注：停栈后最多 `3 s` 进程收割缓冲已随 `systemd` 适配在 `tools/deploy-jetson.sh` 中补齐。）
 - [x] 轻量前端部署 `tools/deploy-web.sh`：纯前端改动不必走全栈部署。主机构建 web（按需 `npm ci`，复用 lock stamp）→ 备份设备 `web/dist` 到 `web.prev` → `rsync --checksum --delete` 替换运行位 `web/dist`；不编后端、不停栈、不重启（适配器按请求读盘，立即生效）。SSH 目标由参数或 `MOZART_JETSON` 提供，`MOZART_RUNTIME_DIR` 覆盖运行目录。接口（适配器路由或 daemon schema）变更仍须走 `deploy-jetson.sh`。板端实测：构建 628 ms，替换后适配器立即提供新哈希资源，web/daemon 进程号不变。
+- [x] Jetson 开机定频与 `systemd` 自启模板及部署/E2E 适配：在仓库独立维护两个单元模板 `deploy/systemd/mozart-clocks.service.in`（开机在 `nvpmodel.service` 之后备份原调频状态并执行 `jetson_clocks`，默认保留自动调速风扇、可选 `--fan` 满载，停服恢复）与 `deploy/systemd/mozart.service.in`（在定频完成后以运行用户前台托管 `~/mozart-runtime/bin/mozart-daemon`，`KillMode=mixed` + `SIGTERM` 平滑退场，经 `--restart <on-failure|no>` 可选故障自动重启）；由 `tools/install-jetson-systemd.sh`（支持远程 SSH 落临时脚本 + 按需 PTY 执行，或 `--local`）按当前用户、动态探测二进制路径与运行目录渲染安装，并写入经 `visudo -cf` 校验的最小权限 `/etc/sudoers.d/mozart-deploy`。`tools/deploy-jetson.sh`（含回滚脚本）与 `tools/jetson-e2e.sh` 核对 `WorkingDirectory` 匹配后，对 `active|activating|reloading|deactivating` 状态的 `mozart.service` 自动改走 `systemctl stop / start` 并补最多 `3 s` 进程收割等待；未装 `systemd` 或指向隔离目录时回退 `mozart-ctl down / up`。
+- [ ] `systemd` 服务板端实机验收：在 Jetson 实机执行 `tools/install-jetson-systemd.sh`、验证开机定频与 `mozart.service` 启停、并跑通一次 `tools/deploy-jetson.sh` 完整部署往返与一次 `tools/jetson-e2e.sh` 停复往返。阻塞原因：尚未将本分支部署到板端并安装系统级 unit；解除条件：用户确认提交后在 Jetson 实机完成安装、部署往返及服务状态核验。
 
 ## 待讨论
 
-- 入口是否再收成 `tools/dev.sh`；当前三条脚本已覆盖职责，暂不新增。
+- 入口是否再收成 `tools/dev.sh`；当前命令已按职责拆分，暂不新增。
 - 设备上原生构建，还是开发机交叉编译。
-- 服务用 systemd，还是简单进程管理脚本。
 - 发布目录布局和保留版本数。
 - 设备端单测是否并入部署动作；当前保持部署无测试。
 - CI 是否增加 self-hosted Jetson runner。

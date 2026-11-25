@@ -178,6 +178,7 @@ class RealtimeChainParamsTest(unittest.TestCase):
     def test_compile_flags(self):
         flags = trtexec_flags()
         self.assertIn("--noTF32", flags)
+        self.assertIn("--fp16", flags)
         self.assertIn("--memPoolSize=workspace:1024", flags)
         self.assertIn("--builderOptimizationLevel=3", flags)
         self.assertIn("--profilingVerbosity=detailed", flags)

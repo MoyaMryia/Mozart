@@ -94,6 +94,60 @@ float normal_from_key(uint64_t key) {
         radius * std::cos(2.0 * 3.14159265358979323846 * u2));
 }
 
+// 绝对时间网格激励生成（文件分窗路径使用）：按绝对帧/样本索引键噪声，
+// 相邻窗重叠区天然同键同噪声；source_phase 按累计 F0 周期接续。
+struct AbsoluteExcitation {
+    std::vector<float> latent_noise;
+    std::vector<float> source_phase;
+    std::vector<float> source_noise;
+};
+
+AbsoluteExcitation build_absolute_excitation(
+    size_t latent_channels,
+    size_t latent_frames,
+    int64_t latent_frame_start,
+    size_t source_frames,
+    int64_t source_frame_start,
+    size_t output_per_frame,
+    size_t source_dim,
+    double absolute_cycles
+) {
+    AbsoluteExcitation out;
+    out.latent_noise.resize(latent_channels * latent_frames);
+    for (size_t channel = 0; channel < latent_channels; ++channel) {
+        for (size_t t = 0; t < latent_frames; ++t) {
+            out.latent_noise[channel * latent_frames + t] = normal_from_key(
+                noise_key(0x1ULL,
+                    static_cast<uint64_t>(latent_frame_start + static_cast<int64_t>(t)),
+                    channel));
+        }
+    }
+    out.source_phase.resize(source_dim);
+    std::mt19937 phase_random(114514);
+    std::uniform_real_distribution<float> uniform(0.0f, 1.0f);
+    for (float& value : out.source_phase) value = uniform(phase_random);
+    if (!out.source_phase.empty()) out.source_phase.front() = 0.0f;
+    for (size_t harmonic = 0; harmonic < source_dim; ++harmonic) {
+        const double cycles = absolute_cycles * static_cast<double>(harmonic + 1);
+        double phase = std::fmod(
+            static_cast<double>(out.source_phase[harmonic]) + cycles, 1.0);
+        if (phase < 0.0) phase += 1.0;
+        out.source_phase[harmonic] = static_cast<float>(phase);
+    }
+    out.source_noise.resize(source_frames * output_per_frame * source_dim);
+    const int64_t sample_start =
+        source_frame_start * static_cast<int64_t>(output_per_frame);
+    for (size_t sample = 0; sample < source_frames * output_per_frame; ++sample) {
+        for (size_t channel = 0; channel < source_dim; ++channel) {
+            out.source_noise[sample * source_dim + channel] = normal_from_key(
+                noise_key(0x2ULL,
+                    static_cast<uint64_t>(sample_start + static_cast<int64_t>(sample)),
+                    channel));
+        }
+    }
+    return out;
+}
+
 void peak_normalize(std::vector<float>& audio, float ceiling) {
     float peak = 0.0f;
     for (float sample : audio) peak = std::max(peak, std::fabs(sample));
@@ -162,50 +216,6 @@ std::vector<float> highpass_48hz(const std::vector<float>& audio) {
     std::vector<float> result(audio.size());
     for (size_t i = 0; i < result.size(); ++i) result[i] = static_cast<float>(ext[pad + i]);
     return result;
-}
-
-std::pair<std::vector<int64_t>, std::vector<float>> f0_to_pitch(
-    const std::vector<float>& f0, int pitch_shift, size_t frames
-) {
-    std::vector<float> raw(frames, 0.0f);
-    const size_t f0_frames = std::max(size_t{1}, f0.size());
-    for (size_t t = 0; t < frames; ++t) {
-        if (!f0.empty()) raw[t] = f0[std::min(t, f0_frames - 1)];
-    }
-    size_t first_voiced = 0;
-    while (first_voiced < raw.size() && raw[first_voiced] <= 0.0f) ++first_voiced;
-    if (first_voiced < raw.size()) {
-        for (size_t t = 0; t < first_voiced; ++t) raw[t] = raw[first_voiced];
-        size_t left = first_voiced;
-        for (size_t t = first_voiced + 1; t < raw.size(); ++t) {
-            if (raw[t] <= 0.0f) continue;
-            const size_t right = t;
-            for (size_t gap = left + 1; gap < right; ++gap) {
-                const float amount = static_cast<float>(gap - left) / static_cast<float>(right - left);
-                raw[gap] = raw[left] * (1.0f - amount) + raw[right] * amount;
-            }
-            left = right;
-        }
-        for (size_t t = left + 1; t < raw.size(); ++t) raw[t] = raw[left];
-    }
-
-    std::vector<int64_t> pitch(frames, 1);
-    std::vector<float> pitchf(frames, 0.0f);
-    const float shift = std::pow(2.0f, static_cast<float>(pitch_shift) / 12.0f);
-    constexpr float f0_min = 50.0f;
-    constexpr float f0_max = 1100.0f;
-    const float mel_min = 1127.0f * std::log1p(f0_min / 700.0f);
-    const float mel_max = 1127.0f * std::log1p(f0_max / 700.0f);
-    for (size_t t = 0; t < frames; ++t) {
-        pitchf[t] = raw[t] > 0.0f ? raw[t] * shift : 0.0f;
-        if (pitchf[t] > 0.0f) {
-            const float f0_mel = 1127.0f * std::log1p(pitchf[t] / 700.0f);
-            const float coarse = (f0_mel - mel_min) * 254.0f / (mel_max - mel_min) + 1.0f;
-            // NumPy's rint (used by the Golden path) rounds exact ties to even.
-            pitch[t] = static_cast<int64_t>(std::clamp(std::nearbyint(coarse), 1.0f, 255.0f));
-        }
-    }
-    return {std::move(pitch), std::move(pitchf)};
 }
 
 std::vector<float> slice_or_pad(const std::vector<float>& src, size_t start, size_t count) {
@@ -304,6 +314,144 @@ void RVCInferencer::reset_realtime() {
     realtime_pitch_cache_.assign(kRealtimePitchCacheFrames, 0);
     realtime_pitchf_cache_.assign(kRealtimePitchCacheFrames, 0.0f);
     realtime_random_.seed(114514);
+}
+
+void RVCInferencer::advance_realtime_silence(size_t shift_frames) {
+    if (shift_frames == 0) return;
+    push_realtime_pitch_cache({}, {}, shift_frames);
+}
+
+std::pair<std::vector<int64_t>, std::vector<float>> RVCInferencer::f0_to_pitch(
+    const std::vector<float>& f0, int pitch_shift, size_t frames,
+    bool interpolate_unvoiced
+) {
+    std::vector<float> raw(frames, 0.0f);
+    const size_t f0_frames = std::max(size_t{1}, f0.size());
+    for (size_t t = 0; t < frames; ++t) {
+        if (!f0.empty()) raw[t] = f0[std::min(t, f0_frames - 1)];
+    }
+    if (interpolate_unvoiced) {
+        size_t first_voiced = 0;
+        while (first_voiced < raw.size() && raw[first_voiced] <= 0.0f) ++first_voiced;
+        if (first_voiced < raw.size()) {
+            for (size_t t = 0; t < first_voiced; ++t) raw[t] = raw[first_voiced];
+            size_t left = first_voiced;
+            for (size_t t = first_voiced + 1; t < raw.size(); ++t) {
+                if (raw[t] <= 0.0f) continue;
+                const size_t right = t;
+                for (size_t gap = left + 1; gap < right; ++gap) {
+                    const float amount = static_cast<float>(gap - left) / static_cast<float>(right - left);
+                    raw[gap] = raw[left] * (1.0f - amount) + raw[right] * amount;
+                }
+                left = right;
+            }
+            for (size_t t = left + 1; t < raw.size(); ++t) raw[t] = raw[left];
+        }
+    }
+
+    std::vector<int64_t> pitch(frames, 1);
+    std::vector<float> pitchf(frames, 0.0f);
+    const float shift = std::pow(2.0f, static_cast<float>(pitch_shift) / 12.0f);
+    constexpr float f0_min = 50.0f;
+    constexpr float f0_max = 1100.0f;
+    const float mel_min = 1127.0f * std::log1p(f0_min / 700.0f);
+    const float mel_max = 1127.0f * std::log1p(f0_max / 700.0f);
+    for (size_t t = 0; t < frames; ++t) {
+        pitchf[t] = raw[t] > 0.0f ? raw[t] * shift : 0.0f;
+        if (pitchf[t] > 0.0f) {
+            const float f0_mel = 1127.0f * std::log1p(pitchf[t] / 700.0f);
+            const float coarse = (f0_mel - mel_min) * 254.0f / (mel_max - mel_min) + 1.0f;
+            // NumPy's rint (used by the Golden path) rounds exact ties to even.
+            pitch[t] = static_cast<int64_t>(std::clamp(std::nearbyint(coarse), 1.0f, 255.0f));
+        }
+    }
+    return {std::move(pitch), std::move(pitchf)};
+}
+
+void RVCInferencer::apply_realtime_protect(
+    std::vector<float>& resized_feats,
+    const std::vector<float>& unindexed_tail,
+    const std::vector<float>& pitchf,
+    size_t skip_head_frames,
+    size_t index_start_frames,
+    size_t feature_frames,
+    size_t emb_dim,
+    float protect
+) {
+    if (protect >= 0.5f || unindexed_tail.empty() || feature_frames == 0 || emb_dim == 0) {
+        return;
+    }
+    const size_t total_frames = std::min(resized_feats.size() / emb_dim, pitchf.size());
+    for (size_t target = skip_head_frames; target < total_frames; ++target) {
+        if (pitchf[target] > 0.0f) continue;
+        const size_t source = std::min(target / 2, feature_frames - 1);
+        if (source < index_start_frames) continue;
+        const size_t tail_off = (source - index_start_frames) * emb_dim;
+        if (tail_off + emb_dim > unindexed_tail.size()) continue;
+        const size_t dst_off = target * emb_dim;
+        for (size_t c = 0; c < emb_dim; ++c) {
+            resized_feats[dst_off + c] = resized_feats[dst_off + c] * protect
+                + unindexed_tail[tail_off + c] * (1.0f - protect);
+        }
+    }
+}
+
+void RVCInferencer::apply_realtime_rms_mix_and_limit(
+    const float* input_16k,
+    size_t input_samples,
+    std::vector<float>& output,
+    uint32_t output_sr,
+    float rms_mix_rate,
+    float peak_ceiling
+) {
+    if (rms_mix_rate < 1.0f && input_16k && input_samples > 0 && !output.empty() && output_sr >= 50) {
+        const auto rms_curve = [](const float* samples, size_t count, size_t frame_size, size_t hop_size) {
+            const size_t center_pad = frame_size / 2;
+            std::vector<float> result;
+            result.reserve(count / hop_size + 2);
+            for (size_t center = 0; center <= count; center += hop_size) {
+                const size_t start = center > center_pad ? center - center_pad : 0;
+                const size_t end = std::min(count, center + center_pad);
+                const size_t width = std::max<size_t>(1, end - start);
+                float sum = 0.0f;
+                for (size_t i = start; i < end; ++i) sum += samples[i] * samples[i];
+                result.push_back(std::sqrt(sum / static_cast<float>(width)));
+            }
+            return result;
+        };
+        // 120 ms 平滑窗、30 ms 步长匹配 300 ms 实时块，吸收声码器群延迟；
+        // 静音/底噪区间不反向放大，避免抬高停顿底噪。
+        const auto in_rms = rms_curve(input_16k, input_samples, 1920, 480);
+        const auto out_rms = rms_curve(output.data(), output.size(), output_sr * 3 / 25, output_sr * 3 / 100);
+        const size_t n_grid = std::min(in_rms.size(), out_rms.size());
+        if (n_grid > 0) {
+            const float exponent = 1.0f - rms_mix_rate;
+            std::vector<float> gains(n_grid, 1.0f);
+            for (size_t g = 0; g < n_grid; ++g) {
+                const float in_lvl = std::max(in_rms[g], 1e-6f);
+                const float out_lvl = std::max(out_rms[g], 1e-6f);
+                float gain = std::min(std::pow(in_lvl / out_lvl, exponent), 4.0f);
+                if (in_rms[g] < 0.005f) {
+                    gain = std::min(gain, 1.0f);
+                }
+                gains[g] = gain;
+            }
+            for (size_t i = 0; i < output.size(); ++i) {
+                float gain = gains.front();
+                if (n_grid > 1) {
+                    const float pos = (static_cast<float>(i) + 0.5f)
+                        * static_cast<float>(n_grid) / static_cast<float>(output.size()) - 0.5f;
+                    const float clamped = std::clamp(pos, 0.0f, static_cast<float>(n_grid - 1));
+                    const size_t left = static_cast<size_t>(clamped);
+                    const size_t right = std::min(left + 1, n_grid - 1);
+                    const float frac = clamped - static_cast<float>(left);
+                    gain = gains[left] * (1.0f - frac) + gains[right] * frac;
+                }
+                output[i] *= gain;
+            }
+        }
+    }
+    limit_peak(output, peak_ceiling);
 }
 
 void RVCInferencer::push_realtime_pitch_cache(
@@ -690,8 +838,10 @@ std::vector<float> RVCInferencer::infer_realtime(
     if (f0.size() < 5) {
         throw std::runtime_error("Realtime F0 extractor returned too few frames");
     }
+    // 实时链路保留无基频帧为 pitch=1、pitchf=0：使声码器 NSF 清音分支关闭正弦谐波，
+    // 同时让清辅音保护（protect）按真实无声帧生效，减少清音与停顿处的电音感。
     auto [new_pitch, new_pitchf] = f0_to_pitch(
-        f0, params.pitch_shift, f0.size()
+        f0, params.pitch_shift, f0.size(), /*interpolate_unvoiced=*/false
     );
 
     const size_t shift = request.block_samples_16k / kHop16k;
@@ -716,10 +866,9 @@ std::vector<float> RVCInferencer::infer_realtime(
         throw std::runtime_error("Realtime HuBERT feature shape is invalid");
     }
     const size_t feature_frames = feats.size() / emb_dim;
+    const size_t index_start = std::min(request.skip_head_frames / 2, feature_frames);
+    std::vector<float> unindexed_tail;
     if (model_->index().loaded() && params.index_rate > 0.0f) {
-        const size_t index_start = std::min(
-            request.skip_head_frames / 2, feature_frames
-        );
         std::vector<float> tail(
             feats.begin() + static_cast<std::ptrdiff_t>(index_start * emb_dim),
             feats.end()
@@ -727,6 +876,9 @@ std::vector<float> RVCInferencer::infer_realtime(
         if (!tail.empty()) {
             model_->index().set_nprobe(static_cast<uint32_t>(params.index_nprobe));
             auto indexed = model_->index().search(tail, emb_dim, params.index_rate);
+            if (params.protect < 0.5f) {
+                unindexed_tail = std::move(tail);
+            }
             std::copy(
                 indexed.begin(), indexed.end(),
                 feats.begin() + static_cast<std::ptrdiff_t>(index_start * emb_dim)
@@ -742,6 +894,10 @@ std::vector<float> RVCInferencer::infer_realtime(
             resized_feats.begin() + static_cast<std::ptrdiff_t>(target * emb_dim)
         );
     }
+    apply_realtime_protect(
+        resized_feats, unindexed_tail, pitchf,
+        request.skip_head_frames, index_start, feature_frames, emb_dim, params.protect
+    );
     const auto profile_hubert = profile::Clock::now();
 
     const auto latent_shape = front.input_shape("latent_noise");
@@ -755,6 +911,22 @@ std::vector<float> RVCInferencer::infer_realtime(
     std::uniform_real_distribution<float> uniform(0.0f, 1.0f);
     std::vector<float> latent_noise(latent_channels * latent_frames);
     for (float& value : latent_noise) value = normal(realtime_random_);
+    std::vector<float> decoder_pitchf(request.return_frames, 0.0f);
+    std::copy_n(
+        pitchf.begin() + static_cast<std::ptrdiff_t>(request.skip_head_frames),
+        request.return_frames, decoder_pitchf.begin()
+    );
+    const auto source_shape = decoder.input_shape("source_noise");
+    const size_t source_dim = source_shape.size() == 3 && source_shape[2] > 0
+        ? static_cast<size_t>(source_shape[2]) : 1;
+    const size_t output_per_frame = model_->config().sample_rate / 100;
+    std::vector<float> source_phase(source_dim);
+    for (float& value : source_phase) value = uniform(realtime_random_);
+    if (!source_phase.empty()) source_phase.front() = 0.0f;
+    std::vector<float> source_noise(
+        request.return_frames * output_per_frame * source_dim
+    );
+    for (float& value : source_noise) value = normal(realtime_random_);
 
     std::vector<int64_t> sid_int64 = {model_->config().spk_id};
     std::vector<int64_t> p_len_int64 = {static_cast<int64_t>(frames)};
@@ -792,23 +964,6 @@ std::vector<float> RVCInferencer::infer_realtime(
         std::move(latent_noise), {}
     ));
 
-    std::vector<float> decoder_pitchf(request.return_frames, 0.0f);
-    std::copy_n(
-        pitchf.begin() + static_cast<std::ptrdiff_t>(request.skip_head_frames),
-        request.return_frames, decoder_pitchf.begin()
-    );
-    const auto source_shape = decoder.input_shape("source_noise");
-    const size_t source_dim = source_shape.size() == 3 && source_shape[2] > 0
-        ? static_cast<size_t>(source_shape[2]) : 1;
-    const size_t output_per_frame = model_->config().sample_rate / 100;
-    std::vector<float> source_phase(source_dim);
-    for (float& value : source_phase) value = uniform(realtime_random_);
-    source_phase.front() = 0.0f;
-    std::vector<float> source_noise(
-        request.return_frames * output_per_frame * source_dim
-    );
-    for (float& value : source_noise) value = normal(realtime_random_);
-
     std::vector<OnnxInput> decoder_inputs;
     decoder_inputs.reserve(5);
     decoder_inputs.push_back(typed_input(
@@ -837,6 +992,19 @@ std::vector<float> RVCInferencer::infer_realtime(
     auto output = front.run_chained(front_inputs, "z", decoder, decoder_inputs, "z", "audio");
     if (output.size() != request.output_samples) {
         throw std::runtime_error("Realtime decoder output shape is invalid");
+    }
+    const size_t block_input_16k = request.return_frames * kHop16k;
+    if (block_input_16k <= audio.size()) {
+        apply_realtime_rms_mix_and_limit(
+            audio.data() + (audio.size() - block_input_16k),
+            block_input_16k,
+            output,
+            model_->config().sample_rate,
+            params.rms_mix_rate,
+            0.99f
+        );
+    } else {
+        limit_peak(output, 0.99f);
     }
     if (profile::enabled()) {
         const auto profile_done = profile::Clock::now();
@@ -1038,36 +1206,14 @@ std::vector<float> RVCInferencer::synthesize_window(
             // 分窗路径按绝对帧/样本索引键噪声：重叠区绝对索引≥0，跨窗同键。
             // 第 0 窗左 pad 绝对索引<0，wrap 成 uint64 仍确定（该区被裁剪）。
             // source_phase 用累计 F0 周期补偿本地 cumsum 的相位起点。
-            const int64_t frame_start = absolute_frame_start;
-            for (size_t channel = 0; channel < channels; ++channel) {
-                for (size_t t = 0; t < T; ++t) {
-                    latent_noise[channel * T + t] = normal_from_key(
-                        noise_key(0x1ULL,
-                            static_cast<uint64_t>(frame_start + static_cast<int64_t>(t)),
-                            channel));
-                }
-            }
-            std::mt19937 phase_random(114514);
-            std::uniform_real_distribution<float> uniform(0.0f, 1.0f);
-            for (float& value : source_phase) value = uniform(phase_random);
-            source_phase.front() = 0.0f;
-            for (size_t harmonic = 0; harmonic < source_dim; ++harmonic) {
-                const double cycles = absolute_cycles * static_cast<double>(harmonic + 1);
-                double phase = std::fmod(
-                    static_cast<double>(source_phase[harmonic]) + cycles, 1.0);
-                if (phase < 0.0) phase += 1.0;
-                source_phase[harmonic] = static_cast<float>(phase);
-            }
-            const int64_t sample_start =
-                frame_start * static_cast<int64_t>(output_per_frame);
-            for (size_t sample = 0; sample < T * output_per_frame; ++sample) {
-                for (size_t channel = 0; channel < source_dim; ++channel) {
-                    source_noise[sample * source_dim + channel] = normal_from_key(
-                        noise_key(0x2ULL,
-                            static_cast<uint64_t>(sample_start + static_cast<int64_t>(sample)),
-                            channel));
-                }
-            }
+            auto excitation = build_absolute_excitation(
+                channels, T, absolute_frame_start,
+                T, absolute_frame_start,
+                output_per_frame, source_dim, absolute_cycles
+            );
+            latent_noise = std::move(excitation.latent_noise);
+            source_phase = std::move(excitation.source_phase);
+            source_noise = std::move(excitation.source_noise);
         }
 
         inputs.push_back(typed_input(

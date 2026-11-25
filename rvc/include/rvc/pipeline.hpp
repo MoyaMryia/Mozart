@@ -67,6 +67,7 @@ public:
         return output;
     }
     virtual void reset_realtime() {}
+    virtual void advance_realtime_silence(size_t /*hop_frames*/) {}
 
     // 文件批处理进度 seam（SPEC-03 blocks）：已完成的 Generator 窗数，
     // 整段一次过计 1。真实管线委托 RVCInferencer（infer_window 计数，单一来源）；
@@ -132,6 +133,7 @@ public:
         const RvcRealtimeRequest& request
     ) override;
     void reset_realtime() override;
+    void advance_realtime_silence(size_t hop_frames) override;
     uint64_t offline_window_count() const override;
     void reset_offline_window_count() override;
     bool switch_model(const std::string& model_id) override;

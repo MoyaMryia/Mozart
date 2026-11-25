@@ -20,13 +20,13 @@
     "sola_search_max_out": 480,
     "crossfade_ms": 50,
     "sola_search_ms": 10,
-    "startup_delay_ms": 400,
+    "startup_delay_ms": 340,
     "startup_delay_max_ms": 15000,
     "startup_buffer_blocks": 1,
     "skip_silence": true
   },
   "compile": {
-    "fp16": false,
+    "fp16": true,
     "no_tf32": true,
     "workspace_mib": 1024,
     "builder_optimization_level": 3,

@@ -1,4 +1,4 @@
-// 搬运自 Mozart-Old/rvc-backend/include/rvc/trt_engine.hpp，未改动。
+// 搬运自 Mozart-Old/rvc-backend/include/rvc/trt_engine.hpp，改动：增加张量复用 CUDA 锁页缓冲。
 #pragma once
 
 // trt_engine.hpp — TensorRT 10 直载引擎（绕过 ONNX Runtime）
@@ -53,13 +53,16 @@ private:
         size_t bytes = 0;
         size_t capacity_bytes = 0;
         void* dev = nullptr;
+        void* host_pinned = nullptr;
+        size_t host_capacity_bytes = 0;
         std::vector<int32_t> int32_staging;
     };
 
+    static bool ensure_host_pinned(Tensor& tensor, size_t bytes);
     Tensor& enqueue(const std::vector<OnnxInput>& inputs, const char* output,
                     void* stream, const char* linked_name = nullptr,
                     const Tensor* linked = nullptr);
-    std::vector<float> read_output(const Tensor& output, void* stream);
+    std::vector<float> read_output(Tensor& output, void* stream);
 
     static std::string dtype_name(int32_t dtype);
 

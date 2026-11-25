@@ -70,12 +70,33 @@ cfg="$root/mozart.toml"
 read -r lock < "$transaction/lock"
 read -r owner < "$lock/owner"
 [ "$owner" = "$transaction" ] || { echo '部署锁不属于本事务，拒绝回滚' >&2; exit 1; }
+systemd_matches_root() {
+  local sctl wd
+  sctl=$(command -v systemctl || true)
+  [ -n "$sctl" ] || return 1
+  wd=$("$sctl" show -p WorkingDirectory --value mozart.service 2>/dev/null || true)
+  [ -n "$wd" ] && [ "$(realpath -m "$wd")" = "$(realpath -m "$root")" ]
+}
+systemd_state() {
+  local sctl
+  sctl=$(command -v systemctl || true)
+  [ -n "$sctl" ] || return 0
+  "$sctl" is-active mozart.service 2>/dev/null || true
+}
 if [ -f "$transaction/installing" ]; then
-  stop_ctl=$ctl
-  if [ -x "$transaction/ctl-before" ]; then stop_ctl="$transaction/ctl-before"; fi
-  if [ -x "$stop_ctl" ]; then
-    if ! "$stop_ctl" --config "$cfg" down; then
-      if pgrep -x mozart-daemon; then echo '无法停止新栈，保留回滚记录' >&2; exit 1; fi
+  sctl=$(command -v systemctl || true)
+  svc_state=$(systemd_state)
+  if [ -n "$sctl" ] && systemd_matches_root && {
+    case "$svc_state" in active|activating|reloading|deactivating) true ;; *) [ -f "$transaction/systemd-managed" ] ;; esac
+  }; then
+    sudo -n "$sctl" stop mozart.service || { echo '无法经 systemd 停止新栈，保留回滚记录' >&2; exit 1; }
+  else
+    stop_ctl=$ctl
+    if [ -x "$transaction/ctl-before" ]; then stop_ctl="$transaction/ctl-before"; fi
+    if [ -x "$stop_ctl" ]; then
+      if ! "$stop_ctl" --config "$cfg" down; then
+        if pgrep -x mozart-daemon; then echo '无法停止新栈，保留回滚记录' >&2; exit 1; fi
+      fi
     fi
   fi
   # 硬链接保留文件 capability；普通用户的复制/rsync 不能保证恢复 security.capability。
@@ -110,7 +131,11 @@ else
   echo '缺少源码事务记录，拒绝回滚' >&2; exit 1
 fi
 if [ -f "$transaction/stopped" ] && [ -f "$transaction/was-running" ]; then
-  "$ctl" --config "$cfg" up
+  if [ -f "$transaction/systemd-managed" ]; then
+    sudo -n "$(command -v systemctl)" start mozart.service
+  else
+    "$ctl" --config "$cfg" up
+  fi
 fi
 if [ -x "$web" ] && [ -f "$transaction/web-stopped" ] && [ -f "$transaction/web-was-running" ]; then
   "$web" "$root" start
@@ -170,12 +195,43 @@ if [ -x "$web" ] && "$web" "$root" status >/dev/null; then
   "$web" "$root" stop
 fi
 : > "$TRANSACTION/status-before.json"
-if [ -x "$ctl" ] && "$ctl" --config "$root/mozart.toml" status --json > "$TRANSACTION/status-before.tmp"; then
-  mv "$TRANSACTION/status-before.tmp" "$TRANSACTION/status-before.json"
-  touch "$TRANSACTION/was-running" "$TRANSACTION/stopped"
-  "$ctl" --config "$root/mozart.toml" down
+sctl=$(command -v systemctl || true)
+svc_wd=""
+svc_state=""
+if [ -n "$sctl" ]; then
+  svc_wd=$("$sctl" show -p WorkingDirectory --value mozart.service 2>/dev/null || true)
+  if [ -n "$svc_wd" ] && [ "$(realpath -m "$svc_wd")" = "$(realpath -m "$root")" ]; then
+    svc_state=$("$sctl" is-active mozart.service 2>/dev/null || true)
+  fi
 fi
+case "$svc_state" in
+  active|activating|reloading|deactivating)
+    if [ -x "$ctl" ] && "$ctl" --config "$root/mozart.toml" status --json > "$TRANSACTION/status-before.tmp" 2>/dev/null; then
+      mv "$TRANSACTION/status-before.tmp" "$TRANSACTION/status-before.json"
+    fi
+    touch "$TRANSACTION/was-running" "$TRANSACTION/systemd-managed"
+    sudo -n "$sctl" stop mozart.service || { echo '无法经 systemd 停止 mozart.service（请检查 /etc/sudoers.d/mozart-deploy）' >&2; exit 1; }
+    touch "$TRANSACTION/stopped"
+    ;;
+  *)
+    if [ -x "$ctl" ] && "$ctl" --config "$root/mozart.toml" status --json > "$TRANSACTION/status-before.tmp"; then
+      mv "$TRANSACTION/status-before.tmp" "$TRANSACTION/status-before.json"
+      touch "$TRANSACTION/was-running"
+      "$ctl" --config "$root/mozart.toml" down
+      touch "$TRANSACTION/stopped"
+    fi
+    ;;
+esac
+# 停栈后留短暂收割缓冲（最多 3 s），避免 systemd/子进程退出竞态误报残留；
 # 只检查实际进程名，不匹配包含命令文本的 ssh/bash 进程；Linux comm 限 15 字节，mozart-web-adapter 截断为 mozart-web-adap。
+for _wait in 1 2 3 4 5 6; do
+  lingering=""
+  for name in mozart-daemon mozart-pre mozart-enhance mozart-rvc mozart-asr mozart-tts mozart-bridge mozart-web-adap llama-server; do
+    if pgrep -x "$name" >/dev/null; then lingering=$name; break; fi
+  done
+  [ -n "$lingering" ] || break
+  sleep 0.5
+done
 for name in mozart-daemon mozart-pre mozart-enhance mozart-rvc mozart-asr mozart-tts mozart-bridge mozart-web-adap llama-server; do
   if pgrep -x "$name"; then echo "仍有活跃进程，停止构建：$name" >&2; exit 1; fi
 done
@@ -253,7 +309,21 @@ if [ "$port" -gt 0 ] && [ "$port" -lt 1024 ]; then
     sudo -n setcap cap_net_bind_service=ep "$root/bin/mozart-web-adapter" || { echo 'grant cap_net_bind_service, or configure a high web.listen port' >&2; exit 1; }
   fi
 fi
-"$root/bin/mozart-ctl" --config "$root/mozart.toml" up
+systemd_used=false
+sctl=$(command -v systemctl || true)
+svc_matches=0
+if [ -n "$sctl" ]; then
+  svc_wd=$("$sctl" show -p WorkingDirectory --value mozart.service 2>/dev/null || true)
+  if [ -n "$svc_wd" ] && [ "$(realpath -m "$svc_wd")" = "$(realpath -m "$root")" ]; then
+    svc_matches=1
+  fi
+fi
+if [ -f "$TRANSACTION/systemd-managed" ] || { [ "$svc_matches" -eq 1 ] && "$sctl" is-enabled --quiet mozart.service 2>/dev/null; }; then
+  sudo -n "$sctl" start mozart.service || { echo '无法经 systemd 启动 mozart.service（请检查 /etc/sudoers.d/mozart-deploy）' >&2; exit 1; }
+  systemd_used=true
+else
+  "$root/bin/mozart-ctl" --config "$root/mozart.toml" up
+fi
 # 包括原本正常的可选服务；不把部署前已降级的服务冒充本次部署失败。
 healthy=0
 for attempt in $(seq 1 90); do
@@ -274,8 +344,8 @@ for attempt in $(seq 1 90); do
 done
 [ "$healthy" = 1 ] || { echo '运行时健康检查失败' >&2; exit 1; }
 mode=full
-jq -n --arg commit "$COMMIT" --argjson dirty "$DIRTY" --arg time "$(date -u +%Y-%m-%dT%H:%M:%SZ)" --arg mode "$mode" \
-  '{commit:$commit,dirty:$dirty,time:$time,preset:"jetson-release",mode:$mode,restarted:"all"}' > "$root/deploy.json.new"
+jq -n --arg commit "$COMMIT" --argjson dirty "$DIRTY" --arg time "$(date -u +%Y-%m-%dT%H:%M:%SZ)" --arg mode "$mode" --argjson systemd "$systemd_used" \
+  '{commit:$commit,dirty:$dirty,time:$time,preset:"jetson-release",mode:$mode,restarted:"all",systemd:$systemd}' > "$root/deploy.json.new"
 mv "$root/deploy.json.new" "$root/deploy.json"
 touch "$TRANSACTION/completed"
 read -r lock < "$TRANSACTION/lock"

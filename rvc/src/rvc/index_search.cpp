@@ -1,4 +1,5 @@
-// 搬运自 Mozart-Old/rvc-backend/src/rvc/index_search.cpp，未改动。
+// 搬运自 Mozart-Old/rvc-backend/src/rvc/index_search.cpp，改动：
+//   - 引入 AArch64 NEON 向量化、32 帧质心分块与多线程并行检索。
 #include "rvc/index_search.hpp"
 #include <spdlog/spdlog.h>
 #include <fstream>
@@ -7,6 +8,10 @@
 #include <algorithm>
 #include <limits>
 #include <stdexcept>
+#include <thread>
+#if defined(__ARM_NEON) && defined(__aarch64__)
+#include <arm_neon.h>
+#endif
 
 namespace rvc {
 
@@ -322,27 +327,124 @@ bool IndexSearch::parse_ivf_index(const std::filesystem::path& path) {
     return true;
 }
 
+namespace {
+
+inline float l2_distance_sq(const float* a, const float* b, size_t dim) noexcept {
+#if defined(__ARM_NEON) && defined(__aarch64__)
+    float32x4_t acc0 = vdupq_n_f32(0.0f);
+    float32x4_t acc1 = vdupq_n_f32(0.0f);
+    float32x4_t acc2 = vdupq_n_f32(0.0f);
+    float32x4_t acc3 = vdupq_n_f32(0.0f);
+    size_t j = 0;
+    for (; j + 16 <= dim; j += 16) {
+        const float32x4_t d0 = vsubq_f32(vld1q_f32(a + j), vld1q_f32(b + j));
+        const float32x4_t d1 = vsubq_f32(vld1q_f32(a + j + 4), vld1q_f32(b + j + 4));
+        const float32x4_t d2 = vsubq_f32(vld1q_f32(a + j + 8), vld1q_f32(b + j + 8));
+        const float32x4_t d3 = vsubq_f32(vld1q_f32(a + j + 12), vld1q_f32(b + j + 12));
+        acc0 = vfmaq_f32(acc0, d0, d0);
+        acc1 = vfmaq_f32(acc1, d1, d1);
+        acc2 = vfmaq_f32(acc2, d2, d2);
+        acc3 = vfmaq_f32(acc3, d3, d3);
+    }
+    acc0 = vaddq_f32(vaddq_f32(acc0, acc1), vaddq_f32(acc2, acc3));
+    for (; j + 4 <= dim; j += 4) {
+        const float32x4_t d0 = vsubq_f32(vld1q_f32(a + j), vld1q_f32(b + j));
+        acc0 = vfmaq_f32(acc0, d0, d0);
+    }
+    float dist = vaddvq_f32(acc0);
+    for (; j < dim; ++j) {
+        const float dv = a[j] - b[j];
+        dist += dv * dv;
+    }
+    return dist;
+#else
+    float acc0 = 0.0f;
+    float acc1 = 0.0f;
+    float acc2 = 0.0f;
+    float acc3 = 0.0f;
+    size_t j = 0;
+    for (; j + 4 <= dim; j += 4) {
+        const float d0 = a[j] - b[j];
+        const float d1 = a[j + 1] - b[j + 1];
+        const float d2 = a[j + 2] - b[j + 2];
+        const float d3 = a[j + 3] - b[j + 3];
+        acc0 += d0 * d0;
+        acc1 += d1 * d1;
+        acc2 += d2 * d2;
+        acc3 += d3 * d3;
+    }
+    float dist = (acc0 + acc1) + (acc2 + acc3);
+    for (; j < dim; ++j) {
+        const float dv = a[j] - b[j];
+        dist += dv * dv;
+    }
+    return dist;
+#endif
+}
+
+struct CentroidEntry {
+    float dist;
+    uint32_t id;
+};
+
+inline void insert_centroid(
+    std::vector<CentroidEntry>& best, uint32_t nprobe, float dist, uint32_t id
+) {
+    if (best.size() == nprobe && dist >= best.back().dist) return;
+    const auto pos = std::lower_bound(best.begin(), best.end(), dist,
+        [](const CentroidEntry& e, float value) { return e.dist < value; });
+    best.insert(pos, CentroidEntry{dist, id});
+    if (best.size() > nprobe) best.pop_back();
+}
+
+struct ThreadJoiner {
+    std::vector<std::thread>& threads;
+    ~ThreadJoiner() {
+        for (auto& th : threads) {
+            if (th.joinable()) th.join();
+        }
+    }
+};
+
+template <typename Fn>
+void run_parallel(size_t workers, Fn&& fn) {
+    if (workers <= 1) {
+        fn(0);
+        return;
+    }
+    std::vector<std::thread> threads;
+    threads.reserve(workers - 1);
+    ThreadJoiner guard{threads};
+    for (size_t w = 1; w < workers; ++w) threads.emplace_back(fn, w);
+    fn(0);
+}
+
+} // namespace
+
 void IndexSearch::find_nearest_centroids(const float* vec, std::vector<uint32_t>& ids) const {
-    // 全量扫描质心，维护 nprobe 个最近表。nlist 最大 1e6，但 RVC 索引实际
-    // 只有 977 / 2870 个表，扫描成本与 nprobe=1 时相同。
-    struct Entry { float dist; uint32_t id; };
-    std::vector<Entry> best;
-    best.reserve(nprobe_);
     const size_t dim = feature_dim_;
+    ids.clear();
+    if (nlist_ == 0) return;
+    if (nprobe_ == 1) {
+        float best_dist = std::numeric_limits<float>::infinity();
+        uint32_t best_id = 0;
+        for (uint32_t i = 0; i < nlist_; ++i) {
+            const float* c = centroids_.data() + static_cast<size_t>(i) * dim;
+            const float dist = l2_distance_sq(vec, c, dim);
+            if (dist < best_dist) {
+                best_dist = dist;
+                best_id = i;
+            }
+        }
+        ids.push_back(best_id);
+        return;
+    }
+    std::vector<CentroidEntry> best;
+    best.reserve(nprobe_);
     for (uint32_t i = 0; i < nlist_; ++i) {
         const float* c = centroids_.data() + static_cast<size_t>(i) * dim;
-        float dist = 0.0f;
-        for (size_t j = 0; j < dim; ++j) {
-            const float dv = vec[j] - c[j];
-            dist += dv * dv;
-        }
-        if (best.size() == nprobe_ && dist >= best.back().dist) continue;
-        const auto pos = std::lower_bound(best.begin(), best.end(), dist,
-            [](const Entry& e, float value) { return e.dist < value; });
-        best.insert(pos, Entry{dist, i});
-        if (best.size() > nprobe_) best.pop_back();
+        insert_centroid(best, nprobe_, l2_distance_sq(vec, c, dim), i);
     }
-    ids.clear();
     ids.reserve(best.size());
     for (const auto& e : best) ids.push_back(e.id);
 }
@@ -360,63 +462,153 @@ std::vector<float> IndexSearch::search(
         return features;
     }
 
-    size_t n_frames = features.size() / feat_dim;
+    const size_t n_frames = features.size() / feat_dim;
+    if (n_frames == 0) {
+        return features;
+    }
     std::vector<float> result = features;
     const size_t dim = feature_dim_;
+    const uint32_t nprobe = std::min(nprobe_, nlist_);
 
-    struct Candidate { float dist; const float* vec; };
-    std::vector<uint32_t> centroids;
-    for (size_t t = 0; t < n_frames; ++t) {
-        const float* feat_vec = features.data() + t * feat_dim;
-        find_nearest_centroids(feat_vec, centroids);
+    const unsigned hw = std::thread::hardware_concurrency();
+    const size_t max_workers = hw > 0 ? std::min<size_t>(4, hw) : 1;
+    const bool parallel = max_workers > 1 && nlist_ >= 256 && n_frames >= 2;
+    const size_t workers = parallel ? max_workers : 1;
 
-        Candidate best[kNeighbours];
-        size_t count = 0;
-        for (const auto cid : centroids) {
-            const uint64_t begin = list_offsets_[cid];
-            const uint64_t end = list_offsets_[cid + 1];
-            for (uint64_t k = begin; k < end; ++k) {
-                const float* cand = codes_.data() + k * dim;
-                float dist = 0.0f;
-                for (size_t j = 0; j < dim; ++j) {
-                    const float dv = feat_vec[j] - cand[j];
-                    dist += dv * dv;
+    // 1. 质心检索：按质心分片、查询帧按 32 帧分块，使每个质心只从主存读一次，
+    //    避免 n_frames 次重复扫描 10+ MB 质心表。
+    constexpr size_t kQueryTile = 32;
+    std::vector<uint32_t> frame_centroids(n_frames * nprobe, 0);
+    if (nprobe == 1) {
+        std::vector<std::vector<float>> part_dist(workers, std::vector<float>(n_frames, std::numeric_limits<float>::infinity()));
+        std::vector<std::vector<uint32_t>> part_id(workers, std::vector<uint32_t>(n_frames, 0));
+        auto scan_centroids = [&](size_t w) {
+            const uint32_t c_begin = static_cast<uint32_t>((static_cast<uint64_t>(nlist_) * w) / workers);
+            const uint32_t c_end = static_cast<uint32_t>((static_cast<uint64_t>(nlist_) * (w + 1)) / workers);
+            auto& best_d = part_dist[w];
+            auto& best_i = part_id[w];
+            for (size_t tile = 0; tile < n_frames; tile += kQueryTile) {
+                const size_t t_end = std::min(tile + kQueryTile, n_frames);
+                for (uint32_t ci = c_begin; ci < c_end; ++ci) {
+                    const float* c = centroids_.data() + static_cast<size_t>(ci) * dim;
+                    for (size_t t = tile; t < t_end; ++t) {
+                        const float* q = features.data() + t * dim;
+                        const float dist = l2_distance_sq(q, c, dim);
+                        if (dist < best_d[t]) {
+                            best_d[t] = dist;
+                            best_i[t] = ci;
+                        }
+                    }
                 }
-                if (count == kNeighbours && dist >= best[count - 1].dist) continue;
-                size_t pos = count < kNeighbours ? count : kNeighbours - 1;
-                while (pos > 0 && best[pos - 1].dist > dist) {
-                    if (pos < kNeighbours) best[pos] = best[pos - 1];
-                    --pos;
+            }
+        };
+        run_parallel(workers, scan_centroids);
+        for (size_t t = 0; t < n_frames; ++t) {
+            float best_d = part_dist[0][t];
+            uint32_t best_i = part_id[0][t];
+            for (size_t w = 1; w < workers; ++w) {
+                if (part_dist[w][t] < best_d) {
+                    best_d = part_dist[w][t];
+                    best_i = part_id[w][t];
                 }
-                best[pos] = Candidate{dist, cand};
-                if (count < kNeighbours) ++count;
             }
+            frame_centroids[t] = best_i;
         }
-
-        // Golden 路径用 k=8 且要求全部命中；候选不足 8 个时整帧不混合。
-        if (count < kNeighbours) {
-            ++skipped_frames_;
-            continue;
-        }
-
-        // Golden: weight = (1 / distance)^2, then normalise.
-        float weight[kNeighbours];
-        float total = 0.0f;
-        for (size_t i = 0; i < kNeighbours; ++i) {
-            const float inv = 1.0f / (best[i].dist + 1e-12f);
-            weight[i] = inv * inv;
-            total += weight[i];
-        }
-        const float norm = 1.0f / total;
-        for (size_t j = 0; j < dim; ++j) {
-            float blended = 0.0f;
-            for (size_t i = 0; i < kNeighbours; ++i) {
-                blended += weight[i] * norm * best[i].vec[j];
+    } else {
+        std::vector<std::vector<std::vector<CentroidEntry>>> part_best(
+            workers, std::vector<std::vector<CentroidEntry>>(n_frames));
+        auto scan_centroids = [&](size_t w) {
+            const uint32_t c_begin = static_cast<uint32_t>((static_cast<uint64_t>(nlist_) * w) / workers);
+            const uint32_t c_end = static_cast<uint32_t>((static_cast<uint64_t>(nlist_) * (w + 1)) / workers);
+            auto& local = part_best[w];
+            for (size_t t = 0; t < n_frames; ++t) local[t].reserve(nprobe);
+            for (size_t tile = 0; tile < n_frames; tile += kQueryTile) {
+                const size_t t_end = std::min(tile + kQueryTile, n_frames);
+                for (uint32_t ci = c_begin; ci < c_end; ++ci) {
+                    const float* c = centroids_.data() + static_cast<size_t>(ci) * dim;
+                    for (size_t t = tile; t < t_end; ++t) {
+                        const float* q = features.data() + t * dim;
+                        insert_centroid(local[t], nprobe, l2_distance_sq(q, c, dim), ci);
+                    }
+                }
             }
-            result[t * feat_dim + j] = feat_vec[j] * (1.0f - index_rate) +
-                                        blended * index_rate;
+        };
+        run_parallel(workers, scan_centroids);
+        std::vector<CentroidEntry> merged;
+        merged.reserve(nprobe);
+        for (size_t t = 0; t < n_frames; ++t) {
+            merged.clear();
+            for (size_t w = 0; w < workers; ++w) {
+                for (const auto& e : part_best[w][t]) {
+                    insert_centroid(merged, nprobe, e.dist, e.id);
+                }
+            }
+            for (size_t k = 0; k < merged.size(); ++k) {
+                frame_centroids[t * nprobe + k] = merged[k].id;
+            }
         }
     }
+
+    // 2. 倒排表精确 k=8 检索与加权混合：帧间完全独立，按帧切片并行。
+    struct Candidate { float dist; const float* vec; };
+    const size_t blend_workers = std::min(workers, n_frames);
+    std::vector<uint64_t> local_skipped(blend_workers, 0);
+    auto search_frames = [&](size_t w) {
+        const size_t t_begin = (n_frames * w) / blend_workers;
+        const size_t t_end = (n_frames * (w + 1)) / blend_workers;
+        uint64_t skipped = 0;
+        for (size_t t = t_begin; t < t_end; ++t) {
+            const float* feat_vec = features.data() + t * dim;
+            Candidate best[kNeighbours];
+            size_t count = 0;
+            for (uint32_t p = 0; p < nprobe; ++p) {
+                const uint32_t cid = frame_centroids[t * nprobe + p];
+                const uint64_t begin = list_offsets_[cid];
+                const uint64_t end = list_offsets_[cid + 1];
+                for (uint64_t k = begin; k < end; ++k) {
+                    const float* cand = codes_.data() + k * dim;
+                    const float dist = l2_distance_sq(feat_vec, cand, dim);
+                    if (count == kNeighbours && dist >= best[count - 1].dist) continue;
+                    size_t pos = count < kNeighbours ? count : kNeighbours - 1;
+                    while (pos > 0 && best[pos - 1].dist > dist) {
+                        if (pos < kNeighbours) best[pos] = best[pos - 1];
+                        --pos;
+                    }
+                    best[pos] = Candidate{dist, cand};
+                    if (count < kNeighbours) ++count;
+                }
+            }
+
+            // Golden 路径用 k=8 且要求全部命中；候选不足 8 个时整帧不混合。
+            if (count < kNeighbours) {
+                ++skipped;
+                continue;
+            }
+
+            // Golden: weight = (1 / distance)^2, then normalise.
+            float weight[kNeighbours];
+            float total = 0.0f;
+            for (size_t i = 0; i < kNeighbours; ++i) {
+                const float inv = 1.0f / (best[i].dist + 1e-12f);
+                weight[i] = inv * inv;
+                total += weight[i];
+            }
+            const float norm = 1.0f / total;
+            for (size_t i = 0; i < kNeighbours; ++i) weight[i] *= norm;
+            float* out_vec = result.data() + t * dim;
+            const float keep = 1.0f - index_rate;
+            for (size_t j = 0; j < dim; ++j) {
+                float blended = 0.0f;
+                for (size_t i = 0; i < kNeighbours; ++i) {
+                    blended += weight[i] * best[i].vec[j];
+                }
+                out_vec[j] = feat_vec[j] * keep + blended * index_rate;
+            }
+        }
+        local_skipped[w] = skipped;
+    };
+    run_parallel(blend_workers, search_frames);
+    for (uint64_t s : local_skipped) skipped_frames_ += s;
 
     return result;
 }

@@ -316,7 +316,7 @@ impl Default for PreConfig {
 /// `realtime_knobs_mirror_params_json` 测试读 JSON 对拍钉住。
 const REALTIME_CROSSFADE_MS_DEFAULT: u32 = 50;
 const REALTIME_SOLA_SEARCH_MS_DEFAULT: u32 = 10;
-const REALTIME_STARTUP_DELAY_MS_DEFAULT: u32 = 400;
+const REALTIME_STARTUP_DELAY_MS_DEFAULT: u32 = 340;
 const REALTIME_SKIP_SILENCE_DEFAULT: bool = true;
 /// 上限按 48 kHz 契约换算成 ms（crossfade_max_out 2400、sola_search_max_out 480）；
 /// 各采样率的 max_out 同比缩放，故 ms 边界与采样率无关。
@@ -2813,7 +2813,7 @@ mod tests {
         let cfg = Config::load_from(Some(&path)).unwrap();
         assert_eq!(cfg.rvc.realtime.crossfade_ms, 50);
         assert_eq!(cfg.rvc.realtime.sola_search_ms, 10);
-        assert_eq!(cfg.rvc.realtime.startup_delay_ms, 400);
+        assert_eq!(cfg.rvc.realtime.startup_delay_ms, 340);
         assert!(cfg.rvc.realtime.skip_silence);
 
         // overlap 锁为 60 ms（50 + 10）；startup_delay 与 skip_silence 仍可调。

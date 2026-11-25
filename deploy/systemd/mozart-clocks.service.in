@@ -1,0 +1,16 @@
+[Unit]
+Description=Mozart Jetson Performance Clocks
+After=nvpmodel.service
+Before=mozart.service
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+TimeoutStopSec=15
+ExecStartPre=/bin/mkdir -p @CLOCKS_BACKUP_DIR@
+ExecStartPre=/bin/sh -c 'test -f @CLOCKS_BACKUP@ || @JETSON_CLOCKS_BIN@ --store @CLOCKS_BACKUP@'
+ExecStart=@JETSON_CLOCKS_BIN@ @CLOCKS_FLAGS@
+ExecStop=/bin/sh -c 'test -f @CLOCKS_BACKUP@ && @JETSON_CLOCKS_BIN@ --restore @CLOCKS_BACKUP@ || true'
+
+[Install]
+WantedBy=multi-user.target

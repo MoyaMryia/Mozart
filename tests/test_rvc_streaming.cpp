@@ -11,9 +11,12 @@
 //   5. 原生多采样率（40k/32k）：块节拍不变，输出帧与启动缓冲按模型采样率量化
 #include "rvc/streaming_pipeline.hpp"
 #include "rvc/realtime_geometry.hpp"
+#include "rvc/index_search.hpp"
 
 #include <cmath>
 #include <cstdio>
+#include <filesystem>
+#include <fstream>
 #include <future>
 #include <stdexcept>
 #include <vector>
@@ -501,7 +504,13 @@ int main()
         s.push(make_frame(301, 1, .1f, 1, 1000000ull));
         CHECK(s.stats().resets.load() == 1, "backward clock triggers reset");
         s.push(make_frame(302, 1, .1f, 1, 2000000000ull));
-        CHECK(s.stats().resets.load() == 2, "large forward clock jump triggers reset");
+        CHECK(s.stats().resets.load() == 1, "continuous frame_idx with forward pts jitter does not reset");
+        for (uint32_t i = 303; i <= 405; ++i) {
+            s.push(make_frame(i, 1, .1f, 1, 2000000000ull + (i - 302) * 20000000ull));
+            while (s.try_process_one(pipe)) {}
+        }
+        CHECK(s.stats().resets.load() == 1 && s.stats().blocks.load() == 4,
+              "stream stays continuous across forward pts jitter");
     }
 
     printf("test_native_40k_realtime_streaming\n");
@@ -708,6 +717,301 @@ int main()
         CHECK(pipe.calls == 2 && s.stats().skipped_blocks.load() == 2
               && s.stats().resets.load() == 0,
               "re-enabled skip_silence skips next silent block with zero resets");
+    }
+
+    printf("test_skip_silence_fades_tail_and_advances_pitch_cache\n");
+    {
+        struct SilenceTrackPipeline : public RVCPipelineBase {
+            std::vector<float> process(const std::vector<float>& audio) override {
+                return std::vector<float>(audio.size() * 3, 0.8f);
+            }
+            std::vector<float> process_realtime(
+                const std::vector<float>&, const RvcRealtimeRequest& request) override {
+                return std::vector<float>(request.output_samples, 0.8f);
+            }
+            void advance_realtime_silence(size_t hop_frames) override {
+                silence_advances.push_back(hop_frames);
+            }
+            std::vector<size_t> silence_advances;
+        } pipe;
+
+        StreamingRvc::Config cfg = realtime_config();
+        cfg.skip_silence = true;
+        StreamingRvc s(cfg);
+        uint32_t idx = 1;
+        // 1) Voiced block: emits 11520 samples ending at 0.8, saves tail_ = 0.8
+        for (size_t i = 0; i < 12; ++i) s.push(make_frame(idx++, 1, 0.2f));
+        CHECK(s.try_process_one(pipe), "voiced block succeeds");
+        const auto b1 = drain(s);
+        CHECK(b1.size() == 11520 && std::fabs(b1.back() - 0.8f) < 1e-6f, "voiced block ends at 0.8");
+
+        // 2) Silent block: fades tail_ from 0.8 -> 0 over 2400 samples, advances pitch cache by 24
+        for (size_t i = 0; i < 12; ++i) s.push(make_frame(idx++, 0, 0.0f));
+        CHECK(s.try_process_one(pipe), "silent skip succeeds");
+        CHECK(pipe.silence_advances.size() == 1 && pipe.silence_advances[0] == 24,
+              "silence skip advances realtime pitch cache by 24 hop frames");
+        const auto b2 = drain(s);
+        CHECK(b2.size() == 11520, "silent skip emits full block length");
+        CHECK(std::fabs(b2.front() - 0.8f) < 1e-5f, "silent block starts smoothly from tail_ without cliff");
+        CHECK(std::fabs(b2[2399]) < 1e-6f && std::fabs(b2[2400]) < 1e-6f && std::fabs(b2.back()) < 1e-6f,
+              "silent block reaches zero at crossfade end and stays zero");
+        float max_step_b2 = std::fabs(b2.front() - b1.back());
+        for (size_t i = 1; i < b2.size(); ++i) {
+            max_step_b2 = std::max(max_step_b2, std::fabs(b2[i] - b2[i - 1]));
+        }
+        CHECK(max_step_b2 < 0.002f, "voiced->silent transition has no hard step");
+
+        // 3) Resumed voiced block: smoothly fades in from 0 -> 0.8 over 2400 samples
+        for (size_t i = 0; i < 12; ++i) s.push(make_frame(idx++, 1, 0.2f));
+        CHECK(s.try_process_one(pipe), "resumed voiced block succeeds");
+        const auto b3 = drain(s);
+        CHECK(b3.size() == 11520 && std::fabs(b3.front()) < 1e-5f && std::fabs(b3.back() - 0.8f) < 1e-6f,
+              "silent->voiced block fades in cleanly from 0 to 0.8");
+        float max_step_b3 = std::fabs(b3.front() - b2.back());
+        for (size_t i = 1; i < b3.size(); ++i) {
+            max_step_b3 = std::max(max_step_b3, std::fabs(b3[i] - b3[i - 1]));
+        }
+        CHECK(max_step_b3 < 0.002f, "silent->voiced transition has no hard step");
+
+        // 4) Direct RVCInferencer pitch cache advance test
+        RVCInferencer inf(nullptr, nullptr);
+        std::vector<int64_t> p(30, 120);
+        std::vector<float> pf(30, 220.0f);
+        inf.push_realtime_pitch_cache(p, pf, 24);
+        const auto before = inf.realtime_state_snapshot();
+        CHECK(before.pitch_cache.back() == 120 && std::fabs(before.pitchf_cache.back() - 220.0f) < 1e-5f,
+              "pitch cache populated before silence advance");
+        inf.advance_realtime_silence(24);
+        const auto after = inf.realtime_state_snapshot();
+        CHECK(after.pitch_cache.size() == before.pitch_cache.size(), "pitch cache size preserved");
+        bool trailing_zero = true;
+        for (size_t i = after.pitch_cache.size() - 24; i < after.pitch_cache.size(); ++i) {
+            trailing_zero = trailing_zero && after.pitch_cache[i] == 0 && after.pitchf_cache[i] == 0.0f;
+        }
+        CHECK(trailing_zero && after.pitch_cache[after.pitch_cache.size() - 25] == 120,
+              "advance_realtime_silence shifts pitch cache by exact 24 frames");
+    }
+
+    printf("test_realtime_protect_rms_mix_and_peak_limit\n");
+    {
+        // protect: 4 frames (2 voiced, 2 unvoiced), emb_dim=2, skip_head=0, index_start=0
+        const std::vector<float> base_indexed = {
+            1.0f, 1.0f,  // t=0 voiced
+            1.0f, 1.0f,  // t=1 unvoiced
+            1.0f, 1.0f,  // t=2 unvoiced
+            1.0f, 1.0f,  // t=3 voiced
+        };
+        const std::vector<float> unindexed = {
+            0.0f, 0.0f,  // src=0 (covers t=0,1)
+            0.0f, 0.0f,  // src=1 (covers t=2,3)
+        };
+        const std::vector<float> pitchf = {200.0f, 0.0f, 0.0f, 220.0f};
+
+        // protect = 0.5 -> disabled (boundary contract)
+        auto f_bypass = base_indexed;
+        RVCInferencer::apply_realtime_protect(f_bypass, unindexed, pitchf, 0, 0, 2, 2, 0.5f);
+        CHECK(f_bypass == base_indexed, "protect=0.5 leaves indexed features unchanged");
+
+        // protect = 0.3 -> unvoiced frames blend to 0.3, voiced stay 1.0
+        auto f_blend = base_indexed;
+        RVCInferencer::apply_realtime_protect(f_blend, unindexed, pitchf, 0, 0, 2, 2, 0.3f);
+        CHECK(std::fabs(f_blend[0] - 1.0f) < 1e-6f && std::fabs(f_blend[2] - 0.3f) < 1e-6f
+              && std::fabs(f_blend[4] - 0.3f) < 1e-6f && std::fabs(f_blend[6] - 1.0f) < 1e-6f,
+              "protect=0.3 blends only unvoiced frames toward unindexed features");
+
+        // rms_mix_rate = 1.0 -> bypass RMS scaling, still applies 0.99 peak limiter
+        std::vector<float> in_16k(4800, 0.1f);
+        std::vector<float> out_48k(14400, 1.5f);
+        RVCInferencer::apply_realtime_rms_mix_and_limit(
+            in_16k.data(), in_16k.size(), out_48k, 48000, 1.0f, 0.99f);
+        CHECK(std::fabs(out_48k[7200] - 0.99f) < 1e-5f,
+              "rms_mix_rate=1.0 skips RMS scaling and limits peak to 0.99");
+
+        // rms_mix_rate = 0.0 -> output matches input RMS at both center and block edge (width normalization)
+        std::vector<float> out_scaled(14400, 0.4f);
+        RVCInferencer::apply_realtime_rms_mix_and_limit(
+            in_16k.data(), in_16k.size(), out_scaled, 48000, 0.0f, 0.99f);
+        CHECK(std::fabs(out_scaled[7200] - 0.1f) < 0.01f
+              && std::fabs(out_scaled[0] - 0.1f) < 0.01f
+              && std::fabs(out_scaled.back() - 0.1f) < 0.01f,
+              "rms_mix_rate=0.0 aligns output envelope to input RMS across interior and edges");
+
+        // quiet input (< 0.005) must not amplify quiet output floor
+        std::vector<float> quiet_in(4800, 0.002f);
+        std::vector<float> quiet_out(14400, 0.0005f);
+        RVCInferencer::apply_realtime_rms_mix_and_limit(
+            quiet_in.data(), quiet_in.size(), quiet_out, 48000, 0.5f, 0.99f);
+        CHECK(std::fabs(quiet_out[7200] - 0.0005f) < 1e-6f,
+              "rms_mix_rate does not boost quiet input floor below 0.005");
+
+        // realtime f0_to_pitch(interpolate_unvoiced=false) preserves unvoiced pitch=1 / pitchf=0
+        // so NSF vocoder disables sine harmonics and protect blends unvoiced consonants.
+        const std::vector<float> mixed_f0 = {0.0f, 200.0f, 0.0f, 220.0f, 0.0f};
+        auto [rt_pitch, rt_pitchf] = RVCInferencer::f0_to_pitch(mixed_f0, 0, mixed_f0.size(), false);
+        CHECK(rt_pitch[0] == 1 && rt_pitchf[0] == 0.0f
+              && rt_pitch[2] == 1 && rt_pitchf[2] == 0.0f
+              && rt_pitch[4] == 1 && rt_pitchf[4] == 0.0f,
+              "realtime f0_to_pitch keeps unvoiced frames at pitch=1 and pitchf=0");
+        CHECK(rt_pitch[1] > 1 && std::fabs(rt_pitchf[1] - 200.0f) < 1e-4f
+              && rt_pitch[3] > 1 && std::fabs(rt_pitchf[3] - 220.0f) < 1e-4f,
+              "realtime f0_to_pitch preserves voiced frames");
+        // offline default (interpolate_unvoiced=true) retains legacy interpolation parity
+        auto [off_pitch, off_pitchf] = RVCInferencer::f0_to_pitch(mixed_f0, 0, mixed_f0.size(), true);
+        CHECK(off_pitchf[0] > 0.0f && off_pitchf[2] > 0.0f && off_pitchf[4] > 0.0f,
+              "offline f0_to_pitch retains unvoiced interpolation");
+    }
+
+    printf("test_index_search_parallel_parity\n");
+    {
+        // Construct a synthetic FAISS IndexIVFFlat ("IwFl") with nlist=260, dim=32
+        // to exercise both SIMD L2 and multi-threaded tiled centroid/list search.
+        const uint32_t dim = 32;
+        const uint32_t nlist = 260;
+        const uint32_t per_list = 10;
+        const uint32_t sparse_cid = 5;
+        const uint32_t sparse_count = 3; // < kNeighbours (8) -> skipped when nprobe=1
+        std::vector<float> centroids(nlist * dim);
+        std::vector<uint64_t> sizes(nlist, per_list);
+        sizes[sparse_cid] = sparse_count;
+        uint64_t ntotal = 0;
+        for (auto s : sizes) ntotal += s;
+
+        for (uint32_t c = 0; c < nlist; ++c) {
+            for (uint32_t j = 0; j < dim; ++j) {
+                centroids[c * dim + j] = std::sin(0.37f * static_cast<float>(c + 1) + 0.19f * static_cast<float>(j))
+                    + (j == 0 ? static_cast<float>(c) * 0.5f : 0.0f);
+            }
+        }
+        std::vector<std::vector<float>> list_vecs(nlist);
+        for (uint32_t c = 0; c < nlist; ++c) {
+            list_vecs[c].resize(sizes[c] * dim);
+            for (uint64_t k = 0; k < sizes[c]; ++k) {
+                for (uint32_t j = 0; j < dim; ++j) {
+                    list_vecs[c][k * dim + j] = centroids[c * dim + j]
+                        + 0.05f * std::cos(static_cast<float>(k * 13 + j * 7 + c));
+                }
+            }
+        }
+
+        const auto tmp_idx = std::filesystem::temp_directory_path() / "mozart_test_index_parity.index";
+        {
+            std::ofstream out(tmp_idx, std::ios::binary);
+            auto wu8 = [&](uint8_t v) { out.write(reinterpret_cast<const char*>(&v), 1); };
+            auto wi32 = [&](int32_t v) { out.write(reinterpret_cast<const char*>(&v), 4); };
+            auto wi64 = [&](int64_t v) { out.write(reinterpret_cast<const char*>(&v), 8); };
+            const int64_t dummy = 0x100000;
+            out.write("IwFl", 4);
+            wi32(static_cast<int32_t>(dim));
+            wi64(static_cast<int64_t>(ntotal));
+            wi64(dummy); wi64(dummy);
+            wu8(1);
+            wi32(1); // METRIC_L2
+            wi64(static_cast<int64_t>(nlist));
+            wi64(1); // nprobe
+            out.write("IxF2", 4);
+            wi32(static_cast<int32_t>(dim));
+            wi64(static_cast<int64_t>(nlist));
+            wi64(dummy); wi64(dummy);
+            wu8(1);
+            wi32(1);
+            wi64(static_cast<int64_t>(nlist * dim));
+            out.write(reinterpret_cast<const char*>(centroids.data()),
+                      static_cast<std::streamsize>(centroids.size() * sizeof(float)));
+            wu8(0); // direct map NoMap
+            wi64(0);
+            out.write("ilar", 4);
+            wi64(static_cast<int64_t>(nlist));
+            wi64(static_cast<int64_t>(dim * 4));
+            out.write("full", 4);
+            wi64(static_cast<int64_t>(nlist));
+            for (auto s : sizes) wi64(static_cast<int64_t>(s));
+            for (uint32_t c = 0; c < nlist; ++c) {
+                out.write(reinterpret_cast<const char*>(list_vecs[c].data()),
+                          static_cast<std::streamsize>(list_vecs[c].size() * sizeof(float)));
+                std::vector<int64_t> ids(sizes[c], 0);
+                out.write(reinterpret_cast<const char*>(ids.data()),
+                          static_cast<std::streamsize>(ids.size() * sizeof(int64_t)));
+            }
+        }
+
+        IndexSearch idx;
+        CHECK(idx.load(tmp_idx, dim), "synthetic FAISS IVF index loads cleanly");
+
+        // Build 40 query frames (spans > kQueryTile=32), frame 0 targets sparse_cid
+        const size_t n_frames = 40;
+        std::vector<float> queries(n_frames * dim);
+        for (size_t t = 0; t < n_frames; ++t) {
+            const uint32_t target_c = (t == 0) ? sparse_cid : static_cast<uint32_t>((t * 7) % nlist);
+            for (uint32_t j = 0; j < dim; ++j) {
+                queries[t * dim + j] = centroids[target_c * dim + j] + 0.01f * static_cast<float>(j % 5);
+            }
+        }
+
+        // Scalar reference solver
+        auto scalar_ref = [&](uint32_t nprobe, float rate) {
+            std::vector<float> ref = queries;
+            for (size_t t = 0; t < n_frames; ++t) {
+                const float* q = queries.data() + t * dim;
+                std::vector<std::pair<float, uint32_t>> cd;
+                for (uint32_t c = 0; c < nlist; ++c) {
+                    float d = 0.0f;
+                    for (uint32_t j = 0; j < dim; ++j) {
+                        const float dv = q[j] - centroids[c * dim + j];
+                        d += dv * dv;
+                    }
+                    cd.push_back({d, c});
+                }
+                std::stable_sort(cd.begin(), cd.end(),
+                    [](const auto& a, const auto& b) { return a.first < b.first; });
+                std::vector<std::pair<float, const float*>> cands;
+                for (uint32_t p = 0; p < nprobe; ++p) {
+                    const uint32_t cid = cd[p].second;
+                    for (uint64_t k = 0; k < sizes[cid]; ++k) {
+                        const float* v = list_vecs[cid].data() + k * dim;
+                        float d = 0.0f;
+                        for (uint32_t j = 0; j < dim; ++j) {
+                            const float dv = q[j] - v[j];
+                            d += dv * dv;
+                        }
+                        cands.push_back({d, v});
+                    }
+                }
+                if (cands.size() < IndexSearch::kNeighbours) continue;
+                std::stable_sort(cands.begin(), cands.end(),
+                    [](const auto& a, const auto& b) { return a.first < b.first; });
+                float w[IndexSearch::kNeighbours];
+                float tot = 0.0f;
+                for (size_t i = 0; i < IndexSearch::kNeighbours; ++i) {
+                    const float inv = 1.0f / (cands[i].first + 1e-12f);
+                    w[i] = inv * inv;
+                    tot += w[i];
+                }
+                for (uint32_t j = 0; j < dim; ++j) {
+                    float b = 0.0f;
+                    for (size_t i = 0; i < IndexSearch::kNeighbours; ++i) b += (w[i] / tot) * cands[i].second[j];
+                    ref[t * dim + j] = q[j] * (1.0f - rate) + b * rate;
+                }
+            }
+            return ref;
+        };
+
+        idx.set_nprobe(1);
+        const auto got1 = idx.search(queries, dim, 0.8f);
+        const auto ref1 = scalar_ref(1, 0.8f);
+        float max_diff1 = 0.0f;
+        for (size_t i = 0; i < got1.size(); ++i) max_diff1 = std::max(max_diff1, std::fabs(got1[i] - ref1[i]));
+        CHECK(max_diff1 < 1e-4f && idx.skipped_frames() == 1,
+              "parallel SIMD IndexSearch matches scalar reference (nprobe=1, sparse frame skipped)");
+
+        idx.set_nprobe(3);
+        const auto got3 = idx.search(queries, dim, 0.8f);
+        const auto ref3 = scalar_ref(3, 0.8f);
+        float max_diff3 = 0.0f;
+        for (size_t i = 0; i < got3.size(); ++i) max_diff3 = std::max(max_diff3, std::fabs(got3[i] - ref3[i]));
+        CHECK(max_diff3 < 1e-4f,
+              "parallel SIMD IndexSearch matches scalar reference (nprobe=3)");
+
+        std::filesystem::remove(tmp_idx);
     }
 
     if (g_fail) {
