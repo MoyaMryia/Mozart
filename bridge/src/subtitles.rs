@@ -12,7 +12,7 @@ use crate::preprocess;
 use crate::state::{unix_ms, Queues, Shared, SpeechGeneration, TranslateJob};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
@@ -216,9 +216,9 @@ fn seq_from_utterance(utterance_id: &str) -> u64 {
 fn apply_source_corrections(
     raw: &str,
     corrections: &[(String, String)],
+    terms: &HashSet<String>,
 ) -> (String, Option<String>, Option<Value>) {
-    let (zh, fixes) =
-        preprocess::correct_with_terms(raw, &preprocess::builtin_correction_terms(), corrections);
+    let (zh, fixes) = preprocess::correct_with_terms(raw, terms, corrections);
     if fixes.is_empty() {
         (zh, None, None)
     } else {
@@ -237,6 +237,7 @@ pub fn apply(
     event: &Event,
     now_ms: u64,
     corrections: &[(String, String)],
+    terms: &HashSet<String>,
     speech_generation: Option<SpeechGeneration>,
 ) -> Option<SubtitleRecord> {
     match event.kind {
@@ -255,7 +256,8 @@ pub fn apply(
                 .unwrap_or(&event.text)
                 .trim()
                 .to_string();
-            let (zh, zh_raw, homophone_fixes) = apply_source_corrections(&raw_text, corrections);
+            let (zh, zh_raw, homophone_fixes) =
+                apply_source_corrections(&raw_text, corrections, terms);
             let is_final = event.kind == EventKind::Final;
             let received_at = now_ms as f64 / 1000.0;
             let record = SubtitleRecord {
@@ -312,7 +314,7 @@ pub fn apply(
                 let trimmed = refined.trim();
                 if !trimmed.is_empty() {
                     let (zh, zh_raw, homophone_fixes) =
-                        apply_source_corrections(trimmed, corrections);
+                        apply_source_corrections(trimmed, corrections, terms);
                     record.zh = zh;
                     record.zh_raw = zh_raw;
                     record.homophone_fixes = homophone_fixes;
@@ -429,15 +431,32 @@ pub struct SubtitleStore {
     writer: Mutex<JsonlWriter>,
     path: PathBuf,
     corrections: Vec<(String, String)>,
+    terms: HashSet<String>,
 }
 
 impl SubtitleStore {
+    #[cfg(test)]
     pub fn new(writer: JsonlWriter, path: PathBuf, corrections: Vec<(String, String)>) -> Self {
+        Self::with_terms(
+            writer,
+            path,
+            corrections,
+            preprocess::builtin_correction_terms(),
+        )
+    }
+
+    pub fn with_terms(
+        writer: JsonlWriter,
+        path: PathBuf,
+        corrections: Vec<(String, String)>,
+        terms: HashSet<String>,
+    ) -> Self {
         Self {
             records: Mutex::new(RecordTable::new()),
             writer: Mutex::new(writer),
             path,
             corrections,
+            terms,
         }
     }
 
@@ -474,6 +493,7 @@ impl SubtitleStore {
             event,
             now,
             &self.corrections,
+            &self.terms,
             shared.speech_generation(),
         ) else {
             return Ok(None);
@@ -703,7 +723,14 @@ mod tests {
         now_ms: u64,
         corrections: &[(String, String)],
     ) -> Option<SubtitleRecord> {
-        super::apply(table, event, now_ms, corrections, None)
+        super::apply(
+            table,
+            event,
+            now_ms,
+            corrections,
+            &preprocess::builtin_correction_terms(),
+            None,
+        )
     }
     use crate::events::{parse, EventKind};
     use serde_json::{json, Value};

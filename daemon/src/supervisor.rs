@@ -2,8 +2,9 @@
 
 use crate::runtime::SharedConfig;
 use crate::state::{lock_state, now_unix_ms, Role, State};
-use mozart_core::config::Config;
+use mozart_core::config::{Config, LlmModelConfig};
 use mozart_core::ctl::schema::ExitInfo;
+use std::ffi::OsString;
 use std::fs::OpenOptions;
 use std::io;
 use std::os::unix::process::CommandExt;
@@ -288,32 +289,11 @@ fn start_child(
     if role == Role::Llama {
         let socket = socket.expect("llama socket configured");
         // llama-server 不说控制协议（SPEC-05）：无 --socket/--config 契约，
-        // --host 直接填 Unix socket 路径；启动参数沿用旧实现。
+        // --host 直接填 Unix socket 路径；启动参数来自生效的翻译模型配置。
         // 第三方进程不会自清陈旧 socket 文件，daemon 重启后残留文件会让其
         // bind 失败崩溃循环，故启动前由 daemon 清除（mozart 子进程自行 unlink）。
         let _ = std::fs::remove_file(socket);
-        command
-            .arg("-m")
-            .arg(&config.bridge.llama_model)
-            .arg("-c")
-            .arg("2048")
-            .arg("-b")
-            .arg("256")
-            .arg("-ub")
-            .arg("128")
-            .arg("--cache-ram")
-            .arg("128")
-            .arg("-ngl")
-            .arg("99")
-            .arg("-np")
-            .arg("1")
-            .arg("-t")
-            .arg("2")
-            .arg("-tb")
-            .arg("2")
-            .arg("--host")
-            .arg(socket)
-            .arg("--jinja");
+        command.args(llama_args(config, socket));
     } else if role == Role::Enhance {
         let socket = socket.expect("enhance socket configured");
         let enhance = config
@@ -433,6 +413,104 @@ pub(crate) fn sleep_unless_stopped(mut remaining: Duration, running: &AtomicBool
     running.load(Ordering::Acquire)
 }
 
+fn llama_args(config: &Config, socket: &Path) -> Vec<OsString> {
+    let model = config
+        .active_llm_model()
+        .unwrap_or_else(|| LlmModelConfig::legacy_default(PathBuf::new()));
+    let threads = model.threads.to_string();
+    vec![
+        OsString::from("-m"),
+        model.path.into_os_string(),
+        OsString::from("-c"),
+        OsString::from(model.ctx_size.to_string()),
+        OsString::from("-b"),
+        OsString::from(model.batch_size.to_string()),
+        OsString::from("-ub"),
+        OsString::from(model.ubatch_size.to_string()),
+        OsString::from("--cache-ram"),
+        OsString::from(model.cache_ram_mb.to_string()),
+        OsString::from("-ngl"),
+        OsString::from(model.gpu_layers.to_string()),
+        OsString::from("-np"),
+        OsString::from("1"),
+        OsString::from("-t"),
+        OsString::from(&threads),
+        OsString::from("-tb"),
+        OsString::from(threads),
+        OsString::from("--host"),
+        socket.as_os_str().to_os_string(),
+        OsString::from("--jinja"),
+    ]
+}
+
 fn next_backoff(current: Duration, max: Duration) -> Duration {
     current.saturating_mul(2).min(max)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn flag_value(args: &[OsString], flag: &str) -> String {
+        args.iter()
+            .position(|arg| arg == flag)
+            .and_then(|idx| args.get(idx + 1))
+            .map(|val| val.to_string_lossy().into_owned())
+            .unwrap_or_default()
+    }
+
+    #[test]
+    fn llama_args_uses_legacy_defaults_when_unconfigured_or_legacy() {
+        let socket = Path::new("/run/mozart/llama.sock");
+        let empty = Config::default();
+        let args = llama_args(&empty, socket);
+        assert_eq!(flag_value(&args, "-m"), "");
+        assert_eq!(flag_value(&args, "-c"), "2048");
+        assert_eq!(flag_value(&args, "-b"), "256");
+        assert_eq!(flag_value(&args, "-ub"), "128");
+        assert_eq!(flag_value(&args, "--cache-ram"), "128");
+        assert_eq!(flag_value(&args, "-ngl"), "99");
+        assert_eq!(flag_value(&args, "-np"), "1");
+        assert_eq!(flag_value(&args, "-t"), "2");
+        assert_eq!(flag_value(&args, "-tb"), "2");
+        assert_eq!(flag_value(&args, "--host"), "/run/mozart/llama.sock");
+        assert!(args.iter().any(|arg| arg == "--jinja"));
+
+        let mut legacy = Config::default();
+        legacy.bridge.llama_model = PathBuf::from("/models/legacy.gguf");
+        let args = llama_args(&legacy, socket);
+        assert_eq!(flag_value(&args, "-m"), "/models/legacy.gguf");
+        assert_eq!(flag_value(&args, "-c"), "2048");
+        assert_eq!(flag_value(&args, "--cache-ram"), "128");
+    }
+
+    #[test]
+    fn llama_args_applies_selected_model_entry() {
+        let mut config = Config::default();
+        config.bridge.llama_model_id = Some("hymt".to_string());
+        config.bridge.models.push(LlmModelConfig {
+            id: "hymt".to_string(),
+            path: PathBuf::from("/models/hymt.gguf"),
+            prompt_profile: mozart_core::config::PromptProfile::HyMt,
+            ctx_size: 1024,
+            cache_ram_mb: 64,
+            batch_size: 512,
+            ubatch_size: 256,
+            gpu_layers: 48,
+            threads: 4,
+            ..LlmModelConfig::default()
+        });
+        let args = llama_args(&config, Path::new("/tmp/llama.sock"));
+        assert_eq!(flag_value(&args, "-m"), "/models/hymt.gguf");
+        assert_eq!(flag_value(&args, "-c"), "1024");
+        assert_eq!(flag_value(&args, "-b"), "512");
+        assert_eq!(flag_value(&args, "-ub"), "256");
+        assert_eq!(flag_value(&args, "--cache-ram"), "64");
+        assert_eq!(flag_value(&args, "-ngl"), "48");
+        assert_eq!(flag_value(&args, "-np"), "1");
+        assert_eq!(flag_value(&args, "-t"), "4");
+        assert_eq!(flag_value(&args, "-tb"), "4");
+        assert_eq!(flag_value(&args, "--host"), "/tmp/llama.sock");
+        assert!(args.iter().any(|arg| arg == "--jinja"));
+    }
 }

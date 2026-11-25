@@ -1,5 +1,7 @@
-//! 翻译预处理（SPEC-05）：显式同音字纠错 → 术语同音索引 → 术语表 → 数字归一化。
+//! 翻译预处理（SPEC-05）：显式同音字纠错 → 术语同音索引 → 数字归一化。
 //! 显式纠错表：内置常见同音误写 + 可选配置文件，词条级替换，长词优先。
+//! 术语表（JSON {"中文术语": "英文译名"}）：中文键并入同音索引，命中词条供翻译提示词注入，
+//! 不在源文中做英文内联替换。
 //! 术语同音索引（旧 homophones.py）：术语表生成无声调拼音索引，识别文本里与术语
 //! 同音、写法不同的 2–4 字中文片段换成术语写法；词频不低于 MIN_FREQ 的真词不替换。
 //! 拼音用 pinyin crate 逐字 plain 读音，与旧实现把文本拆成单字列表喂 pypinyin 一致
@@ -42,27 +44,99 @@ const MIN_FREQ: u32 = 10;
 /// 释义只用于翻译提示，不参与替换，故此处只存术语本身。
 const CORRECTION_TERMS: &[&str] = &["大妈", "大爷", "麻醉剂"];
 
-/// 术语表：v1 为空，加载接口留前端适配器（SPEC-05：glossary 编辑缓）。
+/// 翻译术语表（JSON `{"中文术语": "英文译名"}`）：
+/// 中文键并入拼音同音纠错索引，命中词条作为 `(源术语, 目标译名)` 对注入提示词。
+#[derive(Debug, Clone, Default)]
 pub struct Glossary {
-    terms: HashMap<String, String>,
+    /// 按源词长降序、词典序稳定的条目列表。
+    entries: Vec<(String, String)>,
 }
 
 impl Glossary {
     pub fn empty() -> Self {
         Self {
-            terms: HashMap::new(),
+            entries: Vec::new(),
         }
     }
 
-    /// 词条替换，长词优先；空表恒等。
-    pub fn apply(&self, text: &str) -> String {
-        let mut entries: Vec<(&String, &String)> = self.terms.iter().collect();
-        entries.sort_by(|a, b| b.0.chars().count().cmp(&a.0.chars().count()));
-        let mut out = text.to_string();
-        for (from, to) in entries {
-            out = out.replace(from.as_str(), to);
+    /// 从 `(源术语, 目标译名)` 迭代器构造并按长词优先排序（同键后者覆盖）。
+    pub fn from_pairs<I, K, V>(pairs: I) -> Self
+    where
+        I: IntoIterator<Item = (K, V)>,
+        K: Into<String>,
+        V: Into<String>,
+    {
+        let mut map: HashMap<String, String> = HashMap::new();
+        for (src, tgt) in pairs {
+            map.insert(src.into(), tgt.into());
         }
-        out
+        let mut entries: Vec<(String, String)> = map.into_iter().collect();
+        entries.sort_by(|a, b| {
+            b.0.chars()
+                .count()
+                .cmp(&a.0.chars().count())
+                .then_with(|| a.0.cmp(&b.0))
+        });
+        Self { entries }
+    }
+
+    /// 从 JSON `{"中文术语": "英文译名"}` 文件加载；文件不存在返回空表；
+    /// 非法 JSON、非对象、非字符串或空键值报错停止。
+    pub fn load(path: &Path) -> Result<Self, String> {
+        let text = match std::fs::read_to_string(path) {
+            Ok(text) => text,
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(Self::empty()),
+            Err(err) => return Err(format!("读术语表 {}：{err}", path.display())),
+        };
+        let value: serde_json::Value = serde_json::from_str(&text)
+            .map_err(|err| format!("术语表不是合法 JSON {}：{err}", path.display()))?;
+        let map = value.as_object().ok_or_else(|| {
+            format!(
+                "术语表应为 {{\"中文术语\":\"英文译名\"}} 对象：{}",
+                path.display()
+            )
+        })?;
+        let mut pairs = Vec::with_capacity(map.len());
+        for (src, tgt) in map {
+            let tgt = tgt
+                .as_str()
+                .ok_or_else(|| format!("术语条目值必须是字符串：{src}"))?;
+            let src_trimmed = src.trim();
+            let tgt_trimmed = tgt.trim();
+            if src_trimmed.is_empty() || tgt_trimmed.is_empty() {
+                return Err(format!("术语条目键和值均不能为空：{src} -> {tgt}"));
+            }
+            pairs.push((src_trimmed.to_string(), tgt_trimmed.to_string()));
+        }
+        Ok(Self::from_pairs(pairs))
+    }
+
+    /// 为当前源文匹配命中的 `(中文术语, 英文译名)` 对（长词优先、非重叠）。
+    pub fn match_terms(&self, text: &str) -> Vec<(String, String)> {
+        if self.entries.is_empty() || text.is_empty() {
+            return Vec::new();
+        }
+        let mut covered = vec![false; text.len()];
+        let mut matched = Vec::new();
+        for (src, tgt) in &self.entries {
+            let mut hit = false;
+            for (start, _) in text.match_indices(src.as_str()) {
+                let end = start + src.len();
+                if covered[start..end].iter().all(|&used| !used) {
+                    covered[start..end].fill(true);
+                    hit = true;
+                }
+            }
+            if hit {
+                matched.push((src.clone(), tgt.clone()));
+            }
+        }
+        matched
+    }
+
+    #[cfg(test)]
+    pub fn is_empty(&self) -> bool {
+        self.entries.is_empty()
     }
 }
 
@@ -74,16 +148,17 @@ pub fn builtin_correction_terms() -> HashSet<String> {
 /// 同音索引的术语集：内置纠错术语 + 术语表键（旧 correction_glossary）。
 pub fn correction_terms(glossary: &Glossary) -> HashSet<String> {
     let mut terms = builtin_correction_terms();
-    terms.extend(glossary.terms.keys().cloned());
+    terms.extend(glossary.entries.iter().map(|(src, _)| src.clone()));
     terms
 }
 
-/// 预处理管线：显式纠错 → 同音索引 → 术语表 → 数字归一化。
+/// 预处理管线（供单测验证全流程组合：显式纠错 → 同音索引 → 数字归一化）。
+/// 生产链路中 `subtitles` 已完成合并纠错表与术语同音纠错，`translate` 只做数字归一化与术语匹配。
+#[cfg(test)]
 pub fn process(text: &str, glossary: &Glossary) -> String {
     let terms = correction_terms(glossary);
     let (corrected, _fixes) = correct_with_terms(text, &terms, &builtin_corrections());
-    let glossed = glossary.apply(&corrected);
-    normalize_numbers(&glossed)
+    normalize_numbers(&corrected)
 }
 
 /// 一条纠错记录（沿用旧 homophone_fixes 形态）。
@@ -372,14 +447,18 @@ pub fn normalize_numbers(text: &str) -> String {
     out
 }
 
-/// 带单位数字求值：亿/万分节，节内千百十严格降序；不合语法返回 None（保留原文）。
+/// 带单位数字求值：亿/万分节，节内千百十严格降序；
+/// 支持百/千/万/亿后的单数字口语省位（如 两万七→27000、三千五→3500、两百五→250、一亿二→120000000），
+/// 含“零/〇”占位时不省位（如 两万零七→20007、一百零三→103）；
+/// 万/亿节前出现百/千省位（如 两千五万、两百五万）存在歧义，返回 None 保留原文。
 fn eval_number(run: &str) -> Option<u64> {
     let mut total = 0u64;
     let mut section = 0u64;
     let mut current = 0u64;
     // 节内首个单位不限；后续单位必须严格降序（千>百>十）。
     let mut last_unit_rank = 4u32;
-    let mut seen_digit = false;
+    let mut last_unit_value: Option<u64> = None;
+    let mut had_zero_after_unit = false;
     let mut prev_digit: Option<u64> = None;
     let mut seen_wan = false;
     let mut seen_yi = false;
@@ -389,11 +468,14 @@ fn eval_number(run: &str) -> Option<u64> {
             if prev_digit.is_some_and(|value| value != 0) {
                 return None;
             }
+            if d == 0 && last_unit_value.is_some() {
+                had_zero_after_unit = true;
+            }
             current = d;
-            seen_digit = true;
             prev_digit = Some(d);
             continue;
         }
+        let was_zero = prev_digit == Some(0);
         prev_digit = None;
         match c {
             '十' | '百' | '千' => {
@@ -405,40 +487,87 @@ fn eval_number(run: &str) -> Option<u64> {
                 if rank >= last_unit_rank {
                     return None;
                 }
-                // 「十五」的十前无数字，按 1 计。
-                let factor = if current == 0 { 1 } else { current };
-                section += factor * unit;
+                // 仅「十」在节首允许省略前缀「一」（如 十五、十万、两万零十五）；
+                // 百/千前缺数字（如 几百五→百五、百万）不求值。
+                let factor = if current == 0 {
+                    if c == '十' && section == 0 && (!was_zero || total > 0) {
+                        1
+                    } else {
+                        return None;
+                    }
+                } else {
+                    current
+                };
+                section = section.checked_add(factor.checked_mul(unit)?)?;
                 current = 0;
                 last_unit_rank = rank;
+                last_unit_value = Some(unit);
+                had_zero_after_unit = false;
             }
             '万' => {
                 if seen_wan {
                     return None;
                 }
-                section = (section + current).checked_mul(10_000)?;
-                total += section;
+                // 节内百/千后紧跟非零单数字再接「万」（如 两千五万、两百五万）存在省位歧义，保留原文。
+                if section > 0
+                    && current > 0
+                    && !had_zero_after_unit
+                    && last_unit_value.is_some_and(|unit| unit >= 100)
+                {
+                    return None;
+                }
+                let part = section.checked_add(current)?;
+                if part == 0 {
+                    return None;
+                }
+                section = part.checked_mul(10_000)?;
+                total = total.checked_add(section)?;
                 section = 0;
                 current = 0;
                 last_unit_rank = 4;
+                last_unit_value = Some(10_000);
+                had_zero_after_unit = false;
                 seen_wan = true;
             }
             '亿' => {
                 if seen_yi || seen_wan {
                     return None;
                 }
-                total = (total + section + current).checked_mul(100_000_000)?;
+                if section > 0
+                    && current > 0
+                    && !had_zero_after_unit
+                    && last_unit_value.is_some_and(|unit| unit >= 100)
+                {
+                    return None;
+                }
+                let part = total.checked_add(section)?.checked_add(current)?;
+                if part == 0 {
+                    return None;
+                }
+                total = part.checked_mul(100_000_000)?;
                 section = 0;
                 current = 0;
                 last_unit_rank = 4;
+                last_unit_value = Some(100_000_000);
+                had_zero_after_unit = false;
                 seen_yi = true;
             }
             _ => return None,
         }
     }
-    if !seen_digit {
+    // 含单位串不能以裸「零/〇」收尾（如 一百零几→一百零 留原文）。
+    if prev_digit == Some(0) {
         return None;
     }
-    Some(total + section + current)
+    let tail = if current > 0 && !had_zero_after_unit {
+        match last_unit_value {
+            Some(unit) if unit >= 100 => current.checked_mul(unit / 10)?,
+            _ => current,
+        }
+    } else {
+        current
+    };
+    total.checked_add(section)?.checked_add(tail)
 }
 
 #[cfg(test)]
@@ -510,16 +639,168 @@ mod tests {
     }
 
     #[test]
-    fn glossary_empty_is_identity_and_apply_replaces() {
-        let glossary = Glossary::empty();
-        assert_eq!(glossary.apply("任意文本"), "任意文本");
-        let loaded = Glossary {
-            terms: HashMap::from([
-                ("甲".to_string(), "A".to_string()),
-                ("甲乙".to_string(), "AB".to_string()),
-            ]),
-        };
-        assert_eq!(loaded.apply("甲乙与甲"), "AB与A");
+    fn glossary_load_validates_and_matches_terms() {
+        let dir = crate::testutil::temp_dir("glossary-load");
+        let path = dir.join("glossary.json");
+        // 缺失文件返回空表。
+        assert!(Glossary::load(&path).unwrap().is_empty());
+
+        std::fs::write(
+            &path,
+            r#"{"人工智能":"artificial intelligence","人工":"manual","网赌":"online gambling"}"#,
+        )
+        .unwrap();
+        let glossary = Glossary::load(&path).unwrap();
+        // 长词优先且不重复触发被包含的短词；独立出现时二者都命中。
+        assert_eq!(
+            glossary.match_terms("人工智能发展很快"),
+            vec![("人工智能".to_string(), "artificial intelligence".to_string())]
+        );
+        assert_eq!(
+            glossary.match_terms("人工智能和人工审核"),
+            vec![
+                ("人工智能".to_string(), "artificial intelligence".to_string()),
+                ("人工".to_string(), "manual".to_string()),
+            ]
+        );
+        // 术语键并入拼音同音纠错，且 process 不把中文术语内联替换成英文。
+        assert_eq!(process("碰到王独的人", &glossary), "碰到网赌的人");
+        assert_eq!(
+            glossary.match_terms(&process("碰到王独的人", &glossary)),
+            vec![("网赌".to_string(), "online gambling".to_string())]
+        );
+
+        // 非法 JSON、非对象、非字符串值、空键值均拒绝。
+        for bad in [
+            "{not json",
+            "[]",
+            r#"{"网赌":1}"#,
+            r#"{"":"online gambling"}"#,
+            r#"{"   ":"online gambling"}"#,
+            r#"{"网赌":""}"#,
+            r#"{"网赌":"   "}"#,
+        ] {
+            std::fs::write(&path, bad).unwrap();
+            assert!(Glossary::load(&path).is_err(), "应拒绝：{bad}");
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn numbers_colloquial_omitted_unit_and_zero_placeholder() {
+        // 口语省位数字。
+        let colloquial = [
+            ("两万七", "27000"),
+            ("两万两", "22000"),
+            ("两万七说成三万", "27000说成30000"),
+            ("七万五", "75000"),
+            ("七万五千五", "75500"),
+            ("一万两千五", "12500"),
+            ("一万二百五", "10250"),
+            ("两万零五百五", "20550"),
+            ("一亿两万五", "100025000"),
+            ("二十万五", "205000"),
+            ("三千五", "3500"),
+            ("两百五", "250"),
+            ("二百五", "250"),
+            ("一千二百五", "1250"),
+            ("一亿二", "120000000"),
+            ("两亿七", "270000000"),
+            ("十万", "100000"),
+            ("十亿", "1000000000"),
+        ];
+        for (source, expected) in colloquial {
+            assert_eq!(normalize_numbers(source), expected, "口语省位输入：{source}");
+        }
+        // 与 checks::normalize_translation_quantities 对齐（万/亿口语短式与含零精确数）。
+        for source in [
+            "两万七",
+            "两万两",
+            "两万七说成三万",
+            "七万五",
+            "一亿二",
+            "两亿七",
+            "两万零七",
+            "七万零五",
+            "一亿零五万",
+            "一亿五千万",
+            "十万八千",
+            "两千五百万",
+            "两千零五万",
+            "两万七千",
+        ] {
+            assert_eq!(
+                normalize_numbers(source),
+                crate::checks::normalize_translation_quantities(source),
+                "与 checks::normalize_translation_quantities 对齐：{source}"
+            );
+        }
+        // 含「零/〇」占位严格保留个位值。
+        let with_zero = [
+            ("两万零七", "20007"),
+            ("两万〇七", "20007"),
+            ("两万零十五", "20015"),
+            ("两千零五万", "20050000"),
+            ("一百零三", "103"),
+            ("三千零五", "3005"),
+            ("一亿零二", "100000002"),
+            ("两万七百", "20700"),
+            ("两万七十", "20070"),
+        ];
+        for (source, expected) in with_zero {
+            assert_eq!(normalize_numbers(source), expected, "含零输入：{source}");
+        }
+        // 模糊数量、裸零尾、节前省位歧义（两千五万/两百五万）与缺前导数字不误改。
+        for keep in [
+            "几万七",
+            "几千五",
+            "几百五",
+            "一百零几",
+            "两万零几",
+            "百万富翁",
+            "零十",
+            "一万五亿",
+            "两千五万",
+            "两百五万",
+            "两千五亿",
+        ] {
+            assert_eq!(normalize_numbers(keep), keep, "应保留原文：{keep}");
+        }
+    }
+
+    /// 端到端对拍：preprocess::normalize_numbers 展开后的数字经忠实英文译文送入 quality::check，
+    /// 全部边界用例零误拒；未展开的节前省位歧义（两千五万）也不被 checks 错算为 20050000。
+    #[test]
+    fn normalized_numbers_pass_quality_check_without_false_rejection() {
+        let cases = [
+            ("两万七", "27000"),
+            ("两万两", "22000"),
+            ("七万五千五", "75500"),
+            ("一万两千五", "12500"),
+            ("一万二百五", "10250"),
+            ("两万零五百五", "20550"),
+            ("一亿两万五", "100025000"),
+            ("两万零七", "20007"),
+            ("三千五", "3500"),
+            ("两百五", "250"),
+            ("一亿二", "120000000"),
+        ];
+        for (spoken, digits) in cases {
+            let source = format!("一共花了{spoken}元");
+            let normalized = normalize_numbers(&source);
+            assert_eq!(normalized, format!("一共花了{digits}元"), "预处理：{source}");
+            let en = format!("Spent {digits} yuan in total.");
+            assert!(
+                crate::quality::check(&source, &en, None, &[]).is_ok(),
+                "质检误拒：{source} -> {en}: {:?}",
+                crate::quality::check(&source, &en, None, &[])
+            );
+        }
+        // 节前省位歧义「两千五万」不展开，也不被质检错判为必须包含 20050000。
+        let ambiguous = "一共花了两千五万元";
+        assert_eq!(normalize_numbers(ambiguous), ambiguous);
+        assert!(crate::checks::required_numbers(ambiguous).is_empty());
+        assert!(crate::quality::check(ambiguous, "Spent a large amount of money.", None, &[]).is_ok());
     }
 
     #[test]

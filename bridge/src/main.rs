@@ -21,7 +21,7 @@ mod testutil;
 mod translate;
 
 use clap::Parser;
-use mozart_core::config::Config;
+use mozart_core::config::{Config, LlmModelConfig};
 use mozart_core::thread::{bind_socket, guard_panic, spawn_thread};
 use state::{Queues, Shared, Switches};
 use std::path::PathBuf;
@@ -105,12 +105,21 @@ fn run(cli: Cli) -> Result<(), String> {
         let extra = preprocess::load_corrections(path)?;
         corrections = preprocess::merge_corrections(corrections, extra);
     }
-    let store = Arc::new(subtitles::SubtitleStore::new(
+    // 术语表：入口加载校验，中文键并入同音纠错索引，命中对注入翻译提示词。
+    let glossary = match &config.bridge.glossary_path {
+        Some(path) => preprocess::Glossary::load(path)?,
+        None => preprocess::Glossary::empty(),
+    };
+    let store = Arc::new(subtitles::SubtitleStore::with_terms(
         writer,
         config.bridge.subtitles_path.clone(),
         corrections,
+        preprocess::correction_terms(&glossary),
     ));
-    let llama = http::LlamaClient::new(config.llama_socket());
+    let llm_model = config
+        .active_llm_model()
+        .unwrap_or_else(|| LlmModelConfig::legacy_default(PathBuf::new()));
+    let llama = http::LlamaClient::with_model(config.llama_socket(), llm_model);
     let tts_jobs_path = config.tts_jobs_socket();
 
     // 事件→字幕有界通道：partial 满丢计数，final/refined 阻塞保留（SPEC-05）。
@@ -154,7 +163,7 @@ fn run(cli: Cli) -> Result<(), String> {
         let retry_max = config.bridge.retry_max;
         spawn_thread("mozart-bridge-translate", move || {
             stop_on_fatal(guard_panic(move || {
-                translate::run(queues, shared, store, llama, retry_max, &STOP)
+                translate::run(queues, shared, store, llama, glossary, retry_max, &STOP)
             }))
         })
         .map_err(|err| format!("启动翻译线程：{err}"))?

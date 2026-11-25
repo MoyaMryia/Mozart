@@ -1,6 +1,6 @@
 # Mozart 配置规范（TOML schema）
 
-状态：定稿中。最后更新：2026-11-18。
+状态：定稿中。最后更新：2026-11-25。
 
 本文件是 TOML 配置的唯一 schema 依据：段、键、类型、默认、范围、运行时/重启分类。配置模型（TOML 基线 + 运行时状态文件、`config set`/`config save`、`restart_required` 契约）见 [SPEC-04](SPEC/SPEC-04-daemon.md)，本文件不复述。解析与校验实现于 `core/src/config.rs`，须与本文件一致。
 
@@ -199,15 +199,71 @@ path = "<资产根>/models/asr/<模型id>"
 | socket | string | bridge.sock | 纯文件名 | S |
 | subtitles_path | path | ~/.local/state/mozart/subtitles.jsonl | — | S |
 | corrections_path | path | 空 | 可选显式纠错表；格式见下文 | S |
+| glossary_path | path | 空 | 可选翻译术语表；非空路径，格式见下文 | S |
 | translate_enabled | bool | true | — | R |
 | speech_enabled | bool | true | — | R |
 | llama_socket | string | llama.sock | 纯文件名 | S |
-| llama_model | path | 空 | — | S |
+| llama_model | path | 空 | 旧单模型简写；加载时展开开头的 `~` | S |
+| llama_model_id | string | 空 | 非空，须匹配 `[[bridge.models]]` 的 `id`；优先于 `llama_model` | S |
+| models | array | 空数组 | 翻译模型列表，见 `[[bridge.models]]` | S |
 | translate_queue_capacity | int | 32 | ≥1 | S |
 | speech_queue_capacity | int | 16 | ≥1 | S |
 | retry_max | int | 2 | 0..=2 | S |
 
 `corrections_path` 指向 JSON 对象文件，格式为 `{"原文":"改为"}`，键和值均为非空中文字符串。文件条目覆盖同键内置词条；未配置或文件不存在时使用内置表。非法内容使桥启动失败。路径加载时展开开头的 `~`。
+
+`glossary_path` 指向 JSON 对象文件，格式为 `{"中文术语":"英文译名"}`，键和值均为非空字符串。未配置或文件不存在时使用空表；非法内容使桥启动失败。中文键并入拼音同音纠错索引，命中词条作为翻译提示对注入支持术语的模型模板。路径加载时展开开头的 `~`。
+
+翻译模型解析与回退规则：
+
+- 指定 `llama_model_id` 时，按 `id` 从 `[[bridge.models]]` 选取对应条目；为空或未命中时入口报错。
+- 未指定 `llama_model_id` 且 `llama_model` 非空时，按旧单模型默认参数构造配置（`prompt_profile = "qwen_chat"`、`ctx_size = 2048`、`cache_ram_mb = 128`、`batch_size = 256`、`ubatch_size = 128`、`gpu_layers = 99`、`threads = 2`、`max_tokens = 256`、`temperature = 0.0`、`enable_thinking = false`、`context_window = 0`）。
+- 未指定 `llama_model_id` 且 `llama_model` 为空、但 `[[bridge.models]]` 非空时，入口直接报错，不默认选取首项；两者均空时不启用模型覆盖。
+
+### [[bridge.models]]
+
+可选翻译模型条目列表，由 `daemon` 生成 `llama-server` 启动参数、由 `bridge` 按 `prompt_profile` 组装翻译请求。全表字段均为重启类（S）。
+
+| 键 | 类型 | 默认 | 范围 | 类别 |
+| --- | --- | --- | --- | --- |
+| id | string | 必填 | 非空，列表内唯一 | S |
+| path | path | 必填 | 非空；加载时展开开头的 `~` | S |
+| prompt_profile | enum | qwen_chat | `qwen_chat` / `hy_mt` / `custom` | S |
+| ctx_size | int | 1024 | ≥256 | S |
+| cache_ram_mb | int | 64 | ≥0 | S |
+| batch_size | int | 256 | ≥1 | S |
+| ubatch_size | int | 128 | 1..=batch_size | S |
+| gpu_layers | int | 99 | ≥0 | S |
+| threads | int | 2 | ≥1 | S |
+| max_tokens | int | 256 | 16..=ctx_size | S |
+| temperature | float | 0.0 | 0.0..=2.0，有限数 | S |
+| repeat_penalty | float | 空 | 可选；(0.0, 2.0]，有限数 | S |
+| enable_thinking | bool | 空 | 可选；`qwen_chat` 缺省发 `false`，`hy_mt` 禁止设置 | S |
+| context_window | int | 0 | 0..=8（注入最近若干条源文）；`qwen_chat` 须为 0 | S |
+| system_prompt | string | 空 | 可选；`custom` 或覆盖 `qwen_chat` 时使用，`hy_mt` 禁止设置 | S |
+| user_template | string | 空 | `custom` 必填且须含 `{text}`（可选 `{context}`、`{glossary}`）；非 `custom` 禁止设置 | S |
+
+提示词策略说明：
+
+- `qwen_chat`：发送 `[system, user]` 与 `chat_template_kwargs.enable_thinking`。
+- `hy_mt`：仅发送单条 `user` 消息，不发 `system` 与 `chat_template_kwargs`，按是否命中术语和上文组装指令模板。
+- `custom`：按配置的 `system_prompt`（可选）与 `user_template` 替换 `{text}`、`{context}`、`{glossary}`。
+
+```toml
+[bridge]
+llama_model_id = "hymt"
+glossary_path = "~/.config/mozart/glossary.json"
+
+[[bridge.models]]
+id = "hymt"
+path = "<资产根>/models/llm/<模型文件>.gguf"
+prompt_profile = "hy_mt"
+ctx_size = 1024
+cache_ram_mb = 64
+max_tokens = 256
+repeat_penalty = 1.05
+context_window = 2
+```
 
 ### [file]
 

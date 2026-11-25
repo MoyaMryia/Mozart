@@ -795,7 +795,7 @@ fn translation_and_speech_full_chain() {
     let (_, body) = text.split_once("\r\n\r\n").unwrap();
     let value: Value = serde_json::from_str(body).unwrap();
     assert_eq!(value["messages"][1]["content"], "你好");
-    assert_eq!(value["max_tokens"], 128);
+    assert_eq!(value["max_tokens"], 256);
     assert_eq!(value["temperature"], 0);
     let jobs = jobs.lock().unwrap();
     assert_eq!(jobs.len(), 1);
@@ -909,7 +909,7 @@ fn qc_rejection_blocks_delivery() {
     let dir = run_dir("qc");
     let asr = MockAsr::bind(&dir.join("asr-events.sock"));
     let llama = MockLlama::bind(&dir.join("llama.sock"));
-    // 译文与原文相同：质检拒绝。
+    // 译文与原文相同：默认确定性模型且无上文，不做无效重试，直接质检拒绝。
     let (_requests, llama_server) = llama.spawn(vec![llama_ok("你好")]);
     // 只绑定不应答：拒绝句不应发起投递连接。
     let tts = MockTts::bind(&dir.join("tts-jobs.sock"));
@@ -922,6 +922,7 @@ fn qc_rejection_blocks_delivery() {
         get_status(&control)["qc_rejected"] == 1
     });
     let status = get_status(&control);
+    assert_eq!(status["translate_retried"], 0);
     assert_eq!(status["translated"], 0);
     assert_eq!(status["speech_delivered"], 0);
     assert!(tts.wait_connection(Duration::from_millis(300)).is_none());
@@ -1194,6 +1195,75 @@ fn review_skipped_falls_back_to_online_final_once() {
     assert_eq!(lines[2]["zh"], "在线文本");
     assert_eq!(lines[2]["en"], "Fallback.");
     assert_eq!(lines[2]["translation_status"], "completed");
+
+    sigterm(&child.0);
+    assert!(wait_exit(&mut child.0, Duration::from_secs(2)).success());
+    llama_server.join().unwrap();
+    tts_server.join().unwrap();
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn hy_mt_profile_injects_glossary_context_and_passes_through_english() {
+    let dir = run_dir("hymt-chain");
+    let glossary = dir.join("glossary.json");
+    std::fs::write(&glossary, r#"{"网赌":"online gambling"}"#).unwrap();
+
+    let asr = MockAsr::bind(&dir.join("asr-events.sock"));
+    let llama = MockLlama::bind(&dir.join("llama.sock"));
+    let (requests, llama_server) = llama.spawn(vec![
+        llama_ok("I met someone involved in online gambling."),
+        llama_ok("Do not touch it again."),
+    ]);
+    let tts = MockTts::bind(&dir.join("tts-jobs.sock"));
+    let (jobs, tts_server) = tts.spawn(vec!["submitted", "submitted", "submitted"]);
+
+    let extra = format!(
+        "glossary_path = \"{}\"\nllama_model_id = \"hymt\"\n\n\
+         [[bridge.models]]\nid = \"hymt\"\npath = \"/opt/mozart/hymt.gguf\"\n\
+         prompt_profile = \"hy_mt\"\nrepeat_penalty = 1.05\ncontext_window = 2\n",
+        glossary.display()
+    );
+    let mut child = spawn_bridge(&dir, &extra);
+    let control = connect_control(&dir);
+    let conn = asr.accept();
+
+    // 第 1 句含同音误写「王独」：术语键纠错为「网赌」并注入 HyMt 术语提示。
+    conn.send_event(&event("final", "s", 1, "我今天碰到王独的人了"));
+    // 第 2 句触发 HyMt 上文注入。
+    conn.send_event(&event("final", "s", 2, "以后不要再碰了"));
+    // 第 3 句为纯英文目标语：直通放行，不调 LLM。
+    conn.send_event(&event("final", "s", 3, "See you tomorrow."));
+
+    wait_until("三句全部完成并播报", Duration::from_secs(5), || {
+        let st = get_status(&control);
+        st["translated"] == 3 && st["speech_submitted"] == 3
+    });
+
+    let requests = requests.lock().unwrap();
+    assert_eq!(requests.len(), 2, "纯英文句不得请求 LLM");
+
+    let parse_req = |raw: &[u8]| -> Value {
+        let text = String::from_utf8(raw.to_vec()).unwrap();
+        let (_, body) = text.split_once("\r\n\r\n").unwrap();
+        serde_json::from_str(body).unwrap()
+    };
+    let req1 = parse_req(&requests[0]);
+    assert!(req1.get("chat_template_kwargs").is_none());
+    assert_eq!(req1["repeat_penalty"], 1.05);
+    assert_eq!(req1["messages"].as_array().unwrap().len(), 1);
+    let p1 = req1["messages"][0]["content"].as_str().unwrap();
+    assert!(p1.contains("网赌 翻译成 online gambling"), "{p1}");
+    assert!(p1.ends_with("我今天碰到网赌的人了"), "{p1}");
+
+    let req2 = parse_req(&requests[1]);
+    let p2 = req2["messages"][0]["content"].as_str().unwrap();
+    assert!(p2.contains("我今天碰到网赌的人了\n参考上面的信息"), "{p2}");
+    assert!(p2.ends_with("以后不要再碰了"), "{p2}");
+
+    let jobs = jobs.lock().unwrap();
+    assert_eq!(jobs.len(), 3);
+    assert_eq!(jobs[2]["text"], "See you tomorrow.");
 
     sigterm(&child.0);
     assert!(wait_exit(&mut child.0, Duration::from_secs(2)).success());

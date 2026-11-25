@@ -188,7 +188,7 @@ fn tail_amount_re() -> &'static Regex {
     static RE: OnceLock<Regex> = OnceLock::new();
     RE.get_or_init(|| {
         Regex::new(&format!(
-            r"(?<![\d{NUMERALS}])([零〇一二两三四五六七八九十百千]+)(万|亿)([一二三四五六七八九])(?![百千十\d万亿])"
+            r"(?<![\d{NUMERALS}])([零〇一二两三四五六七八九十百千]+)(万|亿)([一二两三四五六七八九])(?![百千十\d万亿])"
         ))
         .expect("tail amount regex")
     })
@@ -481,36 +481,22 @@ pub fn translation_number_counts(translation: &str) -> Counter {
     actual
 }
 
-/// 宽松中文数字求值（忽略万/亿与非法字符，用于范围与短式）。
-fn integer(text: &str) -> i64 {
-    if !text.is_empty() && text.chars().all(|c| c.is_ascii_digit()) {
-        return text.parse::<i64>().unwrap_or(i64::MAX);
-    }
-    let mut total: i64 = 0;
-    let mut current: i64 = 0;
-    for c in text.chars() {
-        if let Some(d) = digit(c) {
-            current = d;
-        } else if let Some(u) = unit(c) {
-            let factor = if current == 0 { 1 } else { current };
-            total = total.saturating_add(factor.saturating_mul(u));
-            current = 0;
-        }
-    }
-    total.saturating_add(current)
-}
-
-/// 严格解析万以下中文数字节；歧义形式（重复单位/数字串）返回 None。
-fn exact_section(text: &str) -> Option<i64> {
-    let leading_zero = text.starts_with('零') || text.starts_with('〇');
-    let text = text.trim_start_matches(|c| c == '零' || c == '〇');
+/// 解析万以下中文数字节；歧义形式（重复单位/数字串/裸零收尾）返回 None。
+/// `allow_colloquial_tail = true` 时支持百/千后紧跟单数字口语省位（如 三千五→3500、两百五→250），
+/// 且节首「零/〇」仅覆盖节首空位，不阻塞后续百/千后的省位判定（如 零五百五→550）。
+fn exact_section_inner(text: &str, allow_colloquial_tail: bool) -> Option<i64> {
     if text.is_empty() {
         return Some(0);
+    }
+    let text = text.trim_start_matches(|c| c == '零' || c == '〇');
+    if text.is_empty() {
+        return None;
     }
     let mut total: i64 = 0;
     let mut previous_unit: i64 = 10000;
     let mut digit_val: Option<i64> = None;
     let mut zero_after_unit = false;
+    let mut trailing_zero = false;
     for c in text.chars() {
         if let Some(d) = digit(c) {
             if d == 0 {
@@ -518,12 +504,14 @@ fn exact_section(text: &str) -> Option<i64> {
                     return None;
                 }
                 zero_after_unit = true;
+                trailing_zero = true;
                 continue;
             }
             if digit_val.is_some() {
                 return None;
             }
             digit_val = Some(d);
+            trailing_zero = false;
         } else if let Some(u) = unit(c) {
             if u >= previous_unit || (digit_val.is_none() && !(c == '十' && total == 0)) {
                 return None;
@@ -532,21 +520,33 @@ fn exact_section(text: &str) -> Option<i64> {
             digit_val = None;
             previous_unit = u;
             zero_after_unit = false;
+            trailing_zero = false;
         } else {
             return None;
         }
     }
-    if digit_val.is_some() && previous_unit > 10 && !(leading_zero || zero_after_unit) {
-        // 五千五 / 七万五 是口语短式，不唯一对应 5005 / 70005。
-        if total != 0 {
-            return None;
-        }
+    if trailing_zero {
+        return None;
     }
-    Some(total + digit_val.unwrap_or(0))
+    let tail = if let Some(d) = digit_val {
+        if total != 0 && previous_unit > 10 && !zero_after_unit {
+            if allow_colloquial_tail {
+                d * (previous_unit / 10)
+            } else {
+                return None;
+            }
+        } else {
+            d
+        }
+    } else {
+        0
+    };
+    Some(total + tail)
 }
 
-/// 精确复合数量（含万/亿）；范围/残句返回 None。
-fn exact_composite(text: &str) -> Option<i64> {
+/// 复合数量（含万/亿）；范围/残句/节前省位歧义（如 两千五万）返回 None。
+/// `allow_colloquial_tail = true` 时同步展开尾节与万/亿后的单数字口语省位（如 七万五千五→75500、一亿两万五→100025000）。
+fn composite_value(text: &str, allow_colloquial_tail: bool) -> Option<i64> {
     if !text.contains('万') && !text.contains('亿') {
         return None;
     }
@@ -564,51 +564,61 @@ fn exact_composite(text: &str) -> Option<i64> {
     }
     let mut total: i64 = 0;
     let mut rest = text;
+    let mut last_major_scale: i64 = 0;
     if let Some(idx) = rest.find('亿') {
-        let value = exact_section(&rest[..idx])?;
+        let value = exact_section_inner(&rest[..idx], false)?;
         if value == 0 {
             return None;
         }
         total += value * 100_000_000;
         rest = &rest[idx + '亿'.len_utf8()..];
+        last_major_scale = 100_000_000;
     }
     if let Some(idx) = rest.find('万') {
-        let value = exact_section(&rest[..idx])?;
+        let value = exact_section_inner(&rest[..idx], false)?;
         if value == 0 {
             return None;
         }
         total += value * 10_000;
         rest = &rest[idx + '万'.len_utf8()..];
+        last_major_scale = 10_000;
     }
     if !rest.is_empty()
         && rest.chars().all(|c| digit(c).is_some())
         && !(rest.starts_with('零') || rest.starts_with('〇'))
     {
+        if allow_colloquial_tail && rest.chars().count() == 1 {
+            let tail_digit = digit(rest.chars().next().expect("single char")).filter(|&d| d > 0)?;
+            return Some(total + tail_digit * (last_major_scale / 10));
+        }
         return None;
     }
-    let value = exact_section(rest)?;
+    let value = exact_section_inner(rest, allow_colloquial_tail)?;
     Some(total + value)
 }
 
-/// 原子归一化无歧义中文复合数量。
-fn normalize_exact_composites(text: &str) -> String {
+/// 原子归一化中文复合数量。
+fn normalize_composites(text: &str, allow_colloquial_tail: bool) -> String {
     sub(exact_composites_re(), text, |caps| {
         let matched = caps.get(0).expect("group 0").as_str();
-        match exact_composite(matched) {
+        match composite_value(matched, allow_colloquial_tail) {
             Some(value) => value.to_string(),
             None => matched.to_string(),
         }
     })
 }
 
-/// 口语短式补成完整金额（两万七 → 27000），供提示与数字核对共用。
+/// 口语短式补成完整金额（两万七 → 27000、两万两 → 22000），供提示与数字核对共用。
 fn normalize_tail_amounts(text: &str) -> String {
     sub(tail_amount_re(), text, |caps| {
         let whole = caps.get(1).expect("whole").as_str();
+        let Some(base) = exact_section_inner(whole, false).filter(|&v| v > 0) else {
+            return caps.get(0).expect("group 0").as_str().to_string();
+        };
         let unit_str = caps.get(2).expect("unit").as_str();
         let tail_digit = caps.get(3).expect("digit").as_str().chars().next().expect("one char");
         let scale: i64 = if unit_str == "万" { 10_000 } else { 100_000_000 };
-        let value = integer(whole).saturating_mul(scale)
+        let value = base.saturating_mul(scale)
             + digit(tail_digit).expect("digit class").saturating_mul(scale / 10);
         value.to_string()
     })
@@ -631,9 +641,9 @@ fn decade(text: &str) -> String {
     })
 }
 
-/// 源文必须保留的数字计数（含单位换算、逐字年份、口语年代、范围端点）。
+/// 源文必须保留的数字计数（含单位换算、逐字年份、口语年代、范围端点与口语省位）。
 pub fn required_number_counts(source: &str) -> Counter {
-    let text = decade(&normalize_tail_amounts(&normalize_exact_composites(source)));
+    let text = decade(&normalize_tail_amounts(&normalize_composites(source, true)));
     let mut numbers = Counter::default();
     let no_comma = text.replace(',', "");
     let num_re = Regex::new(r"(\d+(?:\.\d+)?)([万亿千百]?)").expect("number unit regex");
@@ -694,8 +704,8 @@ pub fn required_number_counts(source: &str) -> Counter {
             for &c in &chars {
                 numbers.add(&(digit(c).expect("digit class") * scale).to_string(), 1);
             }
-        } else {
-            numbers.add(&integer(amount).saturating_mul(scale).to_string(), 1);
+        } else if let Some(value) = exact_section_inner(amount, false).filter(|&v| v > 0) {
+            numbers.add(&value.saturating_mul(scale).to_string(), 1);
         }
         String::new()
     });
@@ -720,8 +730,8 @@ pub fn required_number_counts(source: &str) -> Counter {
             for &c in &chars[..2] {
                 numbers.add(&(digit(c).expect("digit class") * scale).to_string(), 1);
             }
-        } else if let Some(value) = exact_section(amount) {
-            // 歧义识别结果不做重复单位求和。
+        } else if let Some(value) = exact_section_inner(amount, true).filter(|&v| v > 0) {
+            // 歧义识别结果不做重复单位求和；支持百/千后单数字口语省位（与 preprocess::eval_number 对齐）。
             numbers.add(&value.to_string(), 1);
         }
     }
@@ -744,7 +754,7 @@ pub fn required_numbers(source: &str) -> Vec<String> {
 /// 把明确万/亿数量写成等价阿拉伯数字供 LLM；字幕原文与核对保留原样。
 /// 不猜模糊数量（几万）、残句（一0百）、日期或成语。
 pub fn normalize_translation_quantities(text: &str) -> String {
-    let text = normalize_tail_amounts(&normalize_exact_composites(text));
+    let text = normalize_tail_amounts(&normalize_composites(text, false));
     let text = decade(&text);
     let arabic_re = Regex::new(&format!(
         r"(?<![\d{NUMERALS}])(\d+(?:\.\d+)?)([万亿])(?![\d{NUMERALS}])"
@@ -777,8 +787,10 @@ pub fn normalize_translation_quantities(text: &str) -> String {
                 digit(chars[0]).expect("digit class") * scale,
                 digit(chars[1]).expect("digit class") * scale
             )
+        } else if let Some(value) = exact_section_inner(amount, false).filter(|&v| v > 0) {
+            value.saturating_mul(scale).to_string()
         } else {
-            integer(amount).saturating_mul(scale).to_string()
+            caps.get(0).expect("group 0").as_str().to_string()
         }
     })
 }
@@ -929,6 +941,7 @@ pub fn untranslated_chinese(text: &str) -> bool {
 }
 
 /// 上下文条目：先前句的原文与译文。
+#[derive(Debug, Clone)]
 pub struct ContextItem {
     pub source: String,
     pub translation: String,
@@ -986,11 +999,26 @@ mod tests {
         for (source, expected) in [
             ("两万七说成三万", vec!["27000", "30000"]),
             ("两万七", vec!["27000"]),
+            ("两万两", vec!["22000"]),
             ("两亿七", vec!["270000000"]),
             ("七万五", vec!["75000"]),
+            ("七万五千五", vec!["75500"]),
+            ("一万两千五", vec!["12500"]),
+            ("一万二百五", vec!["10250"]),
+            ("两万零五百五", vec!["20550"]),
+            ("一亿两万五", vec!["100025000"]),
+            ("三千五", vec!["3500"]),
+            ("两百五", vec!["250"]),
+            ("一千二百五", vec!["1250"]),
         ] {
             assert_eq!(required_numbers(source), expected, "{source}");
         }
+        assert_eq!(normalize_translation_quantities("两万两"), "22000");
+        assert_eq!(missing_numbers("花了三千五", "Spent 3,500."), empty());
+        assert_eq!(added_large_numbers("花了三千五", "Spent 3,500."), empty());
+        assert_eq!(missing_numbers("花了两百五", "Spent 250."), empty());
+        assert_eq!(required_numbers("几千五"), empty());
+        assert_eq!(required_numbers("两千五万"), empty());
     }
 
     #[test]

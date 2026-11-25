@@ -1,11 +1,14 @@
 //! llama-server HTTP 客户端（SPEC-05 翻译）：Unix socket + 原生 HTTP/1.1，
-//! POST /v1/chat/completions，max_tokens=128、temperature=0、关闭思考模式。
+//! POST /v1/chat/completions，按 `LlmModelConfig` 与 `PromptProfile` 策略构造请求。
 //! 每请求一连（Connection: close），不维护长连接；连通状态由调用方
 //! 按请求结果记入共享状态（GetStatus 的 llama_connected 与最近成功失败）。
 //! 收发用 poll 分步等待：停止标志置位即放弃在途请求（daemon 2 s 宽限），
 //! 单请求总时限 REQUEST_TIMEOUT。
 
-use serde_json::{json, Value};
+use crate::checks::ContextItem;
+use mozart_core::config::{LlmModelConfig, PromptProfile};
+use serde::{Serialize, Serializer};
+use serde_json::Value;
 use std::io::{self, Read, Write};
 use std::mem;
 use std::os::fd::{AsRawFd, FromRawFd, IntoRawFd, OwnedFd};
@@ -33,6 +36,25 @@ const POLL_STEP: Duration = Duration::from_millis(100);
 /// 响应体上限：翻译输出远小于此，超限按坏响应处理。
 const MAX_RESPONSE_BYTES: usize = 1024 * 1024;
 
+/// 一次翻译请求的输入载荷：待译源文、历史上下文与命中的术语对。
+#[derive(Debug, Clone, Copy)]
+pub struct TranslateRequest<'a> {
+    pub text: &'a str,
+    pub context: &'a [ContextItem],
+    pub glossary: &'a [(String, String)],
+}
+
+impl<'a> TranslateRequest<'a> {
+    #[cfg(test)]
+    pub fn plain(text: &'a str) -> Self {
+        Self {
+            text,
+            context: &[],
+            glossary: &[],
+        }
+    }
+}
+
 /// 一次推理结果：译文正文与结束原因（质检需要 finish_reason=length 判截断）。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Completion {
@@ -42,29 +64,75 @@ pub struct Completion {
 
 pub struct LlamaClient {
     socket: PathBuf,
+    model: LlmModelConfig,
     timeout: Duration,
 }
 
 impl LlamaClient {
+    /// 兼容入口：以旧单模型默认配置构造客户端（仅单测使用）。
+    #[cfg(test)]
     pub fn new(socket: PathBuf) -> Self {
+        Self::with_model(socket, LlmModelConfig::legacy_default(PathBuf::new()))
+    }
+
+    pub fn with_model(socket: PathBuf, model: LlmModelConfig) -> Self {
         Self {
             socket,
+            model,
             timeout: REQUEST_TIMEOUT,
         }
     }
 
-    /// 测试用短时限；生产路径一律走 new。
-    #[cfg(test)]
-    pub fn with_timeout(socket: PathBuf, timeout: Duration) -> Self {
-        Self { socket, timeout }
+    /// 质检拒绝后“去上下文轻量重试”是否会产生实质变化：
+    /// 仅当首次请求实际注入了非空上文，或 `temperature > 0.0`（非确定性采样）时为 true；
+    /// 否则重发逐字节相同请求必得同结果，跳过无效重试。
+    pub fn qc_retry_has_effect(&self, context: &[ContextItem]) -> bool {
+        if self.model.temperature > 0.0 {
+            return true;
+        }
+        let uses_context = match self.model.prompt_profile {
+            PromptProfile::HyMt => true,
+            PromptProfile::Custom => self
+                .model
+                .user_template
+                .as_deref()
+                .is_some_and(|tpl| tpl.contains("{context}")),
+            PromptProfile::QwenChat => false,
+        };
+        uses_context && !format_context_lines(recent_context(context, self.model.context_window)).is_empty()
     }
 
-    /// 一次翻译请求。失败返回原因（连接、超时、HTTP 状态、响应解析）；
-    /// 停止标志置位时尽快返回 Err，由调用方决定是否计数。
+    /// 测试用短时限；生产路径一律走 with_model。
+    #[cfg(test)]
+    pub fn with_timeout(socket: PathBuf, timeout: Duration) -> Self {
+        Self {
+            socket,
+            model: LlmModelConfig::legacy_default(PathBuf::new()),
+            timeout,
+        }
+    }
+
+    /// 一次纯文本翻译请求（无上下文与术语）。
+    #[cfg(test)]
     pub fn translate(&self, text: &str, stop: &AtomicBool) -> Result<Completion, String> {
+        self.translate_with(&TranslateRequest::plain(text), stop)
+    }
+
+    /// 按当前模型策略发起翻译请求。失败返回原因（连接、超时、HTTP 状态、响应解析）；
+    /// 停止标志置位时尽快返回 Err，由调用方决定是否计数。
+    pub fn translate_with(
+        &self,
+        request: &TranslateRequest<'_>,
+        stop: &AtomicBool,
+    ) -> Result<Completion, String> {
         let stream = connect_timeout(&self.socket, CONNECT_TIMEOUT)
             .map_err(|err| format!("connect {}：{err}", self.socket.display()))?;
-        let raw = exchange(&stream, &build_request(text), self.timeout, stop)?;
+        let raw = exchange(
+            &stream,
+            &build_request_for(&self.model, request),
+            self.timeout,
+            stop,
+        )?;
         parse_response(&raw)
     }
 }
@@ -150,19 +218,189 @@ fn sockaddr_un(path: &Path) -> io::Result<(libc::sockaddr_un, libc::socklen_t)> 
     Ok((addr, len as libc::socklen_t))
 }
 
-/// 构造请求报文：系统提示词 + 用户原文，参数固定。
+#[derive(Serialize)]
+struct ChatMessage<'a> {
+    role: &'static str,
+    content: std::borrow::Cow<'a, str>,
+}
+
+#[derive(Serialize)]
+struct ChatTemplateKwargs {
+    enable_thinking: bool,
+}
+
+#[derive(Serialize)]
+struct ChatRequestBody<'a> {
+    model: &'static str,
+    messages: Vec<ChatMessage<'a>>,
+    max_tokens: u32,
+    #[serde(serialize_with = "serialize_f32_clean")]
+    temperature: f32,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    repeat_penalty: Option<f32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    chat_template_kwargs: Option<ChatTemplateKwargs>,
+}
+
+fn serialize_f32_clean<S: Serializer>(value: &f32, serializer: S) -> Result<S::Ok, S::Error> {
+    if *value == 0.0 {
+        serializer.serialize_u8(0)
+    } else {
+        serializer.serialize_f32(*value)
+    }
+}
+
+fn recent_context<'a>(context: &'a [ContextItem], window: usize) -> &'a [ContextItem] {
+    if window == 0 || context.is_empty() {
+        return &[];
+    }
+    let start = context.len().saturating_sub(window);
+    &context[start..]
+}
+
+fn format_context_lines(context: &[ContextItem]) -> String {
+    context
+        .iter()
+        .map(|item| item.source.trim())
+        .filter(|line| !line.is_empty())
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+fn format_glossary_lines(glossary: &[(String, String)]) -> String {
+    glossary
+        .iter()
+        .map(|(src, tgt)| format!("{src} 翻译成 {tgt}"))
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+/// 单遍替换 `{text}` / `{context}` / `{glossary}`，避免源文含占位符字面量时发生二次展开。
+fn render_template(template: &str, text: &str, context: &str, glossary: &str) -> String {
+    let mut out = String::with_capacity(template.len() + text.len());
+    let mut rest = template;
+    while !rest.is_empty() {
+        if let Some(after) = rest.strip_prefix("{text}") {
+            out.push_str(text);
+            rest = after;
+        } else if let Some(after) = rest.strip_prefix("{context}") {
+            out.push_str(context);
+            rest = after;
+        } else if let Some(after) = rest.strip_prefix("{glossary}") {
+            out.push_str(glossary);
+            rest = after;
+        } else {
+            let ch = rest.chars().next().expect("non-empty rest");
+            out.push(ch);
+            rest = &rest[ch.len_utf8()..];
+        }
+    }
+    out
+}
+
+fn build_hymt_prompt(text: &str, context: &str, glossary: &str) -> String {
+    match (context.is_empty(), glossary.is_empty()) {
+        (true, true) => format!(
+            "将以下文本翻译为英文，注意只需要输出翻译后的结果，不要额外解释：\n{text}"
+        ),
+        (true, false) => format!(
+            "参考下面的翻译：\n{glossary}\n将以下文本翻译为英文，注意只需要输出翻译后的结果，不要额外解释：\n{text}"
+        ),
+        (false, true) => format!(
+            "{context}\n参考上面的信息，把下面的文本翻译为英文，注意不需要翻译上文，也不要额外解释：\n{text}"
+        ),
+        (false, false) => format!(
+            "{context}\n参考上面的信息，并参考下面的翻译：\n{glossary}\n把下面的文本翻译为英文，注意不需要翻译上文，也不要额外解释：\n{text}"
+        ),
+    }
+}
+
+fn build_messages<'a>(
+    model: &'a LlmModelConfig,
+    req: &TranslateRequest<'a>,
+) -> Vec<ChatMessage<'a>> {
+    use std::borrow::Cow;
+    match model.prompt_profile {
+        PromptProfile::QwenChat => {
+            let system = model
+                .system_prompt
+                .as_deref()
+                .filter(|s| !s.trim().is_empty())
+                .unwrap_or(SYSTEM_PROMPT);
+            vec![
+                ChatMessage {
+                    role: "system",
+                    content: Cow::Borrowed(system),
+                },
+                ChatMessage {
+                    role: "user",
+                    content: Cow::Borrowed(req.text),
+                },
+            ]
+        }
+        PromptProfile::HyMt => {
+            let context = format_context_lines(recent_context(req.context, model.context_window));
+            let glossary = format_glossary_lines(req.glossary);
+            vec![ChatMessage {
+                role: "user",
+                content: Cow::Owned(build_hymt_prompt(req.text, &context, &glossary)),
+            }]
+        }
+        PromptProfile::Custom => {
+            let context = format_context_lines(recent_context(req.context, model.context_window));
+            let glossary = format_glossary_lines(req.glossary);
+            let template = model
+                .user_template
+                .as_deref()
+                .expect("custom user_template validated at config entry");
+            let user = render_template(template, req.text, &context, &glossary);
+            let mut messages = Vec::with_capacity(2);
+            if let Some(system) = model
+                .system_prompt
+                .as_deref()
+                .filter(|s| !s.trim().is_empty())
+            {
+                messages.push(ChatMessage {
+                    role: "system",
+                    content: Cow::Borrowed(system),
+                });
+            }
+            messages.push(ChatMessage {
+                role: "user",
+                content: Cow::Owned(user),
+            });
+            messages
+        }
+    }
+}
+
+/// 按旧单模型默认配置构造请求报文（兼容测试入口）。
+#[cfg(test)]
 pub fn build_request(text: &str) -> Vec<u8> {
-    let body = serde_json::to_vec(&json!({
-        "model": "default",
-        "messages": [
-            { "role": "system", "content": SYSTEM_PROMPT },
-            { "role": "user", "content": text }
-        ],
-        "max_tokens": 128,
-        "temperature": 0,
-        "chat_template_kwargs": { "enable_thinking": false }
-    }))
-    .expect("request body is JSON-serializable");
+    let model = LlmModelConfig::legacy_default(PathBuf::new());
+    build_request_for(&model, &TranslateRequest::plain(text))
+}
+
+/// 按模型配置与提示词策略构造 HTTP 请求报文。
+pub fn build_request_for(model: &LlmModelConfig, req: &TranslateRequest<'_>) -> Vec<u8> {
+    let chat_template_kwargs = match model.prompt_profile {
+        PromptProfile::QwenChat => Some(ChatTemplateKwargs {
+            enable_thinking: model.enable_thinking.unwrap_or(false),
+        }),
+        PromptProfile::HyMt => None,
+        PromptProfile::Custom => model
+            .enable_thinking
+            .map(|enable_thinking| ChatTemplateKwargs { enable_thinking }),
+    };
+    let payload = ChatRequestBody {
+        model: "default",
+        messages: build_messages(model, req),
+        max_tokens: model.max_tokens,
+        temperature: model.temperature,
+        repeat_penalty: model.repeat_penalty,
+        chat_template_kwargs,
+    };
+    let body = serde_json::to_vec(&payload).expect("request body is JSON-serializable");
     let mut request = format!(
         "POST /v1/chat/completions HTTP/1.1\r\n\
          Host: localhost\r\n\
@@ -366,8 +604,9 @@ mod tests {
         assert!(head.contains(&format!("Content-Length: {}\r\n", body.len())));
         let value: Value = serde_json::from_str(body).unwrap();
         assert_eq!(value["model"], "default");
-        assert_eq!(value["max_tokens"], 128);
+        assert_eq!(value["max_tokens"], 256);
         assert_eq!(value["temperature"], 0);
+        assert!(value.get("repeat_penalty").is_none());
         assert_eq!(value["chat_template_kwargs"]["enable_thinking"], false);
         assert_eq!(value["messages"][0]["role"], "system");
         // 旧实现原文逐字对拍，防止提示词被改写。
@@ -381,6 +620,175 @@ mod tests {
         );
         assert_eq!(value["messages"][1]["role"], "user");
         assert_eq!(value["messages"][1]["content"], "你好");
+    }
+
+    fn parse_request_body(raw: Vec<u8>) -> Value {
+        let text = String::from_utf8(raw).unwrap();
+        let (_, body) = text.split_once("\r\n\r\n").unwrap();
+        serde_json::from_str(body).unwrap()
+    }
+
+    #[test]
+    fn qwen_chat_supports_custom_system_prompt_and_repeat_penalty() {
+        let model = LlmModelConfig {
+            id: "qwen-custom".to_string(),
+            path: PathBuf::from("/models/qwen.gguf"),
+            prompt_profile: PromptProfile::QwenChat,
+            max_tokens: 192,
+            temperature: 0.2,
+            repeat_penalty: Some(1.05),
+            enable_thinking: Some(true),
+            system_prompt: Some("Custom system prompt.".to_string()),
+            ..LlmModelConfig::default()
+        };
+        let value = parse_request_body(build_request_for(&model, &TranslateRequest::plain("测试")));
+        assert_eq!(value["max_tokens"], 192);
+        assert_eq!(value["temperature"], 0.2);
+        assert_eq!(value["repeat_penalty"], 1.05);
+        assert_eq!(value["chat_template_kwargs"]["enable_thinking"], true);
+        assert_eq!(value["messages"][0]["content"], "Custom system prompt.");
+        assert_eq!(value["messages"][1]["content"], "测试");
+    }
+
+    #[test]
+    fn hy_mt_builds_single_user_prompts_for_all_modes() {
+        let model = LlmModelConfig {
+            id: "hymt".to_string(),
+            path: PathBuf::from("/models/hymt.gguf"),
+            prompt_profile: PromptProfile::HyMt,
+            repeat_penalty: Some(1.05),
+            context_window: 2,
+            ..LlmModelConfig::default()
+        };
+        let context = vec![
+            ContextItem {
+                source: "最早一句".to_string(),
+                translation: "Earliest.".to_string(),
+            },
+            ContextItem {
+                source: "第一句上文".to_string(),
+                translation: "First.".to_string(),
+            },
+            ContextItem {
+                source: "第二句上文".to_string(),
+                translation: "Second.".to_string(),
+            },
+        ];
+        let glossary = vec![
+            ("量子计算".to_string(), "quantum computing".to_string()),
+            ("纠错".to_string(), "error correction".to_string()),
+        ];
+
+        // 1. 纯单句：无 system，无 chat_template_kwargs。
+        let plain = parse_request_body(build_request_for(&model, &TranslateRequest::plain("你好")));
+        assert!(plain.get("chat_template_kwargs").is_none());
+        assert_eq!(plain["repeat_penalty"], 1.05);
+        assert_eq!(plain["messages"].as_array().unwrap().len(), 1);
+        assert_eq!(plain["messages"][0]["role"], "user");
+        assert_eq!(
+            plain["messages"][0]["content"],
+            "将以下文本翻译为英文，注意只需要输出翻译后的结果，不要额外解释：\n你好"
+        );
+
+        // 2. 仅术语。
+        let gloss_only = parse_request_body(build_request_for(
+            &model,
+            &TranslateRequest {
+                text: "量子计算需要纠错",
+                context: &[],
+                glossary: &glossary,
+            },
+        ));
+        assert!(gloss_only.get("chat_template_kwargs").is_none());
+        assert_eq!(gloss_only["messages"].as_array().unwrap().len(), 1);
+        assert_eq!(
+            gloss_only["messages"][0]["content"],
+            "参考下面的翻译：\n量子计算 翻译成 quantum computing\n纠错 翻译成 error correction\n\
+             将以下文本翻译为英文，注意只需要输出翻译后的结果，不要额外解释：\n量子计算需要纠错"
+        );
+
+        // 3. 仅上文（只取最近 context_window=2 条源文）。
+        let ctx_only = parse_request_body(build_request_for(
+            &model,
+            &TranslateRequest {
+                text: "接下来怎么办",
+                context: &context,
+                glossary: &[],
+            },
+        ));
+        assert!(ctx_only.get("chat_template_kwargs").is_none());
+        assert_eq!(ctx_only["messages"].as_array().unwrap().len(), 1);
+        assert_eq!(
+            ctx_only["messages"][0]["content"],
+            "第一句上文\n第二句上文\n\
+             参考上面的信息，把下面的文本翻译为英文，注意不需要翻译上文，也不要额外解释：\n接下来怎么办"
+        );
+
+        // 4. 术语 + 上文。
+        let both = parse_request_body(build_request_for(
+            &model,
+            &TranslateRequest {
+                text: "量子计算需要纠错",
+                context: &context,
+                glossary: &glossary,
+            },
+        ));
+        assert!(both.get("chat_template_kwargs").is_none());
+        assert_eq!(both["messages"].as_array().unwrap().len(), 1);
+        assert_eq!(
+            both["messages"][0]["content"],
+            "第一句上文\n第二句上文\n\
+             参考上面的信息，并参考下面的翻译：\n量子计算 翻译成 quantum computing\n纠错 翻译成 error correction\n\
+             把下面的文本翻译为英文，注意不需要翻译上文，也不要额外解释：\n量子计算需要纠错"
+        );
+    }
+
+    #[test]
+    fn custom_profile_renders_template_and_optional_system_prompt() {
+        let context = vec![ContextItem {
+            source: "前文".to_string(),
+            translation: "Prev.".to_string(),
+        }];
+        let glossary = vec![("术语".to_string(), "term".to_string())];
+
+        let with_sys = LlmModelConfig {
+            id: "c1".to_string(),
+            path: PathBuf::from("/models/c.gguf"),
+            prompt_profile: PromptProfile::Custom,
+            context_window: 1,
+            system_prompt: Some("You are a translator.".to_string()),
+            user_template: Some("CTX={context}\nGLOSS={glossary}\nTEXT={text}".to_string()),
+            ..LlmModelConfig::default()
+        };
+        let value = parse_request_body(build_request_for(
+            &with_sys,
+            &TranslateRequest {
+                text: "含{glossary}的术语",
+                context: &context,
+                glossary: &glossary,
+            },
+        ));
+        assert!(value.get("chat_template_kwargs").is_none());
+        assert_eq!(value["messages"].as_array().unwrap().len(), 2);
+        assert_eq!(value["messages"][0]["role"], "system");
+        assert_eq!(value["messages"][0]["content"], "You are a translator.");
+        assert_eq!(value["messages"][1]["role"], "user");
+        // 单遍替换：源文中的 `{glossary}` 字面量不被二次展开。
+        assert_eq!(
+            value["messages"][1]["content"],
+            "CTX=前文\nGLOSS=术语 翻译成 term\nTEXT=含{glossary}的术语"
+        );
+
+        let no_sys = LlmModelConfig {
+            system_prompt: None,
+            enable_thinking: Some(false),
+            ..with_sys
+        };
+        let value = parse_request_body(build_request_for(&no_sys, &TranslateRequest::plain("原文")));
+        assert_eq!(value["messages"].as_array().unwrap().len(), 1);
+        assert_eq!(value["messages"][0]["role"], "user");
+        assert_eq!(value["messages"][0]["content"], "CTX=\nGLOSS=\nTEXT=原文");
+        assert_eq!(value["chat_template_kwargs"]["enable_thinking"], false);
     }
 
     #[test]

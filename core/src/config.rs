@@ -540,6 +540,90 @@ impl Default for TtsConfig {
     }
 }
 
+/// 翻译模型上下文滑动窗口与桥侧历史上限（单一定义源）。
+pub const LLM_CONTEXT_WINDOW_MAX: usize = 8;
+const LLM_CTX_SIZE_MIN: u32 = 256;
+const LLM_MAX_TOKENS_MIN: u32 = 16;
+const LLM_TEMPERATURE_MAX: f32 = 2.0;
+const LLM_REPEAT_PENALTY_MAX: f32 = 2.0;
+
+/// 翻译提示词模板策略（[[bridge.models]].prompt_profile）。
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PromptProfile {
+    /// 沿用英文 system prompt + enable_thinking 开关。
+    #[default]
+    QwenChat,
+    /// 混元翻译官方单 user 指令模板（无 system prompt，支持术语表与上下文）。
+    HyMt,
+    /// 自定义 system_prompt（可选）+ user_template（必填，须含 `{text}`）。
+    Custom,
+}
+
+/// 单个翻译模型配置（[[bridge.models]]）：承载 llama-server 启动参数与提示词策略。
+#[derive(Debug, Clone, PartialEq, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct LlmModelConfig {
+    /// 模型标识（bridge.models 内唯一，非空）。
+    pub id: String,
+    /// GGUF 模型路径（非空，加载时展开开头的 `~`）。
+    pub path: PathBuf,
+    pub prompt_profile: PromptProfile,
+    pub ctx_size: u32,
+    pub cache_ram_mb: u32,
+    pub batch_size: u32,
+    pub ubatch_size: u32,
+    pub gpu_layers: u32,
+    pub threads: u32,
+    pub max_tokens: u32,
+    pub temperature: f32,
+    pub repeat_penalty: Option<f32>,
+    pub enable_thinking: Option<bool>,
+    pub context_window: usize,
+    pub system_prompt: Option<String>,
+    pub user_template: Option<String>,
+}
+
+impl Default for LlmModelConfig {
+    fn default() -> Self {
+        Self {
+            id: String::new(),
+            path: PathBuf::new(),
+            prompt_profile: PromptProfile::QwenChat,
+            ctx_size: 1024,
+            cache_ram_mb: 64,
+            batch_size: 256,
+            ubatch_size: 128,
+            gpu_layers: 99,
+            threads: 2,
+            max_tokens: 256,
+            temperature: 0.0,
+            repeat_penalty: None,
+            enable_thinking: None,
+            context_window: 0,
+            system_prompt: None,
+            user_template: None,
+        }
+    }
+}
+
+impl LlmModelConfig {
+    /// 旧单模型 `bridge.llama_model` 简写的默认参数（单一定义源）。
+    pub fn legacy_default(path: PathBuf) -> Self {
+        Self {
+            id: "legacy".to_string(),
+            path,
+            prompt_profile: PromptProfile::QwenChat,
+            ctx_size: 2048,
+            cache_ram_mb: 128,
+            max_tokens: 256,
+            enable_thinking: Some(false),
+            context_window: 0,
+            ..Self::default()
+        }
+    }
+}
+
 /// 字幕桥配置（语言链）：控制面、字幕落盘、翻译/播报开关与 llama-server 接入。
 #[derive(Debug, Clone, Deserialize)]
 #[serde(default, deny_unknown_fields)]
@@ -550,14 +634,20 @@ pub struct BridgeConfig {
     pub subtitles_path: PathBuf,
     /// 显式同音纠错表文件（JSON {"原文":"改为"}）；缺省用内置表，加载时展开 `~`。
     pub corrections_path: Option<PathBuf>,
+    /// 翻译术语表文件（JSON {"中文术语":"英文译名"}）；加载时展开 `~`。
+    pub glossary_path: Option<PathBuf>,
     /// 翻译开关的 TOML 基线。
     pub translate_enabled: bool,
     /// 播报开关的 TOML 基线。
     pub speech_enabled: bool,
     /// llama-server HTTP 的 Unix socket。
     pub llama_socket: String,
-    /// 翻译模型 GGUF 路径；空表示运行时必须显式提供。
+    /// 旧单模型 GGUF 路径简写（向后兼容）；加载时展开 `~`。
     pub llama_model: PathBuf,
+    /// 选中的翻译模型 id（指向 `bridge.models` 中的条目）；优先于 `llama_model`。
+    pub llama_model_id: Option<String>,
+    /// 可扩展翻译模型列表（[[bridge.models]]）。
+    pub models: Vec<LlmModelConfig>,
     pub translate_queue_capacity: u32,
     pub speech_queue_capacity: u32,
     /// 单句翻译失败后的重试上限（SPEC-05：最多 2 次）。
@@ -570,10 +660,13 @@ impl Default for BridgeConfig {
             socket: "bridge.sock".to_string(),
             subtitles_path: PathBuf::from("~/.local/state/mozart/subtitles.jsonl"),
             corrections_path: None,
+            glossary_path: None,
             translate_enabled: true,
             speech_enabled: true,
             llama_socket: "llama.sock".to_string(),
             llama_model: PathBuf::new(),
+            llama_model_id: None,
+            models: Vec::new(),
             translate_queue_capacity: 32,
             speech_queue_capacity: 16,
             retry_max: 2,
@@ -766,6 +859,13 @@ impl Config {
         if let Some(path) = &config.bridge.corrections_path {
             config.bridge.corrections_path = Some(expand_tilde(path, home.as_deref()));
         }
+        if let Some(path) = &config.bridge.glossary_path {
+            config.bridge.glossary_path = Some(expand_tilde(path, home.as_deref()));
+        }
+        config.bridge.llama_model = expand_tilde(&config.bridge.llama_model, home.as_deref());
+        for model in &mut config.bridge.models {
+            model.path = expand_tilde(&model.path, home.as_deref());
+        }
         config.file.storage_dir = expand_tilde(&config.file.storage_dir, home.as_deref());
         if let Some(web) = &mut config.web {
             web.prepare(path, home.as_deref())?;
@@ -869,6 +969,25 @@ impl Config {
 
     pub fn llama_socket(&self) -> PathBuf {
         self.daemon.run_dir.join(&self.bridge.llama_socket)
+    }
+
+    /// 生效的翻译模型配置（单一解析入口）：
+    /// `bridge.llama_model_id` 优先于旧简写 `bridge.llama_model`；均未配置返回 `None`。
+    pub fn active_llm_model(&self) -> Option<LlmModelConfig> {
+        if let Some(id) = self.bridge.llama_model_id.as_deref() {
+            return self
+                .bridge
+                .models
+                .iter()
+                .find(|model| model.id == id)
+                .cloned();
+        }
+        if !self.bridge.llama_model.as_os_str().is_empty() {
+            return Some(LlmModelConfig::legacy_default(
+                self.bridge.llama_model.clone(),
+            ));
+        }
+        None
     }
 
     /// 受管文件目录；`load_from` 已展开开头的 `~`（同 subtitles_path）。
@@ -1032,6 +1151,43 @@ impl Config {
                 "bridge.retry_max must be at most 2".to_string(),
             ));
         }
+        if self
+            .bridge
+            .glossary_path
+            .as_ref()
+            .is_some_and(|path| path.as_os_str().is_empty())
+        {
+            return Err(ConfigError::Invalid(
+                "bridge.glossary_path must not be empty".to_string(),
+            ));
+        }
+        let mut llm_ids = std::collections::HashSet::new();
+        for model in &self.bridge.models {
+            validate_llm_model(model)?;
+            if !llm_ids.insert(model.id.as_str()) {
+                return Err(ConfigError::Invalid(format!(
+                    "bridge.models duplicate id='{}'",
+                    model.id
+                )));
+            }
+        }
+        if let Some(id) = &self.bridge.llama_model_id {
+            if id.trim().is_empty() {
+                return Err(ConfigError::Invalid(
+                    "bridge.llama_model_id must not be empty".to_string(),
+                ));
+            }
+            if !llm_ids.contains(id.as_str()) {
+                return Err(ConfigError::Invalid(format!(
+                    "bridge.llama_model_id '{id}' not found in [[bridge.models]]"
+                )));
+            }
+        } else if self.bridge.llama_model.as_os_str().is_empty() && !self.bridge.models.is_empty() {
+            return Err(ConfigError::Invalid(
+                "bridge.llama_model_id must be specified when [[bridge.models]] is non-empty"
+                    .to_string(),
+            ));
+        }
         if self.file.queue_capacity == 0 {
             return Err(ConfigError::Invalid(
                 "file.queue_capacity must be at least 1".to_string(),
@@ -1184,6 +1340,110 @@ impl Config {
         }
         Some(Path::new(&self.rvc.models_dir).join(id))
     }
+}
+
+/// 单个翻译模型配置校验（单一入口，由 `Config::validate` 调用一次）。
+fn validate_llm_model(model: &LlmModelConfig) -> Result<(), ConfigError> {
+    if model.id.trim().is_empty() {
+        return Err(ConfigError::Invalid(
+            "bridge.models[].id must not be empty".to_string(),
+        ));
+    }
+    let id = &model.id;
+    if model.path.as_os_str().is_empty() {
+        return Err(ConfigError::Invalid(format!(
+            "bridge.models id='{id}': path must not be empty"
+        )));
+    }
+    if model.ctx_size < LLM_CTX_SIZE_MIN {
+        return Err(ConfigError::Invalid(format!(
+            "bridge.models id='{id}': ctx_size must be at least {LLM_CTX_SIZE_MIN}"
+        )));
+    }
+    if model.batch_size < 1 {
+        return Err(ConfigError::Invalid(format!(
+            "bridge.models id='{id}': batch_size must be at least 1"
+        )));
+    }
+    if model.ubatch_size < 1 || model.ubatch_size > model.batch_size {
+        return Err(ConfigError::Invalid(format!(
+            "bridge.models id='{id}': ubatch_size must be within 1..={}",
+            model.batch_size
+        )));
+    }
+    if model.threads < 1 {
+        return Err(ConfigError::Invalid(format!(
+            "bridge.models id='{id}': threads must be at least 1"
+        )));
+    }
+    if model.max_tokens < LLM_MAX_TOKENS_MIN || model.max_tokens > model.ctx_size {
+        return Err(ConfigError::Invalid(format!(
+            "bridge.models id='{id}': max_tokens must be within {LLM_MAX_TOKENS_MIN}..={}",
+            model.ctx_size
+        )));
+    }
+    if !model.temperature.is_finite() || !(0.0..=LLM_TEMPERATURE_MAX).contains(&model.temperature) {
+        return Err(ConfigError::Invalid(format!(
+            "bridge.models id='{id}': temperature must be within 0.0..={LLM_TEMPERATURE_MAX}"
+        )));
+    }
+    if let Some(penalty) = model.repeat_penalty {
+        if !penalty.is_finite() || penalty <= 0.0 || penalty > LLM_REPEAT_PENALTY_MAX {
+            return Err(ConfigError::Invalid(format!(
+                "bridge.models id='{id}': repeat_penalty must be within (0.0, {LLM_REPEAT_PENALTY_MAX}]"
+            )));
+        }
+    }
+    if model.context_window > LLM_CONTEXT_WINDOW_MAX {
+        return Err(ConfigError::Invalid(format!(
+            "bridge.models id='{id}': context_window must be at most {LLM_CONTEXT_WINDOW_MAX}"
+        )));
+    }
+    match model.prompt_profile {
+        PromptProfile::Custom => match model.user_template.as_deref() {
+            Some(tpl) if tpl.contains("{text}") => {}
+            Some(_) => {
+                return Err(ConfigError::Invalid(format!(
+                    "bridge.models id='{id}': user_template must contain \"{{text}}\""
+                )));
+            }
+            None => {
+                return Err(ConfigError::Invalid(format!(
+                    "bridge.models id='{id}': user_template is required for prompt_profile = \"custom\""
+                )));
+            }
+        },
+        PromptProfile::HyMt => {
+            if model.user_template.is_some() {
+                return Err(ConfigError::Invalid(format!(
+                    "bridge.models id='{id}': user_template is only allowed for prompt_profile = \"custom\""
+                )));
+            }
+            if model.system_prompt.is_some() {
+                return Err(ConfigError::Invalid(format!(
+                    "bridge.models id='{id}': system_prompt is not allowed for prompt_profile = \"hy_mt\""
+                )));
+            }
+            if model.enable_thinking.is_some() {
+                return Err(ConfigError::Invalid(format!(
+                    "bridge.models id='{id}': enable_thinking is not allowed for prompt_profile = \"hy_mt\""
+                )));
+            }
+        }
+        PromptProfile::QwenChat => {
+            if model.user_template.is_some() {
+                return Err(ConfigError::Invalid(format!(
+                    "bridge.models id='{id}': user_template is only allowed for prompt_profile = \"custom\""
+                )));
+            }
+            if model.context_window > 0 {
+                return Err(ConfigError::Invalid(format!(
+                    "bridge.models id='{id}': context_window must be 0 for prompt_profile = \"qwen_chat\""
+                )));
+            }
+        }
+    }
+    Ok(())
 }
 
 /// 会话参数五键的范围校验（单一来源）：Config::validate 与预设解析共用。
@@ -3000,5 +3260,180 @@ mod tests {
             ..Config::default()
         };
         assert!(config.validate().is_ok(), "JSON 默认旋钮必须通过入口校验");
+    }
+
+    #[test]
+    fn bridge_llm_models_parse_defaults_and_active_resolution() {
+        // 默认无模型：active_llm_model 返回 None。
+        let empty = Config::default();
+        assert!(empty.active_llm_model().is_none());
+        assert_eq!(empty.bridge.glossary_path, None);
+        assert_eq!(empty.bridge.llama_model_id, None);
+        assert!(empty.bridge.models.is_empty());
+
+        // 旧单模型简写：回落 legacy_default。
+        let legacy: Config = toml::from_str(
+            "[bridge]\nllama_model = \"/opt/mozart/legacy.gguf\"\n",
+        )
+        .unwrap();
+        legacy.validate().unwrap();
+        let active = legacy.active_llm_model().unwrap();
+        assert_eq!(active.path, PathBuf::from("/opt/mozart/legacy.gguf"));
+        assert_eq!(active.prompt_profile, PromptProfile::QwenChat);
+        assert_eq!(active.ctx_size, 2048);
+        assert_eq!(active.cache_ram_mb, 128);
+        assert_eq!(active.batch_size, 256);
+        assert_eq!(active.ubatch_size, 128);
+        assert_eq!(active.gpu_layers, 99);
+        assert_eq!(active.threads, 2);
+        assert_eq!(active.max_tokens, 256);
+        assert_eq!(active.temperature, 0.0);
+        assert_eq!(active.repeat_penalty, None);
+        assert_eq!(active.enable_thinking, Some(false));
+        assert_eq!(active.context_window, 0);
+
+        // 多模型注册表：llama_model_id 优先于 legacy llama_model，未写字段取 LlmModelConfig 默认。
+        let multi: Config = toml::from_str(
+            r#"
+            [bridge]
+            llama_model = "/opt/mozart/legacy.gguf"
+            llama_model_id = "hymt"
+
+            [[bridge.models]]
+            id = "qwen"
+            path = "/opt/mozart/qwen.gguf"
+            prompt_profile = "qwen_chat"
+            temperature = 0
+
+            [[bridge.models]]
+            id = "hymt"
+            path = "/opt/mozart/hymt.gguf"
+            prompt_profile = "hy_mt"
+            repeat_penalty = 1.05
+            context_window = 2
+
+            [[bridge.models]]
+            id = "custom"
+            path = "/opt/mozart/custom.gguf"
+            prompt_profile = "custom"
+            system_prompt = "Translate accurately."
+            user_template = "Ctx:\n{context}\nTerms:\n{glossary}\nSrc:\n{text}"
+            ctx_size = 512
+            cache_ram_mb = 32
+            batch_size = 128
+            ubatch_size = 64
+            gpu_layers = 40
+            threads = 4
+            max_tokens = 128
+            temperature = 0.2
+            enable_thinking = false
+            context_window = 8
+            "#,
+        )
+        .unwrap();
+        multi.validate().unwrap();
+        let active = multi.active_llm_model().unwrap();
+        assert_eq!(active.id, "hymt");
+        assert_eq!(active.path, PathBuf::from("/opt/mozart/hymt.gguf"));
+        assert_eq!(active.prompt_profile, PromptProfile::HyMt);
+        assert_eq!(active.ctx_size, 1024);
+        assert_eq!(active.cache_ram_mb, 64);
+        assert_eq!(active.max_tokens, 256);
+        assert_eq!(active.repeat_penalty, Some(1.05));
+        assert_eq!(active.context_window, 2);
+        assert_eq!(active.enable_thinking, None);
+    }
+
+    #[test]
+    fn bridge_llm_models_expand_tilde_on_load() {
+        let dir = temp_config_dir("bridge-llm-tilde");
+        let path = dir.join("mozart.toml");
+        std::fs::write(
+            &path,
+            r#"
+            [bridge]
+            glossary_path = "~/mozart-test/glossary.json"
+            llama_model = "~/mozart-test/legacy.gguf"
+            llama_model_id = "m1"
+
+            [[bridge.models]]
+            id = "m1"
+            path = "~/mozart-test/model.gguf"
+            prompt_profile = "hy_mt"
+            "#,
+        )
+        .unwrap();
+        let config = Config::load_from(Some(&path)).unwrap();
+        let home = std::env::var_os("HOME").map(PathBuf::from);
+        let expected = |tail: &str| match &home {
+            Some(home) => home.join(tail),
+            None => PathBuf::from("~/").join(tail),
+        };
+        assert_eq!(
+            config.bridge.glossary_path,
+            Some(expected("mozart-test/glossary.json"))
+        );
+        assert_eq!(
+            config.bridge.llama_model,
+            expected("mozart-test/legacy.gguf")
+        );
+        assert_eq!(
+            config.active_llm_model().unwrap().path,
+            expected("mozart-test/model.gguf")
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn bridge_llm_models_invalid_configs_are_rejected() {
+        let invalid_cases = [
+            // models 非空但未指定 llama_model_id（不静默猜第一个）。
+            "[[bridge.models]]\nid = 'a'\npath = '/a.gguf'\n",
+            // llama_model_id 为空或不存在。
+            "[bridge]\nllama_model_id = ''\n[[bridge.models]]\nid = 'a'\npath = '/a.gguf'\n",
+            "[bridge]\nllama_model_id = 'missing'\n[[bridge.models]]\nid = 'a'\npath = '/a.gguf'\n",
+            "[bridge]\nllama_model_id = 'missing'\n",
+            // glossary_path 显式为空串。
+            "[bridge]\nglossary_path = ''\n",
+            // id 为空、重复，或 path 为空。
+            "[bridge]\nllama_model_id = 'a'\n[[bridge.models]]\nid = ''\npath = '/a.gguf'\n",
+            "[bridge]\nllama_model_id = 'a'\n[[bridge.models]]\nid = 'a'\npath = '/a.gguf'\n[[bridge.models]]\nid = 'a'\npath = '/b.gguf'\n",
+            "[bridge]\nllama_model_id = 'a'\n[[bridge.models]]\nid = 'a'\npath = ''\n",
+            // 数值范围边界。
+            "[bridge]\nllama_model_id = 'a'\n[[bridge.models]]\nid = 'a'\npath = '/a.gguf'\nctx_size = 255\n",
+            "[bridge]\nllama_model_id = 'a'\n[[bridge.models]]\nid = 'a'\npath = '/a.gguf'\nbatch_size = 0\n",
+            "[bridge]\nllama_model_id = 'a'\n[[bridge.models]]\nid = 'a'\npath = '/a.gguf'\nubatch_size = 0\n",
+            "[bridge]\nllama_model_id = 'a'\n[[bridge.models]]\nid = 'a'\npath = '/a.gguf'\nbatch_size = 64\nubatch_size = 65\n",
+            "[bridge]\nllama_model_id = 'a'\n[[bridge.models]]\nid = 'a'\npath = '/a.gguf'\nthreads = 0\n",
+            "[bridge]\nllama_model_id = 'a'\n[[bridge.models]]\nid = 'a'\npath = '/a.gguf'\nmax_tokens = 15\n",
+            "[bridge]\nllama_model_id = 'a'\n[[bridge.models]]\nid = 'a'\npath = '/a.gguf'\nctx_size = 256\nmax_tokens = 257\n",
+            "[bridge]\nllama_model_id = 'a'\n[[bridge.models]]\nid = 'a'\npath = '/a.gguf'\ntemperature = -0.1\n",
+            "[bridge]\nllama_model_id = 'a'\n[[bridge.models]]\nid = 'a'\npath = '/a.gguf'\ntemperature = 2.1\n",
+            "[bridge]\nllama_model_id = 'a'\n[[bridge.models]]\nid = 'a'\npath = '/a.gguf'\ntemperature = nan\n",
+            "[bridge]\nllama_model_id = 'a'\n[[bridge.models]]\nid = 'a'\npath = '/a.gguf'\nrepeat_penalty = 0.0\n",
+            "[bridge]\nllama_model_id = 'a'\n[[bridge.models]]\nid = 'a'\npath = '/a.gguf'\nrepeat_penalty = 2.1\n",
+            "[bridge]\nllama_model_id = 'a'\n[[bridge.models]]\nid = 'a'\npath = '/a.gguf'\nrepeat_penalty = inf\n",
+            "[bridge]\nllama_model_id = 'a'\n[[bridge.models]]\nid = 'a'\npath = '/a.gguf'\ncontext_window = 9\n",
+            // prompt_profile 与模板约束。
+            "[bridge]\nllama_model_id = 'a'\n[[bridge.models]]\nid = 'a'\npath = '/a.gguf'\nprompt_profile = 'custom'\n",
+            "[bridge]\nllama_model_id = 'a'\n[[bridge.models]]\nid = 'a'\npath = '/a.gguf'\nprompt_profile = 'custom'\nuser_template = 'missing placeholder'\n",
+            "[bridge]\nllama_model_id = 'a'\n[[bridge.models]]\nid = 'a'\npath = '/a.gguf'\nprompt_profile = 'hy_mt'\nuser_template = '{text}'\n",
+            "[bridge]\nllama_model_id = 'a'\n[[bridge.models]]\nid = 'a'\npath = '/a.gguf'\nprompt_profile = 'hy_mt'\nsystem_prompt = 'nope'\n",
+            "[bridge]\nllama_model_id = 'a'\n[[bridge.models]]\nid = 'a'\npath = '/a.gguf'\nprompt_profile = 'hy_mt'\nenable_thinking = false\n",
+            "[bridge]\nllama_model_id = 'a'\n[[bridge.models]]\nid = 'a'\npath = '/a.gguf'\nprompt_profile = 'qwen_chat'\nuser_template = '{text}'\n",
+            "[bridge]\nllama_model_id = 'a'\n[[bridge.models]]\nid = 'a'\npath = '/a.gguf'\nprompt_profile = 'qwen_chat'\ncontext_window = 1\n",
+        ];
+        for body in invalid_cases {
+            let config: Config = toml::from_str(body).unwrap_or_else(|e| panic!("应能解析以测试校验：{body} ({e})"));
+            assert!(config.validate().is_err(), "应拒绝：{body}");
+        }
+
+        // 未知字段和未知 prompt_profile 在反序列化阶段拒绝。
+        for bad_toml in [
+            "[[bridge.models]]\nid = 'a'\npath = '/a.gguf'\nunknown_field = 1\n",
+            "[[bridge.models]]\nid = 'a'\npath = '/a.gguf'\nprompt_profile = 'unknown'\n",
+        ] {
+            assert!(toml::from_str::<Config>(bad_toml).is_err(), "应拒绝：{bad_toml}");
+        }
     }
 }

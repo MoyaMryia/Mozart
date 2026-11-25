@@ -460,3 +460,75 @@ fn llama_startup_args_use_host_socket() {
     let _ = std::fs::remove_file(&record);
     let _ = std::fs::remove_file(&script);
 }
+
+#[test]
+fn llama_startup_args_use_selected_bridge_model_config() {
+    let tag = std::process::id();
+    let record = std::env::temp_dir().join(format!("mozart-llama-model-argv-{tag}.txt"));
+    let script = std::env::temp_dir().join(format!("mozart-llama-model-argv-{tag}.sh"));
+    let _ = std::fs::remove_file(&record);
+    std::fs::write(
+        &script,
+        format!(
+            "#!/bin/sh\nprintf '%s\\n' \"$@\" > '{}'\nexec '{}' \"$@\"\n",
+            record.display(),
+            example("llama_stub").display(),
+        ),
+    )
+    .unwrap();
+    let mut perms = std::fs::metadata(&script).unwrap().permissions();
+    perms.set_mode(0o755);
+    std::fs::set_permissions(&script, perms).unwrap();
+
+    let daemon = DaemonProcess::start_full(
+        "llama-model-argv",
+        &example("pre_stub"),
+        &example("rvc_stub"),
+        &example("asr_stub"),
+        &example("tts_stub"),
+        &example("bridge_stub"),
+        &script,
+        "[daemon]\nrpc_timeout_ms = 300\n\n[rvc]\nmodel_id = \"demo\"\n\n\
+         [bridge]\nllama_model_id = \"hymt\"\n\n\
+         [[bridge.models]]\nid = \"hymt\"\npath = \"/opt/mozart/hymt.gguf\"\n\
+         prompt_profile = \"hy_mt\"\nctx_size = 1024\ncache_ram_mb = 64\n\
+         batch_size = 256\nubatch_size = 128\ngpu_layers = 99\nthreads = 3\n",
+    );
+    let conn = daemon.connect();
+    assert!(
+        wait_until(Duration::from_secs(5), || {
+            status(&conn).processes.llama.state == ProcessState::Running
+        }),
+        "llama did not start"
+    );
+    assert!(
+        wait_until(Duration::from_secs(5), || record.exists()),
+        "llama argv record was not written"
+    );
+    let argv: Vec<String> = std::fs::read_to_string(&record)
+        .unwrap()
+        .lines()
+        .map(str::to_string)
+        .collect();
+    let value_after = |flag: &str| {
+        argv.iter()
+            .position(|arg| arg == flag)
+            .and_then(|index| argv.get(index + 1))
+            .cloned()
+            .unwrap_or_default()
+    };
+    assert_eq!(value_after("-m"), "/opt/mozart/hymt.gguf");
+    assert_eq!(value_after("-c"), "1024");
+    assert_eq!(value_after("-b"), "256");
+    assert_eq!(value_after("-ub"), "128");
+    assert_eq!(value_after("--cache-ram"), "64");
+    assert_eq!(value_after("-ngl"), "99");
+    assert_eq!(value_after("-t"), "3");
+    assert_eq!(value_after("-tb"), "3");
+    assert_eq!(value_after("--host"), daemon.dir.join("llama.sock").to_str().unwrap());
+    assert!(argv.iter().any(|arg| arg == "--jinja"));
+
+    drop(conn);
+    let _ = std::fs::remove_file(&record);
+    let _ = std::fs::remove_file(&script);
+}

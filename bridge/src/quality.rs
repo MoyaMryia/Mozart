@@ -14,8 +14,23 @@ pub const MAX_LENGTH_RATIO: f64 = 5.0;
 pub const MIN_LENGTH_RATIO: f64 = 0.1;
 // 允许单字符原文译成短词组，不放行长句。
 const MIN_SOURCE_CHARS_FOR_UPPER_RATIO: usize = 2;
-/// 同一词出现次数超过该值视为过度重复（v1 补充规则）。
+/// 同一非虚词出现总次数超过该值视为过度重复（v1 补充规则）。
 pub const MAX_WORD_REPEATS: usize = 5;
+/// 任意词（含英文虚词）连续出现达到该次数视为退化复读（v1 补充规则）。
+pub const MAX_CONSECUTIVE_WORD_REPEATS: usize = 3;
+
+/// 英文高频虚词：正常长句中高频出现，不计入 `MAX_WORD_REPEATS`。
+const REPEAT_STOPWORDS: &[&str] = &[
+    "the", "a", "an", "to", "of", "and", "in", "on", "for", "is", "it", "that", "this", "with",
+    "as", "at", "by", "from", "or", "be", "are", "was", "were", "i", "you", "we", "they", "he",
+    "she", "not", "but", "so", "if", "have", "has", "had", "do", "does", "did", "will", "would",
+    "can", "could",
+];
+
+fn normalize_repeat_word(word: &str) -> String {
+    word.trim_matches(|c: char| !c.is_alphanumeric())
+        .to_ascii_lowercase()
+}
 
 /// 合格返回 Ok；拒绝返回原因（旧实现 "Translation rejected: ..." 格式）。
 /// source 为纠错后原文；finish_reason 来自 HTTP 响应；context 为先前句对。
@@ -40,12 +55,34 @@ pub fn check(
     if translated_chars > MAX_LENGTH_RATIO * upper_base || ratio < MIN_LENGTH_RATIO {
         return Err(format!("length ratio {ratio:.2} out of range"));
     }
-    let mut counts: HashMap<&str, usize> = HashMap::new();
-    for word in trimmed.split_whitespace() {
-        let count = counts.entry(word).or_insert(0);
+    let mut counts: HashMap<String, usize> = HashMap::new();
+    let mut prev_word: Option<String> = None;
+    let mut consecutive = 0usize;
+    for raw_word in trimmed.split_whitespace() {
+        let word = normalize_repeat_word(raw_word);
+        if word.is_empty() {
+            continue;
+        }
+        if prev_word.as_deref() == Some(word.as_str()) {
+            consecutive += 1;
+            if consecutive >= MAX_CONSECUTIVE_WORD_REPEATS {
+                return Err(format!(
+                    "word repeated {consecutive} times consecutively: {word}"
+                ));
+            }
+        } else {
+            prev_word = Some(word.clone());
+            consecutive = 1;
+        }
+        if REPEAT_STOPWORDS.contains(&word.as_str()) {
+            continue;
+        }
+        let count = counts.entry(word.clone()).or_insert(0);
         *count += 1;
         if *count > MAX_WORD_REPEATS {
-            return Err(format!("word repeated more than {MAX_WORD_REPEATS} times: {word}"));
+            return Err(format!(
+                "word repeated more than {MAX_WORD_REPEATS} times: {word}"
+            ));
         }
     }
 
@@ -156,13 +193,46 @@ mod tests {
 
     #[test]
     fn rejects_excessive_repetition() {
-        // 原文足够长，先过长度比值，再命中重复规则。
+        // 连续复读（>= 3 次）直接拦截。
         let repeated = "ok ok ok ok ok ok";
         assert!(check_ok("你好你好", repeated)
             .unwrap_err()
             .contains("word repeated"));
-        // 恰好 5 次合格。
-        assert!(check_ok("你好你好你好你好你好", "ok ok ok ok ok").is_ok());
+        // 大小写与首尾标点归一后仍拦实词复读。
+        let punctuated = "Ok, ok. OK! ok? ok; ok.";
+        assert!(check_ok("你好你好你好", punctuated)
+            .unwrap_err()
+            .contains("word repeated"));
+        // 非连续出现：恰好 5 次合格，超过 5 次拒绝。
+        let five_non_consecutive = "ok one ok two ok three ok four ok";
+        assert!(check_ok("你好你好你好你好你好你好你好", five_non_consecutive).is_ok());
+        let six_non_consecutive = "ok one ok two ok three ok four ok five ok";
+        assert!(check_ok("你好你好你好你好你好你好你好你好你好", six_non_consecutive)
+            .unwrap_err()
+            .contains("word repeated more than"));
+    }
+
+    #[test]
+    fn rejects_consecutive_stopword_repetition() {
+        let source = "今天我们在办公室讨论了很久，最后决定按原计划继续推进。";
+        for bad in [
+            "The the the meeting starts soon.",
+            "I, I, I think we should go.",
+            "We talked and and and left.",
+        ] {
+            let err = check_ok(source, bad).unwrap_err();
+            assert!(err.contains("consecutively"), "{bad} -> {err}");
+        }
+        // 合法英语语法中的 2 次连续虚词放行（如 that that）。
+        assert!(check_ok(source, "He knew that that plan was solid.").is_ok());
+    }
+
+    #[test]
+    fn accepts_long_sentence_with_frequent_english_stopwords() {
+        let source = "今天上午我在办公室整理了桌面上的文件，顺便把窗边的台灯和门口的箱子都收拾好了。";
+        let translation = "The manager checked the report on the desk in the office near the window by the door under the lamp.";
+        // 包含 7 次非连续 "the"（含首字母大写 "The"），属于正常英文长句，不得误杀。
+        assert!(check_ok(source, translation).is_ok());
     }
 
     #[test]
