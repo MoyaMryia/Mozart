@@ -16,7 +16,7 @@ const stateClass = (online: boolean) => `font-mono text-tiny font-bold ${online 
 </script>
 
 <template>
-  <div class="resource-strip w-full md:w-auto min-w-0 grid grid-cols-2 md:flex md:flex-nowrap items-center gap-x-3 gap-y-1 md:gap-0 px-0.5 md:px-0" role="group" aria-label="连接与资源">
+  <div class="resource-strip w-full md:w-auto min-w-0 grid grid-cols-2 md:flex md:flex-nowrap items-center gap-x-4 gap-y-2 md:gap-0 px-0.5 md:px-0" role="group" aria-label="连接与资源">
     <div data-status="api" class="hardware-stat flex items-center gap-1.5 md:gap-2 min-w-0 py-0.5 md:px-3 md:py-1">
       <svg class="hardware-icon" aria-hidden="true" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" viewBox="0 0 24 24"><rect width="20" height="8" x="2" y="2" rx="2" ry="2"/><rect width="20" height="8" x="2" y="14" rx="2" ry="2"/><path d="M6 6h.01M6 18h.01M10 6h8m-8 12h8"/></svg>
       <span class="hw-label">API</span> <span :class="[stateClass(online), 'ml-auto md:ml-0 inline-block md:min-w-[3em] text-right truncate']">{{ online ? '在线' : '未连接' }}</span>

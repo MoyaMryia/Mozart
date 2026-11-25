@@ -76,8 +76,8 @@ onUnmounted(() => { for (const timer of timers.values()) clearTimeout(timer); })
 </script>
 
 <template>
-  <section :class="embedded ? 'border-t border-edge-soft pt-3 mt-3' : 'card p-3.5 md:p-3'" aria-label="变声参数">
-    <div class="flex items-center gap-2 mb-2 min-w-0">
+  <section :class="embedded ? 'border-t border-edge-soft pt-4 md:pt-3 mt-4 md:mt-3' : 'card p-5 md:p-3'" aria-label="变声参数">
+    <div class="flex items-center gap-2 mb-2.5 md:mb-2 min-w-0">
       <h2 class="text-sm font-extrabold tracking-wider text-ink uppercase section-title shrink-0">参数</h2>
       <!-- 与 default 预设不同时才出现：保存为默认、恢复默认。 -->
       <div class="preset-actions" :class="{ 'is-visible': presetDirty }" :aria-hidden="!presetDirty">
@@ -90,13 +90,13 @@ onUnmounted(() => { for (const timer of timers.values()) clearTimeout(timer); })
       </div>
       <span v-if="!embedded" class="text-micro font-mono font-bold text-ink-2 bg-surface border border-edge rounded-md px-2 py-1 max-w-[60%] truncate ml-auto shrink-0" translate="no">{{ modelId ?? '未加载模型' }}</span>
     </div>
-    <AlertBanner :message="error" dismissible class="mb-2.5" @dismiss="emit('dismissError')" />
-    <p class="text-micro text-ink-3 mb-2">F0 方法：{{ params?.f0_method ?? '未知' }}（只读）</p>
-    <form v-for="field in fields" :key="field.key" class="grid grid-cols-[1fr_auto] items-center gap-3 py-2 border-b border-edge last:border-b-0" @submit.prevent>
-      <label :for="'param-' + field.key" class="text-xs font-bold text-ink-2 truncate">{{ field.label }}</label>
+    <AlertBanner :message="error" dismissible class="mb-3 md:mb-2.5" @dismiss="emit('dismissError')" />
+    <p class="text-xs md:text-micro text-ink-3 mb-2.5 md:mb-2">F0 方法：{{ params?.f0_method ?? '未知' }}（只读）</p>
+    <form v-for="field in fields" :key="field.key" class="grid grid-cols-[1fr_auto] items-center gap-3 py-3 md:py-2 border-b border-edge last:border-b-0" @submit.prevent>
+      <label :for="'param-' + field.key" class="text-sm md:text-xs font-bold text-ink-2 truncate">{{ field.label }}</label>
       <div class="param-stepper">
         <button type="button" class="stepper-btn md:hidden" :aria-label="'减小' + field.label" :disabled="blocked || !ready || !params" @click="nudge(field.key, -field.step)">−</button>
-        <input :id="'param-' + field.key" type="number" inputmode="decimal" step="any" required class="field w-20 md:w-24 h-9 md:h-8 text-center md:text-right font-mono text-sm font-extrabold px-2 tabular-nums" :value="draft[field.key]" :disabled="blocked || !ready || !params" @input="change(field.key, $event)" @blur="blur(field.key)">
+        <input :id="'param-' + field.key" type="number" inputmode="decimal" step="any" required class="field w-20 md:w-24 h-11 md:h-8 text-center md:text-right font-mono text-base md:text-sm font-extrabold px-2 tabular-nums" :value="draft[field.key]" :disabled="blocked || !ready || !params" @input="change(field.key, $event)" @blur="blur(field.key)">
         <button type="button" class="stepper-btn md:hidden" :aria-label="'增大' + field.label" :disabled="blocked || !ready || !params" @click="nudge(field.key, field.step)">+</button>
       </div>
     </form>

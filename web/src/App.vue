@@ -145,43 +145,43 @@ onUnmounted(() => { sectionObserver?.disconnect(); });
 
   <div class="app-frame md:flex-1 md:min-h-0">
   <!-- 顶部状态导航条：移动端 3 行清晰分组，桌面端单行居中。 -->
-  <header class="app-header grid grid-cols-[1fr_auto_auto] md:flex md:flex-nowrap items-center md:justify-center gap-x-2 gap-y-2.5 md:gap-3 px-3.5 pt-[max(0.75rem,env(safe-area-inset-top))] pb-2.5 md:px-8 md:py-3.5 bg-app shrink-0">
-    <div class="flex items-center gap-2 min-w-0 md:order-1">
-      <h1 class="text-lg font-extrabold tracking-tight text-ink shrink-0" translate="no">MOZART</h1>
+  <header class="app-header grid grid-cols-[1fr_auto_auto] md:flex md:flex-nowrap items-center md:justify-center gap-x-2 gap-y-3.5 md:gap-3 px-4 pt-[max(1rem,env(safe-area-inset-top))] pb-3.5 md:px-8 md:py-3.5 bg-app shrink-0">
+    <div class="flex items-center gap-2.5 md:gap-2 min-w-0 pl-2.5 md:pl-0 md:order-1">
+      <h1 class="text-2xl md:text-lg font-extrabold tracking-tight text-ink shrink-0" translate="no">MOZART</h1>
       <div class="flex items-center gap-1.5 min-w-0" :title="activity.stateText" :aria-label="activity.stateText" role="img">
         <span class="relative inline-flex items-center justify-center shrink-0">
           <svg v-if="activity.running || activity.starting" :class="['system-state-icon', activity.stateTone, { 'state-pulse': activity.starting }]" aria-hidden="true" fill="currentColor" viewBox="0 0 48 48"><path d="M24 2a22 22 0 1 0 0 44 22 22 0 0 0 0-44Z"/><path fill="#fff" d="m20 15 14 9-14 9V15Z"/></svg>
           <svg v-else :class="['system-state-icon', activity.stateTone]" aria-hidden="true" fill="currentColor" viewBox="0 0 48 48"><path d="M24 2a22 22 0 1 0 0 44 22 22 0 0 0 0-44Z"/><path fill="#fff" d="M16 16h16v16H16V16Z"/></svg>
         </span>
-        <span :class="['md:hidden text-tiny font-bold truncate', activity.stateTone]">{{ activity.stateText }}</span>
+        <span :class="['md:hidden text-xs font-bold truncate', activity.stateTone]">{{ activity.stateText }}</span>
       </div>
     </div>
 
     <div class="col-span-3 md:col-span-1 md:order-2 transport-control transport-control-2 transport-compact shrink-0" role="group" aria-label="系统运行控制">
       <button type="button" data-state="running" class="transport-button" aria-label="启动系统" title="启动业务服务组" :aria-pressed="activity.running" :class="{ 'is-active': activity.running }" :disabled="busy.lifecycle || !!unknowns.system.length" @click="ui.perform('lifecycle', client.up)">
-        <svg class="w-4 h-4" aria-hidden="true" fill="currentColor" viewBox="0 0 24 24"><path d="M8 5v14l11-7L8 5Z"/></svg>
-        <span class="text-xs md:text-tiny font-bold">启动系统</span>
+        <svg class="w-[18px] h-[18px] md:w-4 md:h-4" aria-hidden="true" fill="currentColor" viewBox="0 0 24 24"><path d="M8 5v14l11-7L8 5Z"/></svg>
+        <span class="text-sm md:text-tiny font-bold">启动系统</span>
       </button>
       <button type="button" data-state="stopped" class="transport-button" aria-label="停止系统" title="停止业务服务组；daemon 与页面保持在线" :aria-pressed="ready && !!status && !activity.running" :class="{ 'is-active': ready && !!status && !activity.running }" :disabled="busy.lifecycle || systemBlocked || !status" @click="ui.perform('lifecycle', client.down)">
-        <svg class="w-4 h-4" aria-hidden="true" fill="currentColor" viewBox="0 0 24 24"><path d="M6 6h12v12H6V6Z"/></svg>
-        <span class="text-xs md:text-tiny font-bold">停止系统</span>
+        <svg class="w-[18px] h-[18px] md:w-4 md:h-4" aria-hidden="true" fill="currentColor" viewBox="0 0 24 24"><path d="M6 6h12v12H6V6Z"/></svg>
+        <span class="text-sm md:text-tiny font-bold">停止系统</span>
       </button>
     </div>
 
     <button type="button" class="col-start-2 row-start-1 md:order-3 icon-button shrink-0" aria-label="刷新" title="刷新状态" :disabled="writing || reloading" @click="ui.reload()">
-      <RefreshIcon :spinning="reloading" />
+      <RefreshIcon :spinning="reloading" size-class="w-[22px] h-[22px] md:w-4 md:h-4" />
     </button>
 
     <ResourceStats class="col-span-3 md:col-span-1 md:order-4" :online="adapterOnline" :ready="ready" :status="status" />
 
     <button type="button" class="col-start-3 row-start-1 md:order-5 icon-button theme-toggle shrink-0" :aria-pressed="theme === 'dark'" aria-label="切换亮暗主题" :title="theme === 'dark' ? '切换到亮色主题' : '切换到暗色主题'" @click="toggleTheme">
-      <svg v-if="theme === 'dark'" class="w-4 h-4" aria-hidden="true" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" viewBox="0 0 24 24"><circle cx="12" cy="12" r="4"/><path d="M12 2v2m0 16v2M4.93 4.93l1.41 1.41m11.32 11.32 1.41 1.41M2 12h2m16 0h2M4.93 19.07l1.41-1.41M17.66 6.34l1.41-1.41"/></svg>
-      <svg v-else class="w-4 h-4" aria-hidden="true" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" viewBox="0 0 24 24"><path d="M21 12.79A9 9 0 1 1 11.21 3 7 7 0 0 0 21 12.79Z"/></svg>
+      <svg v-if="theme === 'dark'" class="w-[22px] h-[22px] md:w-4 md:h-4" aria-hidden="true" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" viewBox="0 0 24 24"><circle cx="12" cy="12" r="4"/><path d="M12 2v2m0 16v2M4.93 4.93l1.41 1.41m11.32 11.32 1.41 1.41M2 12h2m16 0h2M4.93 19.07l1.41-1.41M17.66 6.34l1.41-1.41"/></svg>
+      <svg v-else class="w-[22px] h-[22px] md:w-4 md:h-4" aria-hidden="true" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" viewBox="0 0 24 24"><path d="M21 12.79A9 9 0 1 1 11.21 3 7 7 0 0 0 21 12.79Z"/></svg>
     </button>
   </header>
 
   <!-- 主布局：移动端按实时操作优先级单列排布；桌面端左会话文件 / 右控制设备 -->
-  <main id="content" class="flex-1 min-h-0 flex flex-col gap-3.5 px-3 pt-1 pb-[calc(5.25rem+env(safe-area-inset-bottom))] md:p-0 md:gap-0 md:grid md:grid-cols-[1fr_340px] bg-app overflow-visible md:overflow-hidden">
+  <main id="content" class="flex-1 min-h-0 flex flex-col gap-5 px-4 pt-1.5 pb-[calc(6rem+env(safe-area-inset-bottom))] md:p-0 md:gap-0 md:grid md:grid-cols-[1fr_340px] bg-app overflow-visible md:overflow-hidden">
 
     <div class="workspace contents md:flex md:flex-col md:flex-1 md:min-h-0 md:gap-3 md:px-5 md:py-4 md:w-full md:overflow-y-auto md:h-full">
       <div class="order-2 md:order-none space-y-3">
@@ -193,7 +193,7 @@ onUnmounted(() => { sectionObserver?.disconnect(); });
           @dismiss-error="ui.dismissError('speech')" />
       </div>
       <SubtitlesPanel class="order-3 md:order-none" :records="records" :state="subtitleState" />
-      <div id="sec-files" class="order-6 md:order-none scroll-mt-3">
+      <div id="sec-files" class="order-6 md:order-none scroll-mt-4">
         <FilesPanel :key="uploadGeneration" :jobs="jobs" :paused="paused" :ready="ready && filesFresh" :busy="busy.files" :reloading="reloading" :refresh-blocked="writing"
           :ack-ready="ui.canAcknowledge('files')" :download-supported="downloadSupported" :error="filesError" :unknowns="unknowns.files" @acknowledge="ui.acknowledge('files')"
           @submit="ui.submit" @cancel="jobId => ui.perform('files', () => client.cancel(jobId))"
@@ -204,17 +204,17 @@ onUnmounted(() => { sectionObserver?.disconnect(); });
     </div>
 
     <aside class="right-sidebar contents md:flex md:flex-col md:gap-5 md:p-4 md:border-l md:border-edge-soft bg-app md:overflow-y-auto md:h-full" aria-label="控制与设备">
-      <div id="sec-live" class="order-1 md:order-none space-y-3 scroll-mt-3">
+      <div id="sec-live" class="order-1 md:order-none space-y-3 scroll-mt-4">
         <PendingResult :messages="unknowns.system" :enabled="ui.canAcknowledge('system')" :busy="busy.system" @acknowledge="ui.acknowledge('system')" />
         <!-- 路由切换 -->
-        <section class="card p-3.5 md:p-3" aria-label="路由切换">
-          <div class="flex items-center justify-between gap-2 mb-2 min-w-0">
+        <section class="card p-5 md:p-3" aria-label="路由切换">
+          <div class="flex items-center justify-between gap-2 mb-3 md:mb-2 min-w-0">
             <h2 class="text-base font-extrabold tracking-wider text-ink uppercase section-title shrink-0">路由</h2>
             <span class="text-micro font-mono text-ink-3 truncate">实际：{{ ready && status ? status.route.active : '未知' }}</span>
           </div>
-          <AlertBanner :message="errors.route" dismissible class="mb-2.5" @dismiss="ui.dismissError('route')" />
+          <AlertBanner :message="errors.route" dismissible class="mb-3 md:mb-2.5" @dismiss="ui.dismissError('route')" />
           <label for="system-route" class="sr-only">路由</label>
-          <select id="system-route" class="field w-full min-w-0 text-sm md:text-xs px-3 py-2.5 md:py-2" :value="routeValue" :disabled="busy.route || systemBlocked || !status" @change="selectRoute">
+          <select id="system-route" class="field w-full min-w-0 min-h-[46px] md:min-h-0 text-base md:text-xs px-3.5 py-2.5 md:px-3 md:py-2" :value="routeValue" :disabled="busy.route || systemBlocked || !status" @change="selectRoute">
             <option value="" disabled>未知</option><option value="direct">直出</option><option value="rvc">变声</option>
           </select>
         </section>
@@ -231,19 +231,19 @@ onUnmounted(() => { sectionObserver?.disconnect(); });
       </div>
 
       <!-- 变声音色：模型、default 预设与参数在同一卡片 -->
-      <section id="sec-voice" class="card p-3.5 md:p-3 order-4 md:order-none scroll-mt-3" aria-label="变声音色">
-        <div class="flex items-center gap-2 mb-2 min-w-0">
+      <section id="sec-voice" class="card p-5 md:p-3 order-4 md:order-none scroll-mt-4" aria-label="变声音色">
+        <div class="flex items-center gap-2 mb-3 md:mb-2 min-w-0">
           <h2 class="text-base font-extrabold tracking-wider text-ink uppercase section-title shrink-0">变声音色</h2>
           <span class="text-micro font-mono font-bold text-ink-2 bg-surface border border-edge rounded-md px-2 py-0.5 max-w-[55%] truncate ml-auto shrink-0" translate="no">{{ ready ? (status?.rvc?.model_id ?? '未加载') : '未知' }}</span>
         </div>
-        <AlertBanner :message="voiceError" dismissible class="mb-2.5" @dismiss="dismissErrorGroup('voice')" />
+        <AlertBanner :message="voiceError" dismissible class="mb-3 md:mb-2.5" @dismiss="dismissErrorGroup('voice')" />
         <label for="model-select" class="sr-only">切换模型</label>
-        <select id="model-select" v-model="selectedModel" class="field w-full min-w-0 text-sm md:text-xs px-3 py-2.5 md:py-2" autocomplete="off" :disabled="busy.model || systemBlocked || !modelsFresh">
+        <select id="model-select" v-model="selectedModel" class="field w-full min-w-0 min-h-[46px] md:min-h-0 text-base md:text-xs px-3.5 py-2.5 md:px-3 md:py-2" autocomplete="off" :disabled="busy.model || systemBlocked || !modelsFresh">
           <option value="">选择模型</option>
           <option v-for="item in models" :key="item.id" :value="item.id" :disabled="!item.exists">{{ item.id }}{{ item.loaded ? '（当前）' : '' }}{{ item.exists ? '' : '（缺失）' }}</option>
         </select>
-        <button class="btn btn-accent btn-sm w-full mt-2.5 min-h-[38px] md:min-h-0" :disabled="busy.model || systemBlocked || !selectedModel || !modelsFresh || !models.some(item => item.id === selectedModel && item.exists)" @click="ui.perform('model', () => client.useModel(selectedModel), { context: '切换模型' })">使用模型</button>
-        <PendingResult class="mt-2.5" :messages="unknowns.params" :enabled="ui.canAcknowledge('params')" :busy="busy.params" @acknowledge="ui.acknowledge('params')" />
+        <button class="btn btn-accent btn-sm w-full mt-3 md:mt-2.5 min-h-[46px] md:min-h-0 text-sm md:text-[11px]" :disabled="busy.model || systemBlocked || !selectedModel || !modelsFresh || !models.some(item => item.id === selectedModel && item.exists)" @click="ui.perform('model', () => client.useModel(selectedModel), { context: '切换模型' })">使用模型</button>
+        <PendingResult class="mt-3 md:mt-2.5" :messages="unknowns.params" :enabled="ui.canAcknowledge('params')" :busy="busy.params" @acknowledge="ui.acknowledge('params')" />
         <ParamsPanel embedded :params="ready ? status?.rvc_params ?? null : null" :model-id="ready ? status?.rvc?.model_id ?? null : null" :ready="ready" :blocked="!!unknowns.params.length" :error="errors.params"
           :preset-dirty="presetDirty" :preset-busy="busy.model || busy.system || busy.params || !!unknowns.system.length || !!unknowns.params.length"
           @set="ui.setParam"
@@ -252,7 +252,7 @@ onUnmounted(() => { sectionObserver?.disconnect(); });
           @dismiss-error="ui.dismissError('params')" />
       </section>
 
-      <SystemPanel id="sec-system" class="order-7 md:order-none scroll-mt-3" :status="status" :connected="ready" :busy="busy.system" :write-blocked="!!unknowns.system.length" :error="errors.system"
+      <SystemPanel id="sec-system" class="order-7 md:order-none scroll-mt-4" :status="status" :connected="ready" :busy="busy.system" :write-blocked="!!unknowns.system.length" :error="errors.system"
         @restart="ui.restart" @dismiss-error="ui.dismissError('system')" />
     </aside>
   </main>

@@ -13,13 +13,13 @@ const emit = defineEmits<{ translate: [enabled: boolean]; speech: [enabled: bool
 </script>
 
 <template>
-  <section class="card p-4 space-y-3" aria-label="翻译播报">
+  <section class="card p-5 md:p-4 space-y-4 md:space-y-3" aria-label="翻译播报">
     <div class="flex items-center gap-2 min-w-0">
       <h2 class="text-base md:text-lg font-extrabold text-ink shrink-0">翻译播报</h2>
       <span v-if="missing" class="chip chip-muted ml-auto shrink-0">{{ missing === '未连接' ? '未连接' : `${missing}未连接` }}</span>
     </div>
     <AlertBanner :message="error" dismissible @dismiss="emit('dismissError')" />
-    <div class="flex flex-wrap gap-2.5 md:gap-3">
+    <div class="flex flex-wrap gap-3">
       <label class="toggle-pill" :class="{ 'is-checked': actual.translate, 'is-disabled': busy || !ready || !status?.bridge }">
         <input type="checkbox" class="toggle-pill-input" :checked="actual.translate" :disabled="busy || !ready || !status?.bridge" @change="requestCheckbox($event, actual.translate, value => emit('translate', value))">
         <span class="toggle-pill-dot" aria-hidden="true"></span>

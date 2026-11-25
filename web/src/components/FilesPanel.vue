@@ -34,7 +34,7 @@ function onDrop(event: DragEvent) {
 </script>
 
 <template>
-  <section class="card p-4 space-y-3.5 md:space-y-4" aria-label="文件转换">
+  <section class="card p-5 md:p-4 space-y-4" aria-label="文件转换">
     <div class="flex items-center gap-2 min-w-0">
       <h2 class="text-base md:text-lg font-extrabold text-ink shrink-0">文件转换</h2>
       <div class="ml-auto flex items-center gap-0.5 md:gap-1 shrink-0">
@@ -48,7 +48,7 @@ function onDrop(event: DragEvent) {
     <AlertBanner :message="error" dismissible @dismiss="emit('dismissError')" />
     <PendingResult :messages="unknowns" :enabled="ackReady" :busy="busy" label="已核对队列" @acknowledge="emit('acknowledge')" />
     <label
-      class="dropzone relative p-5 md:p-6 flex flex-col items-center justify-center cursor-pointer"
+      class="dropzone relative py-8 px-5 md:p-6 flex flex-col items-center justify-center cursor-pointer"
       :class="{ 'opacity-50 cursor-not-allowed': uploadDisabled, 'is-dragging': dragging }"
       @dragenter.prevent="onDragEnter"
       @dragover.prevent="onDragEnter"
@@ -73,7 +73,7 @@ function onDrop(event: DragEvent) {
       <ul class="bg-surface border-2 border-[color:var(--edge)] rounded-xl card-shadow overflow-hidden max-h-[280px] overflow-y-auto list-none">
         <li v-if="!jobs.length" class="px-3 py-6 text-center text-xs text-ink-3">暂无任务</li>
         <li v-for="job in jobs" :key="job.job_id" class="border-b border-edge-soft last:border-b-0">
-          <div class="px-3 py-2.5">
+          <div class="px-3.5 py-3.5 md:px-3 md:py-2.5">
             <div class="flex items-center gap-2.5 md:gap-3">
               <div class="min-w-0 flex-1">
                 <div class="text-sm font-bold text-ink truncate">{{ job.name }}</div>

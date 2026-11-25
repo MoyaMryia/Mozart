@@ -50,7 +50,7 @@ onUnmounted(() => { observer?.disconnect(); });
 
 <template>
   <!-- 默认收起；有字幕时在两张大卡片之间弹出，向上滚动可回看之前的句子。 -->
-  <section v-if="records.length" class="subtitles px-1 py-2" aria-label="实时字幕" :data-online="active">
+  <section v-if="records.length" class="subtitles px-1 py-3.5 md:py-2" aria-label="实时字幕" :data-online="active">
     <div class="flex items-center justify-between gap-3">
       <h2 :class="['text-base md:text-lg font-extrabold tracking-tight font-mono shrink-0', active ? 'text-ink' : 'text-ink-4']" translate="no">SUB</h2>
       <Transition name="alert-fade">

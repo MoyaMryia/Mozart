@@ -22,19 +22,19 @@ const toneOf = (service: Service) => stateOf(service) === 'running' ? 'state-ok'
 </script>
 
 <template>
-  <section class="card p-3.5 md:p-3" aria-label="服务">
-    <div class="flex items-center justify-between gap-2 mb-1.5">
+  <section class="card p-5 md:p-3" aria-label="服务">
+    <div class="flex items-center justify-between gap-2 mb-2.5 md:mb-1.5">
       <h2 class="text-base font-extrabold tracking-wider text-ink uppercase section-title">服务</h2>
       <span v-if="!connected || !status" class="chip chip-muted">未连接</span>
     </div>
 
-    <AlertBanner :message="error" dismissible class="mb-2" @dismiss="emit('dismissError')" />
+    <AlertBanner :message="error" dismissible class="mb-2.5 md:mb-2" @dismiss="emit('dismissError')" />
 
     <p v-if="connected && status?.pending_restart.length" class="text-micro text-ink-3 mb-1">待重启：{{ status.pending_restart.join('、') }}</p>
     <p v-if="connected && status?.pending_restart_keys.length" class="text-micro text-ink-4 font-mono mb-1 break-all">{{ status.pending_restart_keys.join('、') }}</p>
 
     <ul class="list-none">
-      <li v-for="service in services" :key="service" class="py-1.5 border-t border-edge-soft first:border-t-0">
+      <li v-for="service in services" :key="service" class="py-2.5 md:py-1.5 border-t border-edge-soft first:border-t-0">
         <div class="flex items-center gap-2">
           <span class="font-mono text-sm font-bold text-ink">{{ service }}</span>
           <span class="relative inline-flex items-center justify-center shrink-0">
