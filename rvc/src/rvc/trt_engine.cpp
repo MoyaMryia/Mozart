@@ -1,5 +1,5 @@
 // trt_engine.cpp — TensorRT 10 直载实现（见头文件）
-// 搬运自 Mozart-Old/rvc-backend/src/rvc/trt_engine.cpp，未改动。
+// 搬运自 Mozart-Old/rvc-backend/src/rvc/trt_engine.cpp，改动：引入有上限的 CUDA 锁页缓冲并支持回退普通拷贝。
 #include "rvc/trt_engine.hpp"
 #include "rvc/profile.hpp"
 #include <spdlog/spdlog.h>
@@ -157,14 +157,6 @@ bool TrtEngine::load(const std::filesystem::path& engine_path) {
                 return false;
             }
             t.capacity_bytes = t.bytes;
-            if (cudaMallocHost(&t.host_pinned, t.bytes) != cudaSuccess) {
-                spdlog::error("cudaMallocHost {} bytes failed for {}", t.bytes, name);
-                cudaFree(t.dev);
-                t.dev = nullptr;
-                unload();
-                return false;
-            }
-            t.host_capacity_bytes = t.bytes;
         }
         if (t.is_input) {
             input_types_[t.name] = t.dtype == 8 ? OnnxInput::Type::Int64
@@ -241,17 +233,32 @@ size_t checked_elements(const std::vector<int64_t>& shape) {
     return result;
 }
 
+// 单张量锁页内存上限（4 MiB）：实时链路全部张量均 < 1 MiB，始终走锁页异步；
+// 离线长音频动态大张量（如 24 s 窗）自动回退普通可分页内存，避免在 8 GB 统一内存
+// 设备上长期钉死数十 MB 不可换出物理内存。
+constexpr size_t kMaxPinnedHostBytes = 4 * 1024 * 1024;
+
 } // namespace
 
-void TrtEngine::ensure_host_pinned(Tensor& tensor, size_t bytes) {
-    if (bytes == 0 || bytes <= tensor.host_capacity_bytes) return;
+bool TrtEngine::ensure_host_pinned(Tensor& tensor, size_t bytes) {
+    if (bytes == 0 || bytes > kMaxPinnedHostBytes) return false;
+    if (bytes <= tensor.host_capacity_bytes) return tensor.host_pinned != nullptr;
+    // 先释放旧块再申请新块（调用方已持 execution_mutex_ 且流上无未完成拷贝），避免扩容瞬时双倍占位。
+    if (tensor.host_pinned) {
+        cudaFreeHost(tensor.host_pinned);
+        tensor.host_pinned = nullptr;
+        tensor.host_capacity_bytes = 0;
+    }
     void* fresh = nullptr;
     if (cudaMallocHost(&fresh, bytes) != cudaSuccess) {
-        throw std::runtime_error("TRT pinned host allocation failed: " + tensor.name);
+        (void)cudaGetLastError();
+        spdlog::warn("TRT pinned host alloc ({} bytes) failed for {}, falling back to pageable copy",
+                     bytes, tensor.name);
+        return false;
     }
-    if (tensor.host_pinned) cudaFreeHost(tensor.host_pinned);
     tensor.host_pinned = fresh;
     tensor.host_capacity_bytes = bytes;
+    return true;
 }
 
 TrtEngine::Tensor& TrtEngine::enqueue(
@@ -328,7 +335,6 @@ TrtEngine::Tensor& TrtEngine::enqueue(
             }
             tensor.capacity_bytes = tensor.bytes;
         }
-        ensure_host_pinned(tensor, tensor.bytes);
         if (!context->setTensorAddress(tensor.name.c_str(), tensor.dev)) {
             throw std::runtime_error("TRT tensor binding failed: " + tensor.name);
         }
@@ -337,18 +343,28 @@ TrtEngine::Tensor& TrtEngine::enqueue(
     for (const auto& input : inputs) {
         Tensor* tensor = find_tensor(input.name);
         if (linked && linked_name && tensor->name == linked_name) continue;
-        ensure_host_pinned(*tensor, tensor->bytes);
+        const bool pinned = ensure_host_pinned(*tensor, tensor->bytes);
+        const void* host = nullptr;
         if (tensor->dtype == 8) {
             if (input.type != OnnxInput::Type::Int64 || input.int64s.size() != tensor->elems) {
                 throw std::invalid_argument("TRT int64 input mismatch: " + tensor->name);
             }
-            if (tensor->bytes > 0) {
+            if (pinned) {
                 std::memcpy(tensor->host_pinned, input.int64s.data(), tensor->bytes);
+                host = tensor->host_pinned;
+            } else {
+                host = input.int64s.data();
             }
         } else if (tensor->dtype == 3) {
             const size_t count = input.type == OnnxInput::Type::Int64 ? input.int64s.size() : input.floats.size();
             if (count != tensor->elems) throw std::invalid_argument("TRT int32 input mismatch: " + tensor->name);
-            auto* dst = static_cast<int32_t*>(tensor->host_pinned);
+            int32_t* dst = nullptr;
+            if (pinned) {
+                dst = static_cast<int32_t*>(tensor->host_pinned);
+            } else {
+                tensor->int32_staging.resize(count);
+                dst = tensor->int32_staging.data();
+            }
             for (size_t i = 0; i < count; ++i) {
                 const double value = input.type == OnnxInput::Type::Int64
                     ? static_cast<double>(input.int64s[i]) : static_cast<double>(input.floats[i]);
@@ -357,18 +373,22 @@ TrtEngine::Tensor& TrtEngine::enqueue(
                 }
                 dst[i] = static_cast<int32_t>(value);
             }
+            host = dst;
         } else if (tensor->dtype == 0) {
             if (input.type != OnnxInput::Type::Float || input.floats.size() != tensor->elems) {
                 throw std::invalid_argument("TRT float input mismatch: " + tensor->name);
             }
-            if (tensor->bytes > 0) {
+            if (pinned) {
                 std::memcpy(tensor->host_pinned, input.floats.data(), tensor->bytes);
+                host = tensor->host_pinned;
+            } else {
+                host = input.floats.data();
             }
         } else {
             throw std::invalid_argument("TRT input dtype is unsupported: " + tensor->name);
         }
         if (tensor->bytes > 0
-            && cudaMemcpyAsync(tensor->dev, tensor->host_pinned, tensor->bytes,
+            && cudaMemcpyAsync(tensor->dev, host, tensor->bytes,
                                cudaMemcpyHostToDevice, stream) != cudaSuccess) {
             throw std::runtime_error("TRT input copy failed: " + tensor->name);
         }
@@ -381,16 +401,19 @@ std::vector<float> TrtEngine::read_output(Tensor& output, void* execution_stream
     auto stream = static_cast<cudaStream_t>(execution_stream);
     std::vector<float> result(output.elems);
     if (output.bytes == 0) return result;
-    ensure_host_pinned(output, output.bytes);
-    // 锁页缓冲随 Tensor 存活，StreamDrain 保证异常退出前流已排干。
+    const bool pinned = ensure_host_pinned(output, output.bytes);
+    void* dst = pinned ? output.host_pinned : static_cast<void*>(result.data());
+    // StreamDrain 保证异常退出前流已排干，不访问已释放缓冲区。
     StreamDrain drain(execution_stream);
-    if (cudaMemcpyAsync(output.host_pinned, output.dev, output.bytes,
+    if (cudaMemcpyAsync(dst, output.dev, output.bytes,
                         cudaMemcpyDeviceToHost, stream) != cudaSuccess
         || cudaStreamSynchronize(stream) != cudaSuccess) {
         throw std::runtime_error("TRT output copy or synchronization failed");
     }
     drain.release();
-    std::memcpy(result.data(), output.host_pinned, output.bytes);
+    if (pinned) {
+        std::memcpy(result.data(), output.host_pinned, output.bytes);
+    }
     return result;
 }
 
@@ -457,7 +480,10 @@ std::vector<float> TrtEngine::run(
 }
 
 void TrtEngine::unload() {
-    if (stream_) cudaStreamDestroy(static_cast<cudaStream_t>(stream_));
+    if (stream_) {
+        cudaStreamSynchronize(static_cast<cudaStream_t>(stream_));
+        cudaStreamDestroy(static_cast<cudaStream_t>(stream_));
+    }
     for (auto& t : tensors_) {
         if (t.dev) cudaFree(t.dev);
         if (t.host_pinned) cudaFreeHost(t.host_pinned);
