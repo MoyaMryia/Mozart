@@ -53,6 +53,12 @@
 ~/mozart-samples/             # 测试音频样本
 ~/mozart-archive/             # 归档：原始权重、基准引擎
 └── legacy/                   # 历史实验目录，仅作追溯
+
+# 可选 systemd 托管文件（仅运行 tools/install-jetson-systemd.sh 时写入）
+/etc/systemd/system/mozart-clocks.service  # 开机定频（jetson_clocks）
+/etc/systemd/system/mozart.service         # 运行时自启（普通运行用户前台托管 daemon）
+/etc/sudoers.d/mozart-deploy               # 最小权限免密（仅放行启停/重启 mozart.service）
+/var/lib/mozart/l4t_dfs.conf               # 原动态调频备份（停止 mozart-clocks 时恢复）
 ```
 
 规则：
@@ -73,7 +79,7 @@
 
 ## 工作流
 
-本机执行，四条命令职责分开：
+本机执行，常用命令按职责分开：
 
 ```bash
 # 本机全量即时测试
@@ -81,6 +87,9 @@ tools/ci-local.sh all
 
 # 部署：同步 → 构建 → 安装 → 重启；不跑测试
 MOZART_JETSON=<SSH目标> tools/deploy-jetson.sh
+
+# 安装 Jetson 开机定频与自启 systemd 服务（默认自动调速风扇，可选 --restart=no / --fan / --uninstall）
+MOZART_JETSON=<SSH目标> tools/install-jetson-systemd.sh
 
 # 仅前端部署：构建 web → 替换运行位 web/dist；不编后端、不停栈、不重启
 MOZART_JETSON=<SSH目标> tools/deploy-web.sh
@@ -116,16 +125,41 @@ MOZART_JETSON=<SSH目标> uv run tools/jetson-audio.py
 3. 构建 Rust 全部二进制与示例；构建 `jetson-release` C++ 产物；rvc 对齐到 `target/debug`。增量时 cargo/ninja 只重编受影响部分。
 4. 构建前停止整栈，释放共享内存；保持停机至安装完成。
 5. 备份 `~/mozart-runtime/bin` 到 `bin.prev` 与 `web.prev`；安装 9 个程序、静态资源与 `examples/rvc_stub`，并清理旧 `bin/mozart-web-service`。安装用临时文件加原子替换，不打断运行中的进程；若配置低端口（`< 1024`）则对 `mozart-web-adapter` 授予 `cap_net_bind_service`。
-6. 用 `mozart.toml` 经 `mozart-ctl up` 整栈启动，等待 `web`、pre、RVC、配置中的增强链路及原本正常的服务恢复。
-7. 写 `~/mozart-runtime/deploy.json`。
+6. 用 `mozart.toml` 启动整栈（若设备已启用 `mozart.service`，自动经 `systemctl start mozart.service` 启动，否则经 `mozart-ctl up`），等待 `web`、pre、RVC、配置中的增强链路及原本正常的服务恢复。
+7. 写 `~/mozart-runtime/deploy.json`（含 `systemd` 托管标记）。
 
-失败时执行事务内的 `rollback.sh`。它恢复独立源码快照，清理失效构建缓存，并恢复原先运行的服务（从旧版迁移失败回滚至 `bin.prev` 时保留旧独立服务恢复兼容）。安装开始后还恢复 `bin.prev` 与 `web.prev`；回滚失败时保留锁和事务记录，不假报成功。
+失败时执行事务内的 `rollback.sh`。它恢复独立源码快照，清理失效构建缓存，并恢复原先运行的服务（按部署前托管方式走 `systemctl` 或 `mozart-ctl`；从旧版迁移失败回滚至 `bin.prev` 时保留旧独立服务恢复兼容）。安装开始后还恢复 `bin.prev` 与 `web.prev`；回滚失败时保留锁和事务记录，不假报成功。
 
-部署要求 `mozart.toml` 已配置 `[web]` 段。`mozart-web-adapter` 由 `daemon` 统一监管（日志位于 `run/logs/web.log`）；网页 `system/down` 或 `mozart-ctl services stop` 仅停业务子服务，`daemon` 与页面保持在线。整机停机走 `mozart-ctl down`，单独重启适配器走 `mozart-ctl restart web`。
+### 开机定频与自启（systemd）
+
+仓库维护两份独立服务模板，不写死设备用户名和路径，安装时按当前运行用户与 `~/mozart-runtime` 渲染：
+
+- `deploy/systemd/mozart-clocks.service.in`：开机在 `nvpmodel.service` 之后备份原调频配置到 `/var/lib/mozart/l4t_dfs.conf`，并执行 `jetson_clocks` 锁定最高频（默认保留自动调速风扇，需满载可加 `--fan`；不声明 `After=nvfancontrol.service` 以避免 `jetson_clocks --restore` 内部启停 `nvfancontrol` 时触发 systemd 死锁）；停止该服务时自动恢复原调频状态。
+- `deploy/systemd/mozart.service.in`：在 `mozart-clocks.service` 就绪后，以运行用户前台启动 `~/mozart-runtime/bin/mozart-daemon --config ~/mozart-runtime/mozart.toml`，停止时发送 `SIGTERM` 由 daemon 在 30 s 内平滑收尾（`KillMode=mixed`）。
+
+安装、切换策略或卸载均通过 `tools/install-jetson-systemd.sh` 完成（也支持在 Jetson 本机加 `--local` 执行）：
+
+```bash
+# 默认安装：开机定频（自动调速风扇）+ 异常退出自动重启（Restart=on-failure）
+MOZART_JETSON=<SSH目标> tools/install-jetson-systemd.sh
+
+# 关闭自动重启（崩溃后停在停止态，便于手工排障）
+MOZART_JETSON=<SSH目标> tools/install-jetson-systemd.sh --restart=no
+
+# 需要满载风扇散热时显式开启
+MOZART_JETSON=<SSH目标> tools/install-jetson-systemd.sh --fan
+
+# 卸载两个服务与部署免密规则
+MOZART_JETSON=<SSH目标> tools/install-jetson-systemd.sh --uninstall
+```
+
+安装脚本会同时生成经 `visudo -cf` 校验的最小权限 `/etc/sudoers.d/mozart-deploy`，仅允许运行用户无交互启停与重启 `mozart.service`。此后执行 `tools/deploy-jetson.sh` 与 `tools/jetson-e2e.sh` 时，脚本会核对 `mozart.service` 的 `WorkingDirectory` 与目标运行目录一致后，自动在更新/测试期间临时停止服务（防止自动重启干扰构建或测试），结束后自动重新拉起；未安装 `systemd` 或指向其他隔离目录时保持原 `mozart-ctl down / up` 行为。
+
+部署要求 `mozart.toml` 已配置 `[web]` 段。`mozart-web-adapter` 由 `daemon` 统一监管（日志位于 `run/logs/web.log`）；网页 `system/down` 或 `mozart-ctl services stop` 仅停业务子服务，`daemon` 与页面保持在线。整机停机在未托管时走 `mozart-ctl down`（启用 `systemd` 托管时走 `sudo systemctl stop mozart.service`），单独重启适配器走 `mozart-ctl restart web`。
 
 默认配置监听 `8080` 高端口，无需 `cap_net_bind_service` 或免密 `sudo` 即可启动。若手动配置低端口（`< 1024`），脚本才通过 `sudo -n setcap` 授予 `cap_net_bind_service`；没有该权限时请保持高端口配置。服务以运行目录所有者启动，不以 root 运行；绑定后、创建工作线程前清除进程 capability。设备需提供 `jq` 和 libcap 工具。
 
-`deploy.json` 记录提交号、dirty 标记、时间、构建预设和构建模式；部署期间整栈重启。当前实测范围及标准整链部署阻塞见[适配器报告](../reports/web-adapter-20261117/RESULTS.md#适用范围)。
+`deploy.json` 记录提交号、dirty 标记、时间、构建预设、构建模式和 `systemd` 托管标记；部署期间整栈重启。当前实测范围及标准整链部署阻塞见[适配器报告](../reports/web-adapter-20261117/RESULTS.md#适用范围)。
 
 ### 仅前端部署
 

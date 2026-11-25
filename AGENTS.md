@@ -67,6 +67,7 @@ Mozart 是面向 NVIDIA Jetson Orin Nano Super 8 GB 的本地语音处理系统�
 | `web-adapter/` | 独立 HTTP/SSE 适配器，连接 daemon 控制面 | Cargo `mozart-web-adapter` |
 | `tests/` | 跨组件 C++ 测试与小型夹具 | CTest |
 | `cmake/` | CMake 模块 | — |
+| `deploy/` | 设备运维服务模板（如 `deploy/systemd/` 开机定频与自启单元） | — |
 | `tools/` | 构建、检查、部署脚本 | — |
 | `docs/` | 长期文档；`docs/SETUP.md` 设备目录与部署；`docs/SPEC/` 模块规格；`docs/architecture/` 架构图；`docs/FUTURE.md` | — |
 | `reports/` | 带日期的实测记录，只跟踪 Markdown | — |

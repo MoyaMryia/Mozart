@@ -1,0 +1,23 @@
+[Unit]
+Description=Mozart Realtime Voice Runtime
+After=sound.target network.target @CLOCKS_UNIT@
+@CLOCKS_WANTS_LINE@
+StartLimitIntervalSec=120
+StartLimitBurst=5
+
+[Service]
+Type=simple
+User=@MOZART_USER@
+Group=@MOZART_GROUP@
+WorkingDirectory=@MOZART_RUNTIME_DIR@
+Environment=HOME=@MOZART_HOME@
+ExecStart=@MOZART_RUNTIME_DIR@/bin/mozart-daemon --config @MOZART_RUNTIME_DIR@/mozart.toml
+KillMode=mixed
+KillSignal=SIGTERM
+TimeoutStopSec=30
+Restart=@MOZART_RESTART@
+RestartSec=5
+LimitNOFILE=65536
+
+[Install]
+WantedBy=multi-user.target
