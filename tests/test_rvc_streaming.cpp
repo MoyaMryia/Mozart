@@ -843,6 +843,22 @@ int main()
             quiet_in.data(), quiet_in.size(), quiet_out, 48000, 0.5f, 0.99f);
         CHECK(std::fabs(quiet_out[7200] - 0.0005f) < 1e-6f,
               "rms_mix_rate does not boost quiet input floor below 0.005");
+
+        // realtime f0_to_pitch(interpolate_unvoiced=false) preserves unvoiced pitch=1 / pitchf=0
+        // so NSF vocoder disables sine harmonics and protect blends unvoiced consonants.
+        const std::vector<float> mixed_f0 = {0.0f, 200.0f, 0.0f, 220.0f, 0.0f};
+        auto [rt_pitch, rt_pitchf] = RVCInferencer::f0_to_pitch(mixed_f0, 0, mixed_f0.size(), false);
+        CHECK(rt_pitch[0] == 1 && rt_pitchf[0] == 0.0f
+              && rt_pitch[2] == 1 && rt_pitchf[2] == 0.0f
+              && rt_pitch[4] == 1 && rt_pitchf[4] == 0.0f,
+              "realtime f0_to_pitch keeps unvoiced frames at pitch=1 and pitchf=0");
+        CHECK(rt_pitch[1] > 1 && std::fabs(rt_pitchf[1] - 200.0f) < 1e-4f
+              && rt_pitch[3] > 1 && std::fabs(rt_pitchf[3] - 220.0f) < 1e-4f,
+              "realtime f0_to_pitch preserves voiced frames");
+        // offline default (interpolate_unvoiced=true) retains legacy interpolation parity
+        auto [off_pitch, off_pitchf] = RVCInferencer::f0_to_pitch(mixed_f0, 0, mixed_f0.size(), true);
+        CHECK(off_pitchf[0] > 0.0f && off_pitchf[2] > 0.0f && off_pitchf[4] > 0.0f,
+              "offline f0_to_pitch retains unvoiced interpolation");
     }
 
     printf("test_index_search_parallel_parity\n");

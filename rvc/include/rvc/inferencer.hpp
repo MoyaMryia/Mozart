@@ -96,6 +96,12 @@ public:
         std::vector<float> pitchf_cache;
         uint32_t next_random = 0;
     };
+    static std::pair<std::vector<int64_t>, std::vector<float>> f0_to_pitch(
+        const std::vector<float>& f0,
+        int pitch_shift,
+        size_t frames,
+        bool interpolate_unvoiced = true
+    );
     static void apply_realtime_protect(
         std::vector<float>& resized_feats,
         const std::vector<float>& unindexed_tail,

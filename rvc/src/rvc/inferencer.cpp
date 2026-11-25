@@ -218,50 +218,6 @@ std::vector<float> highpass_48hz(const std::vector<float>& audio) {
     return result;
 }
 
-std::pair<std::vector<int64_t>, std::vector<float>> f0_to_pitch(
-    const std::vector<float>& f0, int pitch_shift, size_t frames
-) {
-    std::vector<float> raw(frames, 0.0f);
-    const size_t f0_frames = std::max(size_t{1}, f0.size());
-    for (size_t t = 0; t < frames; ++t) {
-        if (!f0.empty()) raw[t] = f0[std::min(t, f0_frames - 1)];
-    }
-    size_t first_voiced = 0;
-    while (first_voiced < raw.size() && raw[first_voiced] <= 0.0f) ++first_voiced;
-    if (first_voiced < raw.size()) {
-        for (size_t t = 0; t < first_voiced; ++t) raw[t] = raw[first_voiced];
-        size_t left = first_voiced;
-        for (size_t t = first_voiced + 1; t < raw.size(); ++t) {
-            if (raw[t] <= 0.0f) continue;
-            const size_t right = t;
-            for (size_t gap = left + 1; gap < right; ++gap) {
-                const float amount = static_cast<float>(gap - left) / static_cast<float>(right - left);
-                raw[gap] = raw[left] * (1.0f - amount) + raw[right] * amount;
-            }
-            left = right;
-        }
-        for (size_t t = left + 1; t < raw.size(); ++t) raw[t] = raw[left];
-    }
-
-    std::vector<int64_t> pitch(frames, 1);
-    std::vector<float> pitchf(frames, 0.0f);
-    const float shift = std::pow(2.0f, static_cast<float>(pitch_shift) / 12.0f);
-    constexpr float f0_min = 50.0f;
-    constexpr float f0_max = 1100.0f;
-    const float mel_min = 1127.0f * std::log1p(f0_min / 700.0f);
-    const float mel_max = 1127.0f * std::log1p(f0_max / 700.0f);
-    for (size_t t = 0; t < frames; ++t) {
-        pitchf[t] = raw[t] > 0.0f ? raw[t] * shift : 0.0f;
-        if (pitchf[t] > 0.0f) {
-            const float f0_mel = 1127.0f * std::log1p(pitchf[t] / 700.0f);
-            const float coarse = (f0_mel - mel_min) * 254.0f / (mel_max - mel_min) + 1.0f;
-            // NumPy's rint (used by the Golden path) rounds exact ties to even.
-            pitch[t] = static_cast<int64_t>(std::clamp(std::nearbyint(coarse), 1.0f, 255.0f));
-        }
-    }
-    return {std::move(pitch), std::move(pitchf)};
-}
-
 std::vector<float> slice_or_pad(const std::vector<float>& src, size_t start, size_t count) {
     std::vector<float> out(count, 0.0f);
     if (start >= src.size()) return out;
@@ -363,6 +319,53 @@ void RVCInferencer::reset_realtime() {
 void RVCInferencer::advance_realtime_silence(size_t shift_frames) {
     if (shift_frames == 0) return;
     push_realtime_pitch_cache({}, {}, shift_frames);
+}
+
+std::pair<std::vector<int64_t>, std::vector<float>> RVCInferencer::f0_to_pitch(
+    const std::vector<float>& f0, int pitch_shift, size_t frames,
+    bool interpolate_unvoiced
+) {
+    std::vector<float> raw(frames, 0.0f);
+    const size_t f0_frames = std::max(size_t{1}, f0.size());
+    for (size_t t = 0; t < frames; ++t) {
+        if (!f0.empty()) raw[t] = f0[std::min(t, f0_frames - 1)];
+    }
+    if (interpolate_unvoiced) {
+        size_t first_voiced = 0;
+        while (first_voiced < raw.size() && raw[first_voiced] <= 0.0f) ++first_voiced;
+        if (first_voiced < raw.size()) {
+            for (size_t t = 0; t < first_voiced; ++t) raw[t] = raw[first_voiced];
+            size_t left = first_voiced;
+            for (size_t t = first_voiced + 1; t < raw.size(); ++t) {
+                if (raw[t] <= 0.0f) continue;
+                const size_t right = t;
+                for (size_t gap = left + 1; gap < right; ++gap) {
+                    const float amount = static_cast<float>(gap - left) / static_cast<float>(right - left);
+                    raw[gap] = raw[left] * (1.0f - amount) + raw[right] * amount;
+                }
+                left = right;
+            }
+            for (size_t t = left + 1; t < raw.size(); ++t) raw[t] = raw[left];
+        }
+    }
+
+    std::vector<int64_t> pitch(frames, 1);
+    std::vector<float> pitchf(frames, 0.0f);
+    const float shift = std::pow(2.0f, static_cast<float>(pitch_shift) / 12.0f);
+    constexpr float f0_min = 50.0f;
+    constexpr float f0_max = 1100.0f;
+    const float mel_min = 1127.0f * std::log1p(f0_min / 700.0f);
+    const float mel_max = 1127.0f * std::log1p(f0_max / 700.0f);
+    for (size_t t = 0; t < frames; ++t) {
+        pitchf[t] = raw[t] > 0.0f ? raw[t] * shift : 0.0f;
+        if (pitchf[t] > 0.0f) {
+            const float f0_mel = 1127.0f * std::log1p(pitchf[t] / 700.0f);
+            const float coarse = (f0_mel - mel_min) * 254.0f / (mel_max - mel_min) + 1.0f;
+            // NumPy's rint (used by the Golden path) rounds exact ties to even.
+            pitch[t] = static_cast<int64_t>(std::clamp(std::nearbyint(coarse), 1.0f, 255.0f));
+        }
+    }
+    return {std::move(pitch), std::move(pitchf)};
 }
 
 void RVCInferencer::apply_realtime_protect(
@@ -835,8 +838,10 @@ std::vector<float> RVCInferencer::infer_realtime(
     if (f0.size() < 5) {
         throw std::runtime_error("Realtime F0 extractor returned too few frames");
     }
+    // 实时链路保留无基频帧为 pitch=1、pitchf=0：使声码器 NSF 清音分支关闭正弦谐波，
+    // 同时让清辅音保护（protect）按真实无声帧生效，减少清音与停顿处的电音感。
     auto [new_pitch, new_pitchf] = f0_to_pitch(
-        f0, params.pitch_shift, f0.size()
+        f0, params.pitch_shift, f0.size(), /*interpolate_unvoiced=*/false
     );
 
     const size_t shift = request.block_samples_16k / kHop16k;
