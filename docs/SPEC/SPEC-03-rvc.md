@@ -206,6 +206,11 @@ RMVPE 前端 mel 128 带、n_fft 1024、hop 160、30–8000 Hz、HTK Slaney（�
   - **改动方案**：在 `infer_realtime` 中保存尾部检索前特征副本，对 `return_frames`（或送入 `front` 的新块区间）内 `pitchf <= 0` 的帧按 `protect` 混合原始特征；对 `decoder` 输出的 300 ms 音频与对应的 300 ms 输入音频做块级短窗 `rms_mix_rate` 包络对齐与 `0.99` 峰值限幅。
   - **独立验收**：C++ 单测验证实时模式下 `protect` 与 `rms_mix_rate` 改变输出且边界值（`protect=0.5`、`rms_mix_rate=1.0`）符合契约；板端实测单块推理耗时增量 < 2 ms，对比 `logmel_vs_file` / `rms_vs_file` 指标与字头吐字清晰度。
 
+- [x] **步骤 5：实时音高关闭无声插值（恢复声码器清浊音开关与 `protect` 生效，减轻电音感）**
+  - **问题根因**：`f0_to_pitch` 将 RMVPE 检出的无基频帧（`f0 <= 0`）全部线性插值覆盖并同时写入 `pitch` 与 `pitchf`，导致声码器 NSF 激励源在清辅音与停顿帧仍持续注入正弦谐波（产生电音），同时 `apply_realtime_protect` 因 `pitchf > 0` 几乎无法在清辅音触发。
+  - **改动方案**：`RVCInferencer::f0_to_pitch` 增加 `interpolate_unvoiced` 开关；实时链路 `infer_realtime` 传入 `false`，保留无基频帧为 `pitch = 1` 且 `pitchf = 0.0f`；离线文件链路 `infer` 保持 `true` 以维持离线对拍口径不变。
+  - **独立验收**：C++ 单测验证 `f0_to_pitch(..., false)` 在混合清浊音序列中保持无声帧 `pitch=1 / pitchf=0`、有声帧正常移调；板端四起点三档对照（`interp` / `pitchf0` / `native`）显示 `native` 静音底噪降 22.5%（`0.0071 → 0.0055`）、人声/背景信噪比升 `+0.95 dB`、停顿跳变降 21%、SOLA 标准差从 `3.62` 降至 `3.39 ms`，实听电音明显减轻。
+
 ---
 
 ### 实时延迟拆解与分阶段降延迟调查
@@ -224,3 +229,4 @@ RMVPE 前端 mel 128 带、n_fft 1024、hop 160、30–8000 Hz、HTK Slaney（�
 - [x] **降延迟步骤 A（配置级 `startup_delay_ms` 扫描与下界验证）**：实测验证流式块化启动延迟硬下界满足 $D_{\min} = W + T_{\text{infer,max}}$。原始 FP32 引擎下（大索引 `bocchi-v2-48k` 单块 177 ms，含 88.6 ms 标量索引检索），下调 `startup_delay_ms` 至 `320/280/240/200 ms` 不会降低净延迟（维持 ~582 ms），反而导致 `pre_gap_frames` 线性增至 `6~10`；在完成 `IndexSearch` NEON 向量化 + 质心分块 + 多线程并行优化（单块 177 ms → 101 ms）后，既有 48k/40k FP32 资产在 `startup_delay_ms = 340 ms` 均达零缺帧（净延迟 ~479 ms，较基线降 ~103 ms），已将默认 `startup_delay_ms` 同步更新为 `340`。
 - [x] **降延迟步骤 B（同机 `--fp16` 重编实时引擎与索引加速）**：在 Jetson 本机使用 `build_realtime_engines.py --fp16` 重建四引擎并消除跨设备 plan 警告；配合 `IndexSearch` 加速（88.6 ms → 6.0 ms），`bocchi-v2-48k`（`index_rate=0.8`，3561 质心 / 138915 向量）单块推理从 `176.7 ms` 降至 `58.6 ms`（P95 `63.8 ms`，3.0× 提速），声学近无损（vs 文件参考 Log-Mel L1 `4.864` vs FP32 `4.742 dB`，RMS L1 `2.691` vs `2.529 dB`）；`startup_delay_ms = 320 ms` 实测物理回录净延迟 `460.2 ms`（`-122.2 ms`），60 s 连续长跑 253 块零欠载、零缺帧、零重置。已将 `realtime_chain_params.json` 的 `compile.fp16` 默认设为 `true`。
 - [x] **降延迟步骤 C（短块 profile 实验：240 ms → 160 ms）**：在隔离目录完成 `window_samples = 2560`（160 ms 块，`front=272`、`decoder=22`、`hubert=43520`、`rmvpe=32`）全套 FP16 资产导出与板端实测：单块推理 `51.3~52.4 ms`（P95 `56.9~62.7 ms`，GPU 占空比 32.8%），`startup_delay_ms = 240 / 220 ms` 均通过 60 s 长跑（378 块零欠载、零缺帧、零重置），物理回录净延迟压至 **`385.6 / 365.6 ms`**（相对 `direct` 纯 RVC 滞后 `292 / 266 ms`，较基线降 **`216.8 ms` / `-37.2%`**）。但 160 ms 块相对 240 ms 存在轻微声学代价（Log-Mel L1 `+0.11~0.23 dB`、RMS L1 `+0.21~0.35 dB`、接缝频率 6.25 vs 4.17 缝/s）且破坏既有 240 ms 资产形状兼容，故**暂不切换主干默认块长**，完整数据归档于 [realtime-quality-latency-20261125/RESULTS.md](../../reports/realtime-quality-latency-20261125/RESULTS.md)。
+- [x] **降延迟步骤 D（板端定频 + `TrtEngine` CUDA 锁页缓冲并行）**：板端启用 `jetson_clocks` 锁定 CPU/GPU/EMC 最高频，消除 240 ms 块间隙空闲降频（`1020 → 306 MHz`），单块 FP16 推理从 `56.8 ms` 降至 `32.2 ms`（P95 `32.4 ms`）；随后在 `TrtEngine`（`rvc/include/rvc/trt_engine.hpp`、`rvc/src/rvc/trt_engine.cpp`）为每个张量引入复用 CUDA 锁页缓冲（`cudaMallocHost` / `cudaFreeHost`）消除非锁页 `cudaMemcpyAsync` 的隐式同步，单块推理进一步降至 **`29.89 ms`**（P95 `30.05 ms`，逐位误差 `0.0000000`），240 ms 切块在 `startup_delay_ms = 260 ms` 下零缺帧达成 **`398~405 ms`** 净延迟（较基线降 `~184 ms`）。后续补充锁页缓冲长跑与动态尺寸切换压测，并将开机定频与 `mozart` 启动纳入受控 `systemd` 单元及部署适配。
