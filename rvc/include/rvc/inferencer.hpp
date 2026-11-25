@@ -90,30 +90,12 @@ public:
     );
     SessionParams snapshot_params() const;
 
-    // 实时音高缓存与激励网格状态观测及推进接口（供 infer_realtime 与单测共用）。
+    // 实时音高缓存与随机状态观测及推进接口（供 infer_realtime 与热更保留单测共用）。
     struct RealtimeStateSnapshot {
         std::vector<int64_t> pitch_cache;
         std::vector<float> pitchf_cache;
         uint32_t next_random = 0;
-        uint64_t frame_cursor = 0;
-        double phase_cycles = 0.0;
     };
-    struct RealtimeExcitation {
-        std::vector<float> latent_noise;
-        std::vector<float> source_phase;
-        std::vector<float> source_noise;
-    };
-    RealtimeExcitation build_realtime_excitation(
-        size_t latent_channels,
-        size_t latent_frames,
-        size_t return_frames,
-        size_t output_per_frame,
-        size_t source_dim
-    ) const;
-    void advance_realtime_excitation(
-        const std::vector<float>& decoder_pitchf,
-        size_t shift_frames
-    );
     static void apply_realtime_protect(
         std::vector<float>& resized_feats,
         const std::vector<float>& unindexed_tail,
@@ -159,8 +141,6 @@ private:
     std::vector<int64_t> realtime_pitch_cache_;
     std::vector<float> realtime_pitchf_cache_;
     std::mt19937 realtime_random_{114514};
-    uint64_t realtime_frame_cursor_ = 0;
-    double realtime_phase_cycles_ = 0.0;
     std::atomic<uint64_t> generator_windows_{0};
 
     std::vector<float> resample(

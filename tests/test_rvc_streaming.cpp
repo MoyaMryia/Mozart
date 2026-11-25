@@ -792,100 +792,6 @@ int main()
               "advance_realtime_silence shifts pitch cache by exact 24 frames");
     }
 
-    printf("test_realtime_excitation_grid_continuity_and_sola_floor\n");
-    {
-        RVCInferencer inf(nullptr, nullptr);
-        constexpr size_t kChannels = 4;
-        constexpr size_t kLatentFrames = 54;
-        constexpr size_t kReturnFrames = 30;
-        constexpr size_t kOutPerFrame = 480;
-        constexpr size_t kSourceDim = 3;
-        constexpr size_t kShift = 24;
-
-        const auto e0 = inf.build_realtime_excitation(
-            kChannels, kLatentFrames, kReturnFrames, kOutPerFrame, kSourceDim);
-        std::vector<float> pitchf(kReturnFrames, 213.5f);
-        inf.advance_realtime_excitation(pitchf, kShift);
-        const auto e1 = inf.build_realtime_excitation(
-            kChannels, kLatentFrames, kReturnFrames, kOutPerFrame, kSourceDim);
-
-        // latent_noise overlap: block0 t=24..53 (abs 0..29) == block1 t=0..29 (abs 0..29)
-        bool latent_match = true;
-        for (size_t c = 0; c < kChannels; ++c) {
-            for (size_t i = 0; i < kReturnFrames; ++i) {
-                if (e0.latent_noise[c * kLatentFrames + (kShift + i)]
-                    != e1.latent_noise[c * kLatentFrames + i]) {
-                    latent_match = false;
-                }
-            }
-        }
-        CHECK(latent_match, "adjacent realtime blocks share identical latent_noise in overlap");
-
-        // source_noise overlap: block0 frames 24..29 == block1 frames 0..5
-        const size_t overlap_samples = (kReturnFrames - kShift) * kOutPerFrame * kSourceDim;
-        const size_t shift_samples = kShift * kOutPerFrame * kSourceDim;
-        bool source_match = true;
-        for (size_t i = 0; i < overlap_samples; ++i) {
-            if (e0.source_noise[shift_samples + i] != e1.source_noise[i]) {
-                source_match = false;
-            }
-        }
-        CHECK(source_match, "adjacent realtime blocks share identical source_noise in overlap");
-
-        // source_phase continuity mod 1 for all harmonics
-        const double expected_cycles = std::fmod(24.0 * 213.5 * 0.01, 1.0);
-        bool phase_match = true;
-        for (size_t h = 0; h < kSourceDim; ++h) {
-            double expect = std::fmod(
-                static_cast<double>(e0.source_phase[h])
-                + expected_cycles * static_cast<double>(h + 1), 1.0);
-            if (expect < 0.0) expect += 1.0;
-            if (std::fabs(static_cast<double>(e1.source_phase[h]) - expect) > 1e-5) {
-                phase_match = false;
-            }
-        }
-        CHECK(phase_match, "source_phase advances continuously mod 1 across harmonics");
-
-        inf.reset_realtime();
-        const auto snap = inf.realtime_state_snapshot();
-        CHECK(snap.frame_cursor == 0 && snap.phase_cycles == 0.0,
-              "reset_realtime clears frame cursor and phase cycles");
-
-        // Weak-signal SOLA locks offset to 0 instead of chasing sub-floor noise.
-        struct WeakSolaPipe : public RVCPipelineBase {
-            std::vector<float> process(const std::vector<float>& audio) override {
-                return std::vector<float>(audio.size() * 3, 0.0f);
-            }
-            std::vector<float> process_realtime(
-                const std::vector<float>&, const RvcRealtimeRequest& req) override {
-                std::vector<float> out(req.output_samples, 0.0f);
-                if (call++ == 0) {
-                    // Quiet tail below 3e-3 floor with a distinct tiny peak at tail[100]
-                    out[11520 + 100] = 5e-4f;
-                } else {
-                    // Block 2 has matching tiny peak shifted by +300 samples, plus strong marker at 6000
-                    out[300 + 100] = 5e-4f;
-                    out[6000] = 0.9f;
-                }
-                return out;
-            }
-            size_t call = 0;
-        } weak_pipe;
-
-        StreamingRvc::Config cfg = realtime_config();
-        cfg.skip_silence = false;
-        StreamingRvc s(cfg);
-        uint32_t idx = 1;
-        for (size_t i = 0; i < 12; ++i) s.push(make_frame(idx++, 1, 0.01f));
-        CHECK(s.try_process_one(weak_pipe), "weak SOLA block 1 runs");
-        drain(s);
-        for (size_t i = 0; i < 12; ++i) s.push(make_frame(idx++, 1, 0.01f));
-        CHECK(s.try_process_one(weak_pipe), "weak SOLA block 2 runs");
-        const auto out2 = drain(s);
-        CHECK(std::fabs(out2[6000] - 0.9f) < 1e-6f && std::fabs(out2[5700]) < 1e-6f,
-              "weak-signal SOLA keeps offset == 0 without jumping to noise peak");
-    }
-
     printf("test_realtime_protect_rms_mix_and_peak_limit\n");
     {
         // protect: 4 frames (2 voiced, 2 unvoiced), emb_dim=2, skip_head=0, index_start=0
@@ -921,12 +827,22 @@ int main()
         CHECK(std::fabs(out_48k[7200] - 0.99f) < 1e-5f,
               "rms_mix_rate=1.0 skips RMS scaling and limits peak to 0.99");
 
-        // rms_mix_rate = 0.0 -> output matches input RMS (0.1 vs 0.4 -> scaled down near 0.1)
+        // rms_mix_rate = 0.0 -> output matches input RMS at both center and block edge (width normalization)
         std::vector<float> out_scaled(14400, 0.4f);
         RVCInferencer::apply_realtime_rms_mix_and_limit(
             in_16k.data(), in_16k.size(), out_scaled, 48000, 0.0f, 0.99f);
-        CHECK(std::fabs(out_scaled[7200] - 0.1f) < 0.01f,
-              "rms_mix_rate=0.0 aligns output envelope to input RMS");
+        CHECK(std::fabs(out_scaled[7200] - 0.1f) < 0.01f
+              && std::fabs(out_scaled[0] - 0.1f) < 0.01f
+              && std::fabs(out_scaled.back() - 0.1f) < 0.01f,
+              "rms_mix_rate=0.0 aligns output envelope to input RMS across interior and edges");
+
+        // quiet input (< 0.005) must not amplify quiet output floor
+        std::vector<float> quiet_in(4800, 0.002f);
+        std::vector<float> quiet_out(14400, 0.0005f);
+        RVCInferencer::apply_realtime_rms_mix_and_limit(
+            quiet_in.data(), quiet_in.size(), quiet_out, 48000, 0.5f, 0.99f);
+        CHECK(std::fabs(quiet_out[7200] - 0.0005f) < 1e-6f,
+              "rms_mix_rate does not boost quiet input floor below 0.005");
     }
 
     printf("test_index_search_parallel_parity\n");
