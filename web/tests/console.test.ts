@@ -76,7 +76,7 @@ function mockBackend() {
 }
 
 beforeEach(() => { vi.useFakeTimers(); sources.length = 0; vi.stubGlobal('EventSource', Source); localStorage.clear(); sessionStorage.clear(); });
-afterEach(() => { for (const { app, root } of mounts.splice(0)) { app.unmount(); root.remove(); } vi.unstubAllGlobals(); vi.useRealTimers(); });
+afterEach(() => { for (const { app, root } of mounts.splice(0)) { app.unmount(); root.remove(); } delete document.documentElement.dataset.theme; vi.unstubAllGlobals(); vi.useRealTimers(); });
 
 // 适配器的真实响应带 Date 头，页面用它得到设备时钟。
 function withDeviceClock(backend: ReturnType<typeof mockBackend>) {
@@ -162,7 +162,7 @@ describe('控制台', () => {
     subtitleStream().dispatchEvent(new MessageEvent('reset', { data: JSON.stringify({ generation: 'g2' }) })); await nextTick();
     expect(reloaded.querySelector('section[aria-label="实时字幕"]')).toBeNull(); expect(sessionStorage.getItem('mozart-subtitles')).toBeNull();
   });
-  it('模型和预设读取失败后禁止使用旧数据，恢复读取后解除', async () => {
+  it('模型和预设读取失败后禁止使用旧数据，关闭告警也不解除，恢复读取后才解除', async () => {
     const backend = mockBackend(); const original = backend.fetcher.getMockImplementation()!;
     const root = mount(); await flush();
     const select = [...root.querySelectorAll('select')].find(item => item.textContent?.includes('选择模型'))!;
@@ -170,6 +170,10 @@ describe('控制台', () => {
     backend.fetcher.mockImplementation((path, init) => path === '/api/v1/models' || path === '/api/v1/preset' ? Promise.resolve(errorResponse('Unavailable', '读取失败', 503)) : original(path, init));
     iconButton(root, '刷新').click(); await flush();
     expect(root.textContent).toContain('读取失败');
+    expect(button(root, '使用模型').disabled).toBe(true);
+    expect(root.querySelector('.preset-actions.is-visible')).toBeNull();
+    iconButton(section(root, '变声音色'), '关闭提示').click();
+    await vi.advanceTimersByTimeAsync(300); await flush();
     expect(button(root, '使用模型').disabled).toBe(true);
     expect(root.querySelector('.preset-actions.is-visible')).toBeNull();
     backend.fetcher.mockImplementation(original); iconButton(root, '刷新').click(); await flush();
@@ -516,6 +520,115 @@ describe('控制台', () => {
     vi.stubGlobal('fetch', vi.fn().mockResolvedValue(new Response('<html>Vite</html>')));
     const root = mount(); await flush(); expect(root.textContent).toContain('HTTP 适配器未连接');
     expect(root.textContent).toContain('CPU —'); expect(root.querySelector('[data-service="pre"]')?.getAttribute('data-state')).toBe('unknown');
+  });
+  it('错误按控件归属展示在对应卡片内，且可手动关闭', async () => {
+    const backend = mockBackend(); const original = backend.fetcher.getMockImplementation()!;
+    backend.fetcher.mockImplementation((path, init) => {
+      if (path === '/api/v1/mute') return Promise.resolve(errorResponse('NotReady', '静音拒绝', 409));
+      if (path === '/api/v1/model') return Promise.resolve(errorResponse('NotLoaded', '模型损坏', 409));
+      return original(path, init);
+    });
+    const root = mount(); await flush();
+    section(root, '设备').querySelector<HTMLInputElement>('input[type=checkbox]')!.click(); await flush();
+    expect(section(root, '设备').textContent).toContain('NotReady：静音拒绝');
+    expect(section(root, '路由').textContent).not.toContain('静音拒绝');
+    const select = root.querySelector<HTMLSelectElement>('#model-select')!;
+    select.value = 'model-a'; select.dispatchEvent(new Event('change')); await nextTick();
+    button(root, '使用模型').click(); await flush();
+    expect(section(root, '变声音色').textContent).toContain('NotLoaded：模型损坏');
+    expect(section(root, '路由').textContent).not.toContain('模型损坏');
+    iconButton(section(root, '变声音色'), '关闭提示').click();
+    await vi.advanceTimersByTimeAsync(300); await flush();
+    expect(section(root, '变声音色').textContent).not.toContain('模型损坏');
+  });
+  it('参数失焦立即提交待写值，改回原值清除脏状态并恢复预设按钮', async () => {
+    const backend = mockBackend(); const root = mount(); await flush();
+    backend.markPresetDirty(); iconButton(root, '刷新').click(); await flush();
+    const input = root.querySelector<HTMLInputElement>('#param-pitch_shift')!;
+    input.value = '4'; input.dispatchEvent(new Event('input', { bubbles: true }));
+    input.dispatchEvent(new Event('blur')); await flush();
+    expect(backend.snapshot.rvc_params!.pitch_shift).toBe(4);
+    input.value = '6'; input.dispatchEvent(new Event('input', { bubbles: true })); await nextTick();
+    expect(iconButton(root, '保存为 default 预设').disabled).toBe(true);
+    input.value = '4'; input.dispatchEvent(new Event('input', { bubbles: true }));
+    await vi.advanceTimersByTimeAsync(250); await flush();
+    expect(iconButton(root, '保存为 default 预设').disabled).toBe(false);
+    iconButton(root, '增大音高增益').click();
+    await vi.advanceTimersByTimeAsync(250); await flush();
+    expect(backend.snapshot.rvc_params!.pitch_shift).toBe(5);
+  });
+  it('日志快速切换服务时忽略过期的旧请求结果', async () => {
+    const backend = mockBackend(); const original = backend.fetcher.getMockImplementation()!;
+    let resolveRvc!: (value: Response) => void;
+    backend.fetcher.mockImplementation((path, init) => {
+      if (path === '/api/v1/logs?name=rvc') return new Promise<Response>(resolve => { resolveRvc = resolve; });
+      return original(path, init);
+    });
+    const root = mount(); await flush();
+    const details = root.querySelector('details')!;
+    details.open = true; details.dispatchEvent(new Event('toggle')); await flush();
+    const select = details.querySelector<HTMLSelectElement>('#log-service')!;
+    select.value = 'pre'; select.dispatchEvent(new Event('change')); await flush();
+    expect(details.querySelector('pre')!.textContent).toContain('pre 日志第一行');
+    resolveRvc(jsonResponse({ name: 'rvc', tail: '迟到的 rvc 日志' })); await flush();
+    expect(details.querySelector('pre')!.textContent).toContain('pre 日志第一行');
+    expect(details.querySelector('pre')!.textContent).not.toContain('迟到的 rvc 日志');
+  });
+  it('操作通知支持自动消隐与手动关闭', async () => {
+    mockBackend(); const root = mount(); await flush();
+    const route = root.querySelector<HTMLSelectElement>('#system-route')!;
+    route.value = 'rvc'; route.dispatchEvent(new Event('change', { bubbles: true })); await flush();
+    expect(root.textContent).toContain('请求已受理');
+    await vi.advanceTimersByTimeAsync(5300); await flush();
+    expect(root.textContent).not.toContain('请求已受理');
+    route.value = 'direct'; route.dispatchEvent(new Event('change', { bubbles: true })); await flush();
+    expect(root.textContent).toContain('请求已受理');
+    iconButton(root, '关闭通知').click();
+    await vi.advanceTimersByTimeAsync(300); await flush();
+    expect(root.textContent).not.toContain('请求已受理');
+  });
+  it('无本地主题存储时保留首屏检测到的暗色主题', async () => {
+    mockBackend();
+    document.documentElement.dataset.theme = 'dark';
+    mount(); await flush();
+    expect(document.documentElement.dataset.theme).toBe('dark');
+  });
+  it('参数前次写入在途时改回原值仍排队写回，不被在途结果覆盖', async () => {
+    const backend = mockBackend(); const original = backend.fetcher.getMockImplementation()!;
+    let finishFirst!: () => void;
+    let firstHeld = true;
+    backend.fetcher.mockImplementation((path, init) => {
+      if (path === '/api/v1/config' && init?.method === 'PUT' && firstHeld) {
+        firstHeld = false;
+        return new Promise<Response>(resolve => { finishFirst = () => resolve(original(path, init)); });
+      }
+      return original(path, init);
+    });
+    const root = mount(); await flush();
+    const input = root.querySelector<HTMLInputElement>('#param-pitch_shift')!;
+    input.value = '4'; input.dispatchEvent(new Event('input', { bubbles: true }));
+    await vi.advanceTimersByTimeAsync(250); await flush();
+    input.value = '0'; input.dispatchEvent(new Event('input', { bubbles: true }));
+    await vi.advanceTimersByTimeAsync(250); await flush();
+    finishFirst(); await flush();
+    expect(backend.snapshot.rvc_params!.pitch_shift).toBe(0);
+    expect(input.value).toBe('0');
+  });
+  it('日志切换服务期间先清空旧服务内容，不继续展示过期日志', async () => {
+    const backend = mockBackend(); const original = backend.fetcher.getMockImplementation()!;
+    let resolvePre!: (value: Response) => void;
+    backend.fetcher.mockImplementation((path, init) => path === '/api/v1/logs?name=pre'
+      ? new Promise<Response>(resolve => { resolvePre = resolve; }) : original(path, init));
+    const root = mount(); await flush();
+    const details = root.querySelector('details')!;
+    details.open = true; details.dispatchEvent(new Event('toggle')); await flush();
+    expect(details.querySelector('pre')!.textContent).toContain('rvc 日志第一行');
+    const select = details.querySelector<HTMLSelectElement>('#log-service')!;
+    select.value = 'pre'; select.dispatchEvent(new Event('change')); await nextTick();
+    expect(details.querySelector('pre')!.textContent).toContain('正在读取日志');
+    expect(details.querySelector('pre')!.textContent).not.toContain('rvc 日志第一行');
+    resolvePre(jsonResponse({ name: 'pre', tail: 'pre 最新日志' })); await flush();
+    expect(details.querySelector('pre')!.textContent).toContain('pre 最新日志');
   });
 });
 

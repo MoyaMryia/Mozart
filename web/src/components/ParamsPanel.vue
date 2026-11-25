@@ -1,14 +1,15 @@
 <script setup lang="ts">
 import { computed, onUnmounted, reactive, watch } from 'vue';
 import type { RvcParams } from '../contracts';
+import AlertBanner from './AlertBanner.vue';
 
 const props = defineProps<{ params: RvcParams | null; modelId: string | null; ready: boolean; blocked: boolean; error?: string; embedded?: boolean; presetDirty: boolean; presetBusy: boolean }>();
-const emit = defineEmits<{ set: [key: string, value: string]; save: []; restore: [] }>();
+const emit = defineEmits<{ set: [key: string, value: string]; save: []; restore: []; dismissError: [] }>();
 const fields = [
-  { key: 'pitch_shift', label: '音高增益' },
-  { key: 'index_rate', label: '贴合音色比例' },
-  { key: 'rms_mix_rate', label: '音量跟随' },
-  { key: 'protect', label: '清辅音保护' },
+  { key: 'pitch_shift', label: '音高增益', step: 1 },
+  { key: 'index_rate', label: '贴合音色比例', step: 0.05 },
+  { key: 'rms_mix_rate', label: '音量跟随', step: 0.05 },
+  { key: 'protect', label: '清辅音保护', step: 0.05 },
 ] as const;
 type Key = typeof fields[number]['key'];
 // 调节后停顿片刻即应用；连点上下箭头只写一次最新值。
@@ -20,14 +21,18 @@ const submitted = reactive<Record<Key, string | undefined>>({ pitch_shift: undef
 const timers = new Map<Key, ReturnType<typeof setTimeout>>();
 const live = (key: Key) => props.params ? String(props.params[key]) : null;
 const valid = (value: string) => value.trim() !== '' && Number.isFinite(Number(value));
-const reset = (key: Key) => { const value = live(key); if (value === null) return; draft[key] = value; dirty[key] = false; };
+const reset = (key: Key) => { const value = live(key); if (value === null) return; draft[key] = value; dirty[key] = false; submitted[key] = undefined; };
 const pending = computed(() => fields.some(({ key }) => dirty[key]));
 watch(() => props.params, (params) => {
   if (!params) return;
   for (const { key } of fields) {
     const value = String(params[key]);
     // 数值相等即视为已确认，吸收服务端的规范化格式。
-    if (!dirty[key] || (valid(draft[key]) && Number(draft[key]) === Number(value))) { draft[key] = value; dirty[key] = false; }
+    if (!dirty[key] || (valid(draft[key]) && Number(draft[key]) === Number(value))) {
+      draft[key] = value;
+      dirty[key] = false;
+      submitted[key] = undefined;
+    }
   }
 }, { immediate: true, deep: true });
 watch(() => props.error, error => {
@@ -42,21 +47,36 @@ watch(() => props.blocked, blocked => {
 function apply(key: Key) {
   timers.delete(key);
   const value = draft[key]; const target = live(key);
-  if (target === null || value === target || !valid(value)) return;
+  if (target === null || !valid(value)) return;
+  if (Number(value) === Number(target) && submitted[key] === undefined) {
+    draft[key] = target;
+    dirty[key] = false;
+    return;
+  }
   submitted[key] = value;
   emit('set', 'rvc.' + key, value);
 }
 function schedule(key: Key) { clearTimeout(timers.get(key)); timers.set(key, setTimeout(() => apply(key), APPLY_MS)); }
 function change(key: Key, event: Event) { draft[key] = (event.target as HTMLInputElement).value; dirty[key] = true; schedule(key); }
+function nudge(key: Key, delta: number) {
+  if (!props.params) return;
+  const base = valid(draft[key]) ? Number(draft[key]) : props.params[key];
+  const next = Number((base + delta).toFixed(2));
+  draft[key] = String(next);
+  dirty[key] = true;
+  schedule(key);
+}
 function blur(key: Key) {
+  const hadTimer = timers.has(key);
   clearTimeout(timers.get(key)); timers.delete(key);
-  if (!valid(draft[key])) reset(key);
+  if (!valid(draft[key])) { reset(key); return; }
+  if (hadTimer && dirty[key]) apply(key);
 }
 onUnmounted(() => { for (const timer of timers.values()) clearTimeout(timer); });
 </script>
 
 <template>
-  <section :class="embedded ? 'border-t border-edge-soft pt-3 mt-3' : 'card p-3'" aria-label="变声参数">
+  <section :class="embedded ? 'border-t border-edge-soft pt-3 mt-3' : 'card p-3.5 md:p-3'" aria-label="变声参数">
     <div class="flex items-center gap-2 mb-2 min-w-0">
       <h2 class="text-sm font-extrabold tracking-wider text-ink uppercase section-title shrink-0">参数</h2>
       <!-- 与 default 预设不同时才出现：保存为默认、恢复默认。 -->
@@ -68,13 +88,17 @@ onUnmounted(() => { for (const timer of timers.values()) clearTimeout(timer); })
           <svg class="w-4 h-4" aria-hidden="true" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" viewBox="0 0 24 24"><path d="M3 12a9 9 0 1 0 9-9 9.75 9.75 0 0 0-6.74 2.74L3 8"/><path d="M3 3v5h5"/></svg>
         </button>
       </div>
-      <span v-if="error" class="banner banner-error text-micro min-w-0 truncate" role="alert" :title="error">{{ error }}</span>
-      <span v-if="!embedded" class="text-micro font-mono font-bold text-ink-2 bg-surface border border-edge rounded-sm px-2 py-1 max-w-[60%] truncate ml-auto shrink-0" translate="no">{{ modelId ?? '未加载模型' }}</span>
+      <span v-if="!embedded" class="text-micro font-mono font-bold text-ink-2 bg-surface border border-edge rounded-md px-2 py-1 max-w-[60%] truncate ml-auto shrink-0" translate="no">{{ modelId ?? '未加载模型' }}</span>
     </div>
-    <p class="text-micro text-ink-3 mb-2.5">F0 方法：{{ params?.f0_method ?? '未知' }}（只读）</p>
+    <AlertBanner :message="error" dismissible class="mb-2.5" @dismiss="emit('dismissError')" />
+    <p class="text-micro text-ink-3 mb-2">F0 方法：{{ params?.f0_method ?? '未知' }}（只读）</p>
     <form v-for="field in fields" :key="field.key" class="grid grid-cols-[1fr_auto] items-center gap-3 py-2 border-b border-edge last:border-b-0" @submit.prevent>
       <label :for="'param-' + field.key" class="text-xs font-bold text-ink-2 truncate">{{ field.label }}</label>
-      <input :id="'param-' + field.key" type="number" step="any" required class="field w-24 h-8 text-right font-mono text-sm font-extrabold px-2 tabular-nums" :value="draft[field.key]" :disabled="blocked || !ready || !params" @input="change(field.key, $event)" @blur="blur(field.key)">
+      <div class="param-stepper">
+        <button type="button" class="stepper-btn md:hidden" :aria-label="'减小' + field.label" :disabled="blocked || !ready || !params" @click="nudge(field.key, -field.step)">−</button>
+        <input :id="'param-' + field.key" type="number" inputmode="decimal" step="any" required class="field w-20 md:w-24 h-9 md:h-8 text-center md:text-right font-mono text-sm font-extrabold px-2 tabular-nums" :value="draft[field.key]" :disabled="blocked || !ready || !params" @input="change(field.key, $event)" @blur="blur(field.key)">
+        <button type="button" class="stepper-btn md:hidden" :aria-label="'增大' + field.label" :disabled="blocked || !ready || !params" @click="nudge(field.key, field.step)">+</button>
+      </div>
     </form>
   </section>
 </template>

@@ -5,6 +5,7 @@ import { SubtitleStore, subscribeStream } from './streams';
 import type { SubtitleRecord } from './contracts';
 
 const REFRESH_MS = 3000;
+const NOTICE_MS = 5000;
 /** 打开页面前这段时间内收到的字幕仍算当前内容，保留正在说的那句。 */
 const LIVE_CONTEXT_S = 10;
 /** 修订在句子说出后不久到达（桥的复核期限为 30 s）；更早的句子不会再有修订，不必记住。 */
@@ -12,8 +13,9 @@ const REVISION_WINDOW_S = 60;
 export type ActionArea = 'system' | 'files' | 'devices' | 'params' | 'speech';
 /** 写锁的粒度：同一控件的写入串行，其余控件照常可用；区域之间的冲突由 daemon 仲裁。 */
 export type Lock = ActionArea | 'mute' | 'route' | 'model' | 'lifecycle';
-/** 每个写锁归属的结果区域：未知结果与错误按区域登记。 */
+/** 每个写锁归属的结果区域：未知结果按区域锁定。 */
 const AREA_OF_LOCK: Record<Lock, ActionArea> = { system: 'system', files: 'files', devices: 'devices', params: 'params', speech: 'speech', mute: 'system', route: 'system', model: 'system', lifecycle: 'system' };
+export type ErrorKey = Lock | 'connection' | 'status' | 'models' | 'preset' | 'deviceList' | 'fileList' | 'captureBaseline' | 'playbackBaseline' | 'theme';
 /** 状态与健康之外，按需重读的数据。 */
 type Resource = 'files' | 'models' | 'preset' | 'devices' | 'baselines';
 /**
@@ -67,9 +69,11 @@ export function useConsole() {
   const unknowns = ref<Record<ActionArea, string[]>>({ system: [], files: [], devices: [], params: [], speech: [] });
   const busy = ref<Record<Lock, boolean>>({ system: false, files: false, devices: false, params: false, speech: false, mute: false, route: false, model: false, lifecycle: false });
   const writing = computed(() => Object.values(busy.value).some(Boolean));
+  const reloading = ref(false);
   const notice = ref('');
-  const errors = ref<Record<ActionArea | 'connection' | 'status' | 'models' | 'preset' | 'deviceList' | 'fileList' | 'captureBaseline' | 'playbackBaseline', string>>({
-    system: '', files: '', devices: '', params: '', speech: '', connection: '', status: '', models: '', preset: '', deviceList: '', fileList: '', captureBaseline: '', playbackBaseline: '',
+  const errors = ref<Record<ErrorKey, string>>({
+    system: '', lifecycle: '', route: '', mute: '', model: '', files: '', devices: '', params: '', speech: '',
+    connection: '', status: '', models: '', preset: '', deviceList: '', fileList: '', captureBaseline: '', playbackBaseline: '', theme: '',
   });
   const subtitleState = ref<ConnectionState>('connecting');
   const statusStreamState = ref<ConnectionState>('connecting');
@@ -78,6 +82,8 @@ export function useConsole() {
   const statusStreamError = ref('');
   const filesFresh = ref(false);
   const devicesFresh = ref(false);
+  const modelsFresh = ref(false);
+  const presetFresh = ref(false);
   const uploadGeneration = ref(0);
   const baselines = ref<Partial<Record<'capture' | 'playback', string>>>({});
   const ready = computed(() => adapterOnline.value && statusFresh.value);
@@ -92,9 +98,21 @@ export function useConsole() {
   let lastStatusAt = 0;
   let inFlight: Promise<void> | undefined;
   let timer: ReturnType<typeof setTimeout> | undefined;
+  let noticeTimer: ReturnType<typeof setTimeout> | undefined;
   let stopStatus: (() => void) | undefined;
   let stopSubtitles: (() => void) | undefined;
   const reads = new AbortController();
+
+  function setNotice(message: string) {
+    clearTimeout(noticeTimer);
+    noticeTimer = undefined;
+    notice.value = message;
+    if (message && !disposed) {
+      noticeTimer = setTimeout(() => { notice.value = ''; noticeTimer = undefined; }, NOTICE_MS);
+    }
+  }
+  function dismissNotice() { setNotice(''); }
+  function dismissError(key: ErrorKey) { errors.value[key] = ''; }
 
   const acceptStatus = (value: Status) => {
     update(status, value);
@@ -135,6 +153,8 @@ export function useConsole() {
       statusFresh.value = false;
       filesFresh.value = false;
       devicesFresh.value = false;
+      modelsFresh.value = false;
+      presetFresh.value = false;
       health.value = null;
       errors.value.connection = describe(error);
       return false;
@@ -220,6 +240,8 @@ export function useConsole() {
           resources.includes('baselines') ? readBaseline('capture') : undefined,
           resources.includes('baselines') ? readBaseline('playback') : undefined,
         ]);
+        if (resources.includes('models')) modelsFresh.value = !errors.value.models;
+        if (resources.includes('preset')) presetFresh.value = !errors.value.preset;
         if (resources.includes('devices')) devicesFresh.value = !errors.value.deviceList;
       }
     })().finally(() => { inFlight = undefined; });
@@ -231,19 +253,28 @@ export function useConsole() {
     if (inFlight) await inFlight;
     await refresh(scope);
   }
-  const reload = () => settle(FULL);
+  let reloadPending = 0;
+  async function reload() {
+    reloadPending++;
+    reloading.value = true;
+    try { await settle(FULL); }
+    finally {
+      reloadPending--;
+      reloading.value = reloadPending > 0;
+    }
+  }
 
   async function perform(lock: Lock, operation: () => Promise<unknown>, options: { message?: string; context?: string; baseline?: 'capture' | 'playback'; resources?: readonly Resource[] } = {}) {
     const area = AREA_OF_LOCK[lock];
     const { message = '请求已受理；实际状态以下次查询为准。', context = '本次操作' } = options;
     if (busy.value[lock] || unknowns.value[area].length) return false;
     busy.value[lock] = true;
-    notice.value = '';
-    errors.value[area] = '';
+    setNotice('');
+    errors.value[lock] = '';
     try {
       await operation();
       if (disposed) return false;
-      if (message) notice.value = message;
+      if (message) setNotice(message);
       const resources: Resource[] = area === 'files' ? ['files'] : [];
       resources.push(...(REREAD[lock] ?? []), ...(options.resources ?? []));
       await settle({ mode: 'write', resources });
@@ -265,7 +296,7 @@ export function useConsole() {
               requiredBaselines.value = options.baseline ? [options.baseline] : ['capture', 'playback'];
             }
           }
-        } else errors.value[area] = describe(error);
+        } else errors.value[lock] = describe(error);
       }
       return false;
     } finally { busy.value[lock] = false; }
@@ -281,8 +312,8 @@ export function useConsole() {
       if (baseline) baselines.value[baseline] = value;
       if (effect.restart_required && effect.affected.length) {
         for (const service of effect.affected) await client.restart(service as Service);
-        notice.value = `已写入基线并重启：${effect.affected.join('、')}`;
-      } else if (area === 'devices') notice.value = '基线已写入；文件任务使用各自的参数快照。';
+        setNotice(`已写入基线并重启：${effect.affected.join('、')}`);
+      } else if (area === 'devices') setNotice('基线已写入；文件任务使用各自的参数快照。');
     }, { message: '', baseline });
   }
 
@@ -303,7 +334,7 @@ export function useConsole() {
   async function submit(file: File, modelId?: string) {
     const accepted = await perform('files', async () => {
       const result = await client.submit(file, modelId);
-      notice.value = `已受理 ${result.job_id} · ${result.state}，转换尚未完成。`;
+      setNotice(`已受理 ${result.job_id} · ${result.state}，转换尚未完成。`);
     }, { message: '', context: `提交 ${file.name}` });
     if (accepted) uploadGeneration.value++;
   }
@@ -316,7 +347,7 @@ export function useConsole() {
       const anchor = document.createElement('a');
       anchor.href = url; anchor.download = name; anchor.click();
       setTimeout(() => URL.revokeObjectURL(url), 0);
-      notice.value = '下载已交给浏览器。';
+      setNotice('下载已交给浏览器。');
     } catch (error) {
       if (!(error instanceof ApiError)) throw error;
       errors.value.files = describe(error);
@@ -362,6 +393,7 @@ export function useConsole() {
   onUnmounted(() => {
     disposed = true;
     clearTimeout(timer);
+    clearTimeout(noticeTimer);
     reads.abort();
     stopStatus?.(); stopSubtitles?.();
   });
@@ -373,11 +405,12 @@ export function useConsole() {
   }
 
   return {
-    status, health, adapterOnline, ready, jobs, paused, models, preset, devices, records, busy, writing, errors, notice,
+    status, health, adapterOnline, ready, jobs, paused, models, preset, devices, records, busy, writing, reloading, errors, notice,
     subtitleState, subtitleError, subtitleStorageError, statusStreamState, statusStreamError, downloadSupported,
-    uploadGeneration, baselines, filesFresh, devicesFresh, unknowns,
+    uploadGeneration, baselines, filesFresh, devicesFresh, modelsFresh, presetFresh, unknowns,
     canAcknowledge,
     acknowledge: (area: ActionArea) => { if (canAcknowledge(area)) unknowns.value[area] = []; },
+    dismissNotice, dismissError,
     reload, perform, restart, setConfig, setParam, submit, download,
   };
 }

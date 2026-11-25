@@ -2,7 +2,8 @@ import { z } from 'zod';
 import { API_ROOT, ApiError, parsePayload } from './api';
 import { envelopeSchema, subtitleSchema, type ConnectionState, type SubtitleRecord } from './contracts';
 
-const RECONNECT_MS = 1000;
+const RECONNECT_MIN_MS = 1000;
+const RECONNECT_MAX_MS = 10000;
 export const SUBTITLE_HISTORY_LIMIT = 50;
 const resetSchema = z.object({ generation: z.string().min(1) });
 const cursorSchema = z.string().regex(/^[^:\s]+:\d+$/);
@@ -98,6 +99,7 @@ export function subscribeStream<T>(options: StreamOptions<T>, factory = (url: st
   let timer: ReturnType<typeof setTimeout> | undefined;
   let cursor = options.cursor;
   let dataError: string | undefined;
+  let reconnectDelay = RECONNECT_MIN_MS;
 
   const disconnect = () => {
     if (source) {
@@ -110,7 +112,9 @@ export function subscribeStream<T>(options: StreamOptions<T>, factory = (url: st
     disconnect();
     options.state('offline');
     options.error(dataError ?? message);
-    timer = setTimeout(connect, RECONNECT_MS);
+    const delay = reconnectDelay;
+    reconnectDelay = Math.min(reconnectDelay * 2, RECONNECT_MAX_MS);
+    timer = setTimeout(connect, delay);
   };
   const decode = <V>(event: MessageEvent, schema: z.ZodType<V>): V => {
     let value: unknown;
@@ -128,7 +132,10 @@ export function subscribeStream<T>(options: StreamOptions<T>, factory = (url: st
     source = next;
     next.onopen = () => {
       if (source === next) {
-        if (!dataError) options.error('');
+        if (!dataError) {
+          reconnectDelay = RECONNECT_MIN_MS;
+          options.error('');
+        }
         options.state(dataError ? 'connecting' : 'online');
       }
     };
@@ -146,6 +153,7 @@ export function subscribeStream<T>(options: StreamOptions<T>, factory = (url: st
       }
       options.accept(value, nextCursor);
       dataError = undefined;
+      reconnectDelay = RECONNECT_MIN_MS;
       cursor = nextCursor;
       options.error('');
       options.state('online');

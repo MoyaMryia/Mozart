@@ -9,8 +9,11 @@ const open = ref(false);
 </script>
 
 <template>
-  <details class="console-log shrink-0 rounded-lg overflow-hidden border border-edge" @toggle="open = ($event.target as HTMLDetailsElement).open">
-    <summary class="console-header cursor-pointer px-3 py-2 text-xs font-bold">INFO</summary>
+  <details class="console-log shrink-0 rounded-xl overflow-hidden border border-edge" @toggle="open = ($event.target as HTMLDetailsElement).open">
+    <summary class="console-header cursor-pointer px-3.5 py-2.5 md:px-3 md:py-2 text-xs font-bold flex items-center gap-2 select-none">
+      <svg class="console-chevron w-3.5 h-3.5 shrink-0" aria-hidden="true" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round" viewBox="0 0 24 24"><path d="m9 18 6-6-6-6"/></svg>
+      <span>INFO</span>
+    </summary>
     <div class="console-entries p-3 space-y-1.5 text-[12px] leading-5 font-mono">
       <p class="text-gray-300 break-words"><span class="text-emerald-400 font-bold">&gt;</span> 状态推送：{{ statusStreamState }}<template v-if="statusStreamError"> · {{ statusStreamError }}</template></p>
       <p class="text-gray-300 break-words"><span class="text-emerald-400 font-bold">&gt;</span> 字幕推送：{{ subtitleState }}<template v-if="subtitleError"> · {{ subtitleError }}</template></p>

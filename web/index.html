@@ -2,8 +2,8 @@
 <html lang="zh-CN">
   <head>
     <meta charset="UTF-8" />
-    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-    <meta name="theme-color" id="meta-theme-color" content="#FCFDFE" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover" />
+    <meta name="theme-color" id="meta-theme-color" content="#EFF6F1" />
     <title>Mozart</title>
     <script>
       // 首帧前确定主题，避免亮暗闪烁。无存储值时跟随系统偏好。
@@ -14,16 +14,16 @@
           : (window.matchMedia('(prefers-color-scheme: dark)').matches ? 'dark' : 'light');
         document.documentElement.dataset.theme = theme;
         var meta = document.getElementById('meta-theme-color');
-        if (meta) meta.setAttribute('content', theme === 'dark' ? '#0C0E11' : '#FCFDFE');
+        if (meta) meta.setAttribute('content', theme === 'dark' ? '#0C1210' : '#EFF6F1');
       })();
     </script>
     <style>
       /* 关键路径：主 CSS 加载完成前防止暗色主题闪白 */
-      html[data-theme="dark"] { background: #0C0E11; }
+      html[data-theme="dark"] { background: #0C1210; }
     </style>
   </head>
-  <body class="bg-app text-ink font-sans min-h-screen md:h-screen flex flex-col overflow-x-clip md:overflow-hidden">
-    <div id="app" class="flex min-h-screen flex-col md:h-full md:min-h-0"></div>
+  <body class="bg-app text-ink font-sans min-h-[100dvh] md:h-screen flex flex-col overflow-x-clip md:overflow-hidden">
+    <div id="app" class="flex min-h-[100dvh] flex-col md:h-full md:min-h-0"></div>
     <script type="module" src="/src/main.ts"></script>
   </body>
 </html>

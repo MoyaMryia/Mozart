@@ -116,4 +116,25 @@ describe('命名 SSE', () => {
     source!.emit('status', { fabricated: true });
     expect(accept).not.toHaveBeenCalled(); expect(state).toHaveBeenLastCalledWith('offline'); expect(error).toHaveBeenCalled(); stop();
   });
+  it('连续断线按指数退避重连并在恢复数据后重置间隔', () => {
+    const sources: Source[] = [];
+    const stop = subscribeStream({ path: '/events/subtitles', event: 'subtitle', schema: subtitleSchema, accept: vi.fn(), state: vi.fn(), error: vi.fn() }, url => {
+      const source = new Source(url); sources.push(source); return source as unknown as EventSource;
+    });
+    const expected = [1000, 2000, 4000, 8000, 10000, 10000];
+    for (const delay of expected) {
+      const count = sources.length;
+      sources.at(-1)!.onerror?.(new Event('error'));
+      vi.advanceTimersByTime(delay - 1);
+      expect(sources).toHaveLength(count);
+      vi.advanceTimersByTime(1);
+      expect(sources).toHaveLength(count + 1);
+    }
+    sources.at(-1)!.emit('subtitle', subtitleFixture(), 'g1:10');
+    const afterRecovery = sources.length;
+    sources.at(-1)!.onerror?.(new Event('error'));
+    vi.advanceTimersByTime(1000);
+    expect(sources).toHaveLength(afterRecovery + 1);
+    stop();
+  });
 });
