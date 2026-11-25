@@ -55,7 +55,7 @@
 
 ### 翻译
 
-- 翻译模型用 llama-server（llama.cpp 的 C++ 服务程序）独立进程，不链库进 Rust，以隔离崩溃域、解耦构建；模型与启动参数沿用旧实现（演示固定 Qwen3.5 0.8B）。llama-server 由 daemon 监管，跟随 SPEC-04。（`daemon/src/supervisor.rs:256-257`）
+- 翻译模型用 llama-server（llama.cpp 的 C++ 服务程序）独立进程，不链库进 Rust，以隔离崩溃域、解耦构建；模型与启动参数经 `[bridge]` 的 `llama_model_id` 与 `[[bridge.models]]` 统一配置（兼容旧单键 `llama_model`），由 `Config::active_llm_model` 同时供给 daemon 启动参数与 bridge 提示词策略。llama-server 由 daemon 监管，跟随 SPEC-04。（`core/src/config.rs`、`daemon/src/supervisor.rs`、`bridge/src/http.rs`）
 - 传输用 Unix socket（llama-server 的 --host 填 .sock 路径），协议沿用其原生 HTTP（OpenAI /v1/chat/completions）。这是系统唯一保留 HTTP 协议之处：不重写第三方推理服务，传输层仍统一 Unix socket。板端需确认 llama-server 支持 --host .sock，不支持则重建 llama.cpp 或暂退 TCP 本机回环。（板端确认仍未做，保留退路）
 - Rust 桥当 HTTP 客户端（经 Unix socket 连接），负责推理之外的全部编排：预处理（同音字纠正、术语表、数字归一化）、质检、失败重试（最多 2 次）、上下文管理、落字幕、投递。llama-server 只做中文→英文纯推理。（`bridge/src/http.rs`、`bridge/src/translate.rs`、`bridge/src/quality.rs`）
 - 同音字纠错（显式表）：显式纠错表搬成 Rust，有行为测试。（`bridge/src/preprocess.rs:13-26`、`bridge/tests/process.rs:395-427`）
@@ -83,6 +83,10 @@
 - 复核丢失后有界收敛：等待到 30 s 单调时限后标记复核跳过，用在线原文继续文字翻译且不补播。桥重启从存档尾部最多 1 MiB、128 条最近 final 按最高修订恢复；仍未决的复核立即标记中断，已完成不重放，迟到复核不覆盖结果。超出读取范围记日志；无法翻译时标明原因。
 - 字幕常驻与播报解耦：由 `SetOutputMode` 切换时不关闭识别和翻译字幕；仅 `broadcast` 模式启用 TTS。用户单独关闭翻译是独立设置，不由模式切换改写。`broadcast` 在无播报帧时静音，不回落到直通输出。验收见[模式往返报告](../../reports/speech-fence-20261123/RESULTS.md)。
 - [ ] 端到端 STS 选型边界：8 GB Jetson 端侧暂不以本地端到端中译英 STS 替换现有 `ASR + LLM + TTS` 管线（受限于统一内存与流式生态）；后续若引入云端 STS，仅作为翻译播报模式的可选在线后端，本地管线保留为离线默认兜底。
+- [x] 语言链路测试脚本与验收门限加固（步骤 1）：已将 `tools/jetson-language-test.sh` 改为 `startup_mode = "broadcast"` 独占播报隔离并校验 `output_mode.applied == "broadcast"`、`phase == "applied"` 与 `pre.playout_policy == "broadcast_only"`；等待就绪状态连续稳定消除启动首秒竞态，播完后补 `2 s` 尾静音并等待全链路队列及字幕完全排空收敛，采用原子快照避免失败破坏文件；新增仓内可复用核验脚本 `tools/verify-language-run.py`（纯标准库可用，含 23 项正反例自测，`--mode smoke|strict` 如实区分健康硬门限与断句/停顿告警），板端 `tools/jetson-e2e.sh --language` 实测 9/9 必需门限通过（`tools/jetson-language-test.sh`、`tools/verify-language-run.py`）。
+- [x] 翻译模型切换至特化小模型与质检误杀修复（步骤 2）：在 `core/src/config.rs` 新增可扩展多模型配置 `[[bridge.models]]`、`llama_model_id`、`glossary_path` 与 `PromptProfile`（`qwen_chat` / `hy_mt` / `custom`，兼容旧 `llama_model`），`daemon/src/supervisor.rs` 按选中模型传递 `-m`、`-c`、`--cache-ram` 等参数；`bridge/src/http.rs` 实现按模板构建请求及术语表、滑动上下文注入；同步完成四项修复——`preprocess::eval_number` 与 `checks.rs` 对齐中文口语省位数字、默认 `max_tokens` 放宽至 `256`、`quality::check` 对英文高频虚词豁免总次数同时保留任意词连续 `>= 3` 次复读拦截、`translate.rs` 对纯 ASCII 英文复核原文直通放行并在有实质变化（去上下文或非零温度）时执行 1 次质检重试；已同步 `docs/config.md`。Jetson 板端已将运行配置切换至 `Hy-MT3-1.8B`（`Q4_K_M`，`hy_mt` 模板、`-c 1024 --cache-ram 64`、`context_window = 2`），7 服务含实时流式 RVC 并发运行 `degraded = []`、`MemAvailable = 1069 MiB`，`jetson-e2e.sh --language` 实测 `11/12` 终句通过、零崩溃零回退。（`core/src/config.rs`、`daemon/src/supervisor.rs`、`bridge/src/{http,preprocess,checks,quality,translate,subtitles,main}.rs`、`docs/config.md`）
+- [ ] TTS 合成与播放解耦消除句间空白（步骤 3）：拆分 `tts/src/synth.rs` 单线程阻塞等待 `output.join()` 的流程，引入双线程单句预合成槽，在按实时节拍播放当前句的同时提前跑完下一句的 PocketTTS LM 与解码阶段，消除相邻两句间 `1.5–3.8 s` 机械空白；若长句连发仍形成排队积压，再按需启用预留的弹性变速播放（`1.15–1.2x`）消化积压。验收：连续播报下超过 `1.5 s` 的异常空白占比 `≤ 10%`、单次最大空白 `≤ 2.5 s`、`tts.skipped == 0`。（`tts/src/synth.rs:262-306`）
+- [ ] 双工断句与长句软切升级（步骤 4）：取消 `asr/src/decoder.rs` 句音频缓冲满 `700` 帧（`14 s`）直接退出重启的做法，改为连续说话超过 `8 s` 后借小换气或声音低谷安全软切并重置解码流；启用板端 `sherpa-onnx` 原生内置的 `Silero VAD v5` 将纯底噪挡在识别缓冲之外；在 `mozart-asr` 接入轻量端侧轮次结束模型 `Smart Turn v3`（约 `8 MB` INT8 ONNX），以短静音（约 `300 ms`）初判加未完结动态延展窗口替代固定 `rule2 = 0.6 s` 单阈值切句；外放双讲场景后续再衔接 `SPEC-02` 的回声消除（WebRTC AEC3）。验收：同音频 3 轮重放句数波动 `≤ 8%`、切分边界重合度 `≥ 85%`、短碎句率与句尾未完切率均 `≤ 15%`、超过 `15 s` 连续语音零重启零丢句、全栈剩余可用内存 `≥ 700 MiB`。（`asr/src/decoder.rs:20,122-140`、`asr/src/ffi.rs:440-442,472-475`）
 
 ## 回归检查
 

@@ -86,6 +86,7 @@
 
 ## 变更记录
 
+- 2026-11-25：完成语言链路测试验收加固与可扩展多翻译模型架构切换（SPEC-05 步骤 1–2、`docs/config.md`）：新增 `[bridge].llama_model_id`、`glossary_path` 与 `[[bridge.models]]` 多模型配置（支持 `qwen_chat` / `hy_mt` / `custom` 提示词策略，兼容旧单键 `llama_model`），`daemon` 按选中模型动态传递 `llama-server` 参数，`bridge` 接入术语表与滑动上下文并修复口语省位数字对拍、`max_tokens=256` 长句防截断、虚词重复误杀（保留连续 `>= 3` 次拦截）、纯英文复核直通与有效质检重试；加固 `tools/jetson-language-test.sh` 为 `broadcast` 独占播报加全链路排空并新增 `tools/verify-language-run.py` 自动化核验工具；Jetson 正式运行时已切至 `Hy-MT3-1.8B`（`Q4_K_M`，`-c 1024 --cache-ram 64`），7 服务与流式 RVC 并发稳定，`MemAvailable = 1069 MiB`，`jetson-e2e.sh --language` 9/9 必需门限通过。
 - 2026-11-25：新增 Jetson 开机定频与 `systemd` 自启维护及部署适配（SPEC-09、SETUP）：仓库新增独立模板 `deploy/systemd/mozart-clocks.service.in` 与 `deploy/systemd/mozart.service.in` 及安装脚本 `tools/install-jetson-systemd.sh`（默认保留自动调速风扇，支持 `--restart on-failure|no`、`--fan`、`--uninstall` 与最小权限 sudoers）；`tools/deploy-jetson.sh` 与 `tools/jetson-e2e.sh` 适配 `mozart.service` 临时停启并补 3 s 收割等待；同步加固 `TrtEngine` 锁页缓冲（单张量 4 MiB 上限、申请失败回退普通拷贝、卸载前同步流）。
 - 2026-11-25：完成实时变声衔接自然度与降延迟优化（SPEC-03）：补齐静音跳过尾音淡出与历史音高缓存推进（步骤 1）、放宽 `frame_idx` 连续时的正向 `pts_ns` 误重置（步骤 2）、补齐实时 `protect` / 120 ms 边缘宽度归一化 `rms_mix_rate` / `0.99` 峰值限幅（步骤 4）、实时音高关闭无声插值恢复声码器清浊音开关（步骤 5），并优化 `IndexSearch`（NEON 向量化 + 质心分块 + 多线程并行）与 `TrtEngine` CUDA 锁页缓冲（配合板端 `jetson_clocks` 定频，240 ms 切块 FP16 单块推理降至 `29.9 ms`、`d=260` 零缺帧净延迟 `398~405 ms`）；四相位锁死消融检出步骤 3 绝对网格初相/噪声与 `3e-3` SOLA 门限存在真实退化与 `+4.9 ms` 开销并已回滚；将默认 `startup_delay_ms` 降至 `340`、默认实时引擎编译 `compile.fp16` 设为 `true`，并归档含 `160 ms` 短块实验在内的实测报告（`reports/realtime-quality-latency-20261125/RESULTS.md`）。
 
