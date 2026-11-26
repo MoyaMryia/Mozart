@@ -1,6 +1,6 @@
 # web：控制台与 HTTP API
 
-状态：v1 首批 HTTP/SSE 接口已实现，完整命令面和设备验收待完成。最后更新：2026-11-24。
+状态：v1 首批 HTTP/SSE 接口已实现，完整命令面和设备验收待完成。最后更新：2026-11-26。
 `[x]` 条目详情已于 2026-11-24 移入 [archive/SPEC-06-web.md](archive/SPEC-06-web.md)，本文件保留契约、关键决策摘要与活跃待办。
 
 适配器作为独立进程连接 daemon 控制 socket；本机入口仍包括
@@ -110,6 +110,7 @@ RPC 截止时间复用 CLI 的普通请求、配置写入及启动停止预算�
 | `PUT /translate` | `{"enabled":true}` | `DAEMON_TRANSLATE_SET` |
 | `PUT /speech` | `{"enabled":true}` | `DAEMON_SPEECH_SET` |
 | `POST /speech/stop` | `{}` | `DAEMON_SPEECH_STOP` |
+| `POST /speech/clear` | `{}` | `DAEMON_SPEECH_CLEAR`；清空待播报队列并截断在途合成，保持 `speech_enabled` 不变与托管模式 |
 | `GET /models` | 无 | `DAEMON_MODEL_LIST`，`{"models":[...]}` |
 | `GET /devices` | 可选 `all=true/false`，默认 false | `DAEMON_DEVICE_LIST`，`{"devices":[...]}` |
 | `GET /config` | 可选查询参数 `key` | `DAEMON_CONFIG_GET`，`{"value":...}`；读取 TOML 基线 |
@@ -132,7 +133,7 @@ retained 是提交结果未知而保留的数量；reasons 列出保留原因，
 `models` 不按 `exists` 过滤；前端可按该字段筛选，但不得把 `exists=true` 显示为推理已就绪。
 `config set` 的支持键和生效成本归 daemon；不得因为配置表列了某键，就假定写回已经接通。
 设备键写入成功后，前端按 `restart_required`/`affected` 自动调用 `POST /services/{service}/restart` 使基线生效；其余重启类提示与 `status.pending_restart` 原样展示。
-设置路由后展示 `route.desired` 与 `route.active`，不把等待切换显示为已经切换。
+设置路由走 `PUT /api/v1/mode`（`direct`/`rvc`/`broadcast`），前端按 `output_mode.requested`、`output_mode.applied`、`output_mode.phase` 与 `output_mode.last_error` 分开展示请求意图、实际模式、过渡阶段及故障原因，不把等待切换显示为已经切换。
 
 ### 业务子服务启停
 
@@ -270,7 +271,8 @@ v1 沿用本地设备／自有热点无认证的决定，不提供公网部署�
 
 ## 七、实现与验收待办
 
-- [ ] 接口与前端收口：保持适配器为 `daemon.sock` 瘦透传层，补齐已有命令映射（前端接入 `PUT /api/v1/mode`，适配器与前端补齐 `DAEMON_DEVICE_USE`）；适配器缓存已加载配置，不再每次 RPC 重读磁盘 TOML；前端改为按需刷新，避免每次写入后并发重拉 ALSA 设备列表与模型列表。
+- [ ] 接口与前端收口：保持适配器为 `daemon.sock` 瘦透传层，补齐已有命令映射（适配器与前端补齐 `DAEMON_DEVICE_USE`）；适配器缓存已加载配置，不再每次 RPC 重读磁盘 TOML；前端改为按需刷新，避免每次写入后并发重拉 ALSA 设备列表与模型列表。
+- [x] 控制台三态互斥路由与条件播报卡片重构：前端路由切换接入 `PUT /api/v1/mode`（`direct`／`rvc`／`broadcast`），移除左侧独立「翻译播报」卡片并在路由卡片内底部提供独立「翻译」开关按钮（`PUT /api/v1/translate`）；仅当播报启用时在右侧路由卡片下方条件展开「播报设置」卡片并提供 `POST /api/v1/speech/clear`「清除播报队列」按钮（不展示未实现功能占位文案）。
 - [ ] 前端写锁与 SSE 断连加固：解耦 HTTP 状态主动查询版本号与 SSE 推送版本号，消除 `statusReadFresh` 被 SSE 抢跑打断的竞态与刷新闪烁；幂等写操作在拉回最新状态后自动解除未知结果锁，仅不可幂等的文件提交保留人工确认；前端 SSE 改用指数退避重连（`1 s` 起至上限 `10 s`），持久数据错误单独降级提示。
 - [ ] 适配器网络异常、字幕回放与上传额度回收加固：将 `transport.rs` 中 `accept()` 未覆盖错误码由 `panic!` 改为记错退避；优化字幕文件增量核验与近期窗口/游标回放，避免历史文件增大导致回放撑爆 `sse_buffer_bytes`；为文件提交超时保留目录补齐可确认回收路径（确认任务状态后释放上传并发额度，不再只能等待重启 daemon）。
 - [ ] 日志尾随接口：适配器提供 `GET /api/v1/logs?name=<服务>`，只读返回 `run/logs` 下该服务日志的末尾片段（白名单、定长）；前端在 INFO 面板内查看并每 2 秒刷新，不写文件、不新增 daemon 命令。

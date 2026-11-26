@@ -106,17 +106,22 @@ try {
   const download = await downloadPromise; await download.saveAs(join(evidence, 'converted.wav'));
   const bytes = await readFile(join(evidence, 'converted.wav')); const output = wav(bytes);
   const fileStatus = await api('status'); assert.equal(fileStatus.rvc.frames_in, 100); assert.equal(fileStatus.rvc.frames_out, 100); assert.equal(fileStatus.rvc.frames_dropped, 0);
-  // Enable speech after file-model setup, and verify the provider state rather than a transient DOM value.
-  const speech = card('翻译播报').getByRole('checkbox', { name: '播报', exact: true });
-  await waitFor(async () => (await api('status')).bridge.speech_enabled === await speech.isChecked());
-  if (await speech.isChecked()) {
-    await speech.click();
-    await waitFor(async () => !(await api('status')).bridge.speech_enabled && !await speech.isChecked());
+  // Enable broadcast mode after file-model setup, and verify output_mode and bridge speech state.
+  const current = await api('status');
+  if (current.output_mode?.applied === 'broadcast') {
+    await page.locator('#system-route').selectOption('direct');
+    await waitFor(async () => {
+      const s = await api('status');
+      return s.output_mode?.applied === 'direct' && !s.bridge.speech_enabled;
+    });
   }
-  const speechResponse = page.waitForResponse(response => response.url().endsWith('/api/v1/speech') && response.request().method() === 'PUT');
-  await speech.click();
-  assert.equal((await speechResponse).status(), 200);
-  await waitFor(async () => (await api('status')).bridge.speech_enabled && await speech.isChecked());
+  const modeResponse = page.waitForResponse(response => response.url().endsWith('/api/v1/mode') && response.request().method() === 'PUT');
+  await page.locator('#system-route').selectOption('broadcast');
+  assert.equal((await modeResponse).status(), 200);
+  await waitFor(async () => {
+    const s = await api('status');
+    return s.output_mode?.applied === 'broadcast' && s.bridge.speech_enabled && await card('播报设置').isVisible();
+  });
   // Observe the real server independently; old history cannot satisfy recovery.
   observer = await observeSubtitles();
   await waitFor(() => { observer.check(); return observer.state.ready; });

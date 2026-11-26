@@ -30,6 +30,8 @@ pub const DAEMON_TRANSLATE_SET: u16 = 0x0106;
 pub const DAEMON_SPEECH_SET: u16 = 0x0107;
 /// 体：{}（空）；daemon 转发到桥 BRIDGE_SPEECH_STOP。
 pub const DAEMON_SPEECH_STOP: u16 = 0x0108;
+/// 体：{}（空）；清播报队列并中止当前合成，保持播报开关不变。
+pub const DAEMON_SPEECH_CLEAR: u16 = 0x0109;
 /// 文件链路（SPEC-04）：体 schema::FileSubmitRequest {"path","model_id"?}；
 /// data {"job_id","state","queue_position"}。
 pub const DAEMON_FILE_SUBMIT: u16 = 0x0110;
@@ -87,7 +89,7 @@ pub fn config_set_timeout_ms(rpc_timeout_ms: u64) -> u64 {
 pub fn request_timeout_ms(rpc_timeout_ms: u64, command: u16) -> u64 {
     match command {
         DAEMON_CONFIG_SET | DAEMON_PRESET_SAVE | DAEMON_PRESET_USE | DAEMON_PRESET_LIST
-        | DAEMON_SPEECH_SET | DAEMON_SPEECH_STOP | DAEMON_OUTPUT_MODE_SET
+        | DAEMON_SPEECH_SET | DAEMON_SPEECH_STOP | DAEMON_SPEECH_CLEAR | DAEMON_OUTPUT_MODE_SET
         | DAEMON_SERVICES_START | DAEMON_SERVICES_STOP => {
             config_set_timeout_ms(rpc_timeout_ms)
         }
@@ -137,6 +139,8 @@ pub const BRIDGE_TRANSLATE_SET: u16 = 0x0503;
 pub const BRIDGE_SPEECH_SET: u16 = 0x0504;
 /// 体：{}（空）。
 pub const BRIDGE_SPEECH_STOP: u16 = 0x0505;
+/// 体：{}（空）或 {"fenced":true}；清待播报队列并推进截止，保持播报开关不变。
+pub const BRIDGE_SPEECH_CLEAR: u16 = 0x0506;
 
 pub const TTS_HELLO: u16 = 0x0601;
 pub const TTS_GET_STATUS: u16 = 0x0602;
@@ -649,6 +653,7 @@ mod tests {
         assert_eq!(DAEMON_TRANSLATE_SET, 0x0106);
         assert_eq!(DAEMON_SPEECH_SET, 0x0107);
         assert_eq!(DAEMON_SPEECH_STOP, 0x0108);
+        assert_eq!(DAEMON_SPEECH_CLEAR, 0x0109);
         assert_eq!(PRE_SPEECH_STOP, 0x0205);
         assert_eq!(ASR_HELLO, 0x0401);
         assert_eq!(ASR_GET_STATUS, 0x0402);
@@ -657,6 +662,7 @@ mod tests {
         assert_eq!(BRIDGE_TRANSLATE_SET, 0x0503);
         assert_eq!(BRIDGE_SPEECH_SET, 0x0504);
         assert_eq!(BRIDGE_SPEECH_STOP, 0x0505);
+        assert_eq!(BRIDGE_SPEECH_CLEAR, 0x0506);
         assert_eq!(TTS_HELLO, 0x0601);
         assert_eq!(TTS_GET_STATUS, 0x0602);
         assert_eq!(TTS_JOB_SUBMIT, 0x0610);
@@ -707,6 +713,7 @@ mod tests {
         ("DAEMON_TRANSLATE_SET", DAEMON_TRANSLATE_SET),
         ("DAEMON_SPEECH_SET", DAEMON_SPEECH_SET),
         ("DAEMON_SPEECH_STOP", DAEMON_SPEECH_STOP),
+        ("DAEMON_SPEECH_CLEAR", DAEMON_SPEECH_CLEAR),
         ("DAEMON_FILE_SUBMIT", DAEMON_FILE_SUBMIT),
         ("DAEMON_FILE_PAUSE", DAEMON_FILE_PAUSE),
         ("DAEMON_FILE_RESUME", DAEMON_FILE_RESUME),
@@ -752,6 +759,7 @@ mod tests {
         ("BRIDGE_TRANSLATE_SET", BRIDGE_TRANSLATE_SET),
         ("BRIDGE_SPEECH_SET", BRIDGE_SPEECH_SET),
         ("BRIDGE_SPEECH_STOP", BRIDGE_SPEECH_STOP),
+        ("BRIDGE_SPEECH_CLEAR", BRIDGE_SPEECH_CLEAR),
         ("TTS_HELLO", TTS_HELLO),
         ("TTS_GET_STATUS", TTS_GET_STATUS),
         ("TTS_JOB_SUBMIT", TTS_JOB_SUBMIT),

@@ -11,13 +11,26 @@ import SystemPanel from './components/SystemPanel.vue';
 import FilesPanel from './components/FilesPanel.vue';
 import DevicesPanel from './components/DevicesPanel.vue';
 import ParamsPanel from './components/ParamsPanel.vue';
-import SpeechPanel from './components/SpeechPanel.vue';
+import BroadcastPanel from './components/BroadcastPanel.vue';
 import SubtitlesPanel from './components/SubtitlesPanel.vue';
 import PendingResult from './components/PendingResult.vue';
 import AlertBanner from './components/AlertBanner.vue';
 import ToastStack, { type ToastItem } from './components/ToastStack.vue';
 import MobileNav, { MOBILE_SECTIONS, type MobileSection } from './components/MobileNav.vue';
-import type { Route } from './contracts';
+import type { OutputMode, OutputPhase } from './contracts';
+
+const MODE_LABELS: Record<OutputMode, string> = {
+  direct: '直出',
+  rvc: '变声',
+  broadcast: '翻译播报',
+};
+const PHASE_LABELS: Record<Exclude<OutputPhase, 'applied'>, string> = {
+  closing_speech: '停止播报中',
+  configuring_playout: '切换输出中',
+  routing: '切换路由中',
+  opening_speech: '开启播报中',
+  reattaching_playout: '恢复输出中',
+};
 
 const ERROR_GROUPS = {
   files: ['files', 'fileList'],
@@ -43,7 +56,27 @@ watch([activeModelId, models], ([next, list], old) => {
 const theme = ref<'light' | 'dark'>('light');
 const activeSection = ref<MobileSection>('live');
 const activity = computed(() => systemActivity(status.value, ready.value));
-const routeValue = computed(() => ready.value && status.value ? status.value.route.desired : '');
+const modeValue = computed<OutputMode | ''>(() => {
+  if (!ready.value || !status.value) return '';
+  if (status.value.output_mode) return status.value.output_mode.requested;
+  return status.value.bridge?.speech_enabled ? 'broadcast' : status.value.route.desired;
+});
+const modeActual = computed(() => {
+  if (!ready.value || !status.value) return { text: '实际：未知', transitioning: false };
+  const om = status.value.output_mode;
+  if (om) {
+    if (om.applied) return { text: `实际：${MODE_LABELS[om.applied]}`, transitioning: false };
+    return { text: om.phase === 'applied' ? '同步中' : PHASE_LABELS[om.phase], transitioning: true };
+  }
+  const base = `实际：${MODE_LABELS[status.value.route.active]}`;
+  return { text: status.value.bridge?.speech_enabled ? `${base} + 播报` : base, transitioning: false };
+});
+const translateEnabled = computed(() => ready.value && !!status.value?.bridge?.translate_enabled);
+const broadcastVisible = computed(() => ready.value && !!status.value && (
+  status.value.output_mode?.requested === 'broadcast'
+  || status.value.output_mode?.applied === 'broadcast'
+  || (status.value.output_mode == null && !!status.value.bridge?.speech_enabled)
+));
 const muted = computed(() => ready.value && !!status.value?.mute);
 const systemBlocked = computed(() => !ready.value || !!unknowns.value.system.length);
 const joinErrors = (keys: readonly (keyof typeof errors.value)[]) => keys.map(key => errors.value[key]).filter(Boolean).join('\n');
@@ -68,13 +101,13 @@ const toasts = computed<ToastItem[]>(() => {
 });
 
 const sectionAlerts = computed<Record<MobileSection, boolean>>(() => ({
-  live: Boolean(errors.value.route || errors.value.speech || unknowns.value.speech.length || unknowns.value.system.length),
+  live: Boolean(errors.value.route || errors.value.translate || errors.value.speech || unknowns.value.speech.length || unknowns.value.system.length || (ready.value && status.value?.output_mode?.last_error)),
   voice: Boolean(voiceError.value || errors.value.params || devicesError.value || unknowns.value.params.length || unknowns.value.devices.length),
   files: Boolean(filesError.value || unknowns.value.files.length),
   system: Boolean(errors.value.system || (ready.value && status.value?.degraded.length)),
 }));
 
-function selectRoute(event: Event) { requestSelect<Route>(event, routeValue.value, value => ui.perform('route', () => client.route(value))); }
+function selectMode(event: Event) { requestSelect<OutputMode>(event, modeValue.value, value => ui.perform('route', () => client.mode(value), { context: '切换路由' })); }
 function dismissToast(id: string) {
   if (id === 'notice') ui.dismissNotice();
   else if (id === 'lifecycle') ui.dismissError('lifecycle');
@@ -194,43 +227,64 @@ onUnmounted(() => { sectionObserver?.disconnect(); });
   <main id="content" class="flex-1 min-h-0 flex flex-col gap-5 px-4 pt-1.5 pb-[calc(6rem+env(safe-area-inset-bottom))] md:p-0 md:gap-0 md:grid md:grid-cols-[1fr_340px] bg-app overflow-visible md:overflow-hidden">
 
     <div class="workspace contents md:flex md:flex-col md:flex-1 md:min-h-0 md:gap-3 md:px-5 md:py-4 md:w-full md:overflow-y-auto md:h-full">
-      <div class="order-2 md:order-none space-y-3">
-        <PendingResult :messages="unknowns.speech" :enabled="ui.canAcknowledge('speech')" :busy="busy.speech" @acknowledge="ui.acknowledge('speech')" />
-        <SpeechPanel :status="ready ? status : null" :ready="ready" :busy="busy.speech || !!unknowns.speech.length" :error="errors.speech"
-          @translate="enabled => ui.perform('speech', () => client.translate(enabled))"
-          @speech="enabled => ui.perform('speech', () => client.speech(enabled))"
-          @stop="ui.perform('speech', client.speechStop)"
-          @dismiss-error="ui.dismissError('speech')" />
-      </div>
-      <SubtitlesPanel class="order-3 md:order-none" :records="records" :state="subtitleState" />
-      <div id="sec-files" class="order-6 md:order-none scroll-mt-4">
+      <SubtitlesPanel class="order-2 md:order-none" :records="records" :state="subtitleState" />
+      <div id="sec-files" class="order-5 md:order-none scroll-mt-4">
         <FilesPanel :key="uploadGeneration" :jobs="jobs" :paused="paused" :ready="ready && filesFresh" :busy="busy.files" :reloading="reloading" :refresh-blocked="writing"
           :ack-ready="ui.canAcknowledge('files')" :download-supported="downloadSupported" :error="filesError" :unknowns="unknowns.files" @acknowledge="ui.acknowledge('files')"
           @submit="ui.submit" @cancel="jobId => ui.perform('files', () => client.cancel(jobId))"
           @pause="value => ui.perform('files', () => client.pause(value))" @refresh="ui.reload()" @download="ui.download"
           @dismiss-error="dismissErrorGroup('files')" />
       </div>
-      <ConnectionLog class="order-8 md:order-none" :status="status" :ready="ready" :status-stream-state="statusStreamState" :status-stream-error="statusStreamError" :subtitle-state="subtitleState" :subtitle-error="subtitleProblem" />
+      <ConnectionLog class="order-7 md:order-none" :status="status" :ready="ready" :status-stream-state="statusStreamState" :status-stream-error="statusStreamError" :subtitle-state="subtitleState" :subtitle-error="subtitleProblem" />
     </div>
 
     <aside class="right-sidebar contents md:flex md:flex-col md:gap-5 md:p-4 md:border-l md:border-edge-soft bg-app md:overflow-y-auto md:h-full" aria-label="控制与设备">
-      <div id="sec-live" class="order-1 md:order-none space-y-3 scroll-mt-4">
-        <PendingResult :messages="unknowns.system" :enabled="ui.canAcknowledge('system')" :busy="busy.system" @acknowledge="ui.acknowledge('system')" />
-        <!-- 路由切换 -->
+      <div id="sec-live" class="order-1 md:order-none scroll-mt-4">
+        <PendingResult class="mb-3" :messages="unknowns.system" :enabled="ui.canAcknowledge('system')" :busy="busy.system" @acknowledge="ui.acknowledge('system')" />
+        <!-- 路由切换与独立翻译开关 -->
         <section class="card p-5 md:p-3" aria-label="路由切换">
           <div class="flex items-center justify-between gap-2 mb-3 md:mb-2 min-w-0">
             <h2 class="text-base font-extrabold tracking-wider text-ink uppercase section-title shrink-0">路由</h2>
-            <span class="text-micro font-mono text-ink-3 truncate">实际：{{ ready && status ? status.route.active : '未知' }}</span>
+            <span :class="['text-micro font-mono truncate', modeActual.transitioning ? 'state-warn font-bold' : 'text-ink-3']">{{ modeActual.text }}</span>
           </div>
           <AlertBanner :message="errors.route" dismissible class="mb-3 md:mb-2.5" @dismiss="ui.dismissError('route')" />
+          <AlertBanner :message="errors.translate" dismissible class="mb-3 md:mb-2.5" @dismiss="ui.dismissError('translate')" />
+          <AlertBanner v-if="ready && status?.output_mode?.last_error" :message="status.output_mode.last_error" tone="warn" class="mb-3 md:mb-2.5" />
           <label for="system-route" class="sr-only">路由</label>
-          <select id="system-route" class="field w-full min-w-0 min-h-[46px] md:min-h-0 text-base md:text-xs px-3.5 py-2.5 md:px-3 md:py-2" :value="routeValue" :disabled="busy.route || systemBlocked || !status" @change="selectRoute">
-            <option value="" disabled>未知</option><option value="direct">直出</option><option value="rvc">变声</option>
+          <select id="system-route" class="field w-full min-w-0 min-h-[46px] md:min-h-0 text-base md:text-xs px-3.5 py-2.5 md:px-3 md:py-2" :value="modeValue" :disabled="busy.route || systemBlocked || !status" @change="selectMode">
+            <option value="" disabled>未知</option><option value="direct">直出</option><option value="rvc">变声</option><option value="broadcast">翻译播报</option>
           </select>
+          <button
+            type="button"
+            class="translate-toggle mt-3 md:mt-2.5"
+            :class="{ 'is-active': translateEnabled }"
+            :aria-pressed="translateEnabled"
+            :disabled="busy.translate || !!unknowns.speech.length || !ready || !status?.bridge"
+            @click="ui.perform('translate', () => client.translate(!translateEnabled), { context: '切换翻译' })"
+          >
+            <span class="translate-toggle-dot" aria-hidden="true"></span>
+            <span>翻译</span>
+            <span class="translate-toggle-state">{{ ready && status?.bridge ? (translateEnabled ? '已开启' : '已关闭') : '未知' }}</span>
+          </button>
         </section>
+        <PendingResult class="mt-3" :messages="unknowns.speech" :enabled="ui.canAcknowledge('speech')" :busy="busy.speech || busy.translate" @acknowledge="ui.acknowledge('speech')" />
+        <Transition name="card-reveal">
+          <div v-if="broadcastVisible" class="card-reveal-wrap">
+            <div class="card-reveal-inner pt-5">
+              <BroadcastPanel
+                :status="ready ? status : null"
+                :ready="ready"
+                :busy="busy.speech || !!unknowns.speech.length"
+                :error="errors.speech"
+                @clear="ui.perform('speech', client.speechClear, { message: '已请求清除播报队列。', context: '清除播报队列' })"
+                @dismiss-error="ui.dismissError('speech')"
+              />
+            </div>
+          </div>
+        </Transition>
       </div>
 
-      <div class="order-5 md:order-none space-y-3">
+      <div class="order-4 md:order-none space-y-3">
         <PendingResult :messages="unknowns.devices" :enabled="ui.canAcknowledge('devices')" :busy="busy.devices" @acknowledge="ui.acknowledge('devices')" />
         <DevicesPanel :devices="devices" :status="ready ? status : null" :baselines="baselines" :ready="ready && devicesFresh" :busy="busy.devices || !!unknowns.devices.length"
           :error="devicesError"
@@ -241,7 +295,7 @@ onUnmounted(() => { sectionObserver?.disconnect(); });
       </div>
 
       <!-- 变声音色：模型、default 预设与参数在同一卡片 -->
-      <section id="sec-voice" class="card p-5 md:p-3 order-4 md:order-none scroll-mt-4" aria-label="变声音色">
+      <section id="sec-voice" class="card p-5 md:p-3 order-3 md:order-none scroll-mt-4" aria-label="变声音色">
         <div class="flex items-center gap-2 mb-3 md:mb-2 min-w-0">
           <h2 class="text-base font-extrabold tracking-wider text-ink uppercase section-title shrink-0">变声音色</h2>
           <span class="text-micro font-mono font-bold text-ink-2 bg-surface border border-edge rounded-md px-2 py-0.5 max-w-[55%] truncate ml-auto shrink-0" translate="no">{{ ready ? (status?.rvc?.model_id ?? '未加载') : '未知' }}</span>
@@ -262,7 +316,7 @@ onUnmounted(() => { sectionObserver?.disconnect(); });
           @dismiss-error="ui.dismissError('params')" />
       </section>
 
-      <SystemPanel id="sec-system" class="order-7 md:order-none scroll-mt-4" :status="status" :connected="ready" :busy="busy.system" :write-blocked="!!unknowns.system.length" :error="errors.system"
+      <SystemPanel id="sec-system" class="order-6 md:order-none scroll-mt-4" :status="status" :connected="ready" :busy="busy.system" :write-blocked="!!unknowns.system.length" :error="errors.system"
         @restart="ui.restart" @dismiss-error="ui.dismissError('system')" />
     </aside>
   </main>

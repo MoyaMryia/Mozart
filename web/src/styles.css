@@ -44,17 +44,20 @@
   --accent: #111827;
   --accent-hover: #374151;
   --accent-text: #FFFFFF;
+  --danger: #B24634;
+  --danger-hover: #963829;
+  --danger-text: #FFFFFF;
   --state-ok: #059669;
-  --state-err: #DC2626;
+  --state-err: #B24634;
   --state-warn: #B45309;
   --ok-bg: #ECFDF5;
   --ok-text: #047857;
   --warn-bg: #FFFBEB;
   --warn-text: #92400E;
   --warn-border: #FDE68A;
-  --err-bg: #FEF2F2;
-  --err-text: #B91C1C;
-  --err-border: #FECACA;
+  --err-bg: #FAF1EE;
+  --err-text: #943627;
+  --err-border: #E8C5BC;
   --info-bg: #EFF6FF;
   --info-text: #1D4ED8;
   --console-bg: #050806;
@@ -85,17 +88,20 @@
   --accent: #E9ECF0;
   --accent-hover: #FFFFFF;
   --accent-text: #11151A;
+  --danger: #A84332;
+  --danger-hover: #BD4F3C;
+  --danger-text: #FFFFFF;
   --state-ok: #34D399;
-  --state-err: #F87171;
+  --state-err: #DC7B68;
   --state-warn: #FBBF24;
   --ok-bg: rgba(52, 211, 153, 0.12);
   --ok-text: #34D399;
   --warn-bg: rgba(251, 191, 36, 0.12);
   --warn-text: #FBBF24;
   --warn-border: rgba(251, 191, 36, 0.35);
-  --err-bg: rgba(248, 113, 113, 0.14);
-  --err-text: #F87171;
-  --err-border: rgba(248, 113, 113, 0.35);
+  --err-bg: rgba(220, 123, 104, 0.14);
+  --err-text: #DC7B68;
+  --err-border: rgba(220, 123, 104, 0.35);
   --info-bg: rgba(96, 165, 250, 0.14);
   --info-text: #60A5FA;
   --card-shadow: 0 2px 4px rgba(0, 0, 0, 0.5), 0 8px 20px rgba(0, 0, 0, 0.36);
@@ -148,7 +154,7 @@ button, h2, h3, .section-title {
   justify-content: center;
   gap: 0.5rem;
   border: 1px solid transparent;
-  border-radius: 0.5rem;
+  border-radius: 1rem;
   font-weight: 700;
   cursor: pointer;
   white-space: nowrap;
@@ -161,32 +167,8 @@ button, h2, h3, .section-title {
 .btn-accent:hover:not(:disabled) { background: var(--accent-hover); }
 .btn-outline { background: var(--surface); border-color: var(--edge); color: var(--ink); }
 .btn-outline:hover:not(:disabled) { border-color: var(--ink); }
-.btn-danger { background: var(--surface); border-color: var(--err-border); color: var(--err-text); }
-.btn-danger:hover:not(:disabled) { background: var(--err-bg); }
-
-/* 停止播报：无边框无填充，悬停时图标与文字变红。 */
-.btn-trash {
-  display: inline-flex;
-  align-items: center;
-  gap: 0.375rem;
-  min-height: 2.75rem;
-  padding: 0 0.625rem;
-  border: 0;
-  border-radius: 0.5rem;
-  background: transparent;
-  color: var(--ink-2);
-  font-size: 13px;
-  font-weight: 800;
-  cursor: pointer;
-  transition: color 150ms ease, background-color 150ms ease, transform 120ms ease;
-}
-@media (min-width: 768px) {
-  .btn-trash { min-height: 2.25rem; padding: 0 0.5rem; font-size: 12px; }
-}
-.btn-trash:hover:not(:disabled) { color: var(--state-err); background: var(--err-bg); }
-.btn-trash:active:not(:disabled) { transform: scale(0.97); }
-.btn-trash:focus-visible { outline: 2px solid var(--ink); outline-offset: 2px; }
-.btn-trash:disabled { opacity: 0.4; cursor: not-allowed; }
+.btn-danger { background: var(--danger); color: var(--danger-text); }
+.btn-danger:hover:not(:disabled) { background: var(--danger-hover); }
 .btn-md { padding: 0.5rem 0.75rem; font-size: 12px; }
 .btn-sm { height: 2rem; padding: 0 0.75rem; font-size: 11px; font-weight: 800; }
 
@@ -208,55 +190,80 @@ button, h2, h3, .section-title {
 select.field, .log-select { font-weight: 700; }
 .form-label { display: block; font-size: 12px; font-weight: 700; color: var(--ink-2); }
 
-/* 翻译/播报胶囊开关：保留原生复选框语义，移动端更易点按。 */
-.toggle-pill {
-  position: relative;
-  display: inline-flex;
+/* 路由卡片底部的独立翻译开关按钮：实线高亮边框，无背景填充 */
+.translate-toggle {
+  display: flex;
   align-items: center;
   gap: 0.5rem;
-  min-height: 2.75rem;
-  padding: 0 1.125rem;
-  border: 1.5px solid var(--edge);
-  border-radius: 999px;
-  background: var(--surface);
-  color: var(--ink-2);
+  width: 100%;
+  min-height: 2.875rem;
+  padding: 0.625rem 0.875rem;
+  border: 2px solid var(--edge);
+  border-radius: 1rem;
+  background: transparent;
+  color: var(--ink-3);
   font-size: 14px;
   font-weight: 700;
   cursor: pointer;
-  user-select: none;
-  transition: border-color 150ms ease, background-color 150ms ease, color 150ms ease, transform 120ms ease;
+  transition: border-color 150ms ease, color 150ms ease, transform 120ms cubic-bezier(0.2, 0, 0, 1);
 }
 @media (min-width: 768px) {
-  .toggle-pill { min-height: 2rem; padding: 0 0.75rem; font-size: 12px; }
+  .translate-toggle { min-height: 2.25rem; padding: 0.45rem 0.75rem; font-size: 12px; }
 }
-.toggle-pill:hover:not(.is-disabled) { border-color: var(--ink-3); color: var(--ink); }
-.toggle-pill:active:not(.is-disabled) { transform: scale(0.97); }
-.toggle-pill:has(.toggle-pill-input:focus-visible) { outline: 2px solid var(--ink); outline-offset: 2px; }
-.toggle-pill.is-checked {
+.translate-toggle:hover:not(:disabled) { border-color: var(--ink-4); color: var(--ink-2); }
+.translate-toggle:active:not(:disabled) { transform: scale(0.98); }
+.translate-toggle:focus-visible { outline: 2px solid var(--ink); outline-offset: 2px; }
+.translate-toggle:disabled { opacity: 0.5; cursor: not-allowed; }
+.translate-toggle.is-active {
   border-color: var(--state-ok);
-  background: var(--ok-bg);
+  background: transparent;
   color: var(--ok-text);
 }
-.toggle-pill.is-disabled { opacity: 0.45; cursor: not-allowed; }
-.toggle-pill-input {
-  position: absolute;
-  inset: 0;
-  width: 100%;
-  height: 100%;
-  margin: 0;
-  opacity: 0;
-  cursor: inherit;
-}
-.toggle-pill-dot {
+.translate-toggle.is-active:hover:not(:disabled) { border-color: var(--ok-text); color: var(--ok-text); }
+.translate-toggle-dot {
   width: 0.5rem;
   height: 0.5rem;
   border-radius: 999px;
-  background: var(--edge);
+  background: var(--ink-4);
+  flex: none;
   transition: background-color 160ms ease, transform 160ms ease;
 }
-.toggle-pill.is-checked .toggle-pill-dot {
+.translate-toggle.is-active .translate-toggle-dot {
   background: var(--state-ok);
   transform: scale(1.1);
+}
+.translate-toggle-state {
+  margin-left: auto;
+  font-family: theme("fontFamily.mono");
+  font-size: 11px;
+  font-weight: 700;
+}
+
+/* 右侧播报设置卡片显隐动效 */
+.card-reveal-wrap {
+  display: grid;
+  grid-template-rows: 1fr;
+}
+.card-reveal-inner {
+  min-height: 0;
+  padding-inline: 4px;
+  margin-inline: -4px;
+}
+.card-reveal-enter-active .card-reveal-inner,
+.card-reveal-leave-active .card-reveal-inner {
+  overflow: hidden;
+}
+.card-reveal-enter-active {
+  transition: grid-template-rows 240ms cubic-bezier(0.22, 1, 0.36, 1), opacity 200ms ease-out, transform 240ms cubic-bezier(0.22, 1, 0.36, 1);
+}
+.card-reveal-leave-active {
+  transition: grid-template-rows 180ms ease-in, opacity 140ms ease-in, transform 180ms ease-in;
+}
+.card-reveal-enter-from,
+.card-reveal-leave-to {
+  grid-template-rows: 0fr;
+  opacity: 0;
+  transform: translateY(-6px);
 }
 
 /* 参数步进器（移动端提供 +/- 微调，桌面端仅保留数字框） */
@@ -540,14 +547,14 @@ select.field, .log-select { font-weight: 700; }
   align-items: center;
   justify-content: center;
   border: 0;
-  border-radius: 0.5rem;
+  border-radius: 1rem;
   background: transparent;
   color: var(--ink-3);
   cursor: pointer;
   transition: color 150ms ease, background-color 150ms ease, transform 120ms ease;
 }
 @media (min-width: 768px) {
-  .icon-button { width: 2rem; height: 2rem; border-radius: 0.375rem; }
+  .icon-button { width: 2rem; height: 2rem; border-radius: 0.75rem; }
 }
 .icon-button:hover:not(:disabled) { color: var(--state-ok); background: color-mix(in srgb, var(--subtle) 75%, transparent); }
 .icon-button:active:not(:disabled) { transform: scale(0.92); }
@@ -700,14 +707,14 @@ button, a, input, select { touch-action: manipulation; }
   align-items: center;
   justify-content: center;
   border: 0;
-  border-radius: 0.5rem;
+  border-radius: 1rem;
   background: transparent;
   color: var(--ink-3);
   cursor: pointer;
   transition: color 150ms ease, background-color 150ms ease, transform 120ms ease;
 }
 @media (min-width: 768px) {
-  .mute-toggle { width: 2rem; height: 2rem; border-radius: 0.375rem; }
+  .mute-toggle { width: 2rem; height: 2rem; border-radius: 0.75rem; }
 }
 .mute-toggle:hover { color: var(--ink); background: color-mix(in srgb, var(--subtle) 75%, transparent); }
 .mute-toggle:active { transform: scale(0.92); }

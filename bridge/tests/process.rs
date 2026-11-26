@@ -301,7 +301,7 @@ fn subtitles_flow_status_and_sigterm() {
     assert_eq!(status["translate_queue_depth"], 0);
     assert_eq!(status["speech_queue_depth"], 0);
     assert_eq!(status["translate_enabled"], false);
-    assert_eq!(status["speech_enabled"], true);
+    assert_eq!(status["speech_enabled"], false);
     assert_eq!(
         status["subtitles_path"],
         dir.join("subtitles.jsonl").display().to_string()
@@ -452,16 +452,17 @@ fn switches_toggle_without_writing_state_file() {
         2,
         br#"{"enabled":false}"#,
     );
-    call_ok(&control, ctl::BRIDGE_SPEECH_SET, 3, br#"{"enabled":false}"#);
+    call_ok(&control, ctl::BRIDGE_SPEECH_SET, 3, br#"{"enabled":true}"#);
     let status = get_status(&control);
     assert_eq!(status["translate_enabled"], false);
-    assert_eq!(status["speech_enabled"], false);
+    assert_eq!(status["speech_enabled"], true);
     assert!(!dir.join("bridge-state.json").exists());
 
     // speech stop：关播报并清队列。
     let stop = call_ok(&control, ctl::BRIDGE_SPEECH_STOP, 4, b"{}");
     assert_eq!(stop["speech_enabled"], false);
     assert_eq!(stop["queue_cleared"], 0);
+    call_ok(&control, ctl::BRIDGE_SPEECH_SET, 5, br#"{"enabled":true}"#);
 
     sigterm(&child.0);
     assert!(wait_exit(&mut child.0, Duration::from_secs(2)).success());
@@ -473,7 +474,7 @@ fn switches_toggle_without_writing_state_file() {
     let _conn = mock.accept();
     let status = get_status(&control);
     assert_eq!(status["translate_enabled"], true);
-    assert_eq!(status["speech_enabled"], true);
+    assert_eq!(status["speech_enabled"], false);
 
     sigterm(&child.0);
     assert!(wait_exit(&mut child.0, Duration::from_secs(2)).success());
@@ -547,7 +548,7 @@ fn invalid_requests_are_rejected_and_service_continues() {
     // 拒绝后仍正常服务，开关未被改动。
     let status = get_status(&control);
     assert_eq!(status["translate_enabled"], true);
-    assert_eq!(status["speech_enabled"], true);
+    assert_eq!(status["speech_enabled"], false);
 
     sigterm(&child.0);
     assert!(wait_exit(&mut child.0, Duration::from_secs(2)).success());
@@ -748,7 +749,7 @@ fn translation_and_speech_full_chain() {
     let (requests, llama_server) = llama.spawn(vec![llama_ok("Hello.")]);
     let tts = MockTts::bind(&dir.join("tts-jobs.sock"));
     let (jobs, tts_server) = tts.spawn(vec!["submitted"]);
-    let mut child = spawn_bridge(&dir, "");
+    let mut child = spawn_bridge(&dir, "speech_enabled = true\n");
     let control = connect_control(&dir);
     let conn = asr.accept();
 
@@ -821,7 +822,7 @@ fn translation_retries_then_succeeds() {
     ]);
     let tts = MockTts::bind(&dir.join("tts-jobs.sock"));
     let (_jobs, tts_server) = tts.spawn(vec!["submitted"]);
-    let mut child = spawn_bridge(&dir, "");
+    let mut child = spawn_bridge(&dir, "speech_enabled = true\n");
     let control = connect_control(&dir);
     let conn = asr.accept();
 
@@ -855,7 +856,7 @@ fn translation_failure_degrades_then_recovers() {
     let tts = MockTts::bind(&dir.join("tts-jobs.sock"));
     let (jobs, tts_server) = tts.spawn(vec!["submitted"]);
     // llama 缺席：连接失败，重试耗尽。
-    let mut child = spawn_bridge(&dir, "");
+    let mut child = spawn_bridge(&dir, "speech_enabled = true\n");
     let control = connect_control(&dir);
     let conn = asr.accept();
 
@@ -913,7 +914,7 @@ fn qc_rejection_blocks_delivery() {
     let (_requests, llama_server) = llama.spawn(vec![llama_ok("你好")]);
     // 只绑定不应答：拒绝句不应发起投递连接。
     let tts = MockTts::bind(&dir.join("tts-jobs.sock"));
-    let mut child = spawn_bridge(&dir, "");
+    let mut child = spawn_bridge(&dir, "speech_enabled = true\n");
     let control = connect_control(&dir);
     let conn = asr.accept();
 
@@ -945,7 +946,7 @@ fn speech_stop_clears_pending_queue() {
     let (_requests, llama_server) =
         llama.spawn(vec![llama_ok("One."), llama_ok("Two."), llama_ok("Three.")]);
     // TTS 缺席：投递线程卡在重连，译文在待播报队列积压。
-    let mut child = spawn_bridge(&dir, "");
+    let mut child = spawn_bridge(&dir, "speech_enabled = true\n");
     let control = connect_control(&dir);
     let conn = asr.accept();
 
@@ -966,6 +967,58 @@ fn speech_stop_clears_pending_queue() {
     sigterm(&child.0);
     assert!(wait_exit(&mut child.0, Duration::from_secs(2)).success());
     llama_server.join().unwrap();
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn speech_clear_clears_pending_queue_and_keeps_enabled() {
+    let dir = run_dir("sp-clear");
+    let asr = MockAsr::bind(&dir.join("asr-events.sock"));
+    let llama = MockLlama::bind(&dir.join("llama.sock"));
+    let (_requests, llama_server) = llama.spawn(vec![
+        llama_ok("One."),
+        llama_ok("Two."),
+        llama_ok("Three."),
+        llama_ok("Next."),
+    ]);
+    let mut child = spawn_bridge(&dir, "speech_enabled = true\n");
+    let control = connect_control(&dir);
+    let conn = asr.accept();
+
+    for (seq, text) in ["甲", "乙", "丙"].into_iter().enumerate() {
+        conn.send_event(&event("final", "s", seq as u64 + 1, text));
+    }
+    wait_until("待播报队列积压", Duration::from_secs(5), || {
+        get_status(&control)["translated"] == 3
+            && get_status(&control)["speech_queue_depth"].as_u64().unwrap() >= 1
+    });
+    let clear = call_ok(&control, ctl::BRIDGE_SPEECH_CLEAR, 2, b"{}");
+    assert_eq!(clear["speech_enabled"], true);
+    assert!(clear["queue_cleared"].as_u64().unwrap() >= 1);
+    let cutoff = clear["cutoff_ns"].as_u64().unwrap();
+    assert!(cutoff > 0);
+    let status = get_status(&control);
+    assert_eq!(status["speech_enabled"], true);
+    assert_eq!(status["speech_queue_depth"], 0);
+    assert_eq!(status["speech_delivered"], 0);
+
+    // 清空后保持播报开启，新句绑定新代次并正常投递给 TTS。
+    let tts = MockTts::bind(&dir.join("tts-jobs.sock"));
+    let (jobs, tts_server) = tts.spawn(vec!["submitted"]);
+    conn.send_event(&event("final", "s", 4, "下一句"));
+    wait_until("清空后新句送达 TTS", Duration::from_secs(5), || {
+        get_status(&control)["speech_submitted"] == 1
+    });
+    let jobs = jobs.lock().unwrap();
+    assert_eq!(jobs.len(), 1);
+    assert_eq!(jobs[0]["utterance_id"], "s:4");
+    assert_eq!(jobs[0]["text"], "Next.");
+    assert!(jobs[0]["issued_ns"].as_u64().unwrap() > cutoff);
+
+    sigterm(&child.0);
+    assert!(wait_exit(&mut child.0, Duration::from_secs(2)).success());
+    llama_server.join().unwrap();
+    tts_server.join().unwrap();
     let _ = std::fs::remove_dir_all(&dir);
 }
 
@@ -999,13 +1052,13 @@ fn review_pending_waits_for_refined_and_broadcasts_once() {
     let (requests, llama_server) = llama.spawn(vec![llama_ok("Reviewed.")]);
     let tts = MockTts::bind(&dir.join("tts-jobs.sock"));
     let (jobs, tts_server) = tts.spawn(vec!["submitted"]);
-    let mut child = spawn_bridge(&dir, "");
+    let mut child = spawn_bridge(&dir, "speech_enabled = true\n");
     let control = connect_control(&dir);
     let conn = asr.accept();
 
-    let mut pending_final = event("final", "a1b2c3d4", 1, "初版错字");
-    pending_final["refinement_status"] = json!("pending");
-    conn.send_event(&pending_final);
+    let mut pending = event("final", "a1b2c3d4", 1, "初版错字");
+    pending["refinement_status"] = json!("pending");
+    conn.send_event(&pending);
     wait_until(
         "pending final 仅落盘原文字幕",
         Duration::from_secs(5),
@@ -1066,7 +1119,7 @@ fn reenabled_speech_does_not_broadcast_a_final_waiting_for_old_review() {
         llama.spawn(vec![llama_ok("Reviewed."), llama_ok("New sentence.")]);
     let tts = MockTts::bind(&dir.join("tts-jobs.sock"));
     let (jobs, tts_server) = tts.spawn(vec!["submitted"]);
-    let mut child = spawn_bridge(&dir, "");
+    let mut child = spawn_bridge(&dir, "speech_enabled = true\n");
     let control = connect_control(&dir);
     let conn = asr.accept();
 
@@ -1116,7 +1169,7 @@ fn bridge_crash_recovers_pending_review_without_broadcasting() {
     let llama = MockLlama::bind(&dir.join("llama.sock"));
     let (requests, server) = llama.spawn(vec![llama_ok("Recovered.")]);
     let tts = MockTts::bind(&dir.join("tts-jobs.sock"));
-    let mut first = spawn_bridge(&dir, "");
+    let mut first = spawn_bridge(&dir, "speech_enabled = true\n");
     let asr_first = asr.accept();
     let mut final_event = event("final", "a1b2c3d4", 1, "在线原文");
     final_event["refinement_status"] = json!("pending");
@@ -1126,7 +1179,7 @@ fn bridge_crash_recovers_pending_review_without_broadcasting() {
     assert!(!wait_exit(&mut first.0, Duration::from_secs(2)).success());
     drop(asr_first);
 
-    let mut second = spawn_bridge(&dir, "");
+    let mut second = spawn_bridge(&dir, "speech_enabled = true\n");
     let asr_second = asr.accept();
     let control = connect_control(&dir);
     wait_until("原文兜底译文已落盘", Duration::from_secs(5), || get_status(&control)["translated"] == 1);
@@ -1156,7 +1209,7 @@ fn review_skipped_falls_back_to_online_final_once() {
     let (requests, llama_server) = llama.spawn(vec![llama_ok("Fallback.")]);
     let tts = MockTts::bind(&dir.join("tts-jobs.sock"));
     let (jobs, tts_server) = tts.spawn(vec!["submitted"]);
-    let mut child = spawn_bridge(&dir, "");
+    let mut child = spawn_bridge(&dir, "speech_enabled = true\n");
     let control = connect_control(&dir);
     let conn = asr.accept();
 
@@ -1219,7 +1272,7 @@ fn hy_mt_profile_injects_glossary_context_and_passes_through_english() {
     let (jobs, tts_server) = tts.spawn(vec!["submitted", "submitted", "submitted"]);
 
     let extra = format!(
-        "glossary_path = \"{}\"\nllama_model_id = \"hymt\"\n\n\
+        "speech_enabled = true\nglossary_path = \"{}\"\nllama_model_id = \"hymt\"\n\n\
          [[bridge.models]]\nid = \"hymt\"\npath = \"/opt/mozart/hymt.gguf\"\n\
          prompt_profile = \"hy_mt\"\nrepeat_penalty = 1.05\ncontext_window = 2\n",
         glossary.display()

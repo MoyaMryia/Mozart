@@ -1,6 +1,6 @@
 # Mozart 配置规范（TOML schema）
 
-状态：定稿中。最后更新：2026-11-25。
+状态：定稿中。最后更新：2026-11-26。
 
 本文件是 TOML 配置的唯一 schema 依据：段、键、类型、默认、范围、运行时/重启分类。配置模型（TOML 基线 + 运行时状态文件、`config set`/`config save`、`restart_required` 契约）见 [SPEC-04](SPEC/SPEC-04-daemon.md)，本文件不复述。解析与校验实现于 `core/src/config.rs`，须与本文件一致。
 
@@ -27,7 +27,7 @@
 | --- | --- | --- | --- | --- |
 | run_dir | path | /run/mozart | — | S |
 | socket | string | daemon.sock | 纯文件名 | S |
-| startup_mode | enum | rvc | rvc / direct / broadcast / manual | S |
+| startup_mode | enum | direct | rvc / direct / broadcast / manual | S |
 | poll_interval_ms | int | 1000 | >0 | R |
 | rpc_timeout_ms | int | 2000 | >0 | R |
 | start_timeout_ms | int | 5000 | >0 | R |
@@ -35,7 +35,7 @@
 | restart_backoff_max_ms | int | 10000 | ≥ restart_backoff_ms | R |
 | restart_stable_ms | int | 30000 | >0 | R |
 
-`startup_mode` 只在启动 daemon 时读取，`MOZART_STARTUP_MODE` 可覆盖。`rvc` 未配置模型时启动为直出；配置了模型但起流失败时保持静音并报告错误。`manual` 保留旧路由和播报命令的独立控制。一次运行期间的模式请求不改启动配置。
+`startup_mode` 只在启动 daemon 时读取，`MOZART_STARTUP_MODE` 可覆盖。默认 `direct` 启动为托管直出模式；`rvc` 未配置模型时回退直出，配置了模型但起流失败时保持静音并报告错误。`manual` 保留旧路由和播报命令的独立控制。一次运行期间的模式请求不改启动配置。
 
 ### [process]
 
@@ -201,7 +201,7 @@ path = "<资产根>/models/asr/<模型id>"
 | corrections_path | path | 空 | 可选显式纠错表；格式见下文 | S |
 | glossary_path | path | 空 | 可选翻译术语表；非空路径，格式见下文 | S |
 | translate_enabled | bool | true | — | R |
-| speech_enabled | bool | true | — | R |
+| speech_enabled | bool | false | — | R |
 | llama_socket | string | llama.sock | 纯文件名 | S |
 | llama_model | path | 空 | 旧单模型简写；加载时展开开头的 `~` | S |
 | llama_model_id | string | 空 | 非空，须匹配 `[[bridge.models]]` 的 `id`；优先于 `llama_model` | S |

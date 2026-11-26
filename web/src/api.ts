@@ -1,8 +1,8 @@
 import { z } from 'zod';
 import {
   configEffectSchema, configSchema, deviceListSchema, envelopeSchema, fileListSchema,
-  healthSchema, lifecycleSchema, modelListSchema, statusSchema, submitSchema, paramsSchema,
-  type Route, type Service,
+  healthSchema, lifecycleSchema, modelListSchema, outputModeStatusSchema, statusSchema, submitSchema, paramsSchema,
+  type OutputMode, type Route, type Service,
 } from './contracts';
 
 export const API_ROOT = '/api/v1';
@@ -99,10 +99,12 @@ export const client = {
   up: () => request('/system/up', lifecycleSchema, json('POST', {})),
   down: () => request('/system/down', lifecycleSchema, json('POST', {})),
   route: (route: Route) => request('/route', objectSchema, json('PUT', { route })),
+  mode: (mode: OutputMode) => request('/mode', outputModeStatusSchema, json('PUT', { mode })),
   mute: (mute: boolean) => request('/mute', objectSchema, json('PUT', { mute })),
   translate: (enabled: boolean) => request('/translate', objectSchema, json('PUT', { enabled })),
   speech: (enabled: boolean) => request('/speech', objectSchema, json('PUT', { enabled })),
   speechStop: () => request('/speech/stop', objectSchema, json('POST', {})),
+  speechClear: () => request('/speech/clear', objectSchema, json('POST', {})),
   restart: (service: Service) => request(`/services/${service}/restart`, objectSchema, json('POST', {})),
   setConfig: (key: string, value: string) => request('/config', configEffectSchema, json('PUT', { key, value })),
   submit: (file: File, modelId?: string) => {

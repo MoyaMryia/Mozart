@@ -39,6 +39,7 @@ fn handle(msg: &Message, state: &mut State) -> Vec<u8> {
         ctl::BRIDGE_TRANSLATE_SET,
         ctl::BRIDGE_SPEECH_SET,
         ctl::BRIDGE_SPEECH_STOP,
+        ctl::BRIDGE_SPEECH_CLEAR,
     ];
     if let Err(reply) = expect_known(msg, &known) {
         return reply;
@@ -76,6 +77,10 @@ fn handle(msg: &Message, state: &mut State) -> Vec<u8> {
         ctl::BRIDGE_SPEECH_STOP => {
             state.speech_enabled = false;
             ok(json!({"speech_enabled": false, "queue_cleared": 0,
+                "cutoff_ns": mozart_core::speech::monotonic_ns()}))
+        }
+        ctl::BRIDGE_SPEECH_CLEAR => {
+            ok(json!({"speech_enabled": state.speech_enabled, "queue_cleared": 0,
                 "cutoff_ns": mozart_core::speech::monotonic_ns()}))
         }
         _ => unreachable!("expect_known covers all commands"),

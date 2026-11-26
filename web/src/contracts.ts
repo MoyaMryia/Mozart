@@ -6,6 +6,24 @@ export const services = ['enhance', 'pre', 'rvc', 'asr', 'tts', 'bridge', 'llama
 export type Service = typeof services[number];
 export const routeSchema = z.enum(['direct', 'rvc']);
 export type Route = z.infer<typeof routeSchema>;
+export const outputModeSchema = z.enum(['direct', 'rvc', 'broadcast']);
+export type OutputMode = z.infer<typeof outputModeSchema>;
+export const outputPhaseSchema = z.enum([
+  'closing_speech',
+  'configuring_playout',
+  'routing',
+  'opening_speech',
+  'reattaching_playout',
+  'applied',
+]);
+export type OutputPhase = z.infer<typeof outputPhaseSchema>;
+export const outputModeStatusSchema = z.object({
+  requested: outputModeSchema,
+  applied: outputModeSchema.nullable(),
+  phase: outputPhaseSchema,
+  last_error: z.string().nullable(),
+}).passthrough();
+export type OutputModeStatus = z.infer<typeof outputModeStatusSchema>;
 export type ConnectionState = 'connecting' | 'online' | 'offline';
 
 const processSchema = z.object({
@@ -20,6 +38,7 @@ export type RvcParams = z.infer<typeof paramsSchema>;
 export const statusSchema = z.object({
   daemon: z.object({ pid: z.number(), version: z.string(), uptime_s: z.number(), poll_interval_ms: z.number().optional() }).passthrough(),
   route: z.object({ desired: routeSchema, active: routeSchema }).passthrough(),
+  output_mode: outputModeStatusSchema.nullable().optional().default(null),
   mute: z.boolean(),
   arbiter: z.object({ gpu: z.object({ owner: z.enum(['realtime', 'file']).nullable() }).passthrough() }).passthrough(),
   processes: z.object({ enhance: processSchema.optional(), pre: processSchema, rvc: processSchema, asr: processSchema, tts: processSchema, bridge: processSchema, llama: processSchema }).passthrough(),

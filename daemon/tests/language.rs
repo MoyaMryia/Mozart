@@ -271,7 +271,7 @@ fn missing_tts_fence_is_not_success_and_blocks_reopening() {
         "lang-fence-without-tts", &example("pre_stub"), &example("rvc_stub"),
         &example("asr_stub"), std::path::Path::new("/bin/false"),
         &example("bridge_stub"), &example("llama_stub"),
-        "[daemon]\nrpc_timeout_ms = 300\n[rvc]\nmodel_id = \"demo\"\n",
+        "[daemon]\nrpc_timeout_ms = 300\n[rvc]\nmodel_id = \"demo\"\n[bridge]\nspeech_enabled = true\n",
     );
     let conn = daemon.connect();
     assert!(wait_until(Duration::from_secs(5), || {
@@ -531,4 +531,125 @@ fn llama_startup_args_use_selected_bridge_model_config() {
     drop(conn);
     let _ = std::fs::remove_file(&record);
     let _ = std::fs::remove_file(&script);
+}
+
+#[test]
+fn default_startup_enters_direct_mode_with_speech_disabled_and_translate_enabled() {
+    use mozart_core::ctl::schema::{OutputMode, OutputPhase, PlayoutPolicy, Route};
+    use std::process::{Command, Stdio};
+
+    let dir = std::env::temp_dir().join(format!("mozart-daemon-{}-default-startup", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let config = dir.join("config.toml");
+    std::fs::write(&config, "[daemon]\nrpc_timeout_ms = 300\n\n[rvc]\nmodel_id = \"demo\"\n").unwrap();
+    let child = Command::new(env!("CARGO_BIN_EXE_mozart-daemon"))
+        .arg("--config")
+        .arg(&config)
+        .env_remove("MOZART_STARTUP_MODE")
+        .env("MOZART_RUN_DIR", &dir)
+        .env("MOZART_STATE_DIR", dir.join("state"))
+        .env("MOZART_PRE_BIN", example("pre_stub"))
+        .env("MOZART_RVC_BIN", example("rvc_stub"))
+        .env("MOZART_ASR_BIN", example("asr_stub"))
+        .env("MOZART_TTS_BIN", example("tts_stub"))
+        .env("MOZART_BRIDGE_BIN", example("bridge_stub"))
+        .env("MOZART_LLAMA_BIN", example("llama_stub"))
+        .env("MOZART_POLL_INTERVAL_MS", "100")
+        .stdout(Stdio::null())
+        .stderr(Stdio::inherit())
+        .spawn()
+        .unwrap();
+    let daemon = DaemonProcess {
+        child,
+        dir: dir.clone(),
+        socket: dir.join("daemon.sock"),
+    };
+    let conn = daemon.connect();
+    assert!(wait_until(Duration::from_secs(5), || {
+        let view = status(&conn);
+        view.output_mode.is_some_and(|mode| mode.phase == OutputPhase::Applied && mode.applied == Some(OutputMode::Direct))
+            && view.route.active == Route::Direct
+            && view.pre.is_some_and(|pre| pre.playout_policy == PlayoutPolicy::RealtimeOnly)
+            && view.bridge.is_some_and(|bridge| !bridge.speech_enabled && bridge.translate_enabled)
+    }));
+}
+
+#[test]
+fn speech_clear_keeps_broadcast_mode_and_speech_enabled() {
+    use mozart_core::ctl::schema::{OutputMode, OutputPhase, PlayoutPolicy};
+
+    let daemon = DaemonProcess::start("lang-speech-clear", &example("pre_stub"), &example("rvc_stub"));
+    let conn = daemon.connect();
+    wait_language_ready(&conn);
+
+    output_mode(&conn, "broadcast");
+    assert!(wait_until(Duration::from_secs(5), || {
+        let view = status(&conn);
+        view.output_mode.is_some_and(|mode| mode.phase == OutputPhase::Applied && mode.applied == Some(OutputMode::Broadcast))
+            && view.bridge.is_some_and(|bridge| bridge.speech_enabled && bridge.translate_enabled)
+            && view.pre.is_some_and(|pre| pre.playout_policy == PlayoutPolicy::BroadcastOnly)
+    }));
+
+    let bad = call(&conn, ctl::DAEMON_SPEECH_CLEAR, br#"{"extra":1}"#);
+    assert_eq!(bad.code, ctl::CODE_INVALID_ARGUMENT);
+
+    let clear = call(&conn, ctl::DAEMON_SPEECH_CLEAR, b"{}");
+    assert_eq!(clear.status, "ok", "{}", clear.reason);
+    assert_eq!(clear.data["speech_enabled"], true);
+    assert!(clear.data["cutoff_ns"].as_u64().unwrap() > 0);
+
+    let view = status(&conn);
+    assert!(view.output_mode.is_some_and(|mode| mode.phase == OutputPhase::Applied && mode.applied == Some(OutputMode::Broadcast)));
+    assert!(view.bridge.is_some_and(|bridge| bridge.speech_enabled && bridge.translate_enabled));
+    assert!(view.pre.is_some_and(|pre| pre.playout_policy == PlayoutPolicy::BroadcastOnly));
+    assert!(view.degraded.is_empty(), "{:?}", view.degraded);
+}
+
+#[test]
+fn speech_clear_fence_reconciles_when_tts_recovers() {
+    use mozart_core::ctl::schema::{OutputMode, OutputPhase};
+
+    let root = std::env::temp_dir().join(format!("mozart-speech-clear-fault-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&root);
+    std::fs::create_dir_all(&root).unwrap();
+    let stop_fault = root.join("stop-fault");
+    let daemon = DaemonProcess::start_file(
+        "speech-clear-fault",
+        &root.join("files"),
+        "",
+        true,
+        &[
+            ("MOZART_STARTUP_MODE", "broadcast".into()),
+            ("MOZART_TTS_STUB_STOP_FAULT", stop_fault.display().to_string()),
+        ],
+    );
+    let conn = daemon.connect();
+    let window = Duration::from_secs(5);
+    assert!(wait_until(window, || {
+        let view = status(&conn);
+        view.output_mode.is_some_and(|mode| mode.phase == OutputPhase::Applied && mode.applied == Some(OutputMode::Broadcast))
+            && view.bridge.is_some_and(|bridge| bridge.speech_enabled)
+    }));
+
+    std::fs::write(&stop_fault, "").unwrap();
+    let reply = call(&conn, ctl::DAEMON_SPEECH_CLEAR, b"{}");
+    assert_eq!(reply.status, "error");
+    let view = status(&conn);
+    assert!(
+        view.degraded.iter().any(|entry| entry.starts_with("speech stop fence: tts:")),
+        "{:?}",
+        view.degraded
+    );
+    assert!(view.output_mode.is_some_and(|mode| mode.phase == OutputPhase::Applied && mode.applied == Some(OutputMode::Broadcast)));
+    assert!(view.bridge.is_some_and(|bridge| bridge.speech_enabled));
+
+    std::fs::remove_file(&stop_fault).unwrap();
+    assert!(wait_until(window, || status(&conn).degraded.is_empty()));
+    let recovered = status(&conn);
+    assert!(recovered.output_mode.is_some_and(|mode| mode.phase == OutputPhase::Applied && mode.applied == Some(OutputMode::Broadcast)));
+    assert!(recovered.bridge.is_some_and(|bridge| bridge.speech_enabled));
+
+    drop(daemon);
+    std::fs::remove_dir_all(root).unwrap();
 }

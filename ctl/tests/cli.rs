@@ -246,6 +246,17 @@ fn translate_and_speech_forward_to_bridge() {
     assert_eq!(data["translate_enabled"], false);
     assert!(wait_bridge(&env, |bridge| !bridge.translate_enabled));
 
+    let speech_on = env.run(&["speech", "on"]);
+    assert_success(&speech_on);
+    assert!(String::from_utf8_lossy(&speech_on.stdout).contains("speech: on"));
+    assert!(wait_bridge(&env, |bridge| bridge.speech_enabled));
+
+    let clear = env.run(&["speech", "clear", "--json"]);
+    assert_success(&clear);
+    let data: serde_json::Value = serde_json::from_slice(&clear.stdout).unwrap();
+    assert_eq!(data["speech_enabled"], true);
+    assert!(wait_bridge(&env, |bridge| bridge.speech_enabled));
+
     let speech_off = env.run(&["speech", "off"]);
     assert_success(&speech_off);
     assert!(String::from_utf8_lossy(&speech_off.stdout).contains("speech: off"));

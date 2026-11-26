@@ -59,9 +59,9 @@ mozart-ctl mute off           # 取消静音
 mozart-ctl model use <模型id>  # 换模型（实时或空闲）
 ```
 
-启动时有已配置的变声模型则默认进入实时变声，没有模型则默认直出。可在 `[daemon]` 中设置 `startup_mode`。
+默认以托管直出模式（`direct`）启动，不自动开启变声或播报；可在 `[daemon]` 中设置 `startup_mode`。
 
-模式命令返回受理结果。用 `mozart-ctl status --json` 查看 `output_mode.applied`；三种模式都保留识别和翻译字幕。手动执行 `route set` 或 `speech` 会退出托管模式。
+模式命令返回受理结果。用 `mozart-ctl status --json` 查看 `output_mode.applied`；三种模式都保留识别和翻译字幕。手动执行 `route set` 或 `speech on|off|stop` 会退出托管模式；`speech clear` 仅清队列与在途播报，保持当前托管模式不变。
 
 `model use` 短暂断流：停流 → 载入新模型 → 载入该模型的 `presets/default.toml` → 重新起流。
 它把模型选择写回配置基线，重启后沿用；`config set rvc.model_id` 被拒绝。
@@ -93,6 +93,7 @@ mozart-ctl translate off      # 关闭翻译
 mozart-ctl speech on          # 开启播报；播报时自动静音实时输出
 mozart-ctl speech off         # 关闭播报
 mozart-ctl speech stop        # 急停并清空待播队列
+mozart-ctl speech clear       # 清空待播队列并中止在途播报，保持开关与托管模式不变
 ```
 
 ## 七、管理与排障

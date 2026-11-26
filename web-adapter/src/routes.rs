@@ -103,7 +103,7 @@ async fn serve(s: &State, req: Request, api: bool) -> Result<Response, ApiError>
     let p: Vec<&str> = parts[2..].iter().map(String::as_str).collect();
     let m = req.method().clone();
     let allow = match p.as_slice() {
-        ["preset", "save" | "use"] | ["system", "up" | "down"] | ["speech", "stop"] | ["config", "save"] | ["services", _, "restart"] | ["files", "pause" | "resume"] | ["files", _, "cancel"] => "POST",
+        ["preset", "save" | "use"] | ["system", "up" | "down"] | ["speech", "stop" | "clear"] | ["config", "save"] | ["services", _, "restart"] | ["files", "pause" | "resume"] | ["files", _, "cancel"] => "POST",
         ["health" | "status" | "models" | "devices" | "preset"] | ["events", "status" | "subtitles"] | ["files", _, "result"] | ["files", _] => "GET",
         ["logs"] => "GET",
         ["route" | "mute" | "translate" | "speech" | "model" | "mode"] => "PUT",
@@ -147,6 +147,7 @@ async fn serve(s: &State, req: Request, api: bool) -> Result<Response, ApiError>
                 (Method::POST, ["services", service, "restart"]) => { body::<Empty>(req).await?; (ctl::DAEMON_RESTART, json!({"service":service})) },
                 (Method::POST, ["files", id, "cancel"]) => { body::<Empty>(req).await?; (ctl::DAEMON_FILE_CANCEL, json!({"job_id":id})) },
                 (Method::POST, ["speech", "stop"]) => { body::<Empty>(req).await?; (ctl::DAEMON_SPEECH_STOP, json!({})) },
+                (Method::POST, ["speech", "clear"]) => { body::<Empty>(req).await?; (ctl::DAEMON_SPEECH_CLEAR, json!({})) },
                 (Method::POST, ["config", "save"]) => { body::<Empty>(req).await?; (ctl::DAEMON_CONFIG_SAVE, json!({})) },
                 (Method::POST, ["files", "pause"]) => { body::<Empty>(req).await?; (ctl::DAEMON_FILE_PAUSE, json!({})) },
                 (Method::POST, ["files", "resume"]) => { body::<Empty>(req).await?; (ctl::DAEMON_FILE_RESUME, json!({})) },

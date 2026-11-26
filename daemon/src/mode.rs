@@ -89,6 +89,7 @@ pub fn tick(
                 // A superseded broadcast request may have started a redundant
                 // fence, but never opened admission. Do not wait on that probe.
                 bridge.speech_stop = None;
+                bridge.clear_fence = None;
                 lock_state(state).clear_degraded_prefix(services::SPEECH_STOP_REASON);
                 Ok(Some(OutputPhase::Routing))
             } else {
@@ -219,7 +220,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn startup_defaults_to_rvc_if_a_model_is_configured() {
+    fn startup_defaults_to_direct_even_if_a_model_is_configured() {
         let mut config = Config::default();
         let mut state = State::new();
         initialize(&mut state, &config);
@@ -229,9 +230,22 @@ mod tests {
         let mut state = State::new();
         initialize(&mut state, &config);
         let mode = state.output_mode.unwrap();
+        assert_eq!(mode.requested, OutputMode::Direct);
+        assert_eq!(mode.phase, OutputPhase::Routing);
+        assert_eq!(state.playout_policy, PlayoutPolicy::Silent);
+
+        config.daemon.startup_mode = StartupMode::Rvc;
+        let mut state = State::new();
+        initialize(&mut state, &config);
+        let mode = state.output_mode.unwrap();
         assert_eq!(mode.requested, OutputMode::Rvc);
         assert_eq!(mode.phase, OutputPhase::Routing);
         assert_eq!(state.playout_policy, PlayoutPolicy::Silent);
+
+        config.rvc.model_id.clear();
+        let mut state = State::new();
+        initialize(&mut state, &config);
+        assert_eq!(state.output_mode.unwrap().requested, OutputMode::Direct);
     }
 }
 

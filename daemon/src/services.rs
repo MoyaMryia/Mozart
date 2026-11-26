@@ -538,6 +538,7 @@ pub fn advance_speech_stop(
         Some(SpeechStop::Withdraw) | None => match begin_speech_stop(services) {
             Ok((fence, data)) => {
                 pending.speech_stop = Some(SpeechStop::Fence(fence));
+                pending.clear_fence = None;
                 pending.speech = None;
                 let saved = state_file.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
                     .set_key("bridge.speech_enabled", json!(false));
@@ -559,6 +560,46 @@ pub fn advance_speech_stop(
     confirm_speech_stop(state, services, fence)?;
     pending.speech_stop = None;
     Ok(data)
+}
+
+/// 清空待播报队列并中止在途播报，保持桥播报开关与托管模式不变。
+pub fn clear_speech_queue(
+    state: &Mutex<State>,
+    services: &Services,
+    pending: &mut BridgeRestore,
+) -> Result<Value, (String, String)> {
+    let response = services
+        .bridge()
+        .call_ok(ctl::BRIDGE_SPEECH_CLEAR, br#"{"fenced":true}"#)
+        .map_err(CallError::into_rejection)?;
+    let cutoff_ns = response.data["cutoff_ns"]
+        .as_u64()
+        .filter(|&value| mozart_core::speech::valid_timestamp(value))
+        .ok_or_else(|| {
+            (
+                ctl::CODE_INTERNAL.into(),
+                "bridge did not return valid speech clear cutoff".into(),
+            )
+        })?;
+    let fence = mozart_core::speech::StopFence { cutoff_ns };
+    pending.clear_fence = Some(fence);
+    confirm_speech_stop(state, services, fence)?;
+    pending.clear_fence = None;
+    Ok(response.data)
+}
+
+/// 在轮询周期对尚未确认的清队列屏障进行对账，恢复后自动清除残留降级状态。
+pub fn advance_speech_clear(
+    state: &Mutex<State>,
+    services: &Services,
+    pending: &mut BridgeRestore,
+) {
+    let Some(fence) = pending.clear_fence else {
+        return;
+    };
+    if confirm_speech_stop(state, services, fence).is_ok() {
+        pending.clear_fence = None;
+    }
 }
 
 /// 启动/重启恢复（SPEC-04）：把状态文件的字幕开关覆盖一次性下发到桥。

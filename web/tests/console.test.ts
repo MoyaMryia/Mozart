@@ -49,6 +49,20 @@ function mockBackend() {
     if (path === '/api/v1/system/up') { running = true; return jsonResponse({ state: 'running' }); }
     if (path === '/api/v1/system/down') { running = false; return jsonResponse({ state: 'stopped' }); }
     if (path === '/api/v1/route') { snapshot.route.desired = body.route; return jsonResponse({ route: body.route }); }
+    if (path === '/api/v1/mode') {
+      const phase = body.mode === 'broadcast' ? 'opening_speech' : 'routing';
+      snapshot.output_mode = { requested: body.mode, applied: null, phase, last_error: null };
+      snapshot.bridge!.speech_enabled = body.mode === 'broadcast';
+      return jsonResponse(snapshot.output_mode);
+    }
+    if (path === '/api/v1/translate') {
+      snapshot.bridge!.translate_enabled = body.enabled;
+      return jsonResponse({ translate_enabled: body.enabled });
+    }
+    if (path === '/api/v1/speech/clear') {
+      snapshot.bridge!.speech_queue_depth = 0;
+      return jsonResponse({});
+    }
     if (path === '/api/v1/mute') { snapshot.mute = body.mute; return jsonResponse({ mute: body.mute }); }
     if (path === '/api/v1/models') return jsonResponse({ models: [{ id: 'model-a', exists: true, loaded: true }] });
     if (path === '/api/v1/preset') return jsonResponse({ model_id: 'model-a', preset: 'default', preset_values: snapshot.rvc_params, live_values: snapshot.rvc_params, dirty: presetDirty });
@@ -273,14 +287,17 @@ describe('控制台', () => {
     const backend = mockBackend(); const root = mount(); await flush();
     const route = root.querySelector<HTMLSelectElement>('#system-route')!;
     route.value = 'rvc'; route.dispatchEvent(new Event('change', { bubbles: true })); await flush();
-    expect(backend.snapshot.route.desired).toBe('rvc'); expect(backend.snapshot.route.active).toBe('direct');
-    expect(route.value).toBe('rvc'); expect(section(root, '路由').textContent).toContain('实际：direct');
+    expect(backend.snapshot.output_mode?.requested).toBe('rvc'); expect(backend.snapshot.output_mode?.applied).toBeNull();
+    expect(route.value).toBe('rvc');
+    const routeCardText = section(root, '路由').textContent ?? '';
+    expect(routeCardText).toContain('切换路由中');
+    expect(routeCardText).not.toContain('实际：变声');
     const writes = backend.fetcher.mock.calls.filter(([, init]) => init?.method && init.method !== 'GET');
-    expect(writes).toHaveLength(1); expect(writes[0][0]).toBe('/api/v1/route');
+    expect(writes).toHaveLength(1); expect(writes[0][0]).toBe('/api/v1/mode');
   });
   it('路由被拒绝后选择器恢复后端已确认值', async () => {
     const backend = mockBackend(); const original = backend.fetcher.getMockImplementation()!;
-    backend.fetcher.mockImplementation((path, init) => path === '/api/v1/route'
+    backend.fetcher.mockImplementation((path, init) => path === '/api/v1/mode'
       ? Promise.resolve(errorResponse('NotReady', '模型未就绪', 409)) : original(path, init));
     const root = mount(); await flush(); const route = root.querySelector<HTMLSelectElement>('#system-route')!;
     route.value = 'rvc'; route.dispatchEvent(new Event('change', { bubbles: true })); await flush();
@@ -411,7 +428,7 @@ describe('控制台', () => {
     const files = section(root, '文件转换');
     expect(root.textContent).toContain('已受理 job-new'); expect(root.textContent).toContain('转换尚未完成');
     expect(files.textContent).toContain('排队中'); expect(files.textContent).not.toContain('已完成');
-    expect(backend.fetcher.mock.calls.some(([path]) => path === '/api/v1/route')).toBe(false);
+    expect(backend.fetcher.mock.calls.some(([path]) => path === '/api/v1/route' || path === '/api/v1/mode')).toBe(false);
     expect(files.querySelector<HTMLInputElement>('input[type=file]')!.files!.length).toBe(0);
   });
   it('提交结果未知时不重复提交，核对后才可继续', async () => {
@@ -653,6 +670,68 @@ describe('控制台', () => {
     expect(details.querySelector('pre')!.textContent).not.toContain('rvc 日志第一行');
     resolvePre(jsonResponse({ name: 'pre', tail: 'pre 最新日志' })); await flush();
     expect(details.querySelector('pre')!.textContent).toContain('pre 最新日志');
+  });
+  it('无左侧翻译播报卡片，播报设置仅在翻译播报时显示且无占位文案', async () => {
+    mockBackend(); const root = mount(); await flush();
+    expect(root.querySelector('section[aria-label="翻译播报"]')).toBeNull();
+    expect(root.querySelector('section[aria-label="播报设置"]')).toBeNull();
+    const route = root.querySelector<HTMLSelectElement>('#system-route')!;
+    route.value = 'rvc'; route.dispatchEvent(new Event('change', { bubbles: true })); await flush();
+    expect(root.querySelector('section[aria-label="播报设置"]')).toBeNull();
+    route.value = 'broadcast'; route.dispatchEvent(new Event('change', { bubbles: true })); await flush();
+    const panel = section(root, '播报设置');
+    expect(panel.textContent).toContain('开启中');
+    expect(panel.textContent).toContain('清除播报队列');
+    expect(panel.textContent).toContain('播报队列');
+    expect(panel.textContent).not.toMatch(/敬请期待|即将|暂未/);
+    const stream = sources.find(item => item.url.endsWith('/events/status'))!;
+    const applied = statusFixture();
+    applied.output_mode = { requested: 'broadcast', applied: 'broadcast', phase: 'applied', last_error: null };
+    applied.bridge!.speech_enabled = true;
+    stream.dispatchEvent(new MessageEvent('status', { data: JSON.stringify(applied) })); await nextTick();
+    expect(section(root, '播报设置').textContent).toContain('播报中');
+    route.value = 'direct'; route.dispatchEvent(new Event('change', { bubbles: true })); await flush();
+    await vi.advanceTimersByTimeAsync(300); await flush();
+    expect(root.querySelector('section[aria-label="播报设置"]')).toBeNull();
+  });
+  it('清除播报队列调用 POST /api/v1/speech/clear 并保持播报与托管模式', async () => {
+    const backend = mockBackend();
+    backend.snapshot.output_mode = { requested: 'broadcast', applied: 'broadcast', phase: 'applied', last_error: null };
+    backend.snapshot.bridge!.speech_enabled = true;
+    backend.snapshot.bridge!.speech_queue_depth = 3;
+    const root = mount(); await flush();
+    expect(section(root, '播报设置').textContent).toContain('播报队列 3');
+    button(section(root, '播报设置'), '清除播报队列').click(); await flush();
+    const writes = backend.fetcher.mock.calls.filter(([, init]) => init?.method && init.method !== 'GET');
+    expect(writes.map(([path]) => path)).toContain('/api/v1/speech/clear');
+    expect(writes.some(([path]) => path === '/api/v1/speech/stop' || path === '/api/v1/speech')).toBe(false);
+    expect(backend.snapshot.bridge!.speech_enabled).toBe(true);
+    expect(backend.snapshot.bridge!.speech_queue_depth).toBe(0);
+    expect(root.querySelector('section[aria-label="播报设置"]')).not.toBeNull();
+  });
+  it('路由卡内独立翻译开关切换 PUT /api/v1/translate 并在播报设置提示状态', async () => {
+    const backend = mockBackend();
+    backend.snapshot.output_mode = { requested: 'broadcast', applied: 'broadcast', phase: 'applied', last_error: null };
+    backend.snapshot.bridge!.speech_enabled = true;
+    const root = mount(); await flush();
+    const toggle = section(root, '路由').querySelector<HTMLButtonElement>('.translate-toggle')!;
+    expect(toggle.getAttribute('aria-pressed')).toBe('true');
+    toggle.click(); await flush();
+    const writes = backend.fetcher.mock.calls.filter(([path, init]) => path === '/api/v1/translate' && init?.method === 'PUT');
+    expect(writes).toHaveLength(1);
+    expect(writes[0][1]!.body).toBe('{"enabled":false}');
+    expect(toggle.getAttribute('aria-pressed')).toBe('false');
+    expect(toggle.textContent).toContain('已关闭');
+    expect(section(root, '播报设置').textContent).toContain('翻译已关闭，当前不会触发播报。');
+    toggle.click(); await flush();
+    expect(toggle.getAttribute('aria-pressed')).toBe('true');
+    expect(section(root, '播报设置').textContent).not.toContain('翻译已关闭，当前不会触发播报。');
+  });
+  it('托管模式切换错误 output_mode.last_error 在路由卡内显示', async () => {
+    const backend = mockBackend();
+    backend.snapshot.output_mode = { requested: 'rvc', applied: null, phase: 'routing', last_error: 'rvc stream failed' };
+    const root = mount(); await flush();
+    expect(section(root, '路由').textContent).toContain('rvc stream failed');
   });
 });
 

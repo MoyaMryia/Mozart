@@ -47,6 +47,7 @@ enum {
     MOZART_CTL_DAEMON_TRANSLATE_SET = 0x0106,  // 体 {"enabled": bool}，转发桥
     MOZART_CTL_DAEMON_SPEECH_SET    = 0x0107,  // 体 {"enabled": bool}，转发桥
     MOZART_CTL_DAEMON_SPEECH_STOP   = 0x0108,  // 体 {}（空），转发桥
+    MOZART_CTL_DAEMON_SPEECH_CLEAR  = 0x0109,  // 体 {}（空），清播报队列并中止当前合成，保持播报开关不变
     // 文件链路与管理命令（SPEC-04 CLI 命令面）；体字段见 core/src/ctl/schema.rs：
     MOZART_CTL_DAEMON_FILE_SUBMIT = 0x0110,  // 体 {"path","model_id"?}，data {"job_id","state","queue_position"}
     MOZART_CTL_DAEMON_FILE_PAUSE  = 0x0111,  // 体 {}（空），data {"paused"}
@@ -113,6 +114,7 @@ enum {
     MOZART_CTL_BRIDGE_TRANSLATE_SET = 0x0503,  // 体 {"enabled": bool}
     MOZART_CTL_BRIDGE_SPEECH_SET    = 0x0504,  // 体 {"enabled": bool}
     MOZART_CTL_BRIDGE_SPEECH_STOP   = 0x0505,  // 体 {}（空）
+    MOZART_CTL_BRIDGE_SPEECH_CLEAR  = 0x0506,  // 体 {}（空）或 {"fenced":true}；清队列、保持开关不变
 
     MOZART_CTL_TTS_HELLO      = 0x0601,
     MOZART_CTL_TTS_GET_STATUS = 0x0602,

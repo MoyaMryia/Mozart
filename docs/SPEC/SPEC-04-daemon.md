@@ -52,7 +52,7 @@
 - 写重启键后 `status` 的待重启显示：daemon 维护 `pending_restart` 集合（写重启键加入、`restart` 该服务受理后清除），`GetStatus` 应答带 `pending_restart` 字段，CLI 人读输出显示待重启提示（`daemon/src/state.rs`、`core/src/ctl/schema.rs` Status）。同一分歧另记键级 `pending_restart_keys`（键 → 尚未重启的受影响服务集合），`GetStatus` 与 `config get` 应答都带该键名数组（无则空数组）；`restart` 某服务只从键的服务集合里去掉它，全部受影响服务都重启后才删键。`config get` 人读输出在值后列出待重启键，单键查询在该键待重启时提示，按段查询（如 `config get pre`）在该段下有待重启键时提示。受影响服务取 `core::config::set_key` 的 `affected`，daemon 不重新推导。
 - 重启两粒度：`restart <service>` 重启单个服务（小模块）；整栈重启（大模块）用 `down`/`up`。`restart <service>` 重读 TOML 后重起该服务（应用 spawn 期键），但不更新 daemon 生效配置；手改的 RVC 会话参数仍需 daemon `down`/`up` 或下一次 `config set` 同键才生效。
 - 控制连接由独立线程处理，空闲 30 s 断开，慢客户端不阻塞其他命令；daemon 退出时先向子进程发 SIGTERM，2 s 后 SIGKILL。
-- `mozart-ctl` v1 命令：`up`、`down`、`status`、`route set <direct|rvc>`、`mute on|off`、`config get|set|save`、`preset save|use|list`、`restart <service>`、`translate on|off`、`speech on|off|stop`、`file submit <path> [--model <id>]`、`file pause`、`file resume`、`file cancel <job_id>`、`file fetch <job_id> [-o path]`、`file status <job_id>`、`file list`、`model list`、`model use <id>`、`device list`；`--json` 输出稳定数据；退出码：0 成功、1 其他错误、2 参数错、3 daemon 不可达、4 请求被拒、5 超时。（`ctl/src/main.rs`）
+- `mozart-ctl` v1 命令：`up`、`down`、`status`、`route set <direct|rvc>`、`mute on|off`、`config get|set|save`、`preset save|use|list`、`restart <service>`、`translate on|off`、`speech on|off|stop|clear`、`file submit <path> [--model <id>]`、`file pause`、`file resume`、`file cancel <job_id>`、`file fetch <job_id> [-o path]`、`file status <job_id>`、`file list`、`model list`、`model use <id>`、`device list`；`--json` 输出稳定数据；退出码：0 成功、1 其他错误、2 参数错、3 daemon 不可达、4 请求被拒、5 超时。（`ctl/src/main.rs`）
 - 控制面命令覆盖字幕链路：字幕开关命令经 daemon 转发到桥执行，命令契约见 SPEC-05。daemon 不持有桥的活状态，只转发命令并轮询汇总。（`daemon/tests/language.rs`）
 - 模式建模用资源仲裁，不用大模式枚举：资源为 GPU 与扬声器；活动（实时变声、文件转换、翻译播报、直出）声明占用，daemon 仲裁，冲突按裁决判据处理；mode 是派生状态。继承旧原则：控制面不碰音频、GPU 互斥、文件队列串行加取消检查点、上限 50。（`daemon/src/file/arbitrate.rs`、`daemon/src/services.rs:327-333`）
 - v1 资源仲裁范围：GPU 仲裁（实时 / 文件互斥）+ 扬声器分时（播报时静音实时、播完恢复，沿用旧实现）；播报经变声占 GPU 的仲裁与混音见 [FUTURE.md](../FUTURE.md)。
@@ -114,7 +114,7 @@ CLI 的 `--json` 输出通常为响应的 `data`，不是完整 socket 响应信
 - [x] 配置覆盖清除失败可重试，`config save` 不把部分成功报成完成。原子写失败清理本次临时文件；保留已执行但未持久化的运行时开关。 见[本机回归](../../reports/postprocessing-stability-20261124/RESULTS.md)。
 
 - [x] 模式切换边界：已确认播报归还且未尝试再开时，直出与变声切换不依赖语言服务。未知播报开启必须重新隔离；未归还的 RVC 不提前重开，等待槽仅保留最新请求。板端范围与故障注入见[切换回归](../../reports/mode-switch-edges-20261124/RESULTS.md)。
-- [x] 新增 `SetOutputMode`（`0x0122`，`direct`／`rvc`／`broadcast`），依次执行停播、路由选择和新播报许可。`GetStatus.output_mode` 分开报告请求、应用、过渡阶段和最近错误；等待文件归还时不抢占。不重启语言链。设路由或播报的旧命令显式退出模式编排，并沿用各自语义。模式选择本身只存在 daemon 内存，停止后的播报关闭覆盖仍按原规则落盘。
+- [x] 新增 `SetOutputMode`（`0x0122`，`direct`／`rvc`／`broadcast`），依次执行停播、路由选择和新播报许可。`GetStatus.output_mode` 分开报告请求、应用、过渡阶段和最近错误；等待文件归还时不抢占。不重启语言链。设路由或播报开启/关闭/停止的旧命令显式退出模式编排，并沿用各自语义；新增 `DAEMON_SPEECH_CLEAR`（`0x0109` / `speech clear`）只清待播报队列并执行 TTS／`pre` 截止屏障，保持 `speech_enabled` 不变且不退出托管 `broadcast` 模式、不写 `state.json`。模式选择本身只存在 daemon 内存，停止后的播报关闭覆盖仍按原规则落盘。
 
 - 用显式 RVC 租约区分空闲、实时、文件和实时待归还。切回直通或补偿起流结果未知时，未收到 RVC 停流确认不释放租约；确认前不调度文件或发起下一次实时起流。状态区分已下发的直通与仍待归还的 RVC。`daemon/tests/file_queue.rs` 覆盖停流命令未执行及已执行但应答丢失两种结果。
 
@@ -125,7 +125,7 @@ CLI 的 `--json` 输出通常为响应的 `data`，不是完整 socket 响应信
 - 实时原生多采样率（控制面）：不做播放采样率协商，播放固定 48 kHz、边界重采样归 pre（SPEC-02）；跨采样率换模型走 `model use` 断流切换，几何随 `StartStream` 重建。主条见 SPEC-03，板端断流代价与多采样率验收见 SPEC-03 板端条目。
 - 音频设备实时热切换命令 `device use <capture|playback> <设备名>`（`DAEMON_DEVICE_USE` `0x0121`）：体 `{"kind","device"}`，data `{"kind","device","previous_device"}`。入口按设备清单校验存在性与方向匹配，再经 `PRE_SET_DEVICE`（`0x0208`）下发 pre 实时生效；不写回 `mozart.toml`、不进 `state.json`，`config set pre.capture_device/playback_device` 维持 S 类。daemon 内存保留当前临时生效设备，pre 意外崩溃自愈重启时通过 `--effective-capture-device` / `--effective-playback-device` 沿用；显式 `restart pre` 或 `down`/`up` 清空临时覆盖、恢复 `mozart.toml` 基线。（`daemon/src/server.rs`、`daemon/src/supervisor.rs`、`daemon/src/runtime.rs`、`ctl/src/main.rs`、`daemon/tests/device_use.rs`）
 - 文件租约归还：文件结果与数据面归还分开；确认停流、释放输出 socket、确认 pre 恢复，才释放文件租约。未知结果由 daemon 对账，可查询且阻止新任务与实时起流。 `arbiter.file_return_pending` 与降级原因区分文件终态和资源状态；停流前、停流后丢应答及 pre 归还失败均有本机故障注入回归。
-- 主模式互斥切换与默认实时变声：有配置模型时默认托管实时变声，无模型时默认托管直出。翻译播报仅输出 TTS 并在空窗静音；实时变声和直出不插播 TTS。三种模式均保留识别和翻译字幕。旧命令与 `startup_mode = "manual"` 保留独立控制。
+- 主模式互斥切换与默认直出：默认以托管直出（`startup_mode = "direct"`）启动，不自动开启变声或播报；配置为 `"rvc"` 且已配置模型时默认托管实时变声（无模型回退直出）。翻译播报仅输出 TTS 并在空窗静音；实时变声和直出不插播 TTS。三种模式均保留识别和翻译字幕。旧命令与 `startup_mode = "manual"` 保留独立控制。
 - 业务子服务组启停控制命令（方案 1）：新增 `DAEMON_SERVICES_START`（`0x0123`）与 `DAEMON_SERVICES_STOP`（`0x0124`）控制命令（`ctl` 对应 `services start|stop`，`Status.services_active` 反映当前状态），在保持 `daemon` 与 `web` 在线的前提下停止或恢复音频与 AI 业务子服务（`pre`、`enhance`、`rvc`、`asr`、`tts`、`bridge`、`llama-server`），供 Web 控制台释放或恢复 GPU 与内存资源；停服期间拒绝业务控制命令与新的文件提交（`NotReady`），文件任务正在跑或 GPU 归还中时拒绝停服（`Busy`），排队任务保留并在恢复服务后继续；整机完全关停仍走 `mozart-ctl down` / `Shutdown`。（`core/include/mozart/ctl.h`、`core/src/ctl.rs`、`core/src/ctl/schema.rs`、`daemon/src/{state,supervisor,poller,services,server}.rs`、`daemon/tests/{control_plane,file_worker}.rs`、`ctl/src/main.rs`）
 - [ ] 控制面超时表与连接队列加固：将 `DAEMON_MODEL_USE`、`DAEMON_FILE_SUBMIT` 纳入 `core::ctl::request_timeout_ms` 共用长超时预算，避免切模型与大文件入队误超时；将 `daemon.sock` 的 `listen` 队列上限由 `8` 调大至 `64`，保留 `transition` 互斥锁串行语义。
 - [ ] 优雅关停与停机超时加固：关停标志置位后 `poller` 立即提前退出、不再继续对已停子服务做轮询等待；`mozart-ctl down` 停机等待时限与 `start_timeout_ms` 解耦并给足缓冲（至少 `10–15 s`），避免满载停栈误超时。

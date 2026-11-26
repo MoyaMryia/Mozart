@@ -12,9 +12,9 @@ const LIVE_CONTEXT_S = 10;
 const REVISION_WINDOW_S = 60;
 export type ActionArea = 'system' | 'files' | 'devices' | 'params' | 'speech';
 /** 写锁的粒度：同一控件的写入串行，其余控件照常可用；区域之间的冲突由 daemon 仲裁。 */
-export type Lock = ActionArea | 'mute' | 'route' | 'model' | 'lifecycle';
+export type Lock = ActionArea | 'mute' | 'route' | 'translate' | 'model' | 'lifecycle';
 /** 每个写锁归属的结果区域：未知结果按区域锁定。 */
-const AREA_OF_LOCK: Record<Lock, ActionArea> = { system: 'system', files: 'files', devices: 'devices', params: 'params', speech: 'speech', mute: 'system', route: 'system', model: 'system', lifecycle: 'system' };
+const AREA_OF_LOCK: Record<Lock, ActionArea> = { system: 'system', files: 'files', devices: 'devices', params: 'params', speech: 'speech', mute: 'system', route: 'system', translate: 'speech', model: 'system', lifecycle: 'system' };
 export type ErrorKey = Lock | 'connection' | 'status' | 'models' | 'preset' | 'deviceList' | 'fileList' | 'captureBaseline' | 'playbackBaseline' | 'theme';
 /** 状态与健康之外，按需重读的数据。 */
 type Resource = 'files' | 'models' | 'preset' | 'devices' | 'baselines';
@@ -67,12 +67,12 @@ export function useConsole() {
   const archivedIds = new Set<string>();
   const records = ref<SubtitleRecord[]>(restored ?? []);
   const unknowns = ref<Record<ActionArea, string[]>>({ system: [], files: [], devices: [], params: [], speech: [] });
-  const busy = ref<Record<Lock, boolean>>({ system: false, files: false, devices: false, params: false, speech: false, mute: false, route: false, model: false, lifecycle: false });
+  const busy = ref<Record<Lock, boolean>>({ system: false, files: false, devices: false, params: false, speech: false, mute: false, route: false, translate: false, model: false, lifecycle: false });
   const writing = computed(() => Object.values(busy.value).some(Boolean));
   const reloading = ref(false);
   const notice = ref('');
   const errors = ref<Record<ErrorKey, string>>({
-    system: '', lifecycle: '', route: '', mute: '', model: '', files: '', devices: '', params: '', speech: '',
+    system: '', lifecycle: '', route: '', mute: '', model: '', files: '', devices: '', params: '', speech: '', translate: '',
     connection: '', status: '', models: '', preset: '', deviceList: '', fileList: '', captureBaseline: '', playbackBaseline: '', theme: '',
   });
   const subtitleState = ref<ConnectionState>('connecting');

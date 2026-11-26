@@ -66,6 +66,8 @@ impl Poller {
                                 if restore.speech_stop.is_some() && lock_state(&state).output_mode.is_none() {
                                     // advance_speech_stop publishes any remaining failure to status.
                                     let _ = services::advance_speech_stop(&state, &services, &state_file, &mut restore);
+                                } else if restore.speech_stop.is_none() && restore.clear_fence.is_some() {
+                                    services::advance_speech_clear(&state, &services, &mut restore);
                                 }
                                 services::restore_bridge_switches(&services, &mut restore);
                             }
@@ -115,5 +117,6 @@ fn finalize_stopped_services(
     if state.stop_finalize_pending() && state.all_business_stopped() {
         state.finalize_services_stopped();
         restore.speech_stop = None;
+        restore.clear_fence = None;
     }
 }

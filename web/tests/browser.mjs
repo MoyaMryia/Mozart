@@ -81,12 +81,20 @@ async function handleApi(req, res) {
   if (path === '/system/up') { running = true; return response(res, { state: 'running' }); }
   if (path === '/services/pre/restart') { snapshot.pending_restart = []; broadcastStatus(); return response(res, { service: 'pre' }); }
   if (path === '/route') { snapshot.route.desired = body.route; broadcastStatus(); return response(res, { route: body.route }); }
+  if (path === '/mode') {
+    const phase = body.mode === 'broadcast' ? 'opening_speech' : 'routing';
+    snapshot.output_mode = { requested: body.mode, applied: null, phase, last_error: null };
+    snapshot.bridge.speech_enabled = body.mode === 'broadcast';
+    broadcastStatus();
+    return response(res, snapshot.output_mode);
+  }
   if (path === '/mute') { snapshot.mute = body.mute; broadcastStatus(); return response(res, { mute: body.mute }); }
   if (path === '/preset/save') { Object.assign(presetValues, snapshot.rvc_params); return response(res, { model_id: 'model-a', preset: 'default', values: presetValues }); }
   if (path === '/preset/use') { Object.assign(snapshot.rvc_params, presetValues); broadcastStatus(); return response(res, { model_id: 'model-a', preset: 'default', values: presetValues }); }
   if (path === '/translate') { snapshot.bridge.translate_enabled = body.enabled; broadcastStatus(); return response(res, body); }
   if (path === '/speech') { snapshot.bridge.speech_enabled = body.enabled; broadcastStatus(); return response(res, body); }
   if (path === '/speech/stop') { snapshot.bridge.speech_enabled = false; broadcastStatus(); return response(res, {}); }
+  if (path === '/speech/clear') { snapshot.bridge.speech_queue_depth = 0; broadcastStatus(); return response(res, {}); }
   if (path === '/files/pause' || path === '/files/resume') { queuePaused = path.endsWith('/pause'); return response(res, { paused: queuePaused }); }
   if (path === '/files/job-new/cancel') { jobs[0].state = 'cancelled'; return response(res, { job_id: 'job-new', state: 'cancelled' }); }
   if (path === '/files') {
@@ -122,11 +130,31 @@ try {
   const card = title => page.locator('section').filter({ has: page.getByRole('heading', { name: title, exact: true }) });
   await page.goto(`http://127.0.0.1:${address.port}`);
   await page.getByText('API 在线', { exact: true }).waitFor(); await page.getByText('Hello', { exact: true }).first().waitFor();
+  assert.equal(await card('翻译播报').count(), 0);
+  assert.equal(await card('播报设置').count(), 0);
   await page.getByLabel('路由', { exact: true }).selectOption('rvc');
   await page.getByText('请求已受理；实际状态以下次查询为准。', { exact: true }).waitFor();
-  assert.equal(snapshot.route.active, 'direct'); assert.equal(snapshot.route.desired, 'rvc');
-  assert.equal(writes.filter(item => item.path === '/route').length, 1);
+  await card('路由').getByText('切换路由中', { exact: true }).waitFor();
+  assert.equal(snapshot.output_mode.requested, 'rvc'); assert.equal(snapshot.output_mode.applied, null);
+  assert.equal(writes.filter(item => item.path === '/mode').length, 1);
+  assert.equal(await card('播报设置').count(), 0);
   assert.equal(writes.some(item => item.path.startsWith('/preprocessor') || item.path.includes('mode/switch')), false);
+
+  const broadcastMode = page.waitForResponse(res => res.url().endsWith('/api/v1/mode') && res.request().method() === 'PUT');
+  await page.getByLabel('路由', { exact: true }).selectOption('broadcast');
+  await broadcastMode;
+  await card('播报设置').waitFor({ state: 'visible' });
+  await card('播报设置').getByRole('button', { name: '清除播报队列', exact: true }).click();
+  await page.getByText('已请求清除播报队列。', { exact: true }).waitFor();
+  assert.equal(writes.some(item => item.path === '/speech/clear'), true);
+  assert.equal(snapshot.bridge.speech_enabled, true);
+  assert.equal(await card('播报设置').isVisible(), true);
+
+  await card('路由').locator('.translate-toggle').click();
+  await card('播报设置').getByText('翻译已关闭，当前不会触发播报。', { exact: true }).waitFor();
+  await card('路由').locator('.translate-toggle').click();
+  await page.getByLabel('路由', { exact: true }).selectOption('direct');
+  await card('播报设置').waitFor({ state: 'detached' });
 
   // 调节即应用：被拒绝后回到已确认值；有效值写入后出现保存与恢复按钮。
   await page.getByLabel('音高增益', { exact: true }).fill('13');

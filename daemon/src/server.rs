@@ -351,6 +351,7 @@ fn handle_request(ctx: &Ctx, msg: &Message) -> (Vec<u8>, bool) {
             Err(reply) => (reply, false),
         },
         ctl::DAEMON_SPEECH_STOP => (speech_stop_reply(ctx, &msg.body), false),
+        ctl::DAEMON_SPEECH_CLEAR => (speech_clear_reply(ctx, &msg.body), false),
         ctl::DAEMON_FILE_SUBMIT => match parse_body::<FileSubmitRequest>(&msg.body) {
             Ok(request) => file_reply(ctx.file.submit(request)),
             Err(reply) => (reply, false),
@@ -461,6 +462,7 @@ fn services_start_reply(ctx: &Ctx, body: &[u8]) -> Vec<u8> {
         }
         // 上一轮的播报停止屏障不得打到新起的服务。
         restore.speech_stop = None;
+        restore.clear_fence = None;
         state.set_services_active(true);
     }
     ctx.services_active.store(true, Ordering::Release);
@@ -480,6 +482,7 @@ fn services_stop_reply(ctx: &Ctx, body: &[u8]) -> Vec<u8> {
             // 超时后进程才停完：重试路径同样收尾，不让旧快照与超时原因长留 status。
             state.finalize_services_stopped();
             restore.speech_stop = None;
+            restore.clear_fence = None;
             return schema::ok_body(json!({"state": "not-running"}));
         }
         if state.gpu_owner() == Some(Activity::File) || state.file_return_pending() {
@@ -567,6 +570,21 @@ fn speech_stop_reply(ctx: &Ctx, body: &[u8]) -> Vec<u8> {
     crate::mode::unmanage(&mut lock_state(&ctx.state));
     let mut restore = lock_bridge_restore(&ctx.bridge_restore);
     match services::advance_speech_stop(&ctx.state, &ctx.services, &ctx.state_file, &mut restore) {
+        Ok(data) => schema::ok_body(data),
+        Err((code, reason)) => schema::error_body(&code, &reason),
+    }
+}
+
+fn speech_clear_reply(ctx: &Ctx, body: &[u8]) -> Vec<u8> {
+    if let Err(reply) = parse_empty_body(body, "speech clear body must be an empty object") {
+        return reply;
+    }
+    let _transition = ctx.services.transition();
+    if let Err(reply) = ensure_services_active(ctx) {
+        return reply;
+    }
+    let mut restore = lock_bridge_restore(&ctx.bridge_restore);
+    match services::clear_speech_queue(&ctx.state, &ctx.services, &mut restore) {
         Ok(data) => schema::ok_body(data),
         Err((code, reason)) => schema::error_body(&code, &reason),
     }

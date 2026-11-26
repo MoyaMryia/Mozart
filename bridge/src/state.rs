@@ -134,6 +134,22 @@ impl SpeechGate {
         self.cutoff = mozart_core::speech::monotonic_ns().max(self.cutoff).max(after_active);
         self.cutoff
     }
+
+    fn reopen(&mut self) {
+        self.active = Some(SpeechGeneration(
+            mozart_core::speech::monotonic_ns()
+                .max(self.cutoff.checked_add(1).expect("speech cutoff overflow")),
+        ));
+    }
+
+    fn clear(&mut self) -> (bool, u64) {
+        let was_enabled = self.active.is_some();
+        let cutoff = self.revoke();
+        if was_enabled {
+            self.reopen();
+        }
+        (was_enabled, cutoff)
+    }
 }
 
 pub struct Shared {
@@ -215,10 +231,7 @@ impl Shared {
             .store(switches.translate_enabled, Relaxed);
         let mut gate = self.speech_gate();
         if switches.speech_enabled && gate.active.is_none() {
-            gate.active = Some(SpeechGeneration(
-                mozart_core::speech::monotonic_ns()
-                    .max(gate.cutoff.checked_add(1).expect("speech cutoff overflow")),
-            ));
+            gate.reopen();
         } else if !switches.speech_enabled && gate.active.is_some() {
             gate.revoke();
         }
@@ -227,6 +240,10 @@ impl Shared {
     pub fn stop_speech(&self) -> u64 {
         let mut gate = self.speech_gate();
         gate.revoke()
+    }
+
+    pub fn clear_speech(&self) -> (bool, u64) {
+        self.speech_gate().clear()
     }
 
     /// 已发布句数按 utterance_id 计，不按 JSONL 行数（沿用旧实现）。
@@ -442,6 +459,14 @@ impl Queues {
         cleared
     }
 
+    /// speech clear：仅清理早于截止令牌的旧代待播报句，避免误删新代句。
+    pub fn clear_speech_before(&self, cutoff_ns: u64) -> u32 {
+        let mut queue = self.speech_queue();
+        let before = queue.len();
+        queue.retain(|job| job.generation.issued_ns() >= cutoff_ns);
+        (before - queue.len()) as u32
+    }
+
     /// SIGTERM 收尾：丢弃在途队列（SPEC-05 桥收尾）。
     pub fn discard(&self) {
         {
@@ -505,6 +530,44 @@ mod tests {
         assert!(next_cutoff >= cutoff);
         shared.set_switches(switches(true));
         assert!(shared.speech_generation().unwrap().issued_ns() > next_cutoff);
+    }
+
+    #[test]
+    fn clear_speech_rotates_generation_while_keeping_enabled_state() {
+        let switches = |speech_enabled| Switches { translate_enabled: true, speech_enabled };
+        let shared = Shared::new(switches(true), PathBuf::new());
+        let first = shared.speech_generation().unwrap();
+        let (enabled, cutoff) = shared.clear_speech();
+        assert!(enabled);
+        assert!(cutoff >= first.issued_ns());
+        let second = shared.speech_generation().expect("speech must remain enabled");
+        assert!(second.issued_ns() > cutoff);
+        assert!(shared.send_current_speech(first, || ()).is_none());
+        assert_eq!(shared.send_current_speech(second, || "ok"), Some("ok"));
+
+        let disabled = Shared::new(switches(false), PathBuf::new());
+        let (enabled, off_cutoff) = disabled.clear_speech();
+        assert!(!enabled);
+        assert!(off_cutoff >= 1);
+        assert!(disabled.speech_generation().is_none());
+
+        let queues = Queues::new(1, 4);
+        queues.push_speech(SpeechJob {
+            utterance_id: "s:1".to_string(),
+            text: "old".to_string(),
+            generation: first,
+        });
+        queues.push_speech(SpeechJob {
+            utterance_id: "s:2".to_string(),
+            text: "new".to_string(),
+            generation: second,
+        });
+        assert_eq!(queues.clear_speech_before(cutoff), 1);
+        assert_eq!(queues.speech_depth(), 1);
+        assert_eq!(
+            queues.recv_speech(Duration::from_millis(10)).unwrap().utterance_id,
+            "s:2"
+        );
     }
 
     #[test]

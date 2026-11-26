@@ -38,9 +38,9 @@
 
 当前实现收口实时 RVC 租约和字幕桥的播报准入。桥在首次处理 `final` 时绑定代次；复核、翻译和重连不更新资格。旧句可以继续发布字幕，但撤销许可后不能从桥新发起 TTS 提交。等待播报任务不占用队列锁，清理不与空队列等待争锁。
 
-daemon 的 `speech stop` 已接通严格停止：桥撤销许可并返回同机时钟截止值，TTS 确认停止发出旧代帧，pre 在播放边界确认拒绝旧代帧。失败留待对账，不允许重新开启；已提交给 ALSA 的尾音自然播完。
+daemon 的 `speech stop` 已接通严格停止：桥撤销许可并返回同机时钟截止值，TTS 确认停止发出旧代帧，pre 在播放边界确认拒绝旧代帧。失败留待对账，不允许重新开启；已提交给 ALSA 的尾音自然播完。新增 `speech clear`（`DAEMON_SPEECH_CLEAR` / `BRIDGE_SPEECH_CLEAR` / `POST /api/v1/speech/clear`）以同一机制轮换播报代次并安装 TTS／pre 截止屏障、清空队列并中止在途合成，同时保持 `speech_enabled` 与托管 `broadcast` 模式不变。
 
-统一入口为 `mozart-ctl mode <direct|rvc|broadcast>` 或 `PUT /api/v1/mode`。请求返回模式过渡快照；用 `status --json` 的 `output_mode.applied` 查询是否生效。翻译播报空窗静音，另外两种托管模式不插播 TTS；单项路由或播报命令取消托管模式。托管模式下重启的桥在 daemon 重新下发许可前不播报。pre 重启时保持静音，直出和变声恢复期间报告 `reattaching_playout`，在路由及播放策略确认后才重新报告生效。具体证据见[本机联调报告](../reports/speech-fence-20261123/RESULTS.md)。
+统一入口为 `mozart-ctl mode <direct|rvc|broadcast>` 或 `PUT /api/v1/mode`；默认启动模式为 `direct`。请求返回模式过渡快照；用 `status --json` 的 `output_mode.applied` 查询是否生效。翻译播报空窗静音，另外两种托管模式不插播 TTS；单项路由或播报开关/停止命令取消托管模式，`speech clear` 保留托管 `broadcast` 模式。托管模式下重启的桥在 daemon 重新下发许可前不播报。pre 重启时保持静音，直出和变声恢复期间报告 `reattaching_playout`，在路由及播放策略确认后才重新报告生效。具体证据见[本机联调报告](../reports/speech-fence-20261123/RESULTS.md)。
 
 ## ASR 逐句收尾
 

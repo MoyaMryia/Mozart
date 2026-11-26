@@ -5,12 +5,28 @@ import { jsonResponse, errorResponse, statusFixture } from './fixtures';
 
 afterEach(() => vi.unstubAllGlobals());
 describe('HTTP 契约', () => {
-  it('只调用新路由，切路由不传旧 mode', async () => {
+  it('旧路由接口调用 PUT /api/v1/route', async () => {
     const fetcher = vi.fn().mockResolvedValue(jsonResponse({ route: 'rvc' })); vi.stubGlobal('fetch', fetcher);
     await client.route('rvc');
     expect(fetcher).toHaveBeenCalledOnce();
     expect(fetcher.mock.calls[0][0]).toBe('/api/v1/route');
     expect(fetcher.mock.calls[0][1]).toMatchObject({ method: 'PUT', body: '{"route":"rvc"}' });
+  });
+  it('切换托管输出模式调用 PUT /api/v1/mode 并解析返回快照', async () => {
+    const reply = { requested: 'broadcast', applied: null, phase: 'opening_speech', last_error: null };
+    const fetcher = vi.fn().mockResolvedValue(jsonResponse(reply)); vi.stubGlobal('fetch', fetcher);
+    const result = await client.mode('broadcast');
+    expect(fetcher).toHaveBeenCalledOnce();
+    expect(fetcher.mock.calls[0][0]).toBe('/api/v1/mode');
+    expect(fetcher.mock.calls[0][1]).toMatchObject({ method: 'PUT', body: '{"mode":"broadcast"}' });
+    expect(result).toEqual(reply);
+  });
+  it('清除播报队列调用 POST /api/v1/speech/clear', async () => {
+    const fetcher = vi.fn().mockResolvedValue(jsonResponse({})); vi.stubGlobal('fetch', fetcher);
+    await client.speechClear();
+    expect(fetcher).toHaveBeenCalledOnce();
+    expect(fetcher.mock.calls[0][0]).toBe('/api/v1/speech/clear');
+    expect(fetcher.mock.calls[0][1]).toMatchObject({ method: 'POST', body: '{}' });
   });
   it('读取四字段信封，保留期望路由和实际路由', async () => {
     const snapshot = statusFixture(); snapshot.route.desired = 'rvc';

@@ -213,6 +213,11 @@ fn bridge_stub_serves_switches() {
     assert_eq!(off["data"]["translate_enabled"], false);
     assert_eq!(off["data"]["speech_enabled"], true);
 
+    let clear = call(&conn, ctl::BRIDGE_SPEECH_CLEAR, b"{}");
+    assert_eq!(clear["status"], "ok");
+    assert_eq!(clear["data"]["speech_enabled"], true);
+    assert!(clear["data"]["cutoff_ns"].as_u64().unwrap() > 0);
+
     let stop = call(&conn, ctl::BRIDGE_SPEECH_STOP, b"{}");
     assert_eq!(stop["data"]["speech_enabled"], false);
 

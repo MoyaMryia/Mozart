@@ -145,6 +145,8 @@ enum SpeechAction {
     Off,
     /// 关播报并清空待播报队列（在途丢弃）
     Stop,
+    /// 清空待播报队列并中止当前播报，保持播报开启
+    Clear,
 }
 
 #[derive(Subcommand)]
@@ -528,6 +530,11 @@ fn speech(config: &Config, action: SpeechAction, json_output: bool) -> Result<()
             "speech: off",
         ),
         SpeechAction::Stop => (ctl::DAEMON_SPEECH_STOP, "{}".to_string(), "speech: stopped"),
+        SpeechAction::Clear => (
+            ctl::DAEMON_SPEECH_CLEAR,
+            "{}".to_string(),
+            "speech: queue cleared",
+        ),
     };
     let conn = connect(config)?;
     let budget = ctl::request_timeout_ms(config.daemon.rpc_timeout_ms, type_);
@@ -1492,6 +1499,12 @@ mod tests {
             parse(&["speech", "stop"]).unwrap().command,
             Action::Speech {
                 action: SpeechAction::Stop
+            }
+        ));
+        assert!(matches!(
+            parse(&["speech", "clear"]).unwrap().command,
+            Action::Speech {
+                action: SpeechAction::Clear
             }
         ));
         assert!(parse(&["speech", "bogus"]).is_err());

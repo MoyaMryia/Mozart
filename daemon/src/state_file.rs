@@ -95,6 +95,7 @@ impl StateFile {
             translate: get("bridge.translate_enabled"),
             speech: get("bridge.speech_enabled"),
             speech_stop: None,
+            clear_fence: None,
         }
     }
 }
@@ -121,6 +122,7 @@ pub struct BridgeRestore {
     pub translate: Option<bool>,
     pub speech: Option<bool>,
     pub speech_stop: Option<SpeechStop>,
+    pub clear_fence: Option<mozart_core::speech::StopFence>,
 }
 
 #[derive(Clone, Copy)]
@@ -215,7 +217,7 @@ mod tests {
         assert!(config.bridge.translate_enabled);
         overlay(&mut config, state.overrides());
         assert!(!config.bridge.translate_enabled);
-        assert!(config.bridge.speech_enabled, "未覆盖的键沿用基线");
+        assert!(!config.bridge.speech_enabled, "未覆盖的键沿用基线");
 
         let restore = state.bridge_restore();
         assert_eq!(restore.translate, Some(false));

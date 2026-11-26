@@ -159,6 +159,7 @@ async fn model_preset_and_output_mode_routes_relay_and_validate() {
         let cases = [
             (ctl::DAEMON_MODEL_USE, json!({"model_id":"voice-a"}), json!({"status":"ok","code":"Ok","reason":"","data":{"model_id":"voice-a","previous_model_id":"old"}})),
             (ctl::DAEMON_OUTPUT_MODE_SET, json!({"mode":"broadcast"}), json!({"status":"ok","code":"Ok","reason":"","data":{"requested":"broadcast","applied":null,"phase":"closing_speech","last_error":null}})),
+            (ctl::DAEMON_SPEECH_CLEAR, json!({}), json!({"status":"ok","code":"Ok","reason":"","data":{"speech_enabled":true,"queue_cleared":2,"cutoff_ns":123}})),
             (ctl::DAEMON_PRESET_LIST, json!({}), json!({"status":"ok","code":"Ok","reason":"","data":{"model_id":"voice-a","preset":"default","dirty":true}})),
             (ctl::DAEMON_PRESET_SAVE, json!({}), json!({"status":"ok","code":"Ok","reason":"","data":{"saved":42}})),
             (ctl::DAEMON_PRESET_USE, json!({}), json!({"status":"error","code":"Busy","reason":"provider busy","data":null})),
@@ -175,6 +176,7 @@ async fn model_preset_and_output_mode_routes_relay_and_validate() {
     let cases = [
         ("PUT", "/api/v1/model", r#"{"model_id":"voice-a"}"#, StatusCode::OK, json!({"status":"ok","code":"Ok","reason":"","data":{"model_id":"voice-a","previous_model_id":"old"}})),
         ("PUT", "/api/v1/mode", r#"{"mode":"broadcast"}"#, StatusCode::OK, json!({"status":"ok","code":"Ok","reason":"","data":{"requested":"broadcast","applied":null,"phase":"closing_speech","last_error":null}})),
+        ("POST", "/api/v1/speech/clear", "{}", StatusCode::OK, json!({"status":"ok","code":"Ok","reason":"","data":{"speech_enabled":true,"queue_cleared":2,"cutoff_ns":123}})),
         ("GET", "/api/v1/preset", "", StatusCode::OK, json!({"status":"ok","code":"Ok","reason":"","data":{"model_id":"voice-a","preset":"default","dirty":true}})),
         ("POST", "/api/v1/preset/save", "{}", StatusCode::OK, json!({"status":"ok","code":"Ok","reason":"","data":{"saved":42}})),
         ("POST", "/api/v1/preset/use", "{}", StatusCode::CONFLICT, json!({"status":"error","code":"Busy","reason":"provider busy","data":null})),
@@ -190,6 +192,8 @@ async fn model_preset_and_output_mode_routes_relay_and_validate() {
         ("POST", "/api/v1/model", "{}", StatusCode::METHOD_NOT_ALLOWED),
         ("GET", "/api/v1/mode", "", StatusCode::METHOD_NOT_ALLOWED),
         ("PUT", "/api/v1/mode", r#"{"mode":"file"}"#, StatusCode::BAD_REQUEST),
+        ("GET", "/api/v1/speech/clear", "", StatusCode::METHOD_NOT_ALLOWED),
+        ("POST", "/api/v1/speech/clear", r#"{"extra":1}"#, StatusCode::BAD_REQUEST),
         ("PUT", "/api/v1/preset", "{}", StatusCode::METHOD_NOT_ALLOWED),
         ("GET", "/api/v1/preset/save", "", StatusCode::METHOD_NOT_ALLOWED),
         ("PUT", "/api/v1/preset/use", "{}", StatusCode::METHOD_NOT_ALLOWED),

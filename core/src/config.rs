@@ -36,8 +36,8 @@ pub struct ModelEntry {
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum StartupMode {
-    #[default]
     Rvc,
+    #[default]
     Direct,
     Broadcast,
     Manual,
@@ -662,7 +662,7 @@ impl Default for BridgeConfig {
             corrections_path: None,
             glossary_path: None,
             translate_enabled: true,
-            speech_enabled: true,
+            speech_enabled: false,
             llama_socket: "llama.sock".to_string(),
             llama_model: PathBuf::new(),
             llama_model_id: None,
@@ -2387,6 +2387,7 @@ mod tests {
         assert_eq!(saved, 2);
         let text = std::fs::read_to_string(&path).unwrap();
         assert!(text.contains("# 顶部注释"), "{text}");
+        assert!(text.contains("speech_enabled = false"), "{text}");
         let config = Config::load_from(Some(&path)).unwrap();
         assert!(!config.bridge.translate_enabled);
         assert!(!config.bridge.speech_enabled);
@@ -2419,6 +2420,7 @@ mod tests {
             PathBuf::from("/run/mozart/rvc-out.sock")
         );
         assert_eq!(config.daemon.poll_interval_ms, 1000);
+        assert_eq!(config.daemon.startup_mode, StartupMode::Direct);
         assert_eq!(config.pre.capture_device, "default");
         assert_eq!(config.pre.playback_device, "default");
         assert_eq!(config.pre.capture_queue_frames, 8);
@@ -2749,7 +2751,7 @@ mod tests {
             PathBuf::from("~/.local/state/mozart/subtitles.jsonl")
         );
         assert!(config.bridge.translate_enabled);
-        assert!(config.bridge.speech_enabled);
+        assert!(!config.bridge.speech_enabled);
         assert_eq!(config.bridge.llama_model, PathBuf::new());
         assert_eq!(config.bridge.translate_queue_capacity, 32);
         assert_eq!(config.bridge.speech_queue_capacity, 16);
@@ -2790,7 +2792,7 @@ mod tests {
             [bridge]
             subtitles_path = "/var/lib/mozart/subtitles.jsonl"
             translate_enabled = false
-            speech_enabled = false
+            speech_enabled = true
             llama_socket = "llm.sock"
             llama_model = "/opt/mozart/qwen.gguf"
             translate_queue_capacity = 64
@@ -2825,7 +2827,7 @@ mod tests {
             PathBuf::from("/var/lib/mozart/subtitles.jsonl")
         );
         assert!(!config.bridge.translate_enabled);
-        assert!(!config.bridge.speech_enabled);
+        assert!(config.bridge.speech_enabled);
         assert_eq!(config.llama_socket(), PathBuf::from("/run/mozart/llm.sock"));
         assert_eq!(
             config.bridge.llama_model,

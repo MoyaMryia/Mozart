@@ -123,6 +123,20 @@ pub fn dispatch(msg: &Message, shared: &Shared, queues: &Queues, tts_jobs_path: 
                 json!({ "speech_enabled": false, "queue_cleared": cleared, "cutoff_ns": cutoff }),
             )
         }
+        ctl::BRIDGE_SPEECH_CLEAR => {
+            let fenced = match parse_stop(&msg.body) {
+                Ok(value) => value,
+                Err(reason) => return error_body(ctl::CODE_INVALID_ARGUMENT, &reason),
+            };
+            let (speech_enabled, cutoff) = shared.clear_speech();
+            let cleared = queues.clear_speech_before(cutoff);
+            if !fenced {
+                crate::speech::send_stop(tts_jobs_path, shared, cutoff);
+            }
+            ok_body(
+                json!({ "speech_enabled": speech_enabled, "queue_cleared": cleared, "cutoff_ns": cutoff }),
+            )
+        }
         _ => error_body(ctl::CODE_UNKNOWN_COMMAND, "unknown command"),
     }
 }
@@ -381,6 +395,13 @@ mod tests {
                 &fixture.tts_path(),
             );
             assert_eq!(error_code(&reply), ctl::CODE_INVALID_ARGUMENT);
+            let reply = dispatch(
+                &message(ctl::BRIDGE_SPEECH_CLEAR, body),
+                &fixture.shared,
+                &fixture.queues,
+                &fixture.tts_path(),
+            );
+            assert_eq!(error_code(&reply), ctl::CODE_INVALID_ARGUMENT);
         }
         // 拒绝后开关不变。
         assert!(fixture.shared.translate_enabled());
@@ -455,5 +476,45 @@ mod tests {
         assert_eq!(result["queue_cleared"], 1);
         assert!(!fixture.shared.speech_enabled());
         assert_eq!(fixture.queues.speech_depth(), 0);
+    }
+
+    #[test]
+    fn speech_clear_keeps_enabled_and_rotates_generation() {
+        let fixture = Fixture::new("clear");
+        let before = fixture.shared.speech_generation().unwrap();
+        fixture.queues.push_speech(SpeechJob {
+            utterance_id: "s:1".to_string(),
+            text: "hello".to_string(),
+            generation: before,
+        });
+        let reply = dispatch(
+            &message(ctl::BRIDGE_SPEECH_CLEAR, br#"{"fenced":true}"#),
+            &fixture.shared,
+            &fixture.queues,
+            &fixture.tts_path(),
+        );
+        let result = data(&reply);
+        let cutoff = result["cutoff_ns"].as_u64().unwrap();
+        assert_eq!(result["speech_enabled"], true);
+        assert_eq!(result["queue_cleared"], 1);
+        assert!(cutoff >= before.issued_ns());
+        assert!(fixture.shared.speech_enabled());
+        assert!(fixture.shared.speech_generation().unwrap().issued_ns() > cutoff);
+        assert_eq!(fixture.queues.speech_depth(), 0);
+
+        fixture.shared.set_switches(Switches {
+            translate_enabled: true,
+            speech_enabled: false,
+        });
+        let reply = dispatch(
+            &message(ctl::BRIDGE_SPEECH_CLEAR, b"{}"),
+            &fixture.shared,
+            &fixture.queues,
+            &fixture.tts_path(),
+        );
+        let result = data(&reply);
+        assert_eq!(result["speech_enabled"], false);
+        assert_eq!(result["queue_cleared"], 0);
+        assert!(!fixture.shared.speech_enabled());
     }
 }

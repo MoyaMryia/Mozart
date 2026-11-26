@@ -4,7 +4,9 @@ export function statusFixture(): Status {
   const process = () => ({ state: 'running' as const, pid: 1, restarts: 0, last_error: null });
   return {
     daemon: { pid: 100, version: '0.1.0', uptime_s: 10, poll_interval_ms: 1000 },
-    route: { desired: 'direct', active: 'direct' }, mute: false, arbiter: { gpu: { owner: null } },
+    route: { desired: 'direct', active: 'direct' },
+    output_mode: { requested: 'direct', applied: 'direct', phase: 'applied', last_error: null },
+    mute: false, arbiter: { gpu: { owner: null } },
     processes: { pre: process(), rvc: process(), asr: process(), tts: process(), bridge: process(), llama: process() },
     pre: { capture_device: 'mic-a', playback_device: 'speaker-a', speaker_state: 'realtime', last_error: null },
     rvc: { state: 'idle', model_id: 'model-a', frames_in: 0, frames_out: 0, frames_dropped: 0, inference_ms_avg: null, inference_ms_p95: null, last_error: null },
