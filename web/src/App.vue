@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { computed, onMounted, onUnmounted, ref } from 'vue';
+import { computed, onMounted, onUnmounted, ref, watch } from 'vue';
 import { client } from './api';
 import { useConsole } from './useConsole';
 import { requestSelect } from './inputs';
@@ -30,6 +30,16 @@ const { status, health, ready, adapterOnline, busy, writing, reloading, notice, 
   records, subtitleState, subtitleError, subtitleStorageError, statusStreamState, statusStreamError, downloadSupported,
   uploadGeneration, baselines, filesFresh, devicesFresh, modelsFresh, presetFresh, unknowns } = ui;
 const selectedModel = ref('');
+const activeModelId = computed(() => status.value?.rvc?.model_id ?? models.value.find(item => item.loaded)?.id ?? '');
+watch([activeModelId, models], ([next, list], old) => {
+  const prev = old?.[0];
+  if (!next) return;
+  const existsInList = list.some(item => item.id === next && item.exists);
+  if (!existsInList) return;
+  if (!selectedModel.value || selectedModel.value === prev || !list.some(item => item.id === selectedModel.value)) {
+    selectedModel.value = next;
+  }
+}, { immediate: true });
 const theme = ref<'light' | 'dark'>('light');
 const activeSection = ref<MobileSection>('live');
 const activity = computed(() => systemActivity(status.value, ready.value));

@@ -6,10 +6,10 @@ import AlertBanner from './AlertBanner.vue';
 const props = defineProps<{ params: RvcParams | null; modelId: string | null; ready: boolean; blocked: boolean; error?: string; embedded?: boolean; presetDirty: boolean; presetBusy: boolean }>();
 const emit = defineEmits<{ set: [key: string, value: string]; save: []; restore: []; dismissError: [] }>();
 const fields = [
-  { key: 'pitch_shift', label: '音高增益', step: 1 },
-  { key: 'index_rate', label: '贴合音色比例', step: 0.05 },
-  { key: 'rms_mix_rate', label: '音量跟随', step: 0.05 },
-  { key: 'protect', label: '清辅音保护', step: 0.05 },
+  { key: 'pitch_shift', label: '音高增益', step: 1, min: -12, max: 12 },
+  { key: 'index_rate', label: '贴合音色比例', step: 0.05, min: 0, max: 1 },
+  { key: 'rms_mix_rate', label: '音量跟随', step: 0.05, min: 0, max: 1 },
+  { key: 'protect', label: '清辅音保护', step: 0.05, min: 0, max: 0.5 },
 ] as const;
 type Key = typeof fields[number]['key'];
 // 调节后停顿片刻即应用；连点上下箭头只写一次最新值。
@@ -60,8 +60,10 @@ function schedule(key: Key) { clearTimeout(timers.get(key)); timers.set(key, set
 function change(key: Key, event: Event) { draft[key] = (event.target as HTMLInputElement).value; dirty[key] = true; schedule(key); }
 function nudge(key: Key, delta: number) {
   if (!props.params) return;
+  const field = fields.find(item => item.key === key)!;
   const base = valid(draft[key]) ? Number(draft[key]) : props.params[key];
-  const next = Number((base + delta).toFixed(2));
+  const clamped = Math.min(field.max, Math.max(field.min, base + delta));
+  const next = Number(clamped.toFixed(2));
   draft[key] = String(next);
   dirty[key] = true;
   schedule(key);
@@ -96,7 +98,7 @@ onUnmounted(() => { for (const timer of timers.values()) clearTimeout(timer); })
       <label :for="'param-' + field.key" class="text-sm md:text-xs font-bold text-ink-2 truncate">{{ field.label }}</label>
       <div class="param-stepper">
         <button type="button" class="stepper-btn md:hidden" :aria-label="'减小' + field.label" :disabled="blocked || !ready || !params" @click="nudge(field.key, -field.step)">−</button>
-        <input :id="'param-' + field.key" type="number" inputmode="decimal" step="any" required class="field w-20 md:w-24 h-11 md:h-8 text-center md:text-right font-mono text-base md:text-sm font-extrabold px-2 tabular-nums" :value="draft[field.key]" :disabled="blocked || !ready || !params" @input="change(field.key, $event)" @blur="blur(field.key)">
+        <input :id="'param-' + field.key" type="number" inputmode="decimal" :step="field.step" :min="field.min" :max="field.max" required class="field w-20 md:w-24 h-11 md:h-8 text-center md:text-right font-mono text-base md:text-sm font-extrabold px-2 tabular-nums" :value="draft[field.key]" :disabled="blocked || !ready || !params" @input="change(field.key, $event)" @blur="blur(field.key)">
         <button type="button" class="stepper-btn md:hidden" :aria-label="'增大' + field.label" :disabled="blocked || !ready || !params" @click="nudge(field.key, field.step)">+</button>
       </div>
     </form>

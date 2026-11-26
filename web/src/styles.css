@@ -205,6 +205,7 @@ button, h2, h3, .section-title {
 .field:hover:not(:disabled) { border-color: var(--ink-3); }
 .field:focus-visible, .field:focus { outline: 2px solid var(--ink); outline-offset: 1px; border-color: var(--ink); }
 .field:disabled { opacity: 0.5; cursor: not-allowed; }
+select.field, .log-select { font-weight: 700; }
 .form-label { display: block; font-size: 12px; font-weight: 700; color: var(--ink-2); }
 
 /* 翻译/播报胶囊开关：保留原生复选框语义，移动端更易点按。 */

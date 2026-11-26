@@ -557,6 +557,30 @@ describe('控制台', () => {
     await vi.advanceTimersByTimeAsync(250); await flush();
     expect(backend.snapshot.rvc_params!.pitch_shift).toBe(5);
   });
+  it('参数输入框使用各字段步进与边界，步进按钮不越界', async () => {
+    const backend = mockBackend(); const root = mount(); await flush();
+    const protect = root.querySelector<HTMLInputElement>('#param-protect')!;
+    const index = root.querySelector<HTMLInputElement>('#param-index_rate')!;
+    const pitch = root.querySelector<HTMLInputElement>('#param-pitch_shift')!;
+    expect(protect.step).toBe('0.05'); expect(protect.min).toBe('0'); expect(protect.max).toBe('0.5');
+    expect(index.step).toBe('0.05'); expect(index.min).toBe('0'); expect(index.max).toBe('1');
+    expect(pitch.step).toBe('1'); expect(pitch.min).toBe('-12'); expect(pitch.max).toBe('12');
+    for (let i = 0; i < 5; i += 1) iconButton(root, '增大清辅音保护').click();
+    await vi.advanceTimersByTimeAsync(250); await flush();
+    expect(backend.snapshot.rvc_params!.protect).toBe(0.5);
+  });
+  it('模型选框初始回显当前加载模型，刷新时不覆盖手动待选模型', async () => {
+    const backend = mockBackend(); const original = backend.fetcher.getMockImplementation()!;
+    backend.fetcher.mockImplementation((path, init) => path === '/api/v1/models'
+      ? Promise.resolve(jsonResponse({ models: [{ id: 'model-a', exists: true, loaded: true }, { id: 'model-b', exists: true, loaded: false }] }))
+      : original(path, init));
+    const root = mount(); await flush();
+    const select = root.querySelector<HTMLSelectElement>('#model-select')!;
+    expect(select.value).toBe('model-a');
+    select.value = 'model-b'; select.dispatchEvent(new Event('change')); await nextTick();
+    iconButton(root, '刷新').click(); await flush();
+    expect(select.value).toBe('model-b');
+  });
   it('日志快速切换服务时忽略过期的旧请求结果', async () => {
     const backend = mockBackend(); const original = backend.fetcher.getMockImplementation()!;
     let resolveRvc!: (value: Response) => void;
