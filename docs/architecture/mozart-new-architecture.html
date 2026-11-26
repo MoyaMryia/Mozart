@@ -188,10 +188,10 @@ var D={
  enhance:{bin:'mozart-enhance (C++)',desc:'可选 CPU 增强后端，权重只读引用。pre 普通线程经有界队列调用，不改变 48 kHz 直通。',pts:[['proto','流式增强','16 kHz','<p>周期 Hann 512／256；320 样本重打包，积攒两帧。源 frame_idx 与 pts_ns 保留；重新连接重置状态。禁用不调用网络，错误不静默回退原声。</p>'],['sock','enhance.sock','0x07xx','<p>Hello 0x0701、GetStatus 0x0702。音频另走 enhance-audio.sock 的 SEQPACKET 会话；启动、重启与状态汇总归 daemon。</p>']]},
  pre:{bin:'mozart-pre',desc:'一次采集供所有链路。实时线程不分配不阻塞。AI 支路恒发。',pts:[
   ['thread','capture','ALSA 48k','<p>64 帧周期累积 960 样本 RawFrame；FL 立体声→单声道 f32。</p>'],
-  ['thread','DSP','信号链','<p>80Hz 高通→WOLA 降噪→gate/AGC/limiter(默认关)→48k trunk→33 抽头 FIR 3:1 抽取→VAD。pack 出 16k InputFrame。</p>'],
+  ['thread','DSP','信号链','<p>80Hz 高通→AEC3 回声消除(可选，默认关)→WOLA 降噪→gate/AGC/limiter(默认关)→48k trunk→33 抽头 FIR 3:1 抽取→VAD。pack 出 16k InputFrame。</p>'],
   ['thread','ai 双路','LazySender','<p>同帧恒发 rvc+asr；惰性 connect 失败计丢弃。consumer_drops 分键 rvc/asr。</p>'],
   ['thread','playback','扬声器分时','<p>播报优先：tts 环有帧→broadcast；空且 holdoff 200ms→realtime。</p><p>rvc 帧经 BoundaryResampler 统一到 48k：模型原生 32/40/48k，只取 valid_samples 有效段插值；48k/960 直通。栈数组、无锁无分配、循环前预创建，切率与缺帧重置历史。</p>'],
-  ['sock','pre.sock','bind 0x02xx','<table class="kv"><tr><td>0x0201</td><td>Hello</td></tr><tr><td>0x0202/03</td><td>SetRoute/SetMute</td></tr><tr><td>0x0204</td><td>GetStatus</td></tr></table>'],
+  ['sock','pre.sock','bind 0x02xx','<table class="kv"><tr><td>0x0201</td><td>Hello</td></tr><tr><td>0x0202/03</td><td>SetRoute/SetMute</td></tr><tr><td>0x0204</td><td>GetStatus</td></tr><tr><td>0x0205/06</td><td>SpeechStop/SetFileMode</td></tr><tr><td>0x0207/08</td><td>SetDsp/SetDevice</td></tr><tr><td>0x0209/0A</td><td>SetPlayout/SetAec</td></tr></table>'],
   ['sock','数据面 ×4','DGRAM','<table class="kv"><tr><td>rvc-in</td><td>connect→rvc 发 InputFrame</td></tr><tr><td>asr-in</td><td>connect→asr 发 InputFrame</td></tr><tr><td>rvc-out</td><td>bind←rvc 收 OutputFrame</td></tr><tr><td>tts-out</td><td>bind←tts 收 OutputFrame</td></tr></table>'],
   ['proto','帧契约','frame.h','<pre>InputFrame 1300B = magic 0x4D5A5254 + meta16 + 320×f32 (16k)\nOutputFrame 3868B = magic 0x54525A4D + meta16 + sample_rate u32 + valid_samples u32 + 960×f32\nmeta: pts_ns u64|frame_idx u32|vad u8|energy u8|conf u8|seg u8</pre><p class="note">输出采样率随模型（32/40/48k），valid_samples = 采样率/50，其余 pcm 补零。播放侧固定 48k，由 BoundaryResampler 在边界重采样。尺寸不符的线包丢帧计数，控制线程记可查询原因（新旧进程混跑诊断）。</p>']]},
  rvc:{bin:'mozart-rvc (C++)',desc:'C++ 推理，ONNX Runtime/TensorRT。流式 1:1 泵。',pts:[

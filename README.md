@@ -31,7 +31,7 @@ tools/jetson-e2e.sh <SSH目标> [套件]      # 部署后测试
 开发入口见 [web/README.md](web/README.md) 和 [web-adapter/README.md](web-adapter/README.md)，接口及命令面欠账见 [SPEC-06](docs/SPEC/SPEC-06-web.md)。
 本机适配器阶段包含真实 daemon、真实 ctl 和协议桩的集成测试，不执行实际 RVC 推理。
 板端已完成真实 RVC 文件、字幕恢复和翻译播报联调，见 [适配器报告](reports/web-adapter-20261117/RESULTS.md)。
-`pre/` 的 AEC、音乐背景处理和多人声早期评估见 [预处理报告](reports/preprocessing-assessment-20261117/RESULTS.md)，未修改正式音频链路。
+`pre/` 已接入 WebRTC AEC3 在线声学回声消除（默认关闭，`pre.aec.enabled` 热切换），契约与多房间声学验收待办见 [SPEC-02](docs/SPEC/SPEC-02-pre.md)。
 
 ## 许可
 

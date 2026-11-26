@@ -48,6 +48,15 @@ mozart-ctl restart pre                              # 重启 pre 生效默认配
 
 优先选 `plughw:`，不要选 `hw:`。无物理声卡时可用 `snd-aloop`。
 
+扬声器外放时，麦克风会拾取扬声器输出，可能引起播报自激或变声回环。可开启声学回声消除（AEC）：
+
+```bash
+mozart-ctl config set pre.aec.enabled true   # 开启回声消除，即时生效
+mozart-ctl config set pre.aec.enabled false  # 关闭
+```
+
+默认关闭。网页设备面板有「回声消除 (AEC)」开关，并显示延时估计、回声衰减（ERLE）与参考丢帧。构建未链接 AEC3 库时开关置灰并显示「未链接」。
+
 ## 四、实时变声
 
 ```bash

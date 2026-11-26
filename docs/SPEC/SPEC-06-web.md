@@ -133,6 +133,7 @@ retained 是提交结果未知而保留的数量；reasons 列出保留原因，
 `models` 不按 `exists` 过滤；前端可按该字段筛选，但不得把 `exists=true` 显示为推理已就绪。
 `config set` 的支持键和生效成本归 daemon；不得因为配置表列了某键，就假定写回已经接通。
 设备键写入成功后，前端按 `restart_required`/`affected` 自动调用 `POST /services/{service}/restart` 使基线生效；其余重启类提示与 `status.pending_restart` 原样展示。
+设备面板提供「回声消除 (AEC)」开关，写 `pre.aec.enabled`（R 类，即时生效），并展示 `status.pre.aec` 的后端、延时估计、ERLE 与参考丢帧；后端为 `unavailable` 时开关置灰并显示「未链接」，`last_error` 以告警条展示。
 设置路由走 `PUT /api/v1/mode`（`direct`/`rvc`/`broadcast`），前端按 `output_mode.requested`、`output_mode.applied`、`output_mode.phase` 与 `output_mode.last_error` 分开展示请求意图、实际模式、过渡阶段及故障原因，不把等待切换显示为已经切换。
 
 ### 业务子服务启停

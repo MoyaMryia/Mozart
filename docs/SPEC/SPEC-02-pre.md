@@ -75,11 +75,28 @@
 
 实现、板端功能证据与整机验收边界见[接入报告](../../reports/ulunas-integration-20261117/RESULTS.md)。
 
+改进待办：
+
+- [ ] 去伴奏效果不足（用户主观反馈，2026-11-26）：UL-UNAS 对背景伴奏的去除不达预期。先用固定伴奏加人声样本做增强开关对照，客观测量伴奏残留能量与近端语音失真，再决定调参或更换降噪器（候选见 [FUTURE](../FUTURE.md)「降噪器切换」）；不以主观听感直接换模型。
+
 ## 声学回声消除（AEC）
 
 目标：适应不同房间混响、音箱摆放与外放设备，防止翻译播报自激与实时变声回环。首选底座为 WebRTC AEC3；处理位序在 `80 Hz` 高通之后、降噪（WOLA／UL-UNAS）与整形级之前。
 
-待步骤 1 实测拍板的 3 项边界：处理采样率采用 `48 kHz` 主干还是 `16 kHz` AI 支路；双声卡时钟漂移是否需要参考侧无分配重采样；集成形态（默认倾向薄 C 封装直链 `mozart-pre`，备选独立 C++ 进程）。
+三项边界已由步骤 2–3 的实现拍板（2026-11-26）：处理采样率取 `48 kHz` 主干（960 样本，AEC3 内部按 10 ms 子块处理）；集成形态为薄 C 封装（`aec3/`，CMake `mozart_aec3`）直链 `mozart-pre`；参考侧时钟漂移以参考环积压修剪加逐帧携带的延时估计吸收。真实双声卡漂移与物理声学延迟的核验、调参仍归步骤 1 实测。
+
+已确认契约（步骤 2–3 已实现）：
+
+- 参考抓取：播放线程在 `fade_in` 与 `mute` 之后、ALSA 写成功后，把最终单声道参考帧经定长无锁 SPSC 环（`rtrb`，容量 16 帧）送入处理线程；零分配、非阻塞，环满丢弃并计数。处理线程积压超过 4 帧时修剪到目标 2 帧，修剪计入参考丢帧。（`pre/src/aec.rs` RefSender/RefReceiver/AecProcessor、`pre/src/playback.rs`）
+- 延时估计：设备打开时一次性估算 ALSA 播放缓冲时长（上限夹到 500 ms，失败回退 45 ms），随参考帧传入 `ProcessStream`；热切设备后重估。（`pre/src/playback.rs` buffer_delay_ms）
+- 因果重置：启用瞬间、采集 `capture_epoch` 跳变、播放 `playback_epoch` 跳变（热切设备、ALSA 欠载恢复）均重置 AEC3 滤波器并计数；参考缺帧计 `ref_underruns`，以静音参考加上一帧延时继续处理；采集削波（|样本| ≥ 0.99）计数。（`pre/src/aec.rs`、`pre/src/playback.rs`）
+- 处理位序：`Dsp::process_frame_with_hook` 在 80 Hz 高通之后、降噪与整形级之前调用 AEC；禁用时排空参考环、主干逐位直通。（`dsp/src/lib.rs`、`pre/src/main.rs` process_thread）
+- 配置与控制面：`[pre.aec].enabled`（bool，默认 false，R 类）；`PRE_SET_AEC`（`0x020A`，体 `{"enabled": bool}`）运行时启停，应答回显请求；`config set pre.aec.enabled` 由 daemon 下发，失败保留 TOML 基线与生效值不变。崩溃自愈经 `--effective-aec` 沿用生效开关。（`core/src/config.rs` PreAecConfig、`core/include/mozart/ctl.h`、`pre/src/control.rs`、`daemon/src/services.rs` set_aec、`daemon/src/server.rs` apply_runtime_key）
+- 可观测：`GetStatus` 的 `aec` 字段报告 enabled/backend/active/delay_ms/erle_db/ref_dropped/ref_underruns/resets/capture_clips/last_error；遥测每 25 帧同步一次，热路径只更新原子。后端不可用时显式记录原因，不修改采集。（`core/src/ctl/schema.rs` PreAecStatus、`pre/src/aec.rs` AecTelemetry）
+- 构建链接：`aec3/` 经 pkg-config 链接 `webrtc-audio-processing-1`（搜索 `MOZART_ASSETS_DIR` 与 `~/mozart-assets` 的 pkgconfig 路径），缺库时跳过该目标。`pre/build.rs` 在 `MOZART_AEC3_LIB_DIR` 设置时链接 `libmozart_aec3` 并置 `has_aec3`，否则用未链接桩，本机 cargo 检查不依赖外部 C++ 库；部署脚本在 `assets/lib/libmozart_aec3.so` 存在时导出该变量。CTest `aec3_wrapper` 覆盖封装层。（`aec3/CMakeLists.txt`、`pre/build.rs`、`tools/deploy-jetson.sh`、`tests/test_aec3_wrapper.cpp`）
+- 离线单测：环满发送侧丢最新、积压修剪丢最旧、禁用直通排空、采播双向 epoch 重置与削波计数、不可用后端显式报错；链接真实库时另跑 65 ms 延时加 100 ppm 漂移的合成回声消除测试。（`pre/src/aec.rs` tests）
+
+顺序说明：步骤 1 原定先实测定参再实现，步骤 2–3 已先行落地（2026-11-26 提交）；步骤 1 的剩余职责是核验上述已定边界并调参，步骤 4 整机验收不变。
 
 已确认探针契约：
 
@@ -88,10 +105,15 @@
 
 分步待办：
 
-- [ ] 步骤 1（多房间真实声学实录与离线定参）：独占真实麦克风与扬声器窗口，覆盖至少 2–3 种房间／摆放条件（小房间近场、较空旷混响环境、中途挪动位置），用 `--aec-probe` 录制翻译播报打断与同源 RVC 双讲（每组不超过 `60 s`），同步核验播放 ALSA 欠载归零；用 `pre/aec-probe/align.py` 检查真实双硬件时钟漂移、物理声学延迟与对齐覆盖率；离线对比 WebRTC AEC3（`48 kHz`／`16 kHz`）与 SpeexDSP，验收回声衰减（ERLE，消除前后回声能量比）、双讲近端失真、ASR 误识别、RVC 听感、板端单线程 CPU 耗时与内存占用，结果写入 `reports/` 并拍板前述三项边界。环回不替代声学验收。
-- [ ] 步骤 2（在线参考流与因果对齐）：在 `pre/src/playback.rs` 的 `fade_in` 与 `mute` 之后取最终送往 ALSA 的单声道参考帧，经定长无锁环（`rtrb`）送入处理线程，附带 `playback_epoch` 与 ALSA 缓冲延时估计；覆盖 ALSA 欠载／溢出（xrun）与热切设备（`PRE_SET_DEVICE`）的对齐重置、参考丢帧与采集削波计数；严守采集／播放 I/O 线程零分配不阻塞，补合成回声、延时跳变与时钟漂移离线单测。
-- [ ] 步骤 3（AEC3 引擎接入与控制面暴露）：按步骤 1 结论接入 WebRTC AEC3 封装层（`80 Hz` 高通后、降噪前）；新增 `[pre.aec]` 配置（同步 [config.md](../config.md)）、运行时开关（默认关闭可随时旁路）与 `GetStatus` 可观测指标（启用状态、估计延迟、参考丢帧、重置次数、削波与降级原因），补主机与板端构建脚本依赖检查。
+- [ ] 步骤 1（多房间真实声学实录与离线定参）：独占真实麦克风与扬声器窗口，覆盖至少 2–3 种房间／摆放条件（小房间近场、较空旷混响环境、中途挪动位置），用 `--aec-probe` 录制翻译播报打断与同源 RVC 双讲（每组不超过 `60 s`），同步核验播放 ALSA 欠载归零；用 `pre/aec-probe/align.py` 检查真实双硬件时钟漂移、物理声学延迟与对齐覆盖率；离线对比 WebRTC AEC3（`48 kHz`／`16 kHz`）与 SpeexDSP，验收回声衰减（ERLE，消除前后回声能量比）、双讲近端失真、ASR 误识别、RVC 听感、板端单线程 CPU 耗时与内存占用，结果写入 `reports/`，核验已定边界（48 kHz 主干、薄封装直链、积压修剪加延时估计）并调参。环回不替代声学验收。
+- [x] 步骤 2（在线参考流与因果对齐）：已实现，契约与证据见上节。（`pre/src/aec.rs`、`pre/src/playback.rs`、`dsp/src/lib.rs` 钩子单测）
+- [x] 步骤 3（AEC3 引擎接入与控制面暴露）：已实现，契约与证据见上节；`[pre.aec]` 已同步 [config.md](../config.md)，网页设备面板提供开关与状态。（`aec3/`、`pre/src/aec.rs`、`daemon/src/services.rs`、`web/src/components/DevicesPanel.vue`）
 - [ ] 步骤 4（多房间整机验收与回归）：先跑 `tools/jetson-e2e.sh` 确认关闭态零回归；再在多房间真实外放环境验收换房免调参收敛、翻译播报零自激且支持人声打断（衔接 [SPEC-05](SPEC-05-language.md) 的 `Silero VAD v5` 与双工断句）、实时 RVC 外放无啸叫且近端人声不明显发闷，记录端到端延迟增量与 `8 GB` 内存余量。
+
+改进待办：
+
+- [ ] AEC 效果不足（用户主观反馈，2026-11-26）：真实外放音量开大后残余回声仍存在，而且场景识别慢。先完成步骤 1 实测取得 ERLE、延时、漂移与场景切换收敛时间数据，定位根因（声学延时估计偏差、双声卡漂移、音乐类回声、收敛速度等）再调参；不以主观听感直接改滤波器。
+- [ ] 补延时跳变离线单测（步骤 2 遗留验收项）：现有单测覆盖逐帧延时透传与合成回声漂移，未覆盖延时跳变场景；补参考延时突变时的处理与重置断言。
 
 ## 改进点
 

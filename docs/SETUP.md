@@ -37,7 +37,7 @@
 └── out/                      # 手工测试输出
 
 ~/mozart-assets/              # 成品资产与工具链依赖（只读）
-├── lib/                      # sherpa 等共享库
+├── lib/                      # sherpa、libmozart_aec3 等共享库
 ├── llama/                    # llama-server 与 .so
 ├── RVC/                      # 上游 RVC 源码树（导出/golden 的 --rvc-source）
 └── models/
@@ -119,6 +119,8 @@ MOZART_JETSON=<SSH目标> uv run tools/jetson-audio.py
 ### 部署行为
 
 `tools/deploy-jetson.sh` 默认保留构建缓存，`--full` 清理缓存后重编。两种模式均在构建前暂停运行时，释放 Jetson 共享内存。
+
+AEC3 为可选构建依赖：部署脚本只编 `mozart-rvc` 与 `mozart-enhance` 两个 C++ 目标，不编 `mozart_aec3`。封装库需预先构建并放入资产 lib 目录（`libmozart_aec3.so`）；部署脚本检测到后导出 `MOZART_AEC3_LIB_DIR` 供 pre 链接真实后端，否则 pre 用未链接桩，`pre.aec.enabled` 开启会报告不可用原因。构建依赖与链接契约见 [SPEC-02](SPEC/SPEC-02-pre.md)。
 
 1. 快照 `~/Mozart` 源码到 `~/.mozart-prev`。
 2. rsync 本机仓库到 `~/Mozart`，排除 `target/`、`build/`、`.git/`。默认按内容同步（`--checksum --no-times`）：变更文件落传输时刻的 mtime，未变更文件保持原 mtime，构建缓存保留。`--full` 时前拨全部源码 mtime 并删除 workspace 成员的 cargo 指纹，强制全量重编。
