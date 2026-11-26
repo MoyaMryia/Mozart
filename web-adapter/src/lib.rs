@@ -23,7 +23,20 @@ pub struct Application {
 pub fn config_description(config: &WebAdapterConfig) -> Result<serde_json::Value, ApiError> {
     routes::origins(&config.web.allowed_origins)?;
     Ok(serde_json::json!({"configured":config.web_configured,"listen":config.web.listen,
-        "port":config.web.listen.port(),"static_dir":config.web.static_dir,"upload_dir":config.web.upload_dir}))
+        "allowed_origins":config.web.allowed_origins,"port":config.web.listen.port(),"static_dir":config.web.static_dir,"upload_dir":config.web.upload_dir}))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn description_reports_configured_origins() {
+        let mut config = WebAdapterConfig::load_from(None).unwrap();
+        config.web.allowed_origins = vec!["http://console.example".into()];
+        assert_eq!(config_description(&config).unwrap()["allowed_origins"],
+                   serde_json::json!(["http://console.example"]));
+    }
 }
 
 pub async fn build(config: WebAdapterConfig, config_path: Option<PathBuf>) -> Result<Application, ApiError> {

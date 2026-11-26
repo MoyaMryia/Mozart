@@ -110,6 +110,8 @@ CLI 的 `--json` 输出通常为响应的 `data`，不是完整 socket 响应信
 
 ## 改进点
 
+- [x] 隔离模式取消回归的启动时序：在直出和 RVC 就绪后切入实时流，再注入停流故障；维持全程仅一次起流的断言。
+
 - [x] 队列写盘失败不改变已提交状态；终态未提交时保留源文件并重试，恢复后继续调度。 见[本机回归](../../reports/postprocessing-stability-20261124/RESULTS.md)。
 - [x] 配置覆盖清除失败可重试，`config save` 不把部分成功报成完成。原子写失败清理本次临时文件；保留已执行但未持久化的运行时开关。 见[本机回归](../../reports/postprocessing-stability-20261124/RESULTS.md)。
 
