@@ -7,8 +7,8 @@
 use crate::state::{DspSwitches, QueueReadout, Shared, VERSION};
 use mozart_core::config::validate_device_name;
 use mozart_core::ctl::schema::{
-    error_body, ok_body, DeviceUseRequest, DspSetRequest, FileModeSetRequest, MuteSetRequest,
-    PlayoutSetRequest, RouteSetRequest,
+    error_body, ok_body, AecSetRequest, DeviceUseRequest, DspSetRequest, FileModeSetRequest,
+    MuteSetRequest, PlayoutSetRequest, RouteSetRequest,
 };
 use mozart_core::ctl::{self, Message, Seqpacket, ACCEPT_POLL, IDLE_TIMEOUT, RECV_POLL};
 use mozart_core::dgram::FRAME_SIZE_MISMATCH_REASON;
@@ -355,6 +355,13 @@ fn dispatch_with_stop(
                     "agc": switches.agc,
                     "limiter": switches.limiter,
                 }))
+            }
+            Err(err) => error_body(ctl::CODE_INVALID_ARGUMENT, &err.to_string()),
+        },
+        ctl::PRE_SET_AEC => match serde_json::from_value::<AecSetRequest>(body) {
+            Ok(request) => {
+                shared.set_aec_enabled(request.enabled);
+                ok_body(json!({ "enabled": request.enabled }))
             }
             Err(err) => error_body(ctl::CODE_INVALID_ARGUMENT, &err.to_string()),
         },
@@ -759,6 +766,36 @@ mod tests {
             assert_eq!(error_code(&reply), ctl::CODE_INVALID_ARGUMENT);
             assert_eq!(shared.dsp_target(), before, "坏体不得改变 DSP 目标");
         }
+    }
+
+    #[test]
+    fn set_aec_roundtrip_and_rejects_invalid_body() {
+        let (shared, cap, trunk, rvc, tts, mut log) = context();
+        assert!(!shared.aec_enabled());
+
+        let reply = dispatch(
+            &message(ctl::PRE_SET_AEC, br#"{"enabled":true}"#),
+            &shared,
+            &cap,
+            &trunk,
+            &rvc,
+            &tts,
+            &mut log,
+        );
+        assert_eq!(data(&reply)["enabled"], true);
+        assert!(shared.aec_enabled());
+
+        let reply = dispatch(
+            &message(ctl::PRE_SET_AEC, br#"{"enabled":true,"extra":1}"#),
+            &shared,
+            &cap,
+            &trunk,
+            &rvc,
+            &tts,
+            &mut log,
+        );
+        assert_eq!(error_code(&reply), ctl::CODE_INVALID_ARGUMENT);
+        assert!(shared.aec_enabled(), "坏体不得覆盖已有开关");
     }
 
     #[test]

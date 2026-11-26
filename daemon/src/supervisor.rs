@@ -321,6 +321,8 @@ fn start_child(
                 .arg(serde_json::to_string(&config.enhance).map_err(io::Error::other)?)
                 .arg("--effective-dsp")
                 .arg(serde_json::to_string(&effective.pre.dsp).map_err(io::Error::other)?)
+                .arg("--effective-aec")
+                .arg(serde_json::to_string(&effective.pre.aec).map_err(io::Error::other)?)
                 .arg("--effective-capture-device")
                 .arg(&effective.pre.capture_device)
                 .arg("--effective-playback-device")

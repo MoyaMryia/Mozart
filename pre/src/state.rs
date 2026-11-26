@@ -343,6 +343,9 @@ pub struct Shared {
     /// 采集设备切换代次：采集热切换成功后递增，触发处理线程重置 WOLA 与增强会话。
     capture_epoch: AtomicU64,
     pub enhancement: Option<std::sync::Arc<crate::enhancement::Enhancement>>,
+    /// 在线 AEC 开关与遥测（控制线程读写开关，处理线程维护遥测）。
+    aec_enabled: AtomicBool,
+    aec: std::sync::Arc<crate::aec::AecTelemetry>,
     /// AI 输出帧坏包丢弃，接收线程发布绝对值。
     ai_recv_dropped: AtomicU64,
     /// TTS 播报帧坏包丢弃，接收线程发布绝对值。
@@ -398,6 +401,10 @@ impl Shared {
             dsp_target: AtomicU64::new(dsp.code().into()),
             capture_epoch: AtomicU64::new(0),
             enhancement: None,
+            aec_enabled: AtomicBool::new(false),
+            aec: std::sync::Arc::new(crate::aec::AecTelemetry::new(
+                crate::aec::default_backend_name(),
+            )),
             ai_recv_dropped: AtomicU64::new(0),
             tts_recv_dropped: AtomicU64::new(0),
             ai_recv_size_mismatch: AtomicU64::new(0),
@@ -558,6 +565,18 @@ impl Shared {
         (DspSwitches::from_code(value as u8), value >> 4)
     }
 
+    pub fn aec_enabled(&self) -> bool {
+        self.aec_enabled.load(Ordering::Acquire)
+    }
+
+    pub fn set_aec_enabled(&self, enabled: bool) {
+        self.aec_enabled.store(enabled, Ordering::Release);
+    }
+
+    pub fn aec_telemetry(&self) -> std::sync::Arc<crate::aec::AecTelemetry> {
+        self.aec.clone()
+    }
+
     pub fn enhancement_epoch(&self) -> u64 {
         self.dsp_snapshot().1.wrapping_add(self.capture_epoch())
     }
@@ -683,6 +702,7 @@ impl Shared {
                 .enhancement
                 .as_ref()
                 .map(|enhance| enhance.status(self.dsp_target().denoise)),
+            aec: Some(self.aec.status(self.aec_enabled())),
             // 路由与静音上报命令目标；淡变在 20 ms 内完成，属执行细节。
             route: self.route_target(),
             mute: self.mute_target(),

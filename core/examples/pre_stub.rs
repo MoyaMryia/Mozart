@@ -23,6 +23,7 @@ use stub_common::{body, expect_known, fail, ok, serve, StubArgs};
 struct PreOverrides {
     enhance: Option<Option<mozart_core::config::EnhanceConfig>>,
     dsp: Option<mozart_core::config::PreDspConfig>,
+    aec: Option<mozart_core::config::PreAecConfig>,
     capture_device: Option<String>,
     playback_device: Option<String>,
 }
@@ -38,6 +39,7 @@ fn parse_pre_args() -> (StubArgs, PreOverrides) {
     let mut overrides = PreOverrides {
         enhance: None,
         dsp: None,
+        aec: None,
         capture_device: None,
         playback_device: None,
     };
@@ -53,6 +55,7 @@ fn parse_pre_args() -> (StubArgs, PreOverrides) {
             "--delay-ms" => args.reply_delay = Duration::from_millis(value.parse().unwrap()),
             "--effective-enhance" => overrides.enhance = Some(serde_json::from_str(&value).unwrap()),
             "--effective-dsp" => overrides.dsp = Some(serde_json::from_str(&value).unwrap()),
+            "--effective-aec" => overrides.aec = Some(serde_json::from_str(&value).unwrap()),
             "--effective-capture-device" => overrides.capture_device = Some(value),
             "--effective-playback-device" => overrides.playback_device = Some(value),
             _ => panic!("unknown argument: {flag}"),
@@ -74,6 +77,7 @@ struct State {
     file_mode_delay: Duration,
     file_restore_fault: Option<std::path::PathBuf>,
     dsp: mozart_core::config::PreDspConfig,
+    aec: mozart_core::config::PreAecConfig,
     capture_device: String,
     playback_device: String,
 }
@@ -88,6 +92,9 @@ fn main() {
     }
     if let Some(dsp) = overrides.dsp {
         config.pre.dsp = dsp;
+    }
+    if let Some(aec) = overrides.aec {
+        config.pre.aec = aec;
     }
     if let Some(capture) = overrides.capture_device {
         config.pre.capture_device = capture;
@@ -123,6 +130,7 @@ fn main() {
         file_mode_delay,
         file_restore_fault: std::env::var_os("MOZART_PRE_STUB_FILE_RESTORE_FAULT").map(Into::into),
         dsp: config.pre.dsp,
+        aec: config.pre.aec,
         capture_device: config.pre.capture_device,
         playback_device: config.pre.playback_device,
     };
@@ -181,6 +189,7 @@ fn handle(msg: &Message, state: &mut State) -> Vec<u8> {
         ctl::PRE_SPEECH_STOP,
         ctl::PRE_SET_FILE_MODE,
         ctl::PRE_SET_DSP,
+        ctl::PRE_SET_AEC,
         ctl::PRE_SET_DEVICE,
         ctl::PRE_SET_PLAYOUT,
     ];
@@ -227,6 +236,15 @@ fn handle(msg: &Message, state: &mut State) -> Vec<u8> {
             };
             record_dsp(&state.dsp);
             ok(serde_json::to_value(&state.dsp).unwrap())
+        }
+        ctl::PRE_SET_AEC => {
+            let request: mozart_core::ctl::schema::AecSetRequest =
+                match serde_json::from_value(body.clone()) {
+                    Ok(request) => request,
+                    Err(err) => return fail(ctl::CODE_INVALID_ARGUMENT, &err.to_string()),
+                };
+            state.aec.enabled = request.enabled;
+            ok(json!({ "enabled": state.aec.enabled }))
         }
         ctl::PRE_SET_DEVICE => {
             if std::env::var("MOZART_PRE_STUB_DEVICE_REJECT_FILE")
@@ -294,6 +312,18 @@ fn handle(msg: &Message, state: &mut State) -> Vec<u8> {
         ctl::PRE_GET_STATUS => ok(json!({
             "state": "ok",
             "dsp": state.dsp,
+            "aec": {
+                "enabled": state.aec.enabled,
+                "backend": "stub",
+                "active": state.aec.enabled,
+                "delay_ms": null,
+                "erle_db": null,
+                "ref_dropped": 0,
+                "ref_underruns": 0,
+                "resets": 0,
+                "capture_clips": 0,
+                "last_error": null,
+            },
             "enhancement": std::env::var("MOZART_PRE_STUB_ENHANCEMENT_FILE").ok().map(|path| {
                 serde_json::from_slice::<mozart_core::ctl::schema::PreEnhanceStatus>(
                     &std::fs::read(path).unwrap()

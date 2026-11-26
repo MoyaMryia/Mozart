@@ -19,6 +19,22 @@ watch(() => [actual.value, props.baselines, props.ready] as const, () => {
   }
 }, { immediate: true, deep: true });
 function change(kind: Kind, event: Event) { draft[kind] = (event.target as HTMLSelectElement).value; dirty[kind] = true; }
+const aec = computed(() => props.status?.pre?.aec ?? null);
+const aecAvailable = computed(() => !!aec.value && aec.value.backend !== 'unavailable');
+const aecEnabled = computed(() => !!aec.value?.enabled);
+const aecStateLabel = computed(() => {
+  if (!props.ready || !aec.value) return '未知';
+  if (!aecAvailable.value) return '未链接';
+  return aec.value.enabled ? (aec.value.active ? '已开启' : '待激活') : '已关闭';
+});
+const aecDetail = computed(() => {
+  if (!aec.value) return '';
+  const parts = [aec.value.backend];
+  if (aec.value.delay_ms != null) parts.push(`延迟 ${aec.value.delay_ms} ms`);
+  if (aec.value.active && aec.value.erle_db != null) parts.push(`ERLE ${aec.value.erle_db.toFixed(1)} dB`);
+  if (aec.value.ref_dropped > 0) parts.push(`参考丢帧 ${aec.value.ref_dropped}`);
+  return parts.join(' · ');
+});
 </script>
 
 <template>
@@ -51,6 +67,22 @@ function change(kind: Kind, event: Event) { draft[kind] = (event.target as HTMLS
         <small class="text-micro text-ink-3 min-w-0 truncate">实际：{{ actual[kind] || '未知' }} · 基线：{{ baselines[kind] ?? '未读取' }}</small>
         <small v-if="dirty[kind]" class="chip chip-warn shrink-0">未应用</small>
       </div>
+    </div>
+    <div v-if="aec" class="mt-4 md:mt-3 pt-3 md:pt-2.5 border-t border-edge">
+      <button
+        type="button"
+        class="translate-toggle"
+        :class="{ 'is-active': aecEnabled }"
+        :aria-pressed="aecEnabled"
+        :disabled="busy || !ready || !aecAvailable"
+        @click="emit('set', 'pre.aec.enabled', aecEnabled ? 'false' : 'true')"
+      >
+        <span class="translate-toggle-dot" aria-hidden="true"></span>
+        <span>回声消除 (AEC)</span>
+        <span class="translate-toggle-state">{{ aecStateLabel }}</span>
+      </button>
+      <small v-if="aecDetail" class="block text-micro text-ink-3 mt-1.5 md:mt-1 truncate" translate="no">{{ aecDetail }}</small>
+      <AlertBanner v-if="aec?.last_error" :message="aec.last_error" tone="warn" class="mt-2" />
     </div>
     <AlertBanner v-if="status?.pending_restart.includes('pre')" message="设备设置待重启 pre 生效。" tone="warn" class="mt-2.5" />
     <AlertBanner v-if="status?.pre?.last_error" :message="status.pre.last_error" class="mt-2.5" />

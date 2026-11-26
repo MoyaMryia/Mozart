@@ -206,6 +206,8 @@ pub struct PreStatus {
     pub playout_policy: PlayoutPolicy,
     #[serde(default)]
     pub enhancement: Option<PreEnhanceStatus>,
+    #[serde(default)]
+    pub aec: Option<PreAecStatus>,
     #[serde(default = "default_denoise_backend")]
     pub denoise_backend: String,
     pub state: String,
@@ -255,6 +257,20 @@ pub struct PreEnhanceStatus {
     pub frames_out: u64,
     pub dropped_frames: u64,
     pub queue_depth: u64,
+    pub last_error: Option<String>,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct PreAecStatus {
+    pub enabled: bool,
+    pub backend: String,
+    pub active: bool,
+    pub delay_ms: Option<i32>,
+    pub erle_db: Option<f64>,
+    pub ref_dropped: u64,
+    pub ref_underruns: u64,
+    pub resets: u64,
+    pub capture_clips: u64,
     pub last_error: Option<String>,
 }
 
@@ -558,6 +574,13 @@ pub struct DspSetRequest {
     pub gate: bool,
     pub agc: bool,
     pub limiter: bool,
+}
+
+/// 声学回声消除开关请求体（PRE_SET_AEC）：{"enabled": bool}。
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct AecSetRequest {
+    pub enabled: bool,
 }
 
 /// 字幕链路开关请求体（DAEMON_TRANSLATE_SET / DAEMON_SPEECH_SET）：{"enabled": bool}。

@@ -135,9 +135,20 @@ impl Dsp {
     /// 置信度语义同旧实现：自上次查询以来的功率加权平均，查询即清零；禁用
     /// 降噪时恒 0。VAD 与 16 kHz 打包经 `pack_frame` 按帧消费该值。
     pub fn process_frame(&mut self, frame: &mut RawFrame) -> f32 {
+        self.process_frame_with_hook(frame, |_| {})
+    }
+
+    /// 就地处理一帧主干（960 样本），并在 80 Hz 高通之后、降噪（WOLA）与
+    /// 整形级之前调用 `post_hp` 钩子（用于接入线性声学回声消除）。
+    pub fn process_frame_with_hook<F: FnMut(&mut [f32; RAW_SAMPLES])>(
+        &mut self,
+        frame: &mut RawFrame,
+        mut post_hp: F,
+    ) -> f32 {
         // packed 字段按值整块搬出，不取引用（同 playback.rs 的约定）。
         let mut pcm = frame.pcm;
         self.hp.process(&mut pcm);
+        post_hp(&mut pcm);
         let written = if self.denoise {
             self.ns.push(&pcm, &mut self.ns_out)
         } else {
@@ -448,5 +459,25 @@ mod tests {
         let (meta, pcm) = (frame.meta, frame.pcm);
         assert_eq!(meta.energy_db, 0, "静音帧能量字节为 0（-100 dB 以下截断）");
         assert!(pcm.iter().all(|&v| v == 0.0));
+    }
+
+    #[test]
+    fn post_hp_hook_runs_after_highpass_and_before_denoise() {
+        let mut input = test_frame(0x12345678);
+        let mut expected_hp = input.pcm;
+        Highpass80::new().process(&mut expected_hp);
+
+        let mut seen = [0.0f32; RAW_SAMPLES];
+        let mut dsp = Dsp::new(true, false, false, false);
+        dsp.process_frame_with_hook(&mut input, |pcm| {
+            seen = *pcm;
+            pcm.fill(0.0);
+        });
+        assert_eq!(seen, expected_hp, "钩子输入必须是 80 Hz 高通后的主干");
+        let after = input.pcm;
+        assert!(
+            after.iter().all(|&v| v == 0.0),
+            "钩子清零后，下游降噪只应看到全零"
+        );
     }
 }

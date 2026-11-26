@@ -132,6 +132,20 @@ impl Services {
         validate_dsp_echo(data.data, dsp)
     }
 
+    /// 调用方持 transition 锁；只在 pre 确认成功后提交共享配置。
+    pub(crate) fn set_aec(
+        &self,
+        aec: &mozart_core::config::PreAecConfig,
+    ) -> Result<(), (String, String)> {
+        let body = serde_json::to_vec(aec)
+            .map_err(|err| (ctl::CODE_INTERNAL.to_string(), err.to_string()))?;
+        let data = self
+            .pre()
+            .call_ok(ctl::PRE_SET_AEC, &body)
+            .map_err(CallError::into_rejection)?;
+        validate_aec_echo(data.data, aec)
+    }
+
     /// 调用方持 transition 锁；只在 pre 确认热切换成功后由调用方更新内存生效设备。
     pub(crate) fn set_device(
         &self,
@@ -1450,6 +1464,25 @@ fn validate_dsp_echo(
     Ok(())
 }
 
+fn validate_aec_echo(
+    data: serde_json::Value,
+    expected: &mozart_core::config::PreAecConfig,
+) -> Result<(), (String, String)> {
+    let echoed: ctl::schema::AecSetRequest = serde_json::from_value(data).map_err(|err| {
+        (
+            ctl::CODE_INTERNAL.to_string(),
+            format!("pre SetAec invalid echo: {err}"),
+        )
+    })?;
+    if echoed.enabled != expected.enabled {
+        return Err((
+            ctl::CODE_INTERNAL.to_string(),
+            "pre SetAec echo differs from request".to_string(),
+        ));
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1469,6 +1502,22 @@ mod tests {
             serde_json::json!({"denoise":true,"gate":false,"agc":false,"limiter":false,"extra":true}),
         ] {
             let (code, reason) = validate_dsp_echo(invalid, &expected).unwrap_err();
+            assert_eq!(code, ctl::CODE_INTERNAL);
+            assert!(reason.contains("echo"));
+        }
+    }
+
+    #[test]
+    fn aec_echo_requires_exact_boolean_match() {
+        let expected = mozart_core::config::PreAecConfig { enabled: true };
+        assert!(validate_aec_echo(serde_json::json!({"enabled": true}), &expected).is_ok());
+        for invalid in [
+            serde_json::json!({}),
+            serde_json::json!({"enabled": "true"}),
+            serde_json::json!({"enabled": false}),
+            serde_json::json!({"enabled": true, "extra": true}),
+        ] {
+            let (code, reason) = validate_aec_echo(invalid, &expected).unwrap_err();
             assert_eq!(code, ctl::CODE_INTERNAL);
             assert!(reason.contains("echo"));
         }

@@ -313,6 +313,8 @@ export function useConsole() {
       if (effect.restart_required && effect.affected.length) {
         for (const service of effect.affected) await client.restart(service as Service);
         setNotice(`已写入基线并重启：${effect.affected.join('、')}`);
+      } else if (key === 'pre.aec.enabled') {
+        setNotice(value === 'true' ? '回声消除已开启。' : '回声消除已关闭。');
       } else if (area === 'devices') setNotice('基线已写入；文件任务使用各自的参数快照。');
     }, { message: '', baseline });
   }

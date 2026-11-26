@@ -94,6 +94,7 @@ enum {
     // 先试打开新设备再关旧句柄，失败保留旧设备；切 capture 清半帧并重置 WOLA，切 playback 首帧 10 ms 淡入。
     MOZART_CTL_PRE_SET_DEVICE = 0x0208,
     MOZART_CTL_PRE_SET_PLAYOUT = 0x0209,  // body: {policy, route, mute}; ACK at playback boundary
+    MOZART_CTL_PRE_SET_AEC     = 0x020A,  // 体 {"enabled": bool}；运行中启停声学回声消除（SPEC-02）
 
     MOZART_CTL_RVC_HELLO        = 0x0301,
     MOZART_CTL_RVC_LOAD_MODEL   = 0x0302,

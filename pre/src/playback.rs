@@ -338,7 +338,16 @@ fn configure_at_boundary(
     request.policy != PlayoutPolicy::RealtimeOnly || router.route() == request.route
 }
 
+/// 打开时估算一次 ALSA 播放缓冲时长（ms），不进入热循环。
+fn buffer_delay_ms(pcm: &alsa::pcm::PCM) -> u16 {
+    pcm.get_params()
+        .ok()
+        .map(|(buffer, _)| ((buffer as usize * 1000) / RAW_SAMPLE_RATE as usize).min(500) as u16)
+        .unwrap_or(45)
+}
+
 /// 播放线程主体。返回 Err 表示致命流错误；主线程据此退出进程。
+#[allow(clippy::too_many_arguments)]
 pub fn run(
     mut pcm: alsa::pcm::PCM,
     trunk: Arc<Ring<RawFrame>>,
@@ -347,6 +356,7 @@ pub fn run(
     shared: Arc<Shared>,
     stop: &'static AtomicBool,
     mut probe: Option<crate::aec_probe::Stream>,
+    mut ref_tx: crate::aec::RefSender,
 ) -> Result<(), String> {
     let mut stereo = [0i16; RAW_SAMPLES * 2];
     let mut router = Router::new(Route::Direct);
@@ -356,6 +366,7 @@ pub fn run(
     let mut previous_speaker = Speaker::Realtime;
     let mut previous_policy = PlayoutPolicy::Silent;
     let mut rvc_resampler = BoundaryResampler::new();
+    let mut playback_delay_ms = buffer_delay_ms(&pcm);
     let mut underruns = 0u64;
     let mut reported = 0u64;
     loop {
@@ -377,6 +388,8 @@ pub fn run(
                         probe.discontinuity();
                     }
                     pcm = new_pcm;
+                    playback_delay_ms = buffer_delay_ms(&pcm);
+                    ref_tx.discontinuity();
                     fade_in.trigger();
                 },
             );
@@ -447,7 +460,10 @@ pub fn run(
             &mut underruns,
             probe.as_mut(),
         ) {
-            Ok(()) => shared.add_played(1),
+            Ok(()) => {
+                shared.add_played(1);
+                ref_tx.push(&mono, playback_delay_ms);
+            }
             Err(StreamError::Cancelled) => return Ok(()),
             Err(StreamError::Reopen) => continue,
             Err(StreamError::NoProgress) => {
@@ -462,6 +478,7 @@ pub fn run(
         }
         if underruns > reported {
             reported = underruns;
+            ref_tx.discontinuity();
             shared.set_playback_underruns(underruns);
             let message = format!("playback underrun recovered (total {underruns})");
             shared.set_last_error(&message);

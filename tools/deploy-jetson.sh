@@ -245,6 +245,7 @@ set -euo pipefail
 cd "$HOME/Mozart"
 assets=${MOZART_ASSETS_DIR:-$HOME/mozart-assets}
 if [ -e "$assets/lib/libsherpa-onnx-c-api.so" ]; then export SHERPA_ONNX_LIB_DIR="$assets/lib"; fi
+if [ -e "$assets/lib/libmozart_aec3.so" ]; then export MOZART_AEC3_LIB_DIR="$assets/lib"; fi
 export LD_LIBRARY_PATH="$assets/lib:$assets/llama${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
 if [ "$FULL" = 1 ]; then cargo clean; fi
 t0=$SECONDS

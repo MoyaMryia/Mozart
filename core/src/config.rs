@@ -250,6 +250,16 @@ pub struct PreConfig {
     pub consumers: Option<Vec<PreConsumerConfig>>,
     /// DSP 阶段开关（[pre.dsp] 段）。
     pub dsp: PreDspConfig,
+    /// 回声消除开关（[pre.aec] 段）。
+    pub aec: PreAecConfig,
+}
+
+/// 回声消除配置（[pre.aec]，SPEC-02）。
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct PreAecConfig {
+    /// 是否启用实时声学回声消除（默认 false，可运行时通过 PRE_SET_AEC 切换）。
+    pub enabled: bool,
 }
 
 /// 输入支路消费者声明（[[pre.consumers]]，SPEC-02 分发）：一个消费者一个
@@ -306,6 +316,7 @@ impl Default for PreConfig {
             capture_queue_frames: 8,
             consumers: None,
             dsp: PreDspConfig::default(),
+            aec: PreAecConfig::default(),
         }
     }
 }
@@ -1592,7 +1603,9 @@ pub fn runtime_key_owner(key: &str) -> Option<&'static str> {
         | "file.max_upload_bytes"
         | "file.ffmpeg_path"
         | "file.ffmpeg_timeout_ms" => Some("daemon"),
-        "pre.dsp.denoise" | "pre.dsp.gate" | "pre.dsp.agc" | "pre.dsp.limiter" => Some("pre"),
+        "pre.dsp.denoise" | "pre.dsp.gate" | "pre.dsp.agc" | "pre.dsp.limiter" | "pre.aec.enabled" => {
+            Some("pre")
+        }
         "rvc.f0_method"
         | "rvc.pitch_shift"
         | "rvc.index_rate"
@@ -1700,7 +1713,8 @@ fn parse_runtime_value(key: &str, value: &str) -> Result<toml_edit::Item, Config
         | "pre.dsp.denoise"
         | "pre.dsp.gate"
         | "pre.dsp.agc"
-        | "pre.dsp.limiter" => match value {
+        | "pre.dsp.limiter"
+        | "pre.aec.enabled" => match value {
             "true" => Ok(toml_edit::value(true)),
             "false" => Ok(toml_edit::value(false)),
             _ => Err(ConfigError::Invalid(format!("键 {key} 需要 true/false"))),
@@ -2104,6 +2118,7 @@ mod tests {
         assert_eq!(runtime_key_owner("file.queue_capacity"), Some("daemon"));
         assert_eq!(runtime_key_owner("file.denoise"), Some("daemon"));
         assert_eq!(runtime_key_owner("pre.dsp.denoise"), Some("pre"));
+        assert_eq!(runtime_key_owner("pre.aec.enabled"), Some("pre"));
         assert_eq!(runtime_key_owner("rvc.pitch_shift"), Some("rvc"));
         assert_eq!(
             runtime_key_owner("bridge.translate_enabled"),
@@ -2162,6 +2177,11 @@ mod tests {
             assert!(set_key(Some(&path), key, "yes").is_err());
             assert!(!set_key(Some(&path), key, "false").unwrap().restart_required);
         }
+        assert!(set_key(Some(&path), "pre.aec.enabled", "yes").is_err());
+        let aec_effect = set_key(Some(&path), "pre.aec.enabled", "true").unwrap();
+        assert!(!aec_effect.restart_required);
+        assert!(aec_effect.affected.is_empty());
+        assert!(Config::load_from(Some(&path)).unwrap().pre.aec.enabled);
         assert!(!Config::load_from(Some(&path)).unwrap().pre.dsp.denoise);
         let config = Config::load_from(Some(&path)).unwrap();
         assert_eq!(

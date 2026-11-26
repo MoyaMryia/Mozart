@@ -783,25 +783,38 @@ fn apply_runtime_key(ctx: &Ctx, key: &str, old: &Config) -> Result<(), (String, 
     let overrides = lock_state_file(&ctx.state_file).overrides().clone();
     state_file::overlay(&mut fresh, &overrides);
     let requested_dsp = fresh.pre.dsp.clone();
+    let requested_aec = fresh.pre.aec.clone();
     crate::runtime::preserve_live_pre_state(&mut fresh, old);
     if runtime_key_owner(key) == Some("pre") {
-        match key {
-            "pre.dsp.denoise" => fresh.pre.dsp.denoise = requested_dsp.denoise,
-            "pre.dsp.gate" => fresh.pre.dsp.gate = requested_dsp.gate,
-            "pre.dsp.agc" => fresh.pre.dsp.agc = requested_dsp.agc,
-            "pre.dsp.limiter" => fresh.pre.dsp.limiter = requested_dsp.limiter,
-            _ => {
-                return Err((
-                    ctl::CODE_INTERNAL.to_string(),
-                    format!("no DSP orchestration for {key}"),
-                ))
+        if key == "pre.aec.enabled" {
+            fresh.pre.aec.enabled = requested_aec.enabled;
+            if ctx.services_active.load(Ordering::Acquire) {
+                ctx.services.set_aec(&fresh.pre.aec).map_err(|(code, reason)| {
+                    (
+                        code,
+                        format!("pre SetAec: {reason}; effective AEC unchanged; TOML baseline kept; retry config set for the same key or restart daemon to apply"),
+                    )
+                })?;
             }
-        }
-        if ctx.services_active.load(Ordering::Acquire) {
-            ctx.services.set_dsp(&fresh.pre.dsp).map_err(|(code, reason)| (
-                code,
-                format!("pre SetDsp: {reason}; effective DSP unchanged; TOML baseline kept; retry config set for the same key or restart daemon to apply"),
-            ))?;
+        } else {
+            match key {
+                "pre.dsp.denoise" => fresh.pre.dsp.denoise = requested_dsp.denoise,
+                "pre.dsp.gate" => fresh.pre.dsp.gate = requested_dsp.gate,
+                "pre.dsp.agc" => fresh.pre.dsp.agc = requested_dsp.agc,
+                "pre.dsp.limiter" => fresh.pre.dsp.limiter = requested_dsp.limiter,
+                _ => {
+                    return Err((
+                        ctl::CODE_INTERNAL.to_string(),
+                        format!("no DSP orchestration for {key}"),
+                    ))
+                }
+            }
+            if ctx.services_active.load(Ordering::Acquire) {
+                ctx.services.set_dsp(&fresh.pre.dsp).map_err(|(code, reason)| (
+                    code,
+                    format!("pre SetDsp: {reason}; effective DSP unchanged; TOML baseline kept; retry config set for the same key or restart daemon to apply"),
+                ))?;
+            }
         }
     }
     if runtime_key_owner(key) == Some("rvc") {

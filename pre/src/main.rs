@@ -16,6 +16,7 @@
 //! 停止：SIGTERM/SIGINT 置停止标志，各线程在时限内退出；启动阶段设备打开失败立即退出，
 //! 运行中支持经 `PRE_SET_DEVICE` 热替换 ALSA 句柄（失败保留旧设备），物理拔线等致命错误退出由 daemon 退避重启。
 
+mod aec;
 mod aec_probe;
 mod ai;
 mod alsa_stream;
@@ -88,6 +89,7 @@ struct Args {
     config: Option<PathBuf>,
     effective_enhance: Option<Option<mozart_core::config::EnhanceConfig>>,
     effective_dsp: Option<mozart_core::config::PreDspConfig>,
+    effective_aec: Option<mozart_core::config::PreAecConfig>,
     effective_capture_device: Option<String>,
     effective_playback_device: Option<String>,
     aec_probe: Option<PathBuf>,
@@ -102,6 +104,7 @@ fn parse_args_from(mut args: impl Iterator<Item = String>) -> Result<Args, Strin
     let mut config = None;
     let mut effective_enhance = None;
     let mut effective_dsp = None;
+    let mut effective_aec = None;
     let mut effective_capture_device = None;
     let mut effective_playback_device = None;
     let mut aec_probe = None;
@@ -119,6 +122,14 @@ fn parse_args_from(mut args: impl Iterator<Item = String>) -> Result<Args, Strin
                     serde_json::from_str(&json)
                         .map_err(|err| format!("--effective-enhance: {err}"))?,
                 );
+            }
+            "--effective-aec" => {
+                let json = args.next().ok_or("--effective-aec needs JSON")?;
+                let aec: mozart_core::ctl::schema::AecSetRequest =
+                    serde_json::from_str(&json).map_err(|err| format!("--effective-aec: {err}"))?;
+                effective_aec = Some(mozart_core::config::PreAecConfig {
+                    enabled: aec.enabled,
+                });
             }
             "--effective-dsp" => {
                 let json = args.next().ok_or("--effective-dsp needs JSON")?;
@@ -160,6 +171,7 @@ fn parse_args_from(mut args: impl Iterator<Item = String>) -> Result<Args, Strin
         config,
         effective_enhance,
         effective_dsp,
+        effective_aec,
         effective_capture_device,
         effective_playback_device,
         aec_probe,
@@ -180,6 +192,7 @@ fn process_thread(
     trunk: Arc<Ring<RawFrame>>,
     shared: Arc<Shared>,
     mut senders: Vec<ai::Sender>,
+    ref_rx: aec::RefReceiver,
 ) -> Result<(), String> {
     // DSP 状态为定长数组，构造后热路径零分配。
     let mut applied = shared.dsp_target();
@@ -191,6 +204,7 @@ fn process_thread(
         applied.agc,
         applied.limiter,
     );
+    let mut aec = aec::AecProcessor::new(aec::default_backend(), ref_rx, shared.aec_telemetry());
     while !STOP.load(Ordering::Relaxed) {
         if let Some(captured) = capture_ring.pop(Some(PROCESS_POLL)) {
             let mut frame = captured.frame;
@@ -209,7 +223,14 @@ fn process_thread(
                 dsp.reset_denoise();
                 last_capture_epoch = captured.capture_epoch;
             }
-            let conf = dsp.process_frame(&mut frame);
+            let aec_on = shared.aec_enabled();
+            let cap_epoch = captured.capture_epoch;
+            let conf = dsp.process_frame_with_hook(&mut frame, |pcm| {
+                aec.process_capture(pcm, cap_epoch, aec_on, |err| {
+                    shared.set_last_error(err);
+                    eprintln!("mozart-pre: {err}");
+                });
+            });
             let input_frame = dsp.pack_frame(&frame, conf);
             trunk.push(frame);
             // 受文件接管影响的消费者仅在 daemon 已断言实时态时发送
@@ -291,6 +312,9 @@ fn main() -> ExitCode {
         if let Some(effective) = args.effective_dsp {
             config.pre.dsp = effective;
         }
+        if let Some(effective) = args.effective_aec {
+            config.pre.aec = effective;
+        }
         if let Some(capture) = args.effective_capture_device {
             config.pre.capture_device = capture;
         }
@@ -338,6 +362,7 @@ fn main() -> ExitCode {
         consumers.clone(),
         state::DspSwitches::from_config(&config.pre.dsp),
     );
+    shared.set_aec_enabled(config.pre.aec.enabled);
     if std::env::var_os(mozart_core::ctl::schema::SUPERVISED_PLAYOUT_ENV).is_some() {
         shared.set_playout_policy(mozart_core::ctl::schema::PlayoutPolicy::Silent);
         shared.speech_cutoff.store(mozart_core::speech::monotonic_ns(), Ordering::SeqCst);
@@ -497,12 +522,13 @@ fn main() -> ExitCode {
     } else {
         (None, senders)
     };
+    let (ref_tx, ref_rx) = aec::channel(&shared.aec_telemetry());
     let process_handle = {
         let from = capture_ring.clone();
         let to = trunk.clone();
         let shared = shared.clone();
         match spawn_thread("mozart-trunk", move || {
-            process_thread(from, to, shared, senders)
+            process_thread(from, to, shared, senders, ref_rx)
         }) {
             Ok(handle) => handle,
             Err(err) => return spawn_failure("process", err),
@@ -549,6 +575,7 @@ fn main() -> ExitCode {
                         shared,
                         &STOP,
                         playback_probe,
+                        ref_tx,
                     )
                 }),
             )
@@ -636,6 +663,38 @@ mod tests {
             assert!(parse(&["--effective-dsp", invalid]).is_err());
         }
         assert!(parse(&["--effective-dsp"]).is_err());
+    }
+
+    #[test]
+    fn effective_aec_args_require_boolean_object() {
+        let parse = |values: &[&str]| {
+            parse_args_from(
+                ["--socket", "/tmp/pre-test.sock"]
+                    .into_iter()
+                    .chain(values.iter().copied())
+                    .map(str::to_string),
+            )
+        };
+        assert!(parse(&[]).unwrap().effective_aec.is_none());
+        assert!(parse(&["--effective-aec", r#"{"enabled":true}"#])
+            .unwrap()
+            .effective_aec
+            .unwrap()
+            .enabled);
+        assert!(!parse(&["--effective-aec", r#"{"enabled":false}"#])
+            .unwrap()
+            .effective_aec
+            .unwrap()
+            .enabled);
+        for invalid in [
+            "{}",
+            "null",
+            r#"{"enabled":"true"}"#,
+            r#"{"enabled":true,"extra":1}"#,
+        ] {
+            assert!(parse(&["--effective-aec", invalid]).is_err());
+        }
+        assert!(parse(&["--effective-aec"]).is_err());
     }
 
     #[test]
@@ -814,7 +873,8 @@ mod tests {
                 ai::Sender::new(rvc_path.clone(), 0, "rvc"),
                 ai::Sender::new(asr_path.clone(), 1, "asr"),
             ];
-            std::thread::spawn(move || process_thread(capture, trunk, shared, senders))
+            let (_, ref_rx) = aec::channel(&shared.aec_telemetry());
+            std::thread::spawn(move || process_thread(capture, trunk, shared, senders, ref_rx))
         };
         let raw = RawFrame {
             meta: mozart_core::FrameMeta {
@@ -918,7 +978,8 @@ mod tests {
                 ai::Sender::new(gated_path.clone(), 0, "gated"),
                 ai::Sender::new(always_path.clone(), 1, "always"),
             ];
-            std::thread::spawn(move || process_thread(capture, trunk, shared, senders))
+            let (_, ref_rx) = aec::channel(&shared.aec_telemetry());
+            std::thread::spawn(move || process_thread(capture, trunk, shared, senders, ref_rx))
         };
         let raw = RawFrame {
             meta: mozart_core::FrameMeta {

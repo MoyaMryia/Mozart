@@ -747,4 +747,48 @@ describe('设备草稿', () => {
     input.value = 'mic-b'; input.dispatchEvent(new Event('change', { bubbles: true })); await nextTick();
     status.pre!.playback_device = 'speaker-b'; await nextTick(); expect(input.value).toBe('mic-b');
   });
+
+  it('回声消除 (AEC) 按钮按当前开关状态切换 pre.aec.enabled', async () => {
+    const status = reactive(statusFixture());
+    (status.pre as NonNullable<typeof status.pre> & { aec?: unknown }).aec = {
+      enabled: false,
+      backend: 'webrtc-aec3',
+      active: false,
+      delay_ms: null,
+      erle_db: null,
+      ref_dropped: 0,
+      ref_underruns: 0,
+      resets: 0,
+      capture_clips: 0,
+      last_error: null,
+    };
+    const emitted: Array<[string, string]> = [];
+    const root = document.createElement('div');
+    document.body.append(root);
+    const app = createApp({
+      render: () => h(DevicesPanel, {
+        status,
+        baselines: { capture: 'mic-a', playback: 'speaker-a' },
+        devices: [],
+        ready: true,
+        busy: false,
+        onSet: (key: string, value: string) => emitted.push([key, value]),
+      }),
+    });
+    app.mount(root);
+    mounts.push({ app, root });
+    await nextTick();
+    const button = Array.from(root.querySelectorAll('button')).find(el => el.textContent?.includes('回声消除 (AEC)'));
+    expect(button).toBeDefined();
+    expect(button!.getAttribute('aria-pressed')).toBe('false');
+    button!.click();
+    expect(emitted[0]).toEqual(['pre.aec.enabled', 'true']);
+
+    (status.pre as NonNullable<typeof status.pre> & { aec?: { enabled: boolean; active: boolean } }).aec!.enabled = true;
+    (status.pre as NonNullable<typeof status.pre> & { aec?: { enabled: boolean; active: boolean } }).aec!.active = true;
+    await nextTick();
+    expect(button!.getAttribute('aria-pressed')).toBe('true');
+    button!.click();
+    expect(emitted[1]).toEqual(['pre.aec.enabled', 'false']);
+  });
 });

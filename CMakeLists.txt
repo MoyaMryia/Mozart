@@ -17,7 +17,7 @@ list(APPEND CMAKE_MODULE_PATH "${CMAKE_CURRENT_SOURCE_DIR}/cmake")
 include(MozartCompiler)
 
 # 组件按目录存在与否自动纳入构建。骨架阶段只有 tests。
-set(MOZART_COMPONENTS core pre rvc enhance daemon)
+set(MOZART_COMPONENTS core pre aec3 rvc enhance daemon)
 foreach(component IN LISTS MOZART_COMPONENTS)
     if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/${component}/CMakeLists.txt")
         add_subdirectory(${component})
