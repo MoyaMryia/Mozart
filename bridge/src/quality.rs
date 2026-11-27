@@ -8,8 +8,9 @@
 use crate::checks::{self, ContextItem};
 use std::collections::HashMap;
 
-/// 译文/原文字符数比上限（含）以上视为异常（v1 补充规则）。
-pub const MAX_LENGTH_RATIO: f64 = 5.0;
+/// 译文/原文字符数比超过上限视为异常（v1 补充规则；放行正常中译英短句与术语长句扩展，
+/// 仍拦截上文泄漏与极端扩写）。
+pub const MAX_LENGTH_RATIO: f64 = 6.5;
 /// 译文/原文字符数比下限（含）以下视为异常（v1 补充规则）。
 pub const MIN_LENGTH_RATIO: f64 = 0.1;
 // 允许单字符原文译成短词组，不放行长句。
@@ -18,6 +19,11 @@ const MIN_SOURCE_CHARS_FOR_UPPER_RATIO: usize = 2;
 pub const MAX_WORD_REPEATS: usize = 5;
 /// 任意词（含英文虚词）连续出现达到该次数视为退化复读（v1 补充规则）。
 pub const MAX_CONSECUTIVE_WORD_REPEATS: usize = 3;
+
+/// 统计文本中用于有效内容判定与长度比核算的字母或数字个数。
+pub fn content_char_count(text: &str) -> usize {
+    text.chars().filter(|c| c.is_alphanumeric()).count()
+}
 
 /// 英文高频虚词：正常长句中高频出现，不计入 `MAX_WORD_REPEATS`。
 const REPEAT_STOPWORDS: &[&str] = &[
@@ -48,11 +54,14 @@ pub fn check(
     if trimmed == source {
         return Err("translation identical to source".to_string());
     }
-    let source_chars = source.chars().filter(|c| c.is_alphanumeric()).count();
-    let translated_chars = trimmed.chars().filter(|c| c.is_alphanumeric()).count() as f64;
+    let source_chars = content_char_count(source);
+    let translated_chars = content_char_count(trimmed);
+    if translated_chars == 0 {
+        return Err("translation has no alphanumeric content".to_string());
+    }
     let upper_base = source_chars.max(MIN_SOURCE_CHARS_FOR_UPPER_RATIO) as f64;
-    let ratio = translated_chars / source_chars.max(1) as f64;
-    if translated_chars > MAX_LENGTH_RATIO * upper_base || ratio < MIN_LENGTH_RATIO {
+    let ratio = translated_chars as f64 / source_chars.max(1) as f64;
+    if translated_chars as f64 > MAX_LENGTH_RATIO * upper_base || ratio < MIN_LENGTH_RATIO {
         return Err(format!("length ratio {ratio:.2} out of range"));
     }
     let mut counts: HashMap<String, usize> = HashMap::new();
@@ -178,13 +187,27 @@ mod tests {
         assert!(check_ok("谢", "Thanks.").is_ok());
         assert!(check_ok("谢。", "Thanks.").is_ok());
         assert!(check_ok("谢", "Thank you.").is_ok());
+        assert!(check_ok("显卡。", "Graphics card.").is_ok());
         assert!(check_ok("谢", "This is completely unrelated.").unwrap_err().contains("length ratio"));
     }
 
     #[test]
+    fn rejects_punctuation_only_translation() {
+        assert_eq!(
+            check_ok("嗯。", "...").unwrap_err(),
+            "translation has no alphanumeric content"
+        );
+        assert_eq!(
+            check_ok("你好", ".").unwrap_err(),
+            "translation has no alphanumeric content"
+        );
+    }
+
+    #[test]
     fn rejects_length_anomaly() {
-        // 2 字原文 → 超过 10 字符译文：比值 > 5。
-        let long = "abcdefghijk";
+        // 2 字原文 → 13 字符译文恰为 6.50 边界放行，14 字符（7.00 > 6.5）拒绝。
+        assert!(check_ok("你好", "abcdefghijklm").is_ok());
+        let long = "abcdefghijklmn";
         assert!(check_ok("你好", long).unwrap_err().contains("length ratio"));
         // 20 字原文 → 1 字符译文：比值 < 0.1。
         let source = "一二三四五六七八九十一二三四五六七八九十";

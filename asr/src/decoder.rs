@@ -258,8 +258,8 @@ impl Decoder {
 }
 
 /// 文本内容判定（沿用旧 stt_service.has_text_content）：含非空白且非 Unicode
-/// 标点（P 类）的字符即视为有内容，用于跳过纯标点 final。
-fn has_text_content(text: &str) -> bool {
+/// 标点（P 类）的字符即视为有内容，供解码切句与复核校验共用。
+pub(crate) fn has_text_content(text: &str) -> bool {
     use unicode_categories::UnicodeCategories;
     text.chars()
         .any(|c| !c.is_whitespace() && !c.is_punctuation())

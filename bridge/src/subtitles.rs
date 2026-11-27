@@ -9,6 +9,7 @@
 
 use crate::events::{Event, EventKind};
 use crate::preprocess;
+use crate::quality::content_char_count;
 use crate::state::{unix_ms, Queues, Shared, SpeechGeneration, TranslateJob};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -35,6 +36,7 @@ const RECORD_CAP: usize = 128;
 
 /// 降级原因：待翻译队列满（后续入队成功时解除）。
 const DEGRADED_TRANSLATE_FULL: &str = "translate queue full";
+const NO_TRANSLATABLE_CONTENT: &str = "no translatable content";
 
 /// ASR 复核待完成状态；复核终态为 completed / failed / skipped。
 const REFINEMENT_PENDING: &str = "pending";
@@ -308,22 +310,36 @@ pub fn apply(
             if sealed_refinement(record) {
                 return None;
             }
-            // 复核文本非空才替换原文（ASR 仅在复核 completed 时携带 refined_text）；
+            // 复核文本含字母数字内容才替换原文（ASR 仅在复核 completed 时携带 refined_text）；
             // 替换时同步更新/清理旧纠错审计字段，避免残留上一版的 zh_raw。
+            let mut rejected_refined = false;
             if let Some(refined) = event.refined_text.as_deref() {
                 let trimmed = refined.trim();
-                if !trimmed.is_empty() {
+                if content_char_count(trimmed) > 0 {
                     let (zh, zh_raw, homophone_fixes) =
                         apply_source_corrections(trimmed, corrections, terms);
                     record.zh = zh;
                     record.zh_raw = zh_raw;
                     record.homophone_fixes = homophone_fixes;
+                } else {
+                    rejected_refined = true;
                 }
             }
-            if let Some(status) = &event.refinement_status {
-                record.refinement_status = Some(status.clone());
-                if is_terminal_refinement(Some(status.as_str())) {
-                    record.review_deadline = None;
+            if rejected_refined && event.refinement_status.as_deref() == Some("completed") {
+                record.refinement_status = Some("failed".to_string());
+                record.refinement_error = Some("refined text has no alphanumeric content".to_string());
+                record.review_deadline = None;
+            } else {
+                if let Some(status) = &event.refinement_status {
+                    record.refinement_status = Some(status.clone());
+                    if is_terminal_refinement(Some(status.as_str())) {
+                        record.review_deadline = None;
+                    }
+                }
+                if event.refinement_error.is_some() {
+                    record.refinement_error = event.refinement_error.clone();
+                } else if event.refinement_status.as_deref() == Some("completed") {
+                    record.refinement_error = None;
                 }
             }
             record.revision += 1;
@@ -674,17 +690,50 @@ pub fn run(
     Ok(())
 }
 
-fn dispatch_fallback(record: SubtitleRecord, store: &SubtitleStore, queues: &Queues, shared: &Shared) -> Result<(), String> {
-    if !shared.translate_enabled() {
-        return store.publish_translation_skipped(&record.utterance_id, "translation disabled", shared);
+enum EnqueueOutcome {
+    Handled,
+    TranslateDisabled,
+    QueueFull,
+}
+
+fn try_enqueue_translation(
+    utterance_id: &str,
+    text: &str,
+    speech_generation: Option<SpeechGeneration>,
+    store: &SubtitleStore,
+    queues: &Queues,
+    shared: &Shared,
+) -> Result<EnqueueOutcome, String> {
+    if content_char_count(text) == 0 {
+        store.publish_translation_skipped(utterance_id, NO_TRANSLATABLE_CONTENT, shared)?;
+        return Ok(EnqueueOutcome::Handled);
     }
-    let job = TranslateJob { utterance_id: record.utterance_id, text: record.zh, speech_generation: None };
-    if queues.push_translate(job.clone()) {
+    if !shared.translate_enabled() {
+        return Ok(EnqueueOutcome::TranslateDisabled);
+    }
+    let job = TranslateJob {
+        utterance_id: utterance_id.to_string(),
+        text: text.to_string(),
+        speech_generation,
+    };
+    if queues.push_translate(job) {
         shared.resolve(DEGRADED_TRANSLATE_FULL);
-        Ok(())
+        Ok(EnqueueOutcome::Handled)
     } else {
         shared.degrade(DEGRADED_TRANSLATE_FULL);
-        store.publish_translation_skipped(&job.utterance_id, DEGRADED_TRANSLATE_FULL, shared)
+        Ok(EnqueueOutcome::QueueFull)
+    }
+}
+
+fn dispatch_fallback(record: SubtitleRecord, store: &SubtitleStore, queues: &Queues, shared: &Shared) -> Result<(), String> {
+    match try_enqueue_translation(&record.utterance_id, &record.zh, None, store, queues, shared)? {
+        EnqueueOutcome::Handled => Ok(()),
+        EnqueueOutcome::TranslateDisabled => {
+            store.publish_translation_skipped(&record.utterance_id, "translation disabled", shared)
+        }
+        EnqueueOutcome::QueueFull => {
+            store.publish_translation_skipped(&record.utterance_id, DEGRADED_TRANSLATE_FULL, shared)
+        }
     }
 }
 
@@ -698,17 +747,15 @@ fn process(
         return Ok(());
     };
     // 复核开启时等 refined 再入待翻译队列；复核关闭时在 final 入队；translate off 只发布原文。
-    if ready_to_translate && shared.translate_enabled() {
-        let job = TranslateJob {
-            utterance_id: record.utterance_id.clone(),
-            text: record.zh.clone(),
-            speech_generation: record.speech_generation,
-        };
-        if !queues.push_translate(job) {
-            shared.degrade(DEGRADED_TRANSLATE_FULL);
-        } else {
-            shared.resolve(DEGRADED_TRANSLATE_FULL);
-        }
+    if ready_to_translate {
+        let _ = try_enqueue_translation(
+            &record.utterance_id,
+            &record.zh,
+            record.speech_generation,
+            store,
+            queues,
+            shared,
+        )?;
     }
     Ok(())
 }
@@ -965,6 +1012,62 @@ mod tests {
         assert_eq!(apply(&mut table, &event(EventKind::Partial, 1, ""), 100, &no_corrections()), None);
         assert_eq!(apply(&mut table, &event(EventKind::Final, 1, "  "), 200, &no_corrections()), None);
         assert_eq!(table.len(), 0);
+    }
+
+    #[test]
+    fn non_alphanumeric_final_is_published_and_skipped_for_translation() {
+        use crate::state::{Shared, Switches};
+
+        let dir = crate::testutil::temp_dir("non-alnum-skip");
+        let path = dir.join("subtitles.jsonl");
+        let shared = Shared::new(
+            Switches {
+                translate_enabled: true,
+                speech_enabled: true,
+            },
+            path.clone(),
+        );
+        let store = SubtitleStore::new(
+            JsonlWriter::open(&path).unwrap(),
+            path.clone(),
+            no_corrections(),
+        );
+        let queues = Queues::new(4, 4);
+
+        for (seq, text) in [(1u64, "＋"), (2u64, "。")] {
+            process(event(EventKind::Final, seq, text), &store, &queues, &shared).unwrap();
+        }
+        assert_eq!(queues.translate_depth(), 0, "无字母数字终句不得入翻译队列");
+
+        let lines: Vec<Value> = fs::read_to_string(&path)
+            .unwrap()
+            .lines()
+            .map(|line| serde_json::from_str(line).unwrap())
+            .collect();
+        assert_eq!(lines.len(), 4);
+        assert_eq!(lines[1]["zh"], "＋");
+        assert_eq!(lines[1]["translation_status"], "skipped");
+        assert_eq!(lines[1]["translation_error"], NO_TRANSLATABLE_CONTENT);
+        assert_eq!(lines[3]["zh"], "。");
+        assert_eq!(lines[3]["translation_status"], "skipped");
+        assert_eq!(lines[3]["translation_error"], NO_TRANSLATABLE_CONTENT);
+
+        let fallback = store
+            .apply_for_dispatch(&event(EventKind::Final, 3, "＋"), &shared)
+            .unwrap()
+            .unwrap()
+            .0;
+        dispatch_fallback(fallback, &store, &queues, &shared).unwrap();
+        assert_eq!(queues.translate_depth(), 0);
+        let latest: Value = serde_json::from_str(
+            fs::read_to_string(&path).unwrap().lines().last().unwrap(),
+        )
+        .unwrap();
+        assert_eq!(latest["utterance_id"], "a1b2c3d4:3");
+        assert_eq!(latest["translation_status"], "skipped");
+        assert_eq!(latest["translation_error"], NO_TRANSLATABLE_CONTENT);
+
+        let _ = fs::remove_dir_all(&dir);
     }
 
     #[test]
@@ -1434,5 +1537,68 @@ mod tests {
         assert_eq!(refined_rec.zh, "我已经说完了。");
         assert!(refined_rec.zh_raw.is_none(), "复核未命中纠错时不得残留旧 zh_raw");
         assert!(refined_rec.homophone_fixes.is_none(), "复核未命中纠错时不得残留旧 homophone_fixes");
+    }
+
+    #[test]
+    fn refined_punctuation_only_keeps_original_and_dispatches_once() {
+        use crate::state::{Shared, Switches};
+
+        let dir = crate::testutil::temp_dir("refined-punct-only");
+        let path = dir.join("subtitles.jsonl");
+        let shared = Shared::new(
+            Switches {
+                translate_enabled: true,
+                speech_enabled: true,
+            },
+            path.clone(),
+        );
+        let store = SubtitleStore::new(
+            JsonlWriter::open(&path).unwrap(),
+            path,
+            no_corrections(),
+        );
+        let (_, ready) = store.apply_for_dispatch(&pending_final(1), &shared).unwrap().unwrap();
+        assert!(!ready);
+
+        let (record, ready) = store
+            .apply_for_dispatch(&refined_event(1, Some("。")), &shared)
+            .unwrap()
+            .unwrap();
+        assert!(ready, "纯标点复核不覆盖原文并应触发一次翻译");
+        assert_eq!(record.zh, "在线原文");
+        assert_eq!(record.refinement_status.as_deref(), Some("failed"));
+        assert_eq!(
+            record.refinement_error.as_deref(),
+            Some("refined text has no alphanumeric content")
+        );
+        assert_eq!(record.revision, 1);
+
+        let (_, ready2) = store.apply_for_dispatch(&pending_final(2), &shared).unwrap().unwrap();
+        assert!(!ready2);
+        let failed_refined = parse(
+            &serde_json::to_vec(&json!({
+                "type": "refined",
+                "startup_id": "a1b2c3d4",
+                "utterance_id": "a1b2c3d4:2",
+                "seq": 2,
+                "text": "在线原文",
+                "refinement_status": "failed",
+                "refinement_error": "复核未返回有效文本",
+            }))
+            .unwrap(),
+        )
+        .unwrap()
+        .unwrap();
+        let (record2, ready2) = store
+            .apply_for_dispatch(&failed_refined, &shared)
+            .unwrap()
+            .unwrap();
+        assert!(ready2);
+        assert_eq!(record2.refinement_status.as_deref(), Some("failed"));
+        assert_eq!(
+            record2.refinement_error.as_deref(),
+            Some("复核未返回有效文本")
+        );
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

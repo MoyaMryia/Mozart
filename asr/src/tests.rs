@@ -529,6 +529,32 @@ fn review_empty_text_is_failed() {
 }
 
 #[test]
+fn review_punctuation_only_text_is_failed() {
+    for punct in ["。", "？..."] {
+        let (fake, _started) = FakeOffline::new(punct, Duration::ZERO);
+        let (job_tx, job_rx) = mpsc::sync_channel::<ReviewJob>(2);
+        let (tx, rx) = mpsc::sync_channel(crate::event::EVENT_QUEUE_CAPACITY);
+        let shared = Arc::new(Shared::new("teststart".to_string()));
+        let worker_shared = shared.clone();
+        let handle = std::thread::spawn(move || {
+            review::run_with(job_rx, Ok(fake), tx, worker_shared, stop_flag())
+        });
+        job_tx.send(review_job(1)).unwrap();
+        drop(job_tx);
+        handle.join().unwrap();
+
+        let events = events_now(&rx);
+        assert_eq!(events.len(), 1);
+        let event = &events[0];
+        assert_eq!(event.refinement_status.as_deref(), Some(REVIEW_FAILED));
+        assert!(event.refined_text.is_none());
+        assert!(event.refinement_error.is_some());
+        assert_eq!(event.text, "在线1");
+        assert_eq!(shared.status(0).review_failed, 1);
+    }
+}
+
+#[test]
 fn review_drain_deadline_skips_remaining() {
     // 每句解码 1.5 s：停止后第 1 句在途完成，限时窗口（1 s）内第 2 句完成，
     // 第 3 句出窗时已超时限 → skipped。

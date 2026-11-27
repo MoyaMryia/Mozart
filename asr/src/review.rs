@@ -94,7 +94,7 @@ fn skip(job: ReviewJob, events: &SyncSender<Event>, shared: &Shared) {
     deliver(events, event, shared);
 }
 
-/// 复核一句：成功发 completed，空文本或错误发 failed。
+/// 复核一句：成功发 completed，空文本、纯标点或错误发 failed。
 fn process(
     job: ReviewJob,
     recognizer: &Result<Box<dyn OfflineRecognizer>, String>,
@@ -108,7 +108,7 @@ fn process(
         Err(err) => Err(err.clone()),
     };
     let event = match result {
-        Ok(text) if !text.trim().is_empty() => job.final_event.into_refined(
+        Ok(text) if crate::decoder::has_text_content(&text) => job.final_event.into_refined(
             REVIEW_COMPLETED,
             Some(text),
             None,
@@ -119,7 +119,7 @@ fn process(
             job.final_event.into_refined(
                 REVIEW_FAILED,
                 None,
-                Some("复核未返回文本".to_string()),
+                Some("复核未返回有效文本".to_string()),
                 0,
             )
         }

@@ -1,6 +1,6 @@
 # SPEC 索引
 
-状态：讨论中。最后更新：2026-11-26。
+状态：讨论中。最后更新：2026-11-27。
 
 ## 总体
 
@@ -86,6 +86,7 @@
 
 ## 变更记录
 
+- 2026-11-27：修复语言链路纯标点复核与无字母数字内容处理，并将译文长度比上限由 5.0 调至 6.5，减少正常中译英短句与术语长句误杀（SPEC-05）。
 - 2026-11-26：接入 WebRTC AEC3 在线声学回声消除（SPEC-02 步骤 2–3）：播放线程在淡入/静音后经 `rtrb` 无锁环投递最终单声道参考，处理线程在 `48 kHz` 主干 `80 Hz` 高通后、降噪前钩入 AEC3；新增 `[pre.aec].enabled`（默认关，R 类）、`PRE_SET_AEC`（`0x020A`）热切换、`GetStatus` `aec` 指标（延时/ERLE/参考丢帧/重置/削波）与网页设备面板开关；`aec3/` 薄 C 封装经 pkg-config 链接 `webrtc-audio-processing-1`，`pre/build.rs` 按 `MOZART_AEC3_LIB_DIR` 可选链接、缺库走未链接桩；采播 epoch 跳变自动重置，崩溃自愈经 `--effective-aec` 沿用生效开关。三项边界（48 kHz 主干、薄封装直链、积压修剪加延时估计吸收漂移）由实现拍板，步骤 1 多房间实测定参与步骤 4 整机验收保留待办；登记用户反馈 AEC 效果不足与 UL-UNAS 去伴奏效果不足改进项（SPEC-02、SPEC-04、SPEC-06、`docs/config.md`、`docs/GUIDE.md`、`docs/SETUP.md`、架构图）。
 - 2026-11-26：将默认启动模式收敛为 `direct`（`[bridge].speech_enabled = false`，`translate_enabled = true` 跨模式保持持久），新增保持 `speech_enabled` 不变与托管模式的清队列命令 `DAEMON_SPEECH_CLEAR`（`0x0109`）/ `BRIDGE_SPEECH_CLEAR`（`0x0506`）/ `POST /api/v1/speech/clear` / `mozart-ctl speech clear`；Web 控制台路由卡片接入 `PUT /api/v1/mode` 三态互斥切换并于底部提供独立「翻译」开关，移除左侧独立「翻译播报」卡片，仅在翻译播报开启时于右侧条件展开带交互动效的「播报设置」卡片（含真实队列指标与「清除播报队列」操作，SPEC-04、SPEC-05、SPEC-06、`docs/config.md`、`docs/MODE-TRANSITIONS.md`）。
 - 2026-11-26：将声学回声消除（AEC）从 `FUTURE.md` 迁入 `SPEC-02` 分 4 步推进：确立以 WebRTC AEC3 为首选自适应底座、位序位于 `80 Hz` 高通后与降噪前；先以多房间真实麦克风／扬声器实录与离线对比拍板处理采样率、双声卡时钟漂移补偿与封装形态，再依次落地在线参考环、AEC3 控制面接入及多房间整机验收（SPEC-02、FUTURE）。

@@ -887,4 +887,93 @@ mod tests {
         assert_eq!(lines[1]["translation_status"], "skipped");
         let _ = std::fs::remove_dir_all(&fixture.dir);
     }
+
+    #[test]
+    fn qc_rejects_punctuation_only_reply_and_retries_without_context() {
+        use mozart_core::config::{LlmModelConfig, PromptProfile};
+
+        // 1. 携带非空上文 + HyMt 模型：首轮返回纯标点 "..." 被拒，去上下文重试后返回 "Mm-hmm." 恢复。
+        let fixture = Fixture::new("tr-qc-punct-retry");
+        let socket = fixture.dir.join("llama.sock");
+        let mock = MockLlama::bind(&socket);
+        let server = mock.spawn(vec![llama_ok("..."), llama_ok("Mm-hmm.")]);
+        fixture.final_record("s:2", "嗯嗯。");
+        let job = TranslateJob {
+            utterance_id: "s:2".to_string(),
+            text: "嗯嗯。".to_string(),
+            speech_generation: fixture.shared.speech_generation(),
+        };
+        let model = LlmModelConfig {
+            id: "hymt".to_string(),
+            path: std::path::PathBuf::from("/models/hymt.gguf"),
+            prompt_profile: PromptProfile::HyMt,
+            context_window: 2,
+            ..LlmModelConfig::default()
+        };
+        let client = LlamaClient::with_model(socket, model);
+        let mut context = VecDeque::from([ContextItem {
+            source: "前文".to_string(),
+            translation: "Previous.".to_string(),
+        }]);
+        process_job(
+            &job,
+            &fixture.queues,
+            &fixture.shared,
+            &fixture.store,
+            &client,
+            2,
+            &Glossary::empty(),
+            &mut context,
+            &fixture.stop,
+        )
+        .unwrap();
+        let requests = server.join().unwrap();
+        assert_eq!(requests.len(), 2);
+        let status = fixture.shared.status(&fixture.queues);
+        assert_eq!(status.translated, 1);
+        assert_eq!(status.translate_retried, 1);
+        assert_eq!(status.qc_rejected, 0);
+        assert_eq!(fixture.queues.speech_depth(), 1);
+        assert_eq!(fixture.lines()[1]["en"], "Mm-hmm.");
+        let _ = std::fs::remove_dir_all(&fixture.dir);
+
+        // 2. 无上文确定性模型返回 "."：不重试，落 failed 且原因明确为无字母数字内容。
+        let fixture = Fixture::new("tr-qc-punct-fail");
+        let socket = fixture.dir.join("llama.sock");
+        let mock = MockLlama::bind(&socket);
+        let server = mock.spawn(vec![llama_ok(".")]);
+        fixture.final_record("s:1", "嗯。");
+        let job = TranslateJob {
+            utterance_id: "s:1".to_string(),
+            text: "嗯。".to_string(),
+            speech_generation: fixture.shared.speech_generation(),
+        };
+        let client = LlamaClient::new(socket);
+        let mut context = VecDeque::new();
+        process_job(
+            &job,
+            &fixture.queues,
+            &fixture.shared,
+            &fixture.store,
+            &client,
+            2,
+            &Glossary::empty(),
+            &mut context,
+            &fixture.stop,
+        )
+        .unwrap();
+        assert_eq!(server.join().unwrap().len(), 1);
+        let status = fixture.shared.status(&fixture.queues);
+        assert_eq!(status.qc_rejected, 1);
+        assert_eq!(status.translate_retried, 0);
+        assert_eq!(status.translated, 0);
+        assert_eq!(fixture.queues.speech_depth(), 0);
+        let lines = fixture.lines();
+        assert_eq!(lines[1]["translation_status"], "failed");
+        assert_eq!(
+            lines[1]["translation_error"],
+            "translation has no alphanumeric content"
+        );
+        let _ = std::fs::remove_dir_all(&fixture.dir);
+    }
 }
