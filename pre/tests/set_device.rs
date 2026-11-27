@@ -130,3 +130,60 @@ fn set_device_rejects_capture_file_and_keeps_old_playback_on_open_failure() {
     assert!(status.success(), "pre 应优雅退出：{status:?}");
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+#[test]
+fn missing_devices_start_in_standby_and_hot_switch_recovers() {
+    let dir = run_dir("standby-device");
+    let config = format!(
+        "[daemon]\nrun_dir = \"{}\"\n[pre]\ncapture_device = \"nonexistent-cap\"\nplayback_device = \"nonexistent-play\"\n",
+        dir.display(),
+    );
+    let mut child = spawn_pre(&dir, &config);
+    wait_sockets(&dir);
+
+    let control = Seqpacket::connect(&dir.join("pre.sock")).unwrap();
+    let status = get_status(&control);
+    assert_eq!(status["state"], "running");
+    assert_eq!(status["frames_captured"], 0);
+    assert_eq!(status["frames_played"], 0);
+    let last_error = status["last_error"].as_str().unwrap_or("");
+    assert!(
+        last_error.contains("playback open (nonexistent-play)")
+            && last_error.contains("capture open (nonexistent-cap)"),
+        "缺失设备启动应保留可查询故障原因：{last_error:?}"
+    );
+
+    let switched_cap = call_ok(
+        &control,
+        ctl::PRE_SET_DEVICE,
+        1,
+        br#"{"kind":"capture","device":"null"}"#,
+    );
+    assert_eq!(switched_cap["device"], "null");
+    assert_eq!(switched_cap["previous_device"], "nonexistent-cap");
+
+    let switched_play = call_ok(
+        &control,
+        ctl::PRE_SET_DEVICE,
+        2,
+        br#"{"kind":"playback","device":"null"}"#,
+    );
+    assert_eq!(switched_play["device"], "null");
+    assert_eq!(switched_play["previous_device"], "nonexistent-play");
+
+    wait_until("采集与播放切回有效设备后恢复计数", Duration::from_secs(3), || {
+        let st = get_status(&control);
+        st["frames_captured"].as_u64().unwrap_or(0) > 0
+            && st["frames_played"].as_u64().unwrap_or(0) > 0
+    });
+    assert_eq!(
+        get_status(&control)["last_error"],
+        Value::Null,
+        "双侧热切恢复后应清除启动期待机打开报错"
+    );
+
+    sigterm(&child.0);
+    let status = wait_exit(&mut child.0, Duration::from_secs(3));
+    assert!(status.success(), "pre 应优雅退出：{status:?}");
+    let _ = std::fs::remove_dir_all(&dir);
+}

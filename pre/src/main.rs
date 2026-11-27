@@ -13,8 +13,8 @@
 //! 释放给 daemon。其余消费者（默认 asr）与主干直出恒跑不受门控。
 //! 发送侧惰性建链，pre 启动不依赖消费者生命周期。
 //! DSP 级开关运行时经 SetDsp 生效：控制线程写目标原子，处理线程逐帧应用。
-//! 停止：SIGTERM/SIGINT 置停止标志，各线程在时限内退出；启动阶段设备打开失败立即退出，
-//! 运行中支持经 `PRE_SET_DEVICE` 热替换 ALSA 句柄（失败保留旧设备），物理拔线等致命错误退出由 daemon 退避重启。
+//! 停止：SIGTERM/SIGINT 置停止标志，各线程在时限内退出；启动阶段 ALSA 设备打开失败
+//! 记录 last_error 并进入待机，保留控制面在线；运行中支持经 `PRE_SET_DEVICE` 热替换 ALSA 句柄（失败保留旧设备），物理拔线等致命错误退出由 daemon 退避重启。
 
 mod aec;
 mod aec_probe;
@@ -430,20 +430,19 @@ fn main() -> ExitCode {
         }
     };
 
-    // 播放设备先就绪，后拉线程；采集源二选一：测试文件（SPEC-02 文件采集源）
-    // 或 ALSA 设备。文件契约在采集线程启动时入口校验，失败走致命错误传播。
-    let playback_pcm = match alsa_stream::open(
+    // 播放设备先尝试打开（失败则记入 last_error 并进入待机，允许随时经 PRE_SET_DEVICE 热切恢复）；
+    // 采集源二选一：测试文件（SPEC-02 文件采集源）或 ALSA 设备（同样允许缺设备待机）。
+    let mut open_errors = Vec::new();
+    let playback_pcm = try_open_alsa(
+        "playback",
         &config.pre.playback_device,
         Direction::Playback,
         probe_enabled,
-    ) {
-        Ok(pcm) => pcm,
-        Err(message) => {
-            eprintln!("mozart-pre: playback open: {message}");
-            return ExitCode::FAILURE;
-        }
-    };
-    alsa_stream::log_stream_setup("playback", &config.pre.playback_device, &playback_pcm);
+        &mut open_errors,
+    );
+    if playback_pcm.is_none() {
+        shared.playback_switch.mark_standby();
+    }
     eprintln!(
         "mozart-pre: ai link out={}",
         config.rvc_output_socket().display()
@@ -465,6 +464,9 @@ fn main() -> ExitCode {
         None => (None, None, None),
     };
     let capture_handle = if let Some(path) = config.pre.capture_file.clone() {
+        if !open_errors.is_empty() {
+            shared.set_last_error(&open_errors.join("; "));
+        }
         let ring = capture_ring.clone();
         let shared = shared.clone();
         match spawn_thread("mozart-capture", move || {
@@ -477,18 +479,19 @@ fn main() -> ExitCode {
             Err(err) => return spawn_failure("capture", err),
         }
     } else {
-        let capture_pcm = match alsa_stream::open(
+        let capture_pcm = try_open_alsa(
+            "capture",
             &config.pre.capture_device,
             Direction::Capture,
             probe_enabled,
-        ) {
-            Ok(pcm) => pcm,
-            Err(message) => {
-                eprintln!("mozart-pre: capture open: {message}");
-                return ExitCode::FAILURE;
-            }
-        };
-        alsa_stream::log_stream_setup("capture", &config.pre.capture_device, &capture_pcm);
+            &mut open_errors,
+        );
+        if capture_pcm.is_none() {
+            shared.capture_switch.mark_standby();
+        }
+        if !open_errors.is_empty() {
+            shared.set_last_error(&open_errors.join("; "));
+        }
         let ring = capture_ring.clone();
         let shared = shared.clone();
         match spawn_thread("mozart-capture", move || {
@@ -628,6 +631,27 @@ fn main() -> ExitCode {
             ExitCode::FAILURE
         }
         None => ExitCode::SUCCESS,
+    }
+}
+
+fn try_open_alsa(
+    role: &str,
+    device: &str,
+    direction: Direction,
+    timestamp: bool,
+    open_errors: &mut Vec<String>,
+) -> Option<alsa::pcm::PCM> {
+    match alsa_stream::open(device, direction, timestamp) {
+        Ok(pcm) => {
+            alsa_stream::log_stream_setup(role, device, &pcm);
+            Some(pcm)
+        }
+        Err(message) => {
+            let reason = format!("{role} open ({device}): {message}");
+            eprintln!("mozart-pre: {reason}");
+            open_errors.push(reason);
+            None
+        }
     }
 }
 

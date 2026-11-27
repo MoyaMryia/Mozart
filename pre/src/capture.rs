@@ -5,9 +5,10 @@ use crate::alsa_stream::{self, Op, StreamError, PERIOD_FRAMES};
 use crate::state::Shared;
 use alsa::Direction;
 use mozart_core::ring::Ring;
-use mozart_core::{FrameMeta, RawFrame, RAW_SAMPLES};
-use std::sync::atomic::AtomicBool;
+use mozart_core::{FrameMeta, RawFrame, FRAME_MS, RAW_SAMPLES};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
+use std::time::Duration;
 
 /// 单调时钟时间戳（纳秒），填 `meta.pts_ns`（frame.h 语义）。
 pub fn now_ns() -> u64 {
@@ -59,9 +60,10 @@ pub fn fl_to_mono(stereo: &[i16], out: &mut [f32]) {
 }
 
 /// 采集线程主体：攒满 960 样本即组装 RawFrame 入队。
-/// 返回 Err 表示致命流错误；主线程据此退出进程，daemon 按退避重启。
+/// 启动阶段若指定采集设备未就绪（`pcm == None`），以待机节拍等待 `PRE_SET_DEVICE` 热切接入；
+/// 运行中遇致命流错误仍返回 `Err`，交 daemon 退避重启。
 pub fn run(
-    mut pcm: alsa::pcm::PCM,
+    mut pcm: Option<alsa::pcm::PCM>,
     ring: Arc<Ring<CapturedFrame>>,
     shared: Arc<Shared>,
     stop: &'static AtomicBool,
@@ -73,6 +75,7 @@ pub fn run(
     let mut frame_idx: u32 = 0;
     let mut overruns = 0u64;
     let mut reported = 0u64;
+    let standby_poll = Duration::from_millis(FRAME_MS as u64);
     loop {
         if shared.capture_switch.has_pending() {
             let timestamp = probe.is_some();
@@ -89,19 +92,27 @@ pub fn run(
                     if let Some(probe) = &mut probe {
                         probe.discontinuity();
                     }
-                    pcm = new_pcm;
+                    pcm = Some(new_pcm);
                     filled = 0;
                     shared.bump_capture_epoch();
+                    shared.clear_startup_open_error_if_ready();
                 },
             );
         }
-        let io = pcm.io_i16().map_err(|err| {
+        let Some(active_pcm) = pcm.as_ref() else {
+            if stop.load(Ordering::Relaxed) {
+                return Ok(());
+            }
+            std::thread::sleep(standby_poll);
+            continue;
+        };
+        let io = active_pcm.io_i16().map_err(|err| {
             let message = format!("capture io_i16: {err}");
             shared.set_last_error(&message);
             message
         })?;
         match alsa_stream::transfer(
-            &pcm,
+            active_pcm,
             &io,
             Op::Read,
             &mut stereo,

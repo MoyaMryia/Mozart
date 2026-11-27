@@ -86,6 +86,8 @@
 
 ## 变更记录
 
+- 2026-11-27：`pre` 启动允许缺失采集或播放设备降级待机（记录 `last_error` 并允许同设备名热切重试，双侧活跃后清除启动打开报错，解除未接麦/扬声器导致的循环重启与部署健康阻塞）；主机集成测试已通过，Jetson 实机验证记录于 `SPEC-02`（SPEC-02）。
+- 2026-11-27：落地 TTS 合成与播放双线程解耦及 `PrefetchSlot` 单句预合成（`in_flight` 终态计数排序对齐 `idle` 回落与 `TTS_JOB_STOP` 中止），主机测试通过；Jetson 板端连续播报验收与弹性变速评估保留于对应待办（SPEC-05）。
 - 2026-11-27：修复语言链路纯标点复核与无字母数字内容处理，并将译文长度比上限由 5.0 调至 6.5，减少正常中译英短句与术语长句误杀（SPEC-05）。
 - 2026-11-26：接入 WebRTC AEC3 在线声学回声消除（SPEC-02 步骤 2–3）：播放线程在淡入/静音后经 `rtrb` 无锁环投递最终单声道参考，处理线程在 `48 kHz` 主干 `80 Hz` 高通后、降噪前钩入 AEC3；新增 `[pre.aec].enabled`（默认关，R 类）、`PRE_SET_AEC`（`0x020A`）热切换、`GetStatus` `aec` 指标（延时/ERLE/参考丢帧/重置/削波）与网页设备面板开关；`aec3/` 薄 C 封装经 pkg-config 链接 `webrtc-audio-processing-1`，`pre/build.rs` 按 `MOZART_AEC3_LIB_DIR` 可选链接、缺库走未链接桩；采播 epoch 跳变自动重置，崩溃自愈经 `--effective-aec` 沿用生效开关。三项边界（48 kHz 主干、薄封装直链、积压修剪加延时估计吸收漂移）由实现拍板，步骤 1 多房间实测定参与步骤 4 整机验收保留待办；登记用户反馈 AEC 效果不足与 UL-UNAS 去伴奏效果不足改进项（SPEC-02、SPEC-04、SPEC-06、`docs/config.md`、`docs/GUIDE.md`、`docs/SETUP.md`、架构图）。
 - 2026-11-26：将默认启动模式收敛为 `direct`（`[bridge].speech_enabled = false`，`translate_enabled = true` 跨模式保持持久），新增保持 `speech_enabled` 不变与托管模式的清队列命令 `DAEMON_SPEECH_CLEAR`（`0x0109`）/ `BRIDGE_SPEECH_CLEAR`（`0x0506`）/ `POST /api/v1/speech/clear` / `mozart-ctl speech clear`；Web 控制台路由卡片接入 `PUT /api/v1/mode` 三态互斥切换并于底部提供独立「翻译」开关，移除左侧独立「翻译播报」卡片，仅在翻译播报开启时于右侧条件展开带交互动效的「播报设置」卡片（含真实队列指标与「清除播报队列」操作，SPEC-04、SPEC-05、SPEC-06、`docs/config.md`、`docs/MODE-TRANSITIONS.md`）。

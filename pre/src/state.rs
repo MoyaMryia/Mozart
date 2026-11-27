@@ -18,6 +18,9 @@ struct SwitchRequest {
 
 struct DeviceSwitchInner {
     current: String,
+    /// 当前是否已实际持有打开的 ALSA 句柄；启动打开失败待机时为 false，
+    /// 允许后续对同设备名发起 PRE_SET_DEVICE 重试打开。
+    active: bool,
     locked_reason: Option<String>,
     request: Option<SwitchRequest>,
 }
@@ -38,10 +41,25 @@ impl DeviceSwitchSlot {
             request_lock: Mutex::new(()),
             inner: Mutex::new(DeviceSwitchInner {
                 current: initial,
+                active: true,
                 locked_reason: None,
                 request: None,
             }),
         }
+    }
+
+    pub fn mark_standby(&self) {
+        self.inner
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .active = false;
+    }
+
+    pub fn is_active(&self) -> bool {
+        self.inner
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .active
     }
 
     pub fn lock(&self, reason: &str) {
@@ -92,7 +110,7 @@ impl DeviceSwitchSlot {
             if let Some(reason) = &inner.locked_reason {
                 return Err((ctl::CODE_INVALID_ARGUMENT.to_string(), reason.clone()));
             }
-            if inner.current == target {
+            if inner.active && inner.current == target {
                 return Ok(inner.current.clone());
             }
             let (tx, rx) = mpsc::channel();
@@ -171,6 +189,7 @@ impl DeviceSwitchSlot {
                         .inner
                         .lock()
                         .unwrap_or_else(|poisoned| poisoned.into_inner());
+                    inner.active = true;
                     std::mem::replace(&mut inner.current, req.target.clone())
                 };
                 on_success(&req.target, stream);
@@ -664,6 +683,23 @@ impl Shared {
             .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(message.to_string());
     }
 
+    /// 采集与播放双侧均已活跃时，清理启动阶段留下的 `playback/capture open (...)` 待机告警。
+    pub fn clear_startup_open_error_if_ready(&self) {
+        if !(self.capture_switch.is_active() && self.playback_switch.is_active()) {
+            return;
+        }
+        let mut slot = self
+            .last_error
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if slot
+            .as_deref()
+            .is_some_and(|msg| msg.starts_with("playback open (") || msg.starts_with("capture open ("))
+        {
+            *slot = None;
+        }
+    }
+
     /// 组装 GetStatus 快照：只读原子与队列读数，不阻塞音频线程。
     pub fn status(&self, queue: QueueReadout) -> PreStatus {
         // consumer_drops 口径（SPEC-02 / SPEC-05）：键随配置消费者列表动态
@@ -1034,5 +1070,29 @@ mod tests {
             .unwrap_err();
         assert_eq!(locked.0, ctl::CODE_INVALID_ARGUMENT);
         assert!(locked.1.contains("capture_file"));
+
+        // 待机态下对同设备名发起切换不得幂等跳过，必须触发 apply_pending 试开恢复。
+        let standby_slot = std::sync::Arc::new(DeviceSwitchSlot::new("dev-a".to_string()));
+        standby_slot.mark_standby();
+        assert!(!standby_slot.is_active());
+        let worker_slot = standby_slot.clone();
+        let handle = std::thread::spawn(move || {
+            while !worker_slot.has_pending() {
+                std::thread::sleep(Duration::from_millis(1));
+            }
+            worker_slot.apply_pending(
+                |target| Ok(format!("reopened:{target}")),
+                |target, stream| {
+                    assert_eq!(target, "dev-a");
+                    assert_eq!(stream, "reopened:dev-a");
+                },
+            );
+        });
+        let recovered = standby_slot
+            .request_switch("dev-a", Duration::from_secs(1), &stop)
+            .unwrap();
+        assert_eq!(recovered, "dev-a");
+        assert!(standby_slot.is_active());
+        handle.join().unwrap();
     }
 }

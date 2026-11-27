@@ -47,7 +47,7 @@
 - 控制面（daemon → pre）：Unix SEQPACKET 定长头 + JSON。命令 `Hello`（版本握手）、`SetRoute{route}`（切 direct/rvc）、`SetMute{mute}`（静音开关）、`SetFileMode{active}`（文件接管开关：暂停/恢复 rvc AI 发送并交接 output_socket 绑定，asr 不受影响）、`SetDsp{denoise,gate,agc,limiter}`（运行中切换 DSP 级）、`GetStatus`。路由与静音由 pre 执行淡变，策略归 daemon。（`pre/src/control.rs`）
 - `SetDsp{denoise,gate,agc,limiter}`（运行中切换 DSP 级）：命令号 0x0207（`core/include/mozart/ctl.h`、`core/src/ctl.rs`），请求体 schema::DspSetRequest 四键必需、拒未知键；pre 校验后写目标原子，处理线程逐帧应用，应答回显四个开关。（`pre/src/control.rs` dispatch、`pre/src/main.rs` process_thread）
 - 状态：`GetStatus` 返回运行状态、路由、静音、文件接管状态（file_mode）、采集/播放设备名、采集/播放/丢弃帧计数、队列深度、各消费者丢弃计数、最近错误、版本。daemon 每秒轮询，pre 不主动推；旧 `pre-status.json` 废弃。（`pre/src/state.rs`）
-- 修改持久基线（`config set`）仍由 daemon 重启 pre 生效；运行时临时换设备走 `PRE_SET_DEVICE`（`0x0208`）。设备枚举归 daemon（SPEC-04），pre 只打开指定设备、打开失败保留旧设备或启动报错。（`pre/src/main.rs`、`pre/src/control.rs`）
+- 修改持久基线（`config set`）仍由 daemon 重启 pre 生效；运行时临时换设备走 `PRE_SET_DEVICE`（`0x0208`）。设备枚举归 daemon（SPEC-04），pre 只打开指定设备、热切失败保留旧设备；启动阶段若 `capture_device` 或 `playback_device` 打开失败，不阻塞启动，记录 `last_error` 并将对应槽位标为待机（`DeviceSwitchSlot::mark_standby`，允许后续对同设备名发起 `PRE_SET_DEVICE` 重试），待机期间 `playback` 不虚计实播帧并在双侧恢复活跃后自动清除启动打开报错（`pre/tests/set_device.rs` 主机测试已通过；未验证项：Jetson 板端真实无外设启动与实插拔恢复实测，阻塞原因：尚未部署本次改动至设备，解除条件：部署后在缺外设与重接后热切场景验证 `pre` 运行态与通音）。（`pre/src/main.rs`、`pre/src/state.rs`、`pre/src/capture.rs`、`pre/src/playback.rs`、`pre/src/control.rs`）
 - DSP 开关经 `SetDsp` 运行时生效；denoise 重新启用时重置 WOLA 流式状态（噪声估计、频谱队列、增益回到初始，重新攒初始化帧，首块同启动的 64 样本补零），避免陈旧状态伪影；gate/agc/limiter 直接切布尔。（`dsp/src/lib.rs` Dsp::set_switches、`dsp/src/noise_suppressor.rs` NoiseSuppressor::reset）
 
 ## UL-UNAS 可选后端

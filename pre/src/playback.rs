@@ -346,10 +346,11 @@ fn buffer_delay_ms(pcm: &alsa::pcm::PCM) -> u16 {
         .unwrap_or(45)
 }
 
-/// 播放线程主体。返回 Err 表示致命流错误；主线程据此退出进程。
+/// 播放线程主体。启动阶段若指定播放设备未就绪（`pcm == None`），按 20 ms 节拍继续排空
+/// 音频环并响应路线/静音确认与 `PRE_SET_DEVICE` 热切接入；运行中遇致命流错误仍返回 `Err`。
 #[allow(clippy::too_many_arguments)]
 pub fn run(
-    mut pcm: alsa::pcm::PCM,
+    mut pcm: Option<alsa::pcm::PCM>,
     trunk: Arc<Ring<RawFrame>>,
     rvc: Arc<Ring<OutputFrame>>,
     tts: Arc<Ring<mozart_core::SpeechFrame>>,
@@ -366,10 +367,11 @@ pub fn run(
     let mut previous_speaker = Speaker::Realtime;
     let mut previous_policy = PlayoutPolicy::Silent;
     let mut rvc_resampler = BoundaryResampler::new();
-    let mut playback_delay_ms = buffer_delay_ms(&pcm);
+    let mut playback_delay_ms = pcm.as_ref().map(buffer_delay_ms).unwrap_or(0);
     let mut underruns = 0u64;
     let mut reported = 0u64;
     loop {
+        let frame_start = Instant::now();
         // This boundary follows the previous ALSA write. Acknowledgement here
         // precedes selection using the installed cutoff.
         if shared.playback_switch.has_pending() {
@@ -387,18 +389,14 @@ pub fn run(
                     if let Some(probe) = &mut probe {
                         probe.discontinuity();
                     }
-                    pcm = new_pcm;
-                    playback_delay_ms = buffer_delay_ms(&pcm);
+                    playback_delay_ms = buffer_delay_ms(&new_pcm);
+                    pcm = Some(new_pcm);
                     ref_tx.discontinuity();
                     fade_in.trigger();
+                    shared.clear_startup_open_error_if_ready();
                 },
             );
         }
-        let io = pcm.io_i16().map_err(|err| {
-            let message = format!("playback io_i16: {err}");
-            shared.set_last_error(&message);
-            message
-        })?;
         // Read the request before its fields so a new command cannot get a
         // playback ACK based on an older route snapshot.
         let request_id = shared.playback_request.load(Ordering::SeqCst);
@@ -428,6 +426,20 @@ pub fn run(
             previous_speaker = state;
         }
 
+        let Some(active_pcm) = pcm.as_ref() else {
+            // 无有效播放设备时仅按 20 ms 节拍排空环而不累加 tts_frames_played / rvc_playout_gap 等实播计数。
+            let _ = trunk.pop(Some(Duration::ZERO));
+            drain_rvc_skipped(&rvc, &shared);
+            rvc_resampler.reset();
+            if let Some(remaining) = REALTIME_FRAME_WAIT.checked_sub(frame_start.elapsed()) {
+                std::thread::sleep(remaining);
+            }
+            if stop.load(Ordering::Relaxed) {
+                return Ok(());
+            }
+            continue;
+        };
+
         let mut mono = match state {
             Speaker::Broadcast => step_broadcast(
                 prev,
@@ -449,8 +461,13 @@ pub fn run(
         mute.apply(&mut mono);
         mono_to_s16_stereo(&mono, &mut stereo);
 
+        let io = active_pcm.io_i16().map_err(|err| {
+            let message = format!("playback io_i16: {err}");
+            shared.set_last_error(&message);
+            message
+        })?;
         match alsa_stream::transfer(
-            &pcm,
+            active_pcm,
             &io,
             Op::Write,
             &mut stereo,

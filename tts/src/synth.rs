@@ -1,26 +1,28 @@
 //! 合成工作线程：从任务队列取句 → 文本预处理 → PocketTTS 流式合成（生成回调每段
-//! 交付 PCM）→ 逐段重采样 48 kHz → 经有界通道交输出线程按节拍发契约帧（v1 不走
-//! 变声，直接喂 pre 播放，合成一段播一段）。模型加载失败为致命错误（进程退出由
-//! daemon 重启）；单句合成失败计数并记录原因，不影响后续任务。SIGTERM 放弃在途
-//! 合成与队列剩余。
+//! 交付 PCM）→ 逐段重采样 48 kHz → 经单句预合成槽 + 有界段通道交由常驻播放线程
+//! 按 20 ms 节拍发契约帧（边合成边播，且在播放当前句时提前合成下一句以消除句间空白；
+//! v1 不走变声，直接喂 pre 播放）。模型加载失败为致命错误（进程退出由 daemon 重启）；
+//! 单句合成失败计数并记录原因，不影响后续任务。SIGTERM 放弃在途合成、预合成槽与队列剩余。
 
 use crate::ffi::{self, Synthesizer};
 use crate::jobs::Job;
 use crate::output::FrameWriter;
 use crate::resample::{Upsample2, TTS_NATIVE_SAMPLE_RATE};
-use crate::state::Shared;
+use crate::state::{Abort, Shared};
 use mozart_core::OUTPUT_SAMPLE_RATE;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering::Relaxed};
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError};
+use std::sync::{Condvar, Mutex};
 use std::time::Duration;
 
 /// 队列轮询步长：让停止标志在百毫秒级生效（daemon 宽限 2 s）。
 const QUEUE_POLL: Duration = Duration::from_millis(100);
 
 /// 合成段通道容量（段数）：输出线程按实时节拍消费，通道满时 sink 阻塞反压，
-/// 把引擎解码节流到播放速率，内存上限约 容量 × 单段时长 × 48 kHz × 4 字节。
-const SEG_BUFFER: usize = 4;
+/// 把引擎解码节流到播放速率；取值 32 使预合成中的下一句短句可先跑完解码
+/// 再等播放槽切换，同时仍把峰值缓冲限制在有界范围内。
+const SEG_BUFFER: usize = 32;
 
 /// 每句时长上限（沿用旧 speech_service.py:520，中文按字符）：
 /// min(45, max(4, 字符数 × 0.35 + 2)) 秒。超限拒绝计 failed。
@@ -217,9 +219,193 @@ pub fn run(
     Ok(())
 }
 
-/// 服务循环（引擎可注入，供测试）。进程停止标志置位后放弃在途结果与队列剩余，
-/// 帧投递中途同样中断；TTS_JOB_STOP 推进任务代际，在途合成经 Abort 中止、在队
-/// 任务下一轮清空（真实 FFI 的在途生成另经进度回调中止，见 ffi::real）。
+enum SynthOutcome {
+    Finished(usize),
+    Failed(String),
+}
+
+struct PlaybackItem<'a> {
+    utterance_id: String,
+    abort: Abort<'a>,
+    seg_rx: Receiver<Vec<f32>>,
+    done_rx: Receiver<SynthOutcome>,
+}
+
+struct SlotState<'a> {
+    item: Option<PlaybackItem<'a>>,
+    closed: bool,
+}
+
+/// 容量为 1 的单句预合成槽：允许合成线程在播放线程按 20 ms 节拍消费当前句时，
+/// 提前启动下一句的 LM + 解码；槽满时阻塞合成线程，避免超前堆积多个长句。
+struct PrefetchSlot<'a> {
+    state: Mutex<SlotState<'a>>,
+    not_full: Condvar,
+    not_empty: Condvar,
+}
+
+impl<'a> PrefetchSlot<'a> {
+    fn new() -> Self {
+        Self {
+            state: Mutex::new(SlotState { item: None, closed: false }),
+            not_full: Condvar::new(),
+            not_empty: Condvar::new(),
+        }
+    }
+
+    /// 等待预合成槽空出或停止信号置位；返回 false 表示应结束循环。
+    fn wait_empty(&self, stop: &AtomicBool) -> bool {
+        let mut guard = self.state.lock().unwrap_or_else(|p| p.into_inner());
+        while guard.item.is_some() {
+            if stop.load(Relaxed) {
+                return false;
+            }
+            let (next, _) = self.not_full.wait_timeout(guard, QUEUE_POLL)
+                .unwrap_or_else(|p| p.into_inner());
+            guard = next;
+        }
+        !stop.load(Relaxed)
+    }
+
+    /// 放入待播报句；调用方（唯一生产者）已在调用前通过 wait_empty 确认槽位为空。
+    fn push(&self, item: PlaybackItem<'a>) {
+        let mut guard = self.state.lock().unwrap_or_else(|p| p.into_inner());
+        debug_assert!(guard.item.is_none() && !guard.closed);
+        guard.item = Some(item);
+        self.not_empty.notify_one();
+    }
+
+    /// 取出下一句，直至槽内已无未消费句且生产者已关闭。
+    fn pop(&self) -> Option<PlaybackItem<'a>> {
+        let mut guard = self.state.lock().unwrap_or_else(|p| p.into_inner());
+        loop {
+            if let Some(item) = guard.item.take() {
+                self.not_full.notify_one();
+                return Some(item);
+            }
+            if guard.closed {
+                return None;
+            }
+            guard = self.not_empty.wait(guard).unwrap_or_else(|p| p.into_inner());
+        }
+    }
+
+    fn close(&self) {
+        let mut guard = self.state.lock().unwrap_or_else(|p| p.into_inner());
+        guard.closed = true;
+        self.not_empty.notify_all();
+        self.not_full.notify_all();
+    }
+}
+
+struct CloseOnDrop<'s, 'a>(&'s PrefetchSlot<'a>);
+
+impl Drop for CloseOnDrop<'_, '_> {
+    fn drop(&mut self) {
+        self.0.close();
+    }
+}
+
+fn synthesize_utterance(
+    job: &Job,
+    engine: &dyn Synthesizer,
+    ref_samples: &[f32],
+    ref_rate: u32,
+    abort: &Abort<'_>,
+    seg_tx: mpsc::SyncSender<Vec<f32>>,
+) -> SynthOutcome {
+    let text = precondition(&job.text);
+    let budget = duration_cap_samples(job.text.chars().count());
+    let rate = engine.sample_rate();
+    let upsample = match rate {
+        OUTPUT_SAMPLE_RATE => false,
+        TTS_NATIVE_SAMPLE_RATE => true,
+        _ => return SynthOutcome::Failed(format!("不支持的 TTS 采样率 {rate} Hz")),
+    };
+
+    // 用累计样本核算时长，包括句末插值样本。句内增益单调不增。
+    let mut remaining_samples = budget;
+    let mut running_gain = 1.0f32;
+    let mut total_samples = 0usize;
+    let mut stream_err: Option<String> = None;
+    let mut resampler = Upsample2::default();
+    let result = {
+        let mut submit = |mut pcm: Vec<f32>| -> Result<(), String> {
+            sanitize_segment(&mut pcm, OUTPUT_SAMPLE_RATE, &mut remaining_samples, &mut running_gain)?;
+            total_samples += pcm.len();
+            seg_tx.send(pcm).map_err(|_| "播报输出已停止".to_string())
+        };
+        let result = {
+            let mut sink = |segment: &[f32]| -> bool {
+                // The FFI callback only delivers non-empty segments.
+                let pcm = if upsample { resampler.push(segment) } else { segment.to_vec() };
+                match submit(pcm) {
+                    Ok(()) => true,
+                    Err(reason) => {
+                        stream_err = Some(reason);
+                        false
+                    }
+                }
+            };
+            engine.synthesize(&text, ref_samples, ref_rate, abort, &mut sink)
+        };
+        if result.is_ok() && stream_err.is_none() && !abort.aborted() {
+            if let Some(tail) = resampler.finish() {
+                stream_err = submit(vec![tail]).err();
+            }
+        }
+        result
+    };
+    // 显式关闭通道（drop 按值接管的 seg_tx），让播放端按正常收尾发完末帧。
+    drop(seg_tx);
+
+    if let Some(reason) = stream_err {
+        SynthOutcome::Failed(reason)
+    } else if let Err(reason) = result {
+        SynthOutcome::Failed(reason)
+    } else {
+        SynthOutcome::Finished(total_samples)
+    }
+}
+
+fn playback_loop(slot: &PrefetchSlot<'_>, writer: &mut FrameWriter, shared: &Shared) {
+    while let Some(item) = slot.pop() {
+        if !item.abort.aborted() {
+            crate::output::write_stream(item.seg_rx, writer, &item.abort);
+        } else {
+            // 已中止则立刻弃置段接收端，解除合成端可能阻塞的 seg_tx.send。
+            drop(item.seg_rx);
+        }
+        let outcome = item.done_rx.recv();
+        // 先撤出在途计数（SeqCst），再发布终态计数，保证外部看到完成增量即可见状态回落 idle。
+        shared.leave_flight();
+        if item.abort.aborted() {
+            // TTS_JOB_STOP 或 SIGTERM 在途到达：取消本句，不计失败。
+            shared.add_stopped(1);
+            continue;
+        }
+        match outcome {
+            Ok(SynthOutcome::Failed(reason)) => {
+                shared.set_last_error(&format!("{}: {reason}", item.utterance_id));
+                shared.add_failed(1);
+            }
+            Ok(SynthOutcome::Finished(0)) => {
+                shared.set_last_error(&format!("{}: 引擎返回空音频", item.utterance_id));
+                shared.add_failed(1);
+            }
+            Ok(SynthOutcome::Finished(_)) => shared.add_synthesized(1),
+            Err(_) => {
+                shared.set_last_error(&format!("{}: 合成通道意外关闭", item.utterance_id));
+                shared.add_failed(1);
+            }
+        }
+    }
+}
+
+/// 服务循环（引擎可注入，供测试）。合成线程与常驻播放线程通过单句预合成槽解耦：
+/// 播放线程按 20 ms 节拍输出当前句时，合成线程可提前合成下一句以消除句间空白。
+/// 进程停止标志置位后放弃在途结果与队列剩余；TTS_JOB_STOP 推进任务代际，在途
+/// 合成与预合成槽中的旧句经 Abort 中止并计 stopped。
 pub fn run_with(
     jobs: Receiver<Job>,
     engine: &dyn Synthesizer,
@@ -232,96 +418,56 @@ pub fn run_with(
         Some(reference) => (reference.samples.as_slice(), reference.sample_rate),
         None => (&[][..], 0),
     };
-    while !stop.load(Relaxed) {
-        let job = match jobs.recv_timeout(QUEUE_POLL) {
-            Ok(job) => job,
-            Err(RecvTimeoutError::Timeout) => continue,
-            Err(RecvTimeoutError::Disconnected) => break,
-        };
-        shared.queue_pop();
-        if stop.load(Relaxed) {
-            break;
-        }
-        let abort = shared.abort_job(stop, job.issued_ns);
-        if abort.aborted() { shared.add_stopped(1); continue; }
-        shared.set_synthesizing(true);
-        let text = precondition(&job.text);
-        let budget = duration_cap_samples(job.text.chars().count());
-        let rate = engine.sample_rate();
-        let upsample = match rate {
-            OUTPUT_SAMPLE_RATE => false,
-            TTS_NATIVE_SAMPLE_RATE => true,
-            _ => {
-                shared.add_failed(1);
-                shared.set_last_error(&format!("{}: 不支持的 TTS 采样率 {rate} Hz", job.utterance_id));
-                shared.set_synthesizing(false);
+    let slot = PrefetchSlot::new();
+    std::thread::scope(|scope| {
+        let playback = scope.spawn(|| playback_loop(&slot, writer, shared));
+        let _close = CloseOnDrop(&slot);
+
+        while !stop.load(Relaxed) {
+            if !slot.wait_empty(stop) {
+                break;
+            }
+            let job = match jobs.recv_timeout(QUEUE_POLL) {
+                Ok(job) => job,
+                Err(RecvTimeoutError::Timeout) => continue,
+                Err(RecvTimeoutError::Disconnected) => break,
+            };
+            if stop.load(Relaxed) {
+                shared.queue_pop();
+                break;
+            }
+            // 先 enter_flight 再 queue_pop，避免两者之间出现 queue_depth==0 && state=="idle" 假窗口。
+            shared.enter_flight();
+            shared.queue_pop();
+            let abort = shared.abort_job(stop, job.issued_ns);
+            if abort.aborted() {
+                shared.leave_flight();
+                shared.add_stopped(1);
                 continue;
             }
-        };
 
-        // 流式：synth 线程经生成回调逐段交付，sink 重采样 + 安全校验后送有界通道；
-        //  scoped 输出线程独占 writer 按节拍发帧。通道满时 sink 阻塞反压引擎解码。
-        let (seg_tx, seg_rx) = mpsc::sync_channel::<Vec<f32>>(SEG_BUFFER);
-        // 用累计样本核算时长，包括句末插值样本。句内增益单调不增。
-        let mut remaining_samples = budget;
-        let mut running_gain = 1.0f32;
-        let mut total_samples = 0usize;
-        let mut stream_err: Option<String> = None;
-
-        let result = std::thread::scope(|scope| {
-            let output = scope.spawn(|| crate::output::write_stream(seg_rx, writer, &abort));
-            let mut resampler = Upsample2::default();
-            let result = {
-                let mut submit = |mut pcm: Vec<f32>| -> Result<(), String> {
-                    sanitize_segment(&mut pcm, OUTPUT_SAMPLE_RATE, &mut remaining_samples, &mut running_gain)?;
-                    total_samples += pcm.len();
-                    seg_tx.send(pcm).map_err(|_| "播报输出已停止".to_string())
-                };
-                let result = {
-                    let mut sink = |segment: &[f32]| -> bool {
-                        // The FFI callback only delivers non-empty segments.
-                        let pcm = if upsample { resampler.push(segment) } else { segment.to_vec() };
-                        match submit(pcm) {
-                            Ok(()) => true,
-                            Err(reason) => {
-                                stream_err = Some(reason);
-                                false
-                            }
-                        }
-                    };
-                    engine.synthesize(&text, ref_samples, ref_rate, &abort, &mut sink)
-                };
-                if result.is_ok() && stream_err.is_none() && !abort.aborted() {
-                    if let Some(tail) = resampler.finish() {
-                        stream_err = submit(vec![tail]).err();
-                    }
-                }
-                result
-            };
-            // sink 按引用借用 seg_tx（send 取 &self），析构不关闭通道；显式 drop
-            // 关闭通道，输出线程排空后退出，再回收 writer 供下一句复用。
-            drop(seg_tx);
-            output.join().expect("输出线程 panic");
-            result
-        });
-
-        if abort.aborted() {
-            // TTS_JOB_STOP 或 SIGTERM 在途到达：取消本句，不投递、不计失败。
-            shared.add_stopped(1);
-        } else if let Some(reason) = stream_err {
-            shared.add_failed(1);
-            shared.set_last_error(&format!("{}: {reason}", job.utterance_id));
-        } else if let Err(reason) = result {
-            shared.add_failed(1);
-            shared.set_last_error(&format!("{}: {reason}", job.utterance_id));
-        } else if total_samples == 0 {
-            shared.add_failed(1);
-            shared.set_last_error(&format!("{}: 引擎返回空音频", job.utterance_id));
-        } else {
-            shared.add_synthesized(1);
+            shared.set_synthesizing(true);
+            let (seg_tx, seg_rx) = mpsc::sync_channel::<Vec<f32>>(SEG_BUFFER);
+            let (done_tx, done_rx) = mpsc::sync_channel::<SynthOutcome>(1);
+            slot.push(PlaybackItem {
+                utterance_id: job.utterance_id.clone(),
+                abort: shared.abort_job(stop, job.issued_ns),
+                seg_rx,
+                done_rx,
+            });
+            let outcome = synthesize_utterance(&job, engine, ref_samples, ref_rate, &abort, seg_tx);
+            // 须在 done_tx.send 前清除 synthesizing，避免 playback_loop 先 leave_flight 并加
+            // 完成计数后，status() 在 idle 检查窗口读到残留的 synthesizing == true。
+            shared.set_synthesizing(false);
+            if done_tx.send(outcome).is_err() {
+                shared.set_last_error(&format!("{}: 播放线程已提前退出", job.utterance_id));
+                break;
+            }
         }
-        shared.set_synthesizing(false);
-    }
+
+        drop(_close);
+        playback.join().expect("播放线程 panic");
+    });
     shared.set_synthesizing(false);
 }
 
@@ -824,6 +970,279 @@ mod tests {
         let p1 = f1.frame.pcm;
         assert!((p0[0] - TARGET_PEAK).abs() < 1e-6);
         assert!((p1[0] - 0.25).abs() < 1e-6, "次段须沿用 0.5 增益：{}", p1[0]);
+        cleanup(&path);
+    }
+
+    /// 预合成解耦：播放第 1 句（~280 ms）的同时提前跑完第 2 句 LM 耗时（180 ms），
+    /// 第 1 句末帧与第 2 句首帧之间的空白须明显小于 LM 耗时，不再串行卡顿。
+    #[test]
+    fn prefetch_overlaps_next_sentence_lm_with_current_playback() {
+        use std::sync::atomic::AtomicUsize;
+        use std::time::Instant;
+
+        const LM_DELAY: Duration = Duration::from_millis(180);
+        const FRAMES_PER_UTT: usize = 15; // 14 * 20ms = 280ms 播放时长
+        struct SlowLmEngine {
+            calls: Arc<AtomicUsize>,
+            second_synth_start: Arc<Mutex<Option<Instant>>>,
+        }
+        impl Synthesizer for SlowLmEngine {
+            fn sample_rate(&self) -> u32 {
+                OUTPUT_SAMPLE_RATE
+            }
+            fn synthesize(
+                &self,
+                _t: &str,
+                _r: &[f32],
+                _rr: u32,
+                abort: &Abort<'_>,
+                sink: &mut dyn FnMut(&[f32]) -> bool,
+            ) -> Result<(), String> {
+                let idx = self.calls.fetch_add(1, Relaxed);
+                if idx == 1 {
+                    *self.second_synth_start.lock().unwrap() = Some(Instant::now());
+                }
+                std::thread::sleep(LM_DELAY);
+                if abort.aborted() {
+                    return Ok(());
+                }
+                let _ = sink(&vec![0.25; FRAMES_PER_UTT * mozart_core::OUTPUT_SAMPLES]);
+                Ok(())
+            }
+        }
+
+        let (path, mut writer, shared, rx) = writer_fixture("prefetch-overlap");
+        let stop = AtomicBool::new(false);
+        let calls = Arc::new(AtomicUsize::new(0));
+        let second_synth_start = Arc::new(Mutex::new(None));
+        let engine = SlowLmEngine {
+            calls: calls.clone(),
+            second_synth_start: second_synth_start.clone(),
+        };
+
+        let j1 = job("a:1");
+        let mut j2 = job("a:2");
+        j2.issued_ns = j1.issued_ns + 1;
+
+        let (tx, jobs_rx) = mpsc::sync_channel(4);
+        tx.send(j1).unwrap();
+        tx.send(j2).unwrap();
+        shared.queue_push();
+        shared.queue_push();
+        drop(tx);
+
+        let receiver = std::thread::spawn(move || {
+            let mut s1_last = None;
+            let mut s2_first = None;
+            for idx in 0..(FRAMES_PER_UTT * 2) {
+                let frame = rx.recv(Some(Duration::from_secs(5))).unwrap();
+                let stamp = frame.issued_ns;
+                if idx == FRAMES_PER_UTT - 1 {
+                    s1_last = Some((Instant::now(), stamp));
+                } else if idx == FRAMES_PER_UTT {
+                    s2_first = Some((Instant::now(), stamp));
+                }
+            }
+            (s1_last.unwrap(), s2_first.unwrap())
+        });
+
+        run_with(jobs_rx, &engine, None, &mut writer, &shared, &stop);
+        let ((s1_last_at, _s1_stamp), (s2_first_at, _s2_stamp)) = receiver.join().unwrap();
+
+        let s2_start = second_synth_start.lock().unwrap().expect("应已开始合成第 2 句");
+        assert!(
+            s2_start < s1_last_at,
+            "第 2 句须在第 1 句播完前提前开始合成"
+        );
+        let gap = s2_first_at.saturating_duration_since(s1_last_at);
+        assert!(
+            gap < Duration::from_millis(100),
+            "句间切换空白 {} ms 须远小于 LM 耗时 {} ms",
+            gap.as_millis(),
+            LM_DELAY.as_millis()
+        );
+        let status = shared.status();
+        assert_eq!(status.synthesized, 2);
+        assert_eq!(status.frames_out, (FRAMES_PER_UTT * 2) as u64);
+        assert_eq!(status.state, "idle");
+        cleanup(&path);
+    }
+
+    /// 预合成槽容量严格为 1：第 1 句播放期间最多预合成第 2 句，第 3 句须等第 1 句交出
+    /// 播放槽（第 2 句弹出预合成槽）后才能开始合成，避免超前堆积多个长句。
+    #[test]
+    fn prefetch_slot_bounds_ahead_to_single_utterance() {
+        use std::sync::atomic::AtomicUsize;
+
+        const FRAMES_S1: usize = 45; // 44 * 20ms = 880ms
+        struct CountingEngine {
+            calls: Arc<AtomicUsize>,
+        }
+        impl Synthesizer for CountingEngine {
+            fn sample_rate(&self) -> u32 {
+                OUTPUT_SAMPLE_RATE
+            }
+            fn synthesize(
+                &self,
+                _t: &str,
+                _r: &[f32],
+                _rr: u32,
+                _abort: &Abort<'_>,
+                sink: &mut dyn FnMut(&[f32]) -> bool,
+            ) -> Result<(), String> {
+                let n = self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst) + 1;
+                let frames = if n == 1 { FRAMES_S1 } else { 3 };
+                let _ = sink(&vec![0.25; frames * mozart_core::OUTPUT_SAMPLES]);
+                Ok(())
+            }
+        }
+
+        let (path, mut writer, shared, rx) = writer_fixture("prefetch-bound");
+        let stop = AtomicBool::new(false);
+        let calls = Arc::new(AtomicUsize::new(0));
+        let engine = CountingEngine { calls: calls.clone() };
+
+        let j1 = job("a:1");
+        let mut j2 = job("a:2");
+        let mut j3 = job("a:3");
+        j2.issued_ns = j1.issued_ns + 1;
+        j3.issued_ns = j1.issued_ns + 2;
+
+        let (tx, jobs_rx) = mpsc::sync_channel(4);
+        tx.send(j1).unwrap();
+        tx.send(j2).unwrap();
+        tx.send(j3).unwrap();
+        shared.queue_push();
+        shared.queue_push();
+        shared.queue_push();
+        drop(tx);
+
+        let receiver = std::thread::spawn(move || {
+            for _ in 0..(FRAMES_S1 + 6) {
+                let _ = rx.recv(Some(Duration::from_secs(5))).unwrap();
+            }
+        });
+
+        let probe_calls = calls.clone();
+        let probe_shared = shared.clone();
+        let probe = std::thread::spawn(move || {
+            // 等待第 2 句也进入预合成槽且第 1 句仍在播放窗口内。
+            let deadline = std::time::Instant::now() + Duration::from_secs(2);
+            while probe_calls.load(std::sync::atomic::Ordering::SeqCst) < 2 {
+                assert!(std::time::Instant::now() < deadline, "超时未见第 2 句预合成");
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            std::thread::sleep(Duration::from_millis(100));
+            let s1_frames_so_far = probe_shared.status().frames_out;
+            assert!(
+                s1_frames_so_far < FRAMES_S1 as u64,
+                "探针超时未停在第 1 句播放窗口内：{s1_frames_so_far}/{FRAMES_S1}"
+            );
+            assert_eq!(
+                probe_calls.load(std::sync::atomic::Ordering::SeqCst),
+                2,
+                "第 1 句仅播出 {s1_frames_so_far}/{FRAMES_S1} 帧时不得开始合成第 3 句"
+            );
+        });
+
+        run_with(jobs_rx, &engine, None, &mut writer, &shared, &stop);
+        probe.join().unwrap();
+        receiver.join().unwrap();
+
+        let status = shared.status();
+        assert_eq!(status.synthesized, 3);
+        assert_eq!(status.queue_depth, 0);
+        assert_eq!(status.state, "idle");
+        cleanup(&path);
+    }
+
+    /// 运行期触发 TTS_JOB_STOP：正播放的第 1 句立即中止，已在预合成槽的第 2 句与
+    /// 在队列的第 3 句均不得播出且全部计入 stopped，最终回落 idle。
+    #[test]
+    fn job_stop_cancels_playing_prefetched_and_queued_utterances() {
+        use std::sync::atomic::AtomicUsize;
+
+        struct ThreeJobEngine {
+            calls: Arc<AtomicUsize>,
+        }
+        impl Synthesizer for ThreeJobEngine {
+            fn sample_rate(&self) -> u32 {
+                OUTPUT_SAMPLE_RATE
+            }
+            fn synthesize(
+                &self,
+                _t: &str,
+                _r: &[f32],
+                _rr: u32,
+                _abort: &Abort<'_>,
+                sink: &mut dyn FnMut(&[f32]) -> bool,
+            ) -> Result<(), String> {
+                let n = self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst) + 1;
+                let frames = if n == 1 { 30 } else { 5 }; // 第 1 句 ~580ms，足够第 2 句进入预合成槽
+                let _ = sink(&vec![0.25; frames * mozart_core::OUTPUT_SAMPLES]);
+                Ok(())
+            }
+        }
+
+        let (path, mut writer, shared, rx) = writer_fixture("jobstop-prefetch");
+        let stop = AtomicBool::new(false);
+        let calls = Arc::new(AtomicUsize::new(0));
+        let engine = ThreeJobEngine { calls: calls.clone() };
+
+        let j1 = job("a:1");
+        let mut j2 = job("a:2");
+        let mut j3 = job("a:3");
+        j2.issued_ns = j1.issued_ns + 1;
+        j3.issued_ns = j1.issued_ns + 2;
+        let s1_ns = j1.issued_ns;
+        let s2_ns = j2.issued_ns;
+        let s3_ns = j3.issued_ns;
+
+        let (tx, jobs_rx) = mpsc::sync_channel(4);
+        tx.send(j1).unwrap();
+        tx.send(j2).unwrap();
+        tx.send(j3).unwrap();
+        shared.queue_push();
+        shared.queue_push();
+        shared.queue_push();
+        drop(tx);
+
+        let stopper_shared = shared.clone();
+        let stopper_calls = calls.clone();
+        let stopper = std::thread::spawn(move || {
+            let deadline = std::time::Instant::now() + Duration::from_secs(2);
+            while stopper_calls.load(std::sync::atomic::Ordering::SeqCst) < 2
+                || stopper_shared.status().frames_out < 1
+            {
+                assert!(std::time::Instant::now() < deadline, "超时未进入第1句播放+第2句预合成态");
+                std::thread::sleep(Duration::from_millis(5));
+            }
+            stopper_shared.stop_jobs();
+        });
+
+        run_with(jobs_rx, &engine, None, &mut writer, &shared, &stop);
+        stopper.join().unwrap();
+
+        let mut seen_s1 = 0usize;
+        let mut seen_other = 0usize;
+        while let Ok(frame) = rx.recv(Some(Duration::from_millis(50))) {
+            let stamp = frame.issued_ns;
+            if stamp == s1_ns {
+                seen_s1 += 1;
+            } else {
+                assert!(stamp != s2_ns && stamp != s3_ns, "被取消的预合成句/排队句不得发帧");
+                seen_other += 1;
+            }
+        }
+        assert!(seen_s1 >= 1 && seen_s1 < 30, "第 1 句应在中途停止：seen_s1={seen_s1}");
+        assert_eq!(seen_other, 0);
+
+        let status = shared.status();
+        assert_eq!(status.synthesized, 0);
+        assert_eq!(status.failed, 0);
+        assert_eq!(status.stopped, 3, "播放中 1 + 预合成槽 1 + 队列 1 全部计 stopped");
+        assert_eq!(status.queue_depth, 0);
+        assert_eq!(status.state, "idle");
         cleanup(&path);
     }
 }
