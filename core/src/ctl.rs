@@ -80,6 +80,9 @@ pub const DAEMON_OUTPUT_MODE_SET: u16 = 0x0122;
 pub const DAEMON_SERVICES_START: u16 = 0x0123;
 /// 体：{}（空），停止业务子服务组（daemon 与 web 在线），data {"state":"stopped"|"not-running"}。
 pub const DAEMON_SERVICES_STOP: u16 = 0x0124;
+/// 体：schema::MicMixerSetRequest {"volume_percent"?:u8,"agc_enabled"?:bool}，
+/// 调节当前活跃采集卡的 ALSA 硬件混音器（不写回 TOML）。
+pub const DAEMON_MIC_MIXER_SET: u16 = 0x0125;
 
 /// Budget for operations involving up to six serial RPCs.
 pub fn config_set_timeout_ms(rpc_timeout_ms: u64) -> u64 {
@@ -117,6 +120,10 @@ pub const PRE_SET_DEVICE: u16 = 0x0208;
 pub const PRE_SET_PLAYOUT: u16 = 0x0209;
 /// 体：schema::AecSetRequest {"enabled": bool}；运行中启停声学回声消除（SPEC-02）。
 pub const PRE_SET_AEC: u16 = 0x020A;
+/// 体：schema::CaptureGainSetRequest {"capture_gain_db": f32}；运行中调节软件前级增益（SPEC-02）。
+pub const PRE_SET_CAPTURE_GAIN: u16 = 0x020B;
+/// 体：schema::MicMixerSetRequest {"volume_percent"?:u8,"agc_enabled"?:bool}；调节当前采集卡硬件混音器（SPEC-02）。
+pub const PRE_SET_MIC_MIXER: u16 = 0x020C;
 
 pub const RVC_HELLO: u16 = 0x0301;
 pub const RVC_LOAD_MODEL: u16 = 0x0302;
@@ -695,6 +702,7 @@ mod tests {
         assert_eq!(DAEMON_OUTPUT_MODE_SET, 0x0122);
         assert_eq!(DAEMON_SERVICES_START, 0x0123);
         assert_eq!(DAEMON_SERVICES_STOP, 0x0124);
+        assert_eq!(DAEMON_MIC_MIXER_SET, 0x0125);
         assert_eq!(RVC_LIST_MODELS, 0x0307);
         assert_eq!(RVC_SET_PARAMS, 0x0308);
         assert_eq!(PRE_SET_FILE_MODE, 0x0206);
@@ -702,6 +710,8 @@ mod tests {
         assert_eq!(PRE_SET_DEVICE, 0x0208);
         assert_eq!(PRE_SET_PLAYOUT, 0x0209);
         assert_eq!(PRE_SET_AEC, 0x020A);
+        assert_eq!(PRE_SET_CAPTURE_GAIN, 0x020B);
+        assert_eq!(PRE_SET_MIC_MIXER, 0x020C);
         assert_eq!(ENHANCE_HELLO, 0x0701);
         assert_eq!(ENHANCE_GET_STATUS, 0x0702);
     }
@@ -738,6 +748,7 @@ mod tests {
         ("DAEMON_OUTPUT_MODE_SET", DAEMON_OUTPUT_MODE_SET),
         ("DAEMON_SERVICES_START", DAEMON_SERVICES_START),
         ("DAEMON_SERVICES_STOP", DAEMON_SERVICES_STOP),
+        ("DAEMON_MIC_MIXER_SET", DAEMON_MIC_MIXER_SET),
         ("PRE_HELLO", PRE_HELLO),
         ("PRE_SET_ROUTE", PRE_SET_ROUTE),
         ("PRE_SET_MUTE", PRE_SET_MUTE),
@@ -748,6 +759,8 @@ mod tests {
         ("PRE_SET_DEVICE", PRE_SET_DEVICE),
         ("PRE_SET_PLAYOUT", PRE_SET_PLAYOUT),
         ("PRE_SET_AEC", PRE_SET_AEC),
+        ("PRE_SET_CAPTURE_GAIN", PRE_SET_CAPTURE_GAIN),
+        ("PRE_SET_MIC_MIXER", PRE_SET_MIC_MIXER),
         ("RVC_HELLO", RVC_HELLO),
         ("RVC_LOAD_MODEL", RVC_LOAD_MODEL),
         ("RVC_START_STREAM", RVC_START_STREAM),

@@ -1,7 +1,7 @@
 //! 控制面 JSON 体契约：应答信封、请求体与 daemon 状态快照。
 //! 字段名是 CLI 与以后网页适配器的稳定机器契约。
 
-use crate::config::RvcSessionValues;
+use crate::config::{PreDspConfig, RvcSessionValues};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 
@@ -200,6 +200,27 @@ pub struct PlayoutSetRequest {
     pub mute: bool,
 }
 
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
+pub struct PreMicMixerStatus {
+    pub supported: bool,
+    #[serde(default)]
+    pub card_name: Option<String>,
+    #[serde(default)]
+    pub volume_percent: Option<u8>,
+    #[serde(default)]
+    pub gain_db: Option<f32>,
+    #[serde(default)]
+    pub min_db: Option<f32>,
+    #[serde(default)]
+    pub max_db: Option<f32>,
+    #[serde(default)]
+    pub agc_supported: bool,
+    #[serde(default)]
+    pub agc_enabled: Option<bool>,
+    #[serde(default)]
+    pub error: Option<String>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PreStatus {
     #[serde(default)]
@@ -208,6 +229,12 @@ pub struct PreStatus {
     pub enhancement: Option<PreEnhanceStatus>,
     #[serde(default)]
     pub aec: Option<PreAecStatus>,
+    #[serde(default)]
+    pub dsp: Option<PreDspConfig>,
+    #[serde(default)]
+    pub capture_gain_db: f32,
+    #[serde(default)]
+    pub mic_mixer: Option<PreMicMixerStatus>,
     #[serde(default = "default_denoise_backend")]
     pub denoise_backend: String,
     pub state: String,
@@ -581,6 +608,37 @@ pub struct DspSetRequest {
 #[serde(deny_unknown_fields)]
 pub struct AecSetRequest {
     pub enabled: bool,
+}
+
+/// 软件采集前级数字增益请求体（PRE_SET_CAPTURE_GAIN）：{"capture_gain_db": f32}。
+#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CaptureGainSetRequest {
+    pub capture_gain_db: f32,
+}
+
+pub const MIC_MIXER_VOLUME_MAX: u8 = 100;
+
+/// 采集卡硬件混音器调节请求体（DAEMON_MIC_MIXER_SET / PRE_SET_MIC_MIXER）。
+#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct MicMixerSetRequest {
+    #[serde(default)]
+    pub volume_percent: Option<u8>,
+    #[serde(default)]
+    pub agc_enabled: Option<bool>,
+}
+
+impl MicMixerSetRequest {
+    pub fn validate(&self) -> Result<(), &'static str> {
+        if self.volume_percent.is_none() && self.agc_enabled.is_none() {
+            return Err("volume_percent or agc_enabled must be provided");
+        }
+        if self.volume_percent.is_some_and(|v| v > MIC_MIXER_VOLUME_MAX) {
+            return Err("volume_percent must be within 0..=100");
+        }
+        Ok(())
+    }
 }
 
 /// 字幕链路开关请求体（DAEMON_TRANSLATE_SET / DAEMON_SPEECH_SET）：{"enabled": bool}。
@@ -1008,6 +1066,34 @@ mod tests {
         assert_eq!(back.speaker_state, "broadcast");
         assert_eq!(back.tts_frames_played, 7);
         assert!(back.file_mode);
+    }
+
+    #[test]
+    fn mic_mixer_set_request_validates_fields() {
+        assert!(MicMixerSetRequest {
+            volume_percent: Some(60),
+            agc_enabled: None,
+        }
+        .validate()
+        .is_ok());
+        assert!(MicMixerSetRequest {
+            volume_percent: None,
+            agc_enabled: Some(true),
+        }
+        .validate()
+        .is_ok());
+        assert!(MicMixerSetRequest {
+            volume_percent: None,
+            agc_enabled: None,
+        }
+        .validate()
+        .is_err());
+        assert!(MicMixerSetRequest {
+            volume_percent: Some(MIC_MIXER_VOLUME_MAX + 1),
+            agc_enabled: None,
+        }
+        .validate()
+        .is_err());
     }
 
     #[test]

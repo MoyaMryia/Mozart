@@ -329,6 +329,12 @@ impl State {
         self.pre = status;
     }
 
+    pub fn patch_pre_status(&mut self, f: impl FnOnce(&mut PreStatus)) {
+        if let Some(pre) = self.pre.as_mut() {
+            f(pre);
+        }
+    }
+
     /// 最近一次轮询的 pre 文件接管状态（PreStatus.file_mode）。
     /// None 表示本轮未取得 pre 状态，不能作为失接管证据。
     pub fn pre_file_mode(&self) -> Option<bool> {

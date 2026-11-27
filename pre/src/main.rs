@@ -24,6 +24,7 @@ mod capture;
 mod control;
 mod enhancement;
 mod file_capture;
+mod mixer;
 mod playback;
 mod route;
 mod state;
@@ -90,6 +91,7 @@ struct Args {
     effective_enhance: Option<Option<mozart_core::config::EnhanceConfig>>,
     effective_dsp: Option<mozart_core::config::PreDspConfig>,
     effective_aec: Option<mozart_core::config::PreAecConfig>,
+    effective_capture_gain_db: Option<f32>,
     effective_capture_device: Option<String>,
     effective_playback_device: Option<String>,
     aec_probe: Option<PathBuf>,
@@ -105,6 +107,7 @@ fn parse_args_from(mut args: impl Iterator<Item = String>) -> Result<Args, Strin
     let mut effective_enhance = None;
     let mut effective_dsp = None;
     let mut effective_aec = None;
+    let mut effective_capture_gain_db = None;
     let mut effective_capture_device = None;
     let mut effective_playback_device = None;
     let mut aec_probe = None;
@@ -130,6 +133,17 @@ fn parse_args_from(mut args: impl Iterator<Item = String>) -> Result<Args, Strin
                 effective_aec = Some(mozart_core::config::PreAecConfig {
                     enabled: aec.enabled,
                 });
+            }
+            "--effective-capture-gain-db" => {
+                let raw = args
+                    .next()
+                    .ok_or("--effective-capture-gain-db needs a number")?;
+                let db: f32 = raw
+                    .parse()
+                    .map_err(|err| format!("--effective-capture-gain-db: {err}"))?;
+                mozart_core::config::validate_capture_gain_db(db)
+                    .map_err(|err| format!("--effective-capture-gain-db: {err}"))?;
+                effective_capture_gain_db = Some(db);
             }
             "--effective-dsp" => {
                 let json = args.next().ok_or("--effective-dsp needs JSON")?;
@@ -172,6 +186,7 @@ fn parse_args_from(mut args: impl Iterator<Item = String>) -> Result<Args, Strin
         effective_enhance,
         effective_dsp,
         effective_aec,
+        effective_capture_gain_db,
         effective_capture_device,
         effective_playback_device,
         aec_probe,
@@ -225,6 +240,15 @@ fn process_thread(
             }
             let aec_on = shared.aec_enabled();
             let cap_epoch = captured.capture_epoch;
+            let gain_db = shared.capture_gain_db();
+            if gain_db.abs() > 1e-4 {
+                let gain = mixer::linear_gain(gain_db);
+                let mut pcm = frame.pcm;
+                for sample in &mut pcm {
+                    *sample = (*sample * gain).clamp(-1.0, 1.0);
+                }
+                frame.pcm = pcm;
+            }
             let conf = dsp.process_frame_with_hook(&mut frame, |pcm| {
                 aec.process_capture(pcm, cap_epoch, aec_on, |err| {
                     shared.set_last_error(err);
@@ -315,6 +339,9 @@ fn main() -> ExitCode {
         if let Some(effective) = args.effective_aec {
             config.pre.aec = effective;
         }
+        if let Some(db) = args.effective_capture_gain_db {
+            config.pre.capture_gain_db = db;
+        }
         if let Some(capture) = args.effective_capture_device {
             config.pre.capture_device = capture;
         }
@@ -363,6 +390,7 @@ fn main() -> ExitCode {
         state::DspSwitches::from_config(&config.pre.dsp),
     );
     shared.set_aec_enabled(config.pre.aec.enabled);
+    shared.set_capture_gain_db(config.pre.capture_gain_db);
     if std::env::var_os(mozart_core::ctl::schema::SUPERVISED_PLAYOUT_ENV).is_some() {
         shared.set_playout_policy(mozart_core::ctl::schema::PlayoutPolicy::Silent);
         shared.speech_cutoff.store(mozart_core::speech::monotonic_ns(), Ordering::SeqCst);
@@ -489,6 +517,7 @@ fn main() -> ExitCode {
         if capture_pcm.is_none() {
             shared.capture_switch.mark_standby();
         }
+        shared.refresh_capture_mixer(capture_pcm.as_ref(), &config.pre.capture_device);
         if !open_errors.is_empty() {
             shared.set_last_error(&open_errors.join("; "));
         }

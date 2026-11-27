@@ -40,6 +40,7 @@ pub(crate) fn preserve_live_pre_state(fresh: &mut Config, old: &Config) {
     fresh.process.enhance_bin = old.process.enhance_bin.clone();
     fresh.pre.dsp = old.pre.dsp.clone();
     fresh.pre.aec = old.pre.aec.clone();
+    fresh.pre.capture_gain_db = old.pre.capture_gain_db;
     fresh.pre.capture_device = old.pre.capture_device.clone();
     fresh.pre.playback_device = old.pre.playback_device.clone();
 }

@@ -355,14 +355,20 @@ describe('控制台', () => {
     const root = mount(); await flush();
     const select = root.querySelector<HTMLSelectElement>('#device-capture')!;
     select.value = 'mic-b'; select.dispatchEvent(new Event('change', { bubbles: true })); await nextTick();
+    const devButtons = [
+      iconButton(section(root, '设备'), '设置输入设备'),
+      iconButton(section(root, '设备'), '设置输出设备'),
+      iconButton(section(root, '设备'), '降低软件增益'),
+      iconButton(section(root, '设备'), '提高软件增益'),
+    ];
     iconButton(section(root, '设备'), '设置输入设备').click(); await flush();
-    expect(section(root, '设备').querySelectorAll<HTMLButtonElement>('button:disabled')).toHaveLength(2);
+    expect(devButtons.map(item => item.disabled)).toEqual([true, true, true, true]);
     expect(root.querySelector<HTMLSelectElement>('#device-playback')!.disabled).toBe(true);
     const others = [button(root, '启动系统'), iconButton(root, '暂停队列'), root.querySelector<HTMLSelectElement>('#system-route')!,
       root.querySelector<HTMLInputElement>('#param-pitch_shift')!, section(root, '设备').querySelector<HTMLInputElement>('input[type=checkbox]')!];
     expect(others.map(item => (item as HTMLButtonElement).disabled)).toEqual([false, false, false, false, false]);
     finish(); await flush();
-    expect(section(root, '设备').querySelectorAll('button:disabled')).toHaveLength(0);
+    expect(devButtons.map(item => item.disabled)).toEqual([false, false, false, false]);
   });
   it('其他控件的写入结果未知时，重新发起本控件的确认读取', async () => {
     const backend = mockBackend(); const original = backend.fetcher.getMockImplementation()!;
@@ -790,5 +796,116 @@ describe('设备草稿', () => {
     expect(button!.getAttribute('aria-pressed')).toBe('true');
     button!.click();
     expect(emitted[1]).toEqual(['pre.aec.enabled', 'false']);
+  });
+
+  it('麦克风调校折叠栏支持调节硬件增益、软件增益与前置处理开关', async () => {
+    const status = reactive(statusFixture());
+    (status.pre as NonNullable<typeof status.pre> & {
+      dsp?: unknown;
+      capture_gain_db?: number;
+      mic_mixer?: unknown;
+      aec?: unknown;
+    }).dsp = { denoise: true, gate: false, agc: false, limiter: true };
+    (status.pre as NonNullable<typeof status.pre> & { capture_gain_db?: number }).capture_gain_db = -3;
+    (status.pre as NonNullable<typeof status.pre> & { mic_mixer?: unknown }).mic_mixer = {
+      supported: true,
+      card_name: 'Audio',
+      volume_percent: 65,
+      gain_db: 20.5,
+      min_db: 0,
+      max_db: 32,
+      agc_supported: true,
+      agc_enabled: false,
+      error: null,
+    };
+    (status.pre as NonNullable<typeof status.pre> & { aec?: unknown }).aec = {
+      enabled: true, backend: 'webrtc-aec3', active: true, delay_ms: 16, erle_db: 0.2,
+      ref_dropped: 0, ref_underruns: 0, resets: 0, capture_clips: 12, last_error: null,
+    };
+    const setCalls: Array<[string, string]> = [];
+    const mixerCalls: Array<{ volume_percent?: number; agc_enabled?: boolean }> = [];
+    const root = document.createElement('div');
+    document.body.append(root);
+    const app = createApp({
+      render: () => h(DevicesPanel, {
+        status,
+        baselines: { capture: 'mic-a', playback: 'speaker-a' },
+        devices: [],
+        ready: true,
+        busy: false,
+        onSet: (key: string, value: string) => setCalls.push([key, value]),
+        onMixer: (payload: { volume_percent?: number; agc_enabled?: boolean }) => mixerCalls.push(payload),
+      }),
+    });
+    app.mount(root);
+    mounts.push({ app, root });
+    await nextTick();
+
+    expect(root.textContent).toContain('削波 12');
+    const hwDown = root.querySelector<HTMLButtonElement>('button[aria-label="降低硬件增益"]')!;
+    hwDown.click();
+    expect(mixerCalls[0]).toEqual({ volume_percent: 60 });
+
+    const agcBtn = Array.from(root.querySelectorAll('button')).find(el => el.textContent?.includes('硬件自动增益 (AGC)'))!;
+    agcBtn.click();
+    expect(mixerCalls[1]).toEqual({ agc_enabled: true });
+
+    const swUp = root.querySelector<HTMLButtonElement>('button[aria-label="提高软件增益"]')!;
+    swUp.click();
+    expect(setCalls[0]).toEqual(['pre.capture_gain_db', '-2']);
+
+    const gateBtn = Array.from(root.querySelectorAll('button')).find(el => el.textContent?.includes('噪声门'))!;
+    gateBtn.click();
+    expect(setCalls[1]).toEqual(['pre.dsp.gate', 'true']);
+  });
+
+  it('麦克风混音器写入按实际回读校正并在拒绝时回滚草稿，纯 AGC 设备也显示开关', async () => {
+    const backend = mockBackend();
+    const original = backend.fetcher.getMockImplementation()!;
+    let mixerShouldFail = false;
+    (backend.snapshot.pre as NonNullable<typeof backend.snapshot.pre> & { mic_mixer?: unknown }).mic_mixer = {
+      supported: true, card_name: 'Audio', volume_percent: 80, gain_db: 24, min_db: 0, max_db: 32, agc_supported: false, agc_enabled: null, error: null,
+    };
+    backend.fetcher.mockImplementation(async (path, init) => {
+      if (path === '/api/v1/devices/capture-mixer' && init?.method === 'PUT') {
+        if (mixerShouldFail) return errorResponse('NotReady', '混音器不可用', 409);
+        const body = JSON.parse(String(init.body));
+        const mixer = { supported: true, card_name: 'Audio', volume_percent: body.volume_percent === 75 ? 77 : body.volume_percent, gain_db: 22, min_db: 0, max_db: 32, agc_supported: false, agc_enabled: null, error: null };
+        (backend.snapshot.pre as NonNullable<typeof backend.snapshot.pre> & { mic_mixer?: unknown }).mic_mixer = mixer;
+        return jsonResponse(mixer);
+      }
+      return original(path, init);
+    });
+    const root = mount(); await flush();
+    const slider = () => root.querySelector<HTMLInputElement>('#mic-hw-gain')!;
+    expect(slider().value).toBe('80');
+
+    // 请求 75% 但硬件按步进量化回传 77%：待写完成后校正到实际回读 77%。
+    iconButton(section(root, '设备'), '降低硬件增益').click(); await flush();
+    expect(slider().value).toBe('77');
+
+    // 后端拒绝后续写入：回滚到最近已确认值 77%。
+    mixerShouldFail = true;
+    const sw = root.querySelector<HTMLInputElement>('#mic-hw-gain')!;
+    sw.value = '30';
+    sw.dispatchEvent(new Event('input', { bubbles: true }));
+    sw.dispatchEvent(new Event('change', { bubbles: true }));
+    await flush();
+    expect(slider().value).toBe('77');
+    expect(section(root, '设备').textContent).toContain('NotReady：混音器不可用');
+
+    // 无音量滑块但有 AGC 开关的设备仍应显示硬件 AGC 按钮。
+    const status = reactive(statusFixture());
+    (status.pre as NonNullable<typeof status.pre> & { mic_mixer?: unknown }).mic_mixer = {
+      supported: false, card_name: 'AgcOnly', volume_percent: null, gain_db: null, min_db: null, max_db: null, agc_supported: true, agc_enabled: true, error: null,
+    };
+    const agcRoot = document.createElement('div');
+    document.body.append(agcRoot);
+    const agcApp = createApp({ render: () => h(DevicesPanel, { status, baselines: {}, devices: [], ready: true, busy: false }) });
+    agcApp.mount(agcRoot);
+    mounts.push({ app: agcApp, root: agcRoot });
+    await nextTick();
+    expect(agcRoot.textContent).toContain('未暴露硬件混音器滑块');
+    expect(Array.from(agcRoot.querySelectorAll('button')).some(el => el.textContent?.includes('硬件自动增益 (AGC)'))).toBe(true);
   });
 });

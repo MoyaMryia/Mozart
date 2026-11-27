@@ -290,6 +290,7 @@ onUnmounted(() => { sectionObserver?.disconnect(); });
           :error="devicesError"
           :muted="muted" :mute-blocked="busy.mute || !!unknowns.system.length"
           @set="(key, value) => ui.setConfig(key, value, 'devices')"
+          @mixer="ui.setMicMixer"
           @mute="value => ui.perform('mute', () => client.mute(value))"
           @dismiss-error="dismissErrorGroup('devices')" />
       </div>

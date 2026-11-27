@@ -232,6 +232,20 @@ fn default_enhance_timeout() -> u32 {
     100
 }
 
+/// 软件采集前级数字增益边界（dB，SPEC-02）：单一定义源，配置与 pre 运行时共用。
+pub const CAPTURE_GAIN_DB_MIN: f32 = -24.0;
+pub const CAPTURE_GAIN_DB_MAX: f32 = 24.0;
+
+pub fn validate_capture_gain_db(db: f32) -> Result<f32, ConfigError> {
+    if db.is_finite() && (CAPTURE_GAIN_DB_MIN..=CAPTURE_GAIN_DB_MAX).contains(&db) {
+        Ok(db)
+    } else {
+        Err(ConfigError::Invalid(format!(
+            "pre.capture_gain_db must be finite and within {CAPTURE_GAIN_DB_MIN}..={CAPTURE_GAIN_DB_MAX}"
+        )))
+    }
+}
+
 #[derive(Debug, Clone, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct PreConfig {
@@ -245,6 +259,8 @@ pub struct PreConfig {
     pub playback_device: String,
     /// 采集 → DSP 环形队列容量（帧），1..=1024。
     pub capture_queue_frames: u32,
+    /// 软件采集前级数字增益（dB，默认 0.0，-24..=24，R 类运行时键）。
+    pub capture_gain_db: f32,
     /// 消费者列表（[[pre.consumers]]）：未设置时回退 rvc+asr 两支路，
     /// socket 沿用 [rvc]/[asr] 的 input_socket（经 Config::pre_consumers 取用）。
     pub consumers: Option<Vec<PreConsumerConfig>>,
@@ -314,6 +330,7 @@ impl Default for PreConfig {
             capture_file: None,
             playback_device: "default".to_string(),
             capture_queue_frames: 8,
+            capture_gain_db: 0.0,
             consumers: None,
             dsp: PreDspConfig::default(),
             aec: PreAecConfig::default(),
@@ -1042,6 +1059,7 @@ impl Config {
                 "pre.capture_queue_frames must be within 1..=1024".to_string(),
             ));
         }
+        validate_capture_gain_db(self.pre.capture_gain_db)?;
         if let Some(consumers) = &self.pre.consumers {
             let mut names = std::collections::HashSet::new();
             let mut sockets = std::collections::HashSet::new();
@@ -1603,7 +1621,12 @@ pub fn runtime_key_owner(key: &str) -> Option<&'static str> {
         | "file.max_upload_bytes"
         | "file.ffmpeg_path"
         | "file.ffmpeg_timeout_ms" => Some("daemon"),
-        "pre.dsp.denoise" | "pre.dsp.gate" | "pre.dsp.agc" | "pre.dsp.limiter" | "pre.aec.enabled" => {
+        "pre.dsp.denoise"
+        | "pre.dsp.gate"
+        | "pre.dsp.agc"
+        | "pre.dsp.limiter"
+        | "pre.aec.enabled"
+        | "pre.capture_gain_db" => {
             Some("pre")
         }
         "rvc.f0_method"
@@ -1720,7 +1743,7 @@ fn parse_runtime_value(key: &str, value: &str) -> Result<toml_edit::Item, Config
             _ => Err(ConfigError::Invalid(format!("键 {key} 需要 true/false"))),
         },
         "file.ffmpeg_path" | "rvc.f0_method" => Ok(toml_edit::value(value)),
-        "rvc.index_rate" | "rvc.rms_mix_rate" | "rvc.protect" => {
+        "pre.capture_gain_db" | "rvc.index_rate" | "rvc.rms_mix_rate" | "rvc.protect" => {
             let number: f64 = value
                 .parse()
                 .map_err(|_| ConfigError::Invalid(format!("键 {key} 需要浮点")))?;
@@ -2119,6 +2142,7 @@ mod tests {
         assert_eq!(runtime_key_owner("file.denoise"), Some("daemon"));
         assert_eq!(runtime_key_owner("pre.dsp.denoise"), Some("pre"));
         assert_eq!(runtime_key_owner("pre.aec.enabled"), Some("pre"));
+        assert_eq!(runtime_key_owner("pre.capture_gain_db"), Some("pre"));
         assert_eq!(runtime_key_owner("rvc.pitch_shift"), Some("rvc"));
         assert_eq!(
             runtime_key_owner("bridge.translate_enabled"),
@@ -2181,8 +2205,16 @@ mod tests {
         let aec_effect = set_key(Some(&path), "pre.aec.enabled", "true").unwrap();
         assert!(!aec_effect.restart_required);
         assert!(aec_effect.affected.is_empty());
-        assert!(Config::load_from(Some(&path)).unwrap().pre.aec.enabled);
-        assert!(!Config::load_from(Some(&path)).unwrap().pre.dsp.denoise);
+        assert!(set_key(Some(&path), "pre.capture_gain_db", "25").is_err());
+        assert!(set_key(Some(&path), "pre.capture_gain_db", "-25").is_err());
+        assert!(set_key(Some(&path), "pre.capture_gain_db", "NaN").is_err());
+        let gain_effect = set_key(Some(&path), "pre.capture_gain_db", "-6.5").unwrap();
+        assert!(!gain_effect.restart_required);
+        assert!(gain_effect.affected.is_empty());
+        let loaded = Config::load_from(Some(&path)).unwrap();
+        assert!(loaded.pre.aec.enabled);
+        assert!(!loaded.pre.dsp.denoise);
+        assert!((loaded.pre.capture_gain_db - (-6.5)).abs() < 1e-6);
         let config = Config::load_from(Some(&path)).unwrap();
         assert_eq!(
             config.daemon.rpc_timeout_ms, 1500,

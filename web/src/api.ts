@@ -107,6 +107,8 @@ export const client = {
   speechClear: () => request('/speech/clear', objectSchema, json('POST', {})),
   restart: (service: Service) => request(`/services/${service}/restart`, objectSchema, json('POST', {})),
   setConfig: (key: string, value: string) => request('/config', configEffectSchema, json('PUT', { key, value })),
+  setMicMixer: (payload: { volume_percent?: number; agc_enabled?: boolean }) =>
+    request('/devices/capture-mixer', objectSchema, json('PUT', payload)),
   submit: (file: File, modelId?: string) => {
     const body = new FormData();
     body.append('file', file);

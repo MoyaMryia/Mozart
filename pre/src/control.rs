@@ -5,10 +5,10 @@
 //! 控制线程）。连接逐个服务：daemon 持单连接每秒轮询，断开后回到 accept。
 
 use crate::state::{DspSwitches, QueueReadout, Shared, VERSION};
-use mozart_core::config::validate_device_name;
+use mozart_core::config::{validate_capture_gain_db, validate_device_name};
 use mozart_core::ctl::schema::{
-    error_body, ok_body, AecSetRequest, DeviceUseRequest, DspSetRequest, FileModeSetRequest,
-    MuteSetRequest, PlayoutSetRequest, RouteSetRequest,
+    error_body, ok_body, AecSetRequest, CaptureGainSetRequest, DeviceUseRequest, DspSetRequest,
+    FileModeSetRequest, MicMixerSetRequest, MuteSetRequest, PlayoutSetRequest, RouteSetRequest,
 };
 use mozart_core::ctl::{self, Message, Seqpacket, ACCEPT_POLL, IDLE_TIMEOUT, RECV_POLL};
 use mozart_core::dgram::FRAME_SIZE_MISMATCH_REASON;
@@ -362,6 +362,37 @@ fn dispatch_with_stop(
             Ok(request) => {
                 shared.set_aec_enabled(request.enabled);
                 ok_body(json!({ "enabled": request.enabled }))
+            }
+            Err(err) => error_body(ctl::CODE_INVALID_ARGUMENT, &err.to_string()),
+        },
+        ctl::PRE_SET_CAPTURE_GAIN => match serde_json::from_value::<CaptureGainSetRequest>(body) {
+            Ok(request) => match validate_capture_gain_db(request.capture_gain_db) {
+                Ok(db) => {
+                    shared.set_capture_gain_db(db);
+                    ok_body(json!({ "capture_gain_db": db }))
+                }
+                Err(err) => error_body(ctl::CODE_INVALID_ARGUMENT, &err.to_string()),
+            },
+            Err(err) => error_body(ctl::CODE_INVALID_ARGUMENT, &err.to_string()),
+        },
+        ctl::PRE_SET_MIC_MIXER => match serde_json::from_value::<MicMixerSetRequest>(body) {
+            Ok(request) => {
+                if let Err(reason) = request.validate() {
+                    return error_body(ctl::CODE_INVALID_ARGUMENT, reason);
+                }
+                let Some((generation, ctl_name, label)) = shared.begin_capture_mixer_apply() else {
+                    return error_body(
+                        ctl::CODE_NOT_READY,
+                        "current capture device has no hardware ALSA mixer",
+                    );
+                };
+                match crate::mixer::apply(&ctl_name, Some(&label), &request) {
+                    Ok(status) => {
+                        let current = shared.finish_capture_mixer_apply(generation, status);
+                        ok_body(json!(current))
+                    }
+                    Err(err) => error_body(ctl::CODE_NOT_READY, &err),
+                }
             }
             Err(err) => error_body(ctl::CODE_INVALID_ARGUMENT, &err.to_string()),
         },
@@ -738,6 +769,77 @@ mod tests {
                 limiter: true,
             }
         );
+    }
+
+    #[test]
+    fn set_capture_gain_roundtrip_and_rejects_invalid_body() {
+        let (shared, cap, trunk, rvc, tts, mut log) = context();
+        let reply = dispatch(
+            &message(ctl::PRE_SET_CAPTURE_GAIN, br#"{"capture_gain_db":-6.5}"#),
+            &shared,
+            &cap,
+            &trunk,
+            &rvc,
+            &tts,
+            &mut log,
+        );
+        assert_eq!(data(&reply)["capture_gain_db"], -6.5);
+        assert_eq!(shared.capture_gain_db(), -6.5);
+
+        for bad in [
+            &b"{}"[..],
+            br#"{"capture_gain_db":25}"#,
+            br#"{"capture_gain_db":-25}"#,
+            br#"{"capture_gain_db":0,"extra":1}"#,
+        ] {
+            let reply = dispatch(
+                &message(ctl::PRE_SET_CAPTURE_GAIN, bad),
+                &shared,
+                &cap,
+                &trunk,
+                &rvc,
+                &tts,
+                &mut log,
+            );
+            assert_eq!(
+                error_code(&reply),
+                ctl::CODE_INVALID_ARGUMENT,
+                "body: {:?}",
+                std::str::from_utf8(bad)
+            );
+        }
+        assert_eq!(shared.capture_gain_db(), -6.5);
+    }
+
+    #[test]
+    fn set_mic_mixer_rejects_bad_body_and_missing_hardware_mixer() {
+        let (shared, cap, trunk, rvc, tts, mut log) = context();
+        for bad in [
+            &b"{}"[..],
+            br#"{"volume_percent":101}"#,
+            br#"{"volume_percent":50,"extra":true}"#,
+        ] {
+            let reply = dispatch(
+                &message(ctl::PRE_SET_MIC_MIXER, bad),
+                &shared,
+                &cap,
+                &trunk,
+                &rvc,
+                &tts,
+                &mut log,
+            );
+            assert_eq!(error_code(&reply), ctl::CODE_INVALID_ARGUMENT);
+        }
+        let missing = dispatch(
+            &message(ctl::PRE_SET_MIC_MIXER, br#"{"volume_percent":60}"#),
+            &shared,
+            &cap,
+            &trunk,
+            &rvc,
+            &tts,
+            &mut log,
+        );
+        assert_eq!(error_code(&missing), ctl::CODE_NOT_READY);
     }
 
     #[test]

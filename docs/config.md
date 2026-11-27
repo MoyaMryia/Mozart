@@ -67,6 +67,7 @@ LD_LIBRARY_PATH = "<资产根>/lib:<资产根>/llama"
 | capture_file | path | 空 | WAV PCM16、48000 Hz、至少 1 声道；pre 启动时校验；设置后替代 ALSA 采集 | S |
 | playback_device | string | default | 非空、无 NUL | S |
 | capture_queue_frames | int | 8 | 1..=1024 | S |
+| capture_gain_db | float | 0.0 | -24.0..=24.0（dB）；软件前置数字增益，0.0 时逐位直通 | R |
 | consumers | array | rvc+asr 两支路 | 见 [[pre.consumers]]；未设置时 socket 沿用 [rvc]/[asr] 的 input_socket | S |
 
 ### [pre.dsp]

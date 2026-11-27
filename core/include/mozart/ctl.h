@@ -76,6 +76,7 @@ enum {
     MOZART_CTL_DAEMON_OUTPUT_MODE_SET = 0x0122, // {"mode":"direct"|"rvc"|"broadcast"}
     MOZART_CTL_DAEMON_SERVICES_START  = 0x0123, // 体 {}（空），恢复启动业务子服务组，data {"state":"running"|"already-running"}
     MOZART_CTL_DAEMON_SERVICES_STOP   = 0x0124, // 体 {}（空），停止业务子服务组（daemon 与 web 在线），data {"state":"stopped"|"not-running"}
+    MOZART_CTL_DAEMON_MIC_MIXER_SET   = 0x0125, // 体 {"volume_percent"?:u8,"agc_enabled"?:bool}，直发 pre 调节当前采集卡硬件混音器（不写 TOML）
 
     MOZART_CTL_PRE_HELLO      = 0x0201,
     MOZART_CTL_PRE_SET_ROUTE  = 0x0202,
@@ -94,7 +95,9 @@ enum {
     // 先试打开新设备再关旧句柄，失败保留旧设备；切 capture 清半帧并重置 WOLA，切 playback 首帧 10 ms 淡入。
     MOZART_CTL_PRE_SET_DEVICE = 0x0208,
     MOZART_CTL_PRE_SET_PLAYOUT = 0x0209,  // body: {policy, route, mute}; ACK at playback boundary
-    MOZART_CTL_PRE_SET_AEC     = 0x020A,  // 体 {"enabled": bool}；运行中启停声学回声消除（SPEC-02）
+    MOZART_CTL_PRE_SET_AEC          = 0x020A,  // 体 {"enabled": bool}；运行中启停声学回声消除（SPEC-02）
+    MOZART_CTL_PRE_SET_CAPTURE_GAIN = 0x020B,  // 体 {"capture_gain_db": f32}；运行中调节软件采集前级增益（SPEC-02）
+    MOZART_CTL_PRE_SET_MIC_MIXER    = 0x020C,  // 体 {"volume_percent"?:u8,"agc_enabled"?:bool}；调节当前采集声卡 ALSA 硬件混音器（SPEC-02）
 
     MOZART_CTL_RVC_HELLO        = 0x0301,
     MOZART_CTL_RVC_LOAD_MODEL   = 0x0302,

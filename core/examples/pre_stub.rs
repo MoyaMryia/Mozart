@@ -24,6 +24,7 @@ struct PreOverrides {
     enhance: Option<Option<mozart_core::config::EnhanceConfig>>,
     dsp: Option<mozart_core::config::PreDspConfig>,
     aec: Option<mozart_core::config::PreAecConfig>,
+    capture_gain_db: Option<f32>,
     capture_device: Option<String>,
     playback_device: Option<String>,
 }
@@ -40,6 +41,7 @@ fn parse_pre_args() -> (StubArgs, PreOverrides) {
         enhance: None,
         dsp: None,
         aec: None,
+        capture_gain_db: None,
         capture_device: None,
         playback_device: None,
     };
@@ -56,6 +58,7 @@ fn parse_pre_args() -> (StubArgs, PreOverrides) {
             "--effective-enhance" => overrides.enhance = Some(serde_json::from_str(&value).unwrap()),
             "--effective-dsp" => overrides.dsp = Some(serde_json::from_str(&value).unwrap()),
             "--effective-aec" => overrides.aec = Some(serde_json::from_str(&value).unwrap()),
+            "--effective-capture-gain-db" => overrides.capture_gain_db = Some(value.parse().unwrap()),
             "--effective-capture-device" => overrides.capture_device = Some(value),
             "--effective-playback-device" => overrides.playback_device = Some(value),
             _ => panic!("unknown argument: {flag}"),
@@ -78,6 +81,8 @@ struct State {
     file_restore_fault: Option<std::path::PathBuf>,
     dsp: mozart_core::config::PreDspConfig,
     aec: mozart_core::config::PreAecConfig,
+    capture_gain_db: f32,
+    mic_mixer: mozart_core::ctl::schema::PreMicMixerStatus,
     capture_device: String,
     playback_device: String,
 }
@@ -95,6 +100,9 @@ fn main() {
     }
     if let Some(aec) = overrides.aec {
         config.pre.aec = aec;
+    }
+    if let Some(db) = overrides.capture_gain_db {
+        config.pre.capture_gain_db = db;
     }
     if let Some(capture) = overrides.capture_device {
         config.pre.capture_device = capture;
@@ -131,6 +139,8 @@ fn main() {
         file_restore_fault: std::env::var_os("MOZART_PRE_STUB_FILE_RESTORE_FAULT").map(Into::into),
         dsp: config.pre.dsp,
         aec: config.pre.aec,
+        capture_gain_db: config.pre.capture_gain_db,
+        mic_mixer: mozart_core::ctl::schema::PreMicMixerStatus::default(),
         capture_device: config.pre.capture_device,
         playback_device: config.pre.playback_device,
     };
@@ -190,6 +200,8 @@ fn handle(msg: &Message, state: &mut State) -> Vec<u8> {
         ctl::PRE_SET_FILE_MODE,
         ctl::PRE_SET_DSP,
         ctl::PRE_SET_AEC,
+        ctl::PRE_SET_CAPTURE_GAIN,
+        ctl::PRE_SET_MIC_MIXER,
         ctl::PRE_SET_DEVICE,
         ctl::PRE_SET_PLAYOUT,
     ];
@@ -245,6 +257,37 @@ fn handle(msg: &Message, state: &mut State) -> Vec<u8> {
                 };
             state.aec.enabled = request.enabled;
             ok(json!({ "enabled": state.aec.enabled }))
+        }
+        ctl::PRE_SET_CAPTURE_GAIN => {
+            let request: mozart_core::ctl::schema::CaptureGainSetRequest =
+                match serde_json::from_value(body.clone()) {
+                    Ok(request) => request,
+                    Err(err) => return fail(ctl::CODE_INVALID_ARGUMENT, &err.to_string()),
+                };
+            if let Err(err) = mozart_core::config::validate_capture_gain_db(request.capture_gain_db) {
+                return fail(ctl::CODE_INVALID_ARGUMENT, &err.to_string());
+            }
+            state.capture_gain_db = request.capture_gain_db;
+            ok(json!({ "capture_gain_db": state.capture_gain_db }))
+        }
+        ctl::PRE_SET_MIC_MIXER => {
+            let request: mozart_core::ctl::schema::MicMixerSetRequest =
+                match serde_json::from_value(body.clone()) {
+                    Ok(request) => request,
+                    Err(err) => return fail(ctl::CODE_INVALID_ARGUMENT, &err.to_string()),
+                };
+            if let Err(reason) = request.validate() {
+                return fail(ctl::CODE_INVALID_ARGUMENT, reason);
+            }
+            if let Some(vol) = request.volume_percent {
+                state.mic_mixer.supported = true;
+                state.mic_mixer.volume_percent = Some(vol);
+            }
+            if let Some(agc) = request.agc_enabled {
+                state.mic_mixer.agc_supported = true;
+                state.mic_mixer.agc_enabled = Some(agc);
+            }
+            ok(serde_json::to_value(&state.mic_mixer).unwrap())
         }
         ctl::PRE_SET_DEVICE => {
             if std::env::var("MOZART_PRE_STUB_DEVICE_REJECT_FILE")
@@ -312,6 +355,8 @@ fn handle(msg: &Message, state: &mut State) -> Vec<u8> {
         ctl::PRE_GET_STATUS => ok(json!({
             "state": "ok",
             "dsp": state.dsp,
+            "capture_gain_db": state.capture_gain_db,
+            "mic_mixer": state.mic_mixer,
             "aec": {
                 "enabled": state.aec.enabled,
                 "backend": "stub",

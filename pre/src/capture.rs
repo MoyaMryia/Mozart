@@ -88,7 +88,7 @@ pub fn run(
                         timestamp,
                     )
                 },
-                |_, new_pcm| {
+                |target, new_pcm| {
                     if let Some(probe) = &mut probe {
                         probe.discontinuity();
                     }
@@ -96,6 +96,7 @@ pub fn run(
                     filled = 0;
                     shared.bump_capture_epoch();
                     shared.clear_startup_open_error_if_ready();
+                    shared.refresh_capture_mixer(pcm.as_ref(), target);
                 },
             );
         }

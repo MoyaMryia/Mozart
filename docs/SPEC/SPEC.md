@@ -86,6 +86,7 @@
 
 ## 变更记录
 
+- 2026-11-27：新增麦克风增益与前端「麦克风调校」折叠栏（SPEC-02 / SPEC-04 / SPEC-06 / `docs/config.md`）：后端接入硬件 ALSA Mixer 实时采集增益与 AGC 开关（`DAEMON_MIC_MIXER_SET` `0x0125` / `PRE_SET_MIC_MIXER` `0x020C` / `PUT /api/v1/devices/capture-mixer`，无控件显式报不支持）以及软件前置数字增益 `[pre].capture_gain_db`（`-24..=24 dB`，`PRE_SET_CAPTURE_GAIN` `0x020B`，R 类即时生效、`--effective-capture-gain-db` 自愈沿用），`PreStatus` 补全 `dsp`/`capture_gain_db`/`mic_mixer` 快照，网页设备面板折叠抽屉集中提供削波告警、双级增益滑块与 `pre.dsp.*` 四开关；主机测试已覆盖，Jetson 实机未验证项及阻塞/解除条件见 `SPEC-02`。
 - 2026-11-27：`pre` 启动允许缺失采集或播放设备降级待机（记录 `last_error` 并允许同设备名热切重试，双侧活跃后清除启动打开报错，解除未接麦/扬声器导致的循环重启与部署健康阻塞）；主机集成测试已通过，Jetson 实机验证记录于 `SPEC-02`（SPEC-02）。
 - 2026-11-27：落地 TTS 合成与播放双线程解耦及 `PrefetchSlot` 单句预合成（`in_flight` 终态计数排序对齐 `idle` 回落与 `TTS_JOB_STOP` 中止），主机测试通过；Jetson 板端连续播报验收与弹性变速评估保留于对应待办（SPEC-05）。
 - 2026-11-27：修复语言链路纯标点复核与无字母数字内容处理，并将译文长度比上限由 5.0 调至 6.5，减少正常中译英短句与术语长句误杀（SPEC-05）。

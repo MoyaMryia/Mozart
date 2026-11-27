@@ -26,7 +26,7 @@
 - DSP 用 Rust 重写，逐阶段与旧输出对拍。第一版覆盖全部阶段：80 Hz 高通、WOLA 谱降噪、gate、AGC、limiter、FIR 3:1 降采样与 VAD；对拍夹具由旧 C 核心离线生成，小型 PCM 放 `tests/fixtures/` 并在 `.gitignore` 白名单。（`dsp/src/golden.rs:128-344`，夹具 `tests/fixtures/dsp/` 共 11 项）
 - DSP 抽成独立共享 crate：pre 实时链路与 daemon 离线文件降噪共用同一实现，不做两套；逐阶段对拍口径不变。（`pre/Cargo.toml:9`、`daemon/Cargo.toml:11`）
 - 采集与播放设备名、数据面 socket 路径等部署配置经 `--config` 读取；daemon 拉起 pre 时传同一配置路径。
-- `[pre]` 配置段键：`capture_device`、`playback_device`（默认 `default`）、`capture_queue_frames`（采集→DSP 环容量，默认 8，1..=1024）、`capture_file`（测试采集文件路径，默认不设置）、`consumers`（消费者列表，见下条分发；未设置回退 rvc+asr）。（`core/src/config.rs` PreConfig）
+- `[pre]` 配置段键：`capture_device`、`playback_device`（默认 `default`）、`capture_queue_frames`（采集→DSP 环容量，默认 8，1..=1024）、`capture_gain_db`（软件前级数字增益，默认 `0.0`，`-24.0..=24.0` dB，R 类运行时键）、`capture_file`（测试采集文件路径，默认不设置）、`consumers`（消费者列表，见下条分发；未设置回退 rvc+asr）。（`core/src/config.rs` PreConfig）
 - 文件采集源（测试注入）：`capture_file` 设置后，采集线程读 WAV 文件替代 ALSA 采集，播放仍走 ALSA；用于无麦克风环境的离线对拍，下游 DSP 与分发链路不变。文件契约：PCM16（format tag 1，不含 WAVE_FORMAT_EXTENSIBLE）、48000 Hz、至少 1 声道，取首声道（与设备采集取 FL 一致）；启动时入口校验一次，不合契约报错退出，由 daemon 退避重启。按实时节拍每 20 ms 发射一帧，文件播完循环；`frame_idx` 与 `pts_ns` 语义与设备采集一致。`GetStatus` 的采集设备名报告文件路径。换文件与换设备一样由重启生效，不做在线命令。（`pre/src/file_capture.rs`）
 - `[pre.dsp]` 配置段键：`denoise`（WOLA 谱降噪开关，默认 true，沿用旧 main.c 代码默认）、`gate`、`agc`、`limiter`（整形级开关，默认 false，沿用旧 main.c 代码默认）。禁用降噪时该级全部计算跳过：不走旧实现的旁路 WOLA 重建，无切换收敛期、无发射延迟，置信度恒 0；禁用整形级时逐位恒等跳过。（`core/src/config.rs:60-113`、`dsp/src/lib.rs:88-93`）
 - WOLA 谱降噪流式合同（旧实现实测口径）：960 样本定块首块发射 896、其后每块 960；发射流滞后输入流 64 样本，处理级对首块缺口补零保持 20 ms 帧节拍（旧 dsp.c wrapper 语义）。旧注释的“192 样本发射延迟”指 64 样本 hop 的完整重建跨度（frame 128 + hop 64）。（`dsp/src/lib.rs:84-107`、`dsp/src/noise_suppressor.rs:96-114`）
@@ -117,6 +117,7 @@
 
 ## 改进点
 
+- [x] 麦克风增益与调校：`[pre].capture_gain_db` 经 `PRE_SET_CAPTURE_GAIN`（`0x020B`）运行时切换并在 `process_thread` 入口（高通与 AEC 之前）就地缩放且钳位 `±1.0`（`0.0 dB` 逐位直通），daemon 重启自愈通过 `--effective-capture-gain-db` 沿用；同时 `pre/src/mixer.rs` 在采集卡打开/热切换及 `PRE_SET_MIC_MIXER`（`0x020C`，体 `{"volume_percent"?:0..=100,"agc_enabled"?:bool}`）控制路径按需读写 ALSA 硬件 `Capture` 增益与 `Auto Gain Control` 开关（不进入实时采集线程，虚拟/无混音器卡报 `supported=false`）；`GetStatus` 同步上报 `dsp`、`capture_gain_db` 与 `mic_mixer` 快照。主机单测覆盖配置校验、控制协议与 `mixer` 解析；板端真机 USB 麦削波抑制与硬件混音调节未验证（阻塞原因：本阶段尚未部署至 Jetson 硬件实测环境；解除条件：部署后在目标设备网页「麦克风调校」折叠栏调低物理采集卡硬件增益，确认 `capture_clips` 不再递增且近端人声/RVC 输出正常）。（`pre/src/mixer.rs`、`pre/src/main.rs`、`pre/src/control.rs`、`pre/src/state.rs`）
 - [x] 受监管 pre 静音启动，重接 `PRE_SET_PLAYOUT` 在同一请求携带路由、静音和播放策略。实时播放确认前选定正确路由；后台未就绪时保持静音，daemon 报告 `reattaching_playout`。
 - [x] 零有效样本的 48 kHz 帧进入欠载淡出，不索引 PCM。 见[本机回归](../../reports/postprocessing-stability-20261124/RESULTS.md)。
 

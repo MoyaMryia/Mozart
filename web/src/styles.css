@@ -663,7 +663,14 @@ select.field, .log-select { font-weight: 700; }
 .console-header::-webkit-details-marker { display: none; }
 .console-header:hover { background: color-mix(in srgb, var(--console-header-bg) 82%, var(--console-header-text) 18%); }
 .console-chevron { transition: transform 200ms cubic-bezier(0.22, 1, 0.36, 1); }
-.console-log[open] .console-chevron { transform: rotate(90deg); }
+.console-log[open] .console-chevron,
+.mic-tuning-details[open] .console-chevron { transform: rotate(90deg); }
+.mic-tuning-summary::-webkit-details-marker { display: none; }
+.mic-slider {
+  accent-color: var(--ink);
+  cursor: pointer;
+}
+.mic-slider:disabled { opacity: 0.45; cursor: not-allowed; }
 
 /* INFO 面板内的日志选择与尾随正文（暗色终端风格）。 */
 .log-select {

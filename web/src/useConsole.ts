@@ -315,8 +315,17 @@ export function useConsole() {
         setNotice(`已写入基线并重启：${effect.affected.join('、')}`);
       } else if (key === 'pre.aec.enabled') {
         setNotice(value === 'true' ? '回声消除已开启。' : '回声消除已关闭。');
+      } else if (key === 'pre.capture_gain_db' || key.startsWith('pre.dsp.')) {
+        setNotice('麦克风参数已应用并保存。');
       } else if (area === 'devices') setNotice('基线已写入；文件任务使用各自的参数快照。');
     }, { message: '', baseline });
+  }
+
+  async function setMicMixer(payload: { volume_percent?: number; agc_enabled?: boolean }) {
+    await perform('devices', () => client.setMicMixer(payload), {
+      message: '硬件混音设置已应用。',
+      context: '调节麦克风混音器',
+    });
   }
 
   // 连续调节参数时按顺序写入，同一参数只写最新值；前一次还在途时排队，不丢弃。
@@ -413,6 +422,6 @@ export function useConsole() {
     canAcknowledge,
     acknowledge: (area: ActionArea) => { if (canAcknowledge(area)) unknowns.value[area] = []; },
     dismissNotice, dismissError,
-    reload, perform, restart, setConfig, setParam, submit, download,
+    reload, perform, restart, setConfig, setMicMixer, setParam, submit, download,
   };
 }

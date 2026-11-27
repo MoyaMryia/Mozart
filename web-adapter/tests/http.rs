@@ -267,3 +267,34 @@ async fn system_up_and_down_relay_to_daemon() {
         assert_eq!(response.status(), status, "{method} {path} {body}");
     }
 }
+
+#[tokio::test]
+async fn capture_mixer_relays_to_daemon_and_checks_method() {
+    let dir = tempfile::tempdir().unwrap();
+    let app = setup(&dir).await;
+    let mixer_data = json!({"supported":true,"card_name":"Audio","volume_percent":60,"agc_supported":false});
+    let server = mock(&dir, vec![vec![(ctl::DAEMON_MIC_MIXER_SET, mixer_data.clone())]]);
+    let ok_resp = app.router.clone().oneshot(web_request(
+        "PUT",
+        "/api/v1/devices/capture-mixer",
+        "application/json",
+        br#"{"volume_percent":60}"#.to_vec(),
+    )).await.unwrap();
+    assert_eq!(ok_resp.status(), StatusCode::OK);
+    let actual: Value = serde_json::from_slice(&to_bytes(ok_resp.into_body(), 4096).await.unwrap()).unwrap();
+    assert_eq!(actual, json!({"status":"ok","code":"Ok","reason":"","data":mixer_data}));
+    server.join().unwrap();
+
+    for (method, body, status) in [
+        ("GET", "", StatusCode::METHOD_NOT_ALLOWED),
+        ("PUT", r#"{"volume_percent":60,"extra":1}"#, StatusCode::BAD_REQUEST),
+    ] {
+        let resp = app.router.clone().oneshot(web_request(
+            method,
+            "/api/v1/devices/capture-mixer",
+            "application/json",
+            body.as_bytes().to_vec(),
+        )).await.unwrap();
+        assert_eq!(resp.status(), status, "{method} {body}");
+    }
+}

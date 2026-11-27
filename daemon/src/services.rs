@@ -146,6 +146,45 @@ impl Services {
         validate_aec_echo(data.data, aec)
     }
 
+    /// 调用方持 transition 锁；只在 pre 确认成功后提交共享配置。
+    pub(crate) fn set_capture_gain(&self, capture_gain_db: f32) -> Result<(), (String, String)> {
+        let req = ctl::schema::CaptureGainSetRequest { capture_gain_db };
+        let body = serde_json::to_vec(&req)
+            .map_err(|err| (ctl::CODE_INTERNAL.to_string(), err.to_string()))?;
+        let data = self
+            .pre()
+            .call_ok(ctl::PRE_SET_CAPTURE_GAIN, &body)
+            .map_err(CallError::into_rejection)?;
+        let echoed: ctl::schema::CaptureGainSetRequest =
+            serde_json::from_value(data.data).map_err(|err| {
+                (
+                    ctl::CODE_INTERNAL.to_string(),
+                    format!("pre SetCaptureGain invalid echo: {err}"),
+                )
+            })?;
+        if (echoed.capture_gain_db - capture_gain_db).abs() > 1e-4 {
+            return Err((
+                ctl::CODE_INTERNAL.to_string(),
+                "pre SetCaptureGain echo differs from request".to_string(),
+            ));
+        }
+        Ok(())
+    }
+
+    /// 调用方持 transition 锁；调节当前采集声卡 ALSA 硬件混音器。
+    pub(crate) fn set_mic_mixer(
+        &self,
+        request: &ctl::schema::MicMixerSetRequest,
+    ) -> Result<Value, (String, String)> {
+        let body = serde_json::to_vec(request)
+            .map_err(|err| (ctl::CODE_INTERNAL.to_string(), err.to_string()))?;
+        let data = self
+            .pre()
+            .call_ok(ctl::PRE_SET_MIC_MIXER, &body)
+            .map_err(CallError::into_rejection)?;
+        Ok(data.data)
+    }
+
     /// 调用方持 transition 锁；只在 pre 确认热切换成功后由调用方更新内存生效设备。
     pub(crate) fn set_device(
         &self,

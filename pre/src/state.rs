@@ -3,9 +3,9 @@
 
 use mozart_core::config::{PreConsumerConfig, PreDspConfig};
 use mozart_core::ctl;
-use mozart_core::ctl::schema::{PlayoutPolicy, PreStatus, Route};
+use mozart_core::ctl::schema::{PlayoutPolicy, PreMicMixerStatus, PreStatus, Route};
 use std::collections::BTreeMap;
-use std::sync::atomic::{AtomicBool, AtomicU64, AtomicU8, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicU8, AtomicUsize, Ordering};
 use std::sync::{mpsc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -365,6 +365,10 @@ pub struct Shared {
     /// 在线 AEC 开关与遥测（控制线程读写开关，处理线程维护遥测）。
     aec_enabled: AtomicBool,
     aec: std::sync::Arc<crate::aec::AecTelemetry>,
+    /// 软件采集前级数字增益（dB，f32::to_bits；控制线程写，处理线程只读）。
+    capture_gain_bits: AtomicU32,
+    /// 当前采集卡 ALSA Mixer 控制入口与快照（单锁附带代次防并发撕裂；绝不进实时音频循环）。
+    capture_mixer: Mutex<CaptureMixerState>,
     /// AI 输出帧坏包丢弃，接收线程发布绝对值。
     ai_recv_dropped: AtomicU64,
     /// TTS 播报帧坏包丢弃，接收线程发布绝对值。
@@ -396,6 +400,13 @@ impl Drop for SendPermit<'_> {
     }
 }
 
+#[derive(Default)]
+struct CaptureMixerState {
+    generation: u64,
+    ctl: Option<(String, String)>,
+    status: PreMicMixerStatus,
+}
+
 impl Shared {
     pub fn new(
         capture_device: String,
@@ -424,6 +435,8 @@ impl Shared {
             aec: std::sync::Arc::new(crate::aec::AecTelemetry::new(
                 crate::aec::default_backend_name(),
             )),
+            capture_gain_bits: AtomicU32::new(0.0f32.to_bits()),
+            capture_mixer: Mutex::new(CaptureMixerState::default()),
             ai_recv_dropped: AtomicU64::new(0),
             tts_recv_dropped: AtomicU64::new(0),
             ai_recv_size_mismatch: AtomicU64::new(0),
@@ -592,6 +605,64 @@ impl Shared {
         self.aec_enabled.store(enabled, Ordering::Release);
     }
 
+    pub fn capture_gain_db(&self) -> f32 {
+        f32::from_bits(self.capture_gain_bits.load(Ordering::Acquire))
+    }
+
+    pub fn set_capture_gain_db(&self, db: f32) {
+        self.capture_gain_bits
+            .store(db.to_bits(), Ordering::Release);
+    }
+
+    pub fn refresh_capture_mixer(&self, pcm: Option<&alsa::pcm::PCM>, device: &str) {
+        let ctl = crate::mixer::card_ctl_from_device(pcm, device);
+        let status = crate::mixer::probe(
+            ctl.as_ref().map(|(c, _)| c.as_str()),
+            ctl.as_ref().map(|(_, l)| l.as_str()),
+        );
+        let mut guard = self
+            .capture_mixer
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        guard.generation = guard.generation.wrapping_add(1);
+        guard.ctl = ctl;
+        guard.status = status;
+    }
+
+    pub fn begin_capture_mixer_apply(&self) -> Option<(u64, String, String)> {
+        let guard = self
+            .capture_mixer
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        guard
+            .ctl
+            .as_ref()
+            .map(|(ctl, label)| (guard.generation, ctl.clone(), label.clone()))
+    }
+
+    pub fn finish_capture_mixer_apply(
+        &self,
+        generation: u64,
+        status: PreMicMixerStatus,
+    ) -> PreMicMixerStatus {
+        let mut guard = self
+            .capture_mixer
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if guard.generation == generation {
+            guard.status = status;
+        }
+        guard.status.clone()
+    }
+
+    pub fn mic_mixer_status(&self) -> PreMicMixerStatus {
+        self.capture_mixer
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .status
+            .clone()
+    }
+
     pub fn aec_telemetry(&self) -> std::sync::Arc<crate::aec::AecTelemetry> {
         self.aec.clone()
     }
@@ -725,6 +796,7 @@ impl Shared {
             "tts".to_string(),
             self.tts_recv_dropped.load(Ordering::Relaxed) + queue.tts_dropped,
         );
+        let dsp = self.dsp_target();
         PreStatus {
             playout_policy: self.playout_policy(),
             state: "running".to_string(),
@@ -737,8 +809,16 @@ impl Shared {
             enhancement: self
                 .enhancement
                 .as_ref()
-                .map(|enhance| enhance.status(self.dsp_target().denoise)),
+                .map(|enhance| enhance.status(dsp.denoise)),
             aec: Some(self.aec.status(self.aec_enabled())),
+            dsp: Some(PreDspConfig {
+                denoise: dsp.denoise,
+                gate: dsp.gate,
+                agc: dsp.agc,
+                limiter: dsp.limiter,
+            }),
+            capture_gain_db: self.capture_gain_db(),
+            mic_mixer: Some(self.mic_mixer_status()),
             // 路由与静音上报命令目标；淡变在 20 ms 内完成，属执行细节。
             route: self.route_target(),
             mute: self.mute_target(),

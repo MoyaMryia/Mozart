@@ -14,7 +14,8 @@ use mozart_core::config::{
 use mozart_core::ctl::schema::{
     self, Activity, ConfigGetRequest, ConfigSetRequest, DeviceKind, DeviceListRequest,
     DeviceUseRequest, FileCancelRequest, FileFetchRequest, FileStatusRequest, FileSubmitRequest,
-    MuteSetRequest, RestartRequest, RouteSetRequest, RvcParams, SwitchSetRequest,
+    MicMixerSetRequest, MuteSetRequest, RestartRequest, RouteSetRequest, RvcParams,
+    SwitchSetRequest,
 };
 use mozart_core::ctl::{self, Message, Seqpacket};
 use serde_json::json;
@@ -394,6 +395,10 @@ fn handle_request(ctx: &Ctx, msg: &Message) -> (Vec<u8>, bool) {
             Ok(request) => (device_use_reply(ctx, &request), false),
             Err(reply) => (reply, false),
         },
+        ctl::DAEMON_MIC_MIXER_SET => match parse_body::<MicMixerSetRequest>(&msg.body) {
+            Ok(request) => (mic_mixer_reply(ctx, &request), false),
+            Err(reply) => (reply, false),
+        },
         ctl::DAEMON_CONFIG_SET => match parse_body::<ConfigSetRequest>(&msg.body) {
             Ok(request) => (config_set_reply(ctx, &request), false),
             Err(reply) => (reply, false),
@@ -707,6 +712,27 @@ fn device_use_reply(ctx: &Ctx, request: &DeviceUseRequest) -> Vec<u8> {
     }
 }
 
+fn mic_mixer_reply(ctx: &Ctx, request: &MicMixerSetRequest) -> Vec<u8> {
+    if let Err(reason) = request.validate() {
+        return schema::error_body(ctl::CODE_INVALID_ARGUMENT, reason);
+    }
+    let _transition = ctx.services.transition();
+    if let Err(reply) = ensure_services_active(ctx) {
+        return reply;
+    }
+    match ctx.services.set_mic_mixer(request) {
+        Ok(data) => {
+            if let Ok(status) =
+                serde_json::from_value::<mozart_core::ctl::schema::PreMicMixerStatus>(data.clone())
+            {
+                lock_state(&ctx.state).patch_pre_status(|pre| pre.mic_mixer = Some(status));
+            }
+            schema::ok_body(data)
+        }
+        Err((code, reason)) => schema::error_body(&code, &reason),
+    }
+}
+
 /// config set（SPEC-04）：设备键先对照当前清单校验存在（防呆），再原子写基线，
 /// 回重启提示契约 restart_required + affected，并登记待重启。daemon 运行时键与
 /// rvc 会话参数键写基线后即时应用：daemon/file 键清覆盖并重建生效配置；rvc 会话
@@ -784,6 +810,7 @@ fn apply_runtime_key(ctx: &Ctx, key: &str, old: &Config) -> Result<(), (String, 
     state_file::overlay(&mut fresh, &overrides);
     let requested_dsp = fresh.pre.dsp.clone();
     let requested_aec = fresh.pre.aec.clone();
+    let requested_capture_gain_db = fresh.pre.capture_gain_db;
     crate::runtime::preserve_live_pre_state(&mut fresh, old);
     if runtime_key_owner(key) == Some("pre") {
         if key == "pre.aec.enabled" {
@@ -795,6 +822,26 @@ fn apply_runtime_key(ctx: &Ctx, key: &str, old: &Config) -> Result<(), (String, 
                         format!("pre SetAec: {reason}; effective AEC unchanged; TOML baseline kept; retry config set for the same key or restart daemon to apply"),
                     )
                 })?;
+                lock_state(&ctx.state).patch_pre_status(|pre| {
+                    if let Some(aec) = pre.aec.as_mut() {
+                        aec.enabled = fresh.pre.aec.enabled;
+                    }
+                });
+            }
+        } else if key == "pre.capture_gain_db" {
+            fresh.pre.capture_gain_db = requested_capture_gain_db;
+            if ctx.services_active.load(Ordering::Acquire) {
+                ctx.services
+                    .set_capture_gain(fresh.pre.capture_gain_db)
+                    .map_err(|(code, reason)| {
+                        (
+                            code,
+                            format!("pre SetCaptureGain: {reason}; effective capture gain unchanged; TOML baseline kept; retry config set for the same key or restart daemon to apply"),
+                        )
+                    })?;
+                lock_state(&ctx.state).patch_pre_status(|pre| {
+                    pre.capture_gain_db = fresh.pre.capture_gain_db;
+                });
             }
         } else {
             match key {
@@ -814,6 +861,9 @@ fn apply_runtime_key(ctx: &Ctx, key: &str, old: &Config) -> Result<(), (String, 
                     code,
                     format!("pre SetDsp: {reason}; effective DSP unchanged; TOML baseline kept; retry config set for the same key or restart daemon to apply"),
                 ))?;
+                lock_state(&ctx.state).patch_pre_status(|pre| {
+                    pre.dsp = Some(fresh.pre.dsp.clone());
+                });
             }
         }
     }
