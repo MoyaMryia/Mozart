@@ -202,7 +202,7 @@ code {
 
 <h2>总流程</h2>
 
-<p class="flow">16 kHz 契约帧 → 帧调度 → HuBERT 与 RMVPE → 音高映射 → 索引检索（可选）→ front → decoder → SOLA → 模型原生采样率契约帧</p>
+<p class="flow">16 kHz 契约帧 → 帧调度 → HuBERT 与 RMVPE → 音高映射 → 索引检索与辅音保护（可选）→ front → decoder → 音量跟随与限幅 → SOLA → 模型原生采样率契约帧</p>
 
 <p>真实推理不是一帧一帧独立做，而是先攒成 240 ms 的块，再带上 2.5 秒过去上下文，凑成 2.8 秒分析窗。分析窗里只有最新一块会被回放，历史只用来提供上下文。</p>
 
@@ -227,14 +227,14 @@ code {
 
 <p>分析窗，44800 个 16 kHz 采样点<span class="src src-fixed">〔代码写死〕</span>。它等于 2.8 秒，由过去上下文、当前块和 960 个采样点的对齐余量组成。余量在 16 kHz 侧计算，与输出采样率无关。HuBERT 和 RMVPE 都吃这个窗。</p>
 
-<p>启动缓冲，默认 400 ms<span class="src src-run">〔推理时可调〕</span>。首次出声前先等这么久，再等输出环攒满一个完整块。它用来吸收推理耗时和送达抖动。配置键 <code>startup_delay_ms</code>，范围 0 到 15000 ms 且须为 20 ms 的倍数，改动经停流再起流生效。</p>
+<p>启动缓冲，默认 340 ms<span class="src src-run">〔推理时可调〕</span>。首次出声前先等这么久，再等输出环攒满一个完整块。它用来吸收推理耗时和送达抖动。配置键 <code>startup_delay_ms</code>，范围 0 到 15000 ms 且须为 20 ms 的倍数，改动经停流再起流生效。</p>
 
 <p>输出环，768000 个采样点<span class="src src-fixed">〔代码写死〕</span>。在 48 kHz 下等于 16 秒，采样率越低可缓冲时长越长。推理可以领先消费端数块。环满丢最旧并计数。</p>
 
 <h3>帧调度接口</h3>
 
 <ul class="io">
-<li><strong>输入参数：</strong>两个非形状旋钮可调：<code>startup_delay_ms</code>（默认 400，范围 0 到 15000，须为 20 ms 的倍数）、<code>skip_silence</code>（默认 true）。<code>crossfade_ms</code> 与 <code>sola_search_ms</code> 锁为定值 50 与 10，合计 60 ms，偏离在入口回 InvalidArgument。块长、过去上下文与输出环由几何常量固定。</li>
+<li><strong>输入参数：</strong>两个非形状旋钮可调：<code>startup_delay_ms</code>（默认 340，范围 0 到 15000，须为 20 ms 的倍数）、<code>skip_silence</code>（默认 true）。<code>crossfade_ms</code> 与 <code>sola_search_ms</code> 锁为定值 50 与 10，合计 60 ms，偏离在入口回 InvalidArgument。块长、过去上下文与输出环由几何常量固定。</li>
 <li><strong>输入信号：</strong>16 kHz 输入帧，每帧 320 个 float32 样本；元数据包含 <code>pts_ns</code>、<code>frame_idx</code>、<code>vad_flag</code>、<code>energy_db</code>、<code>conf</code>、<code>segment_id</code>。</li>
 <li><strong>输出：</strong>模型原生采样率输出帧，缓冲 960 个 float32 样本，有效样本数等于采样率除以 50（48k 为 960、40k 为 800、32k 为 640）。每收到一帧输入就回一帧输出，输出环不足时补零。</li>
 <li><strong>内部中间量（48 kHz 参考值，输出侧按采样率同比缩放）：</strong>分析窗 [44800]；单块 decoder 输出 [14400]（40k [12000]、32k [9600]）；实际推进 [11520]（40k [9600]、32k [7680]）；淡化尾 [2400]（40k [2000]、32k [1600]）。</li>
@@ -247,7 +247,7 @@ code {
 <li><strong>为什么过去上下文是 2.5 秒：</strong>生成器需要历史来维持音色和韵律。2.5 秒是当前实测可用值，不是理论下限。</li>
 <li><strong>为什么分析窗是 2.8 秒：</strong>2.5 秒历史加 240 ms 当前块，再加 60 ms 对齐余量，正好 2.8 秒。</li>
 <li><strong>为什么 1:1 回帧：</strong>输入和输出都是 20 ms 一帧。推理快慢由输出环吸收，接口始终保持一帧进、一帧出。</li>
-<li><strong>静音和断流怎么处理：</strong>整窗没有 VAD 标记就跳过推理，输出等长静音；帧号缺口过大或时间戳跳变就清环、丢淡化尾、恢复启动缓冲。</li>
+<li><strong>静音和断流怎么处理：</strong>整窗没有 VAD 标记就跳过推理，有残留淡化尾时以余弦平方曲线平滑淡出再补零，并同步向音高缓存推进等长无声帧；仅帧号缺口大于 4 / 重复或时间戳回退才触发全量重置（正向到达抖动不重置）。</li>
 </ul>
 </aside>
 
@@ -318,7 +318,7 @@ code {
 <ul class="io">
 <li><strong>输入参数：</strong><code>pitch_shift</code> 推理时可调，范围 -12 到 12，单位是半音；<code>f0_method</code> 只接受 <code>rmvpe</code>。</li>
 <li><strong>输入信号：</strong>RMVPE 缓存里的 F0 值。当前块更新 28 帧，接口按 280 帧读取。</li>
-<li><strong>输出：</strong><code>pitch</code> [1, 280]，1 到 255 的离散编号；<code>pitchf</code> [1, 280]，变调后的连续频率。front 用完整的 <code>pitch</code>，decoder 用最后 30 帧 <code>pitchf</code>。</li>
+<li><strong>输出：</strong><code>pitch</code> [1, 280]，1 到 255 的离散编号；<code>pitchf</code> [1, 280]，变调后的连续频率（实时关闭无声帧插值，无基频帧保持 <code>pitch=1</code>、<code>pitchf=0</code>）。front 用完整的 <code>pitch</code>，decoder 用最后 30 帧 <code>pitchf</code>。</li>
 </ul>
 
 <aside class="why">
@@ -330,23 +330,24 @@ code {
 </ul>
 </aside>
 
-<h2>第 5 站 索引检索</h2>
+<h2>第 5 站 索引检索与辅音保护</h2>
 
-<p>这一站是可选的。它用训练集特征库修正内容特征，让音色更接近训练数据。没有 index 文件时不执行。</p>
+<p>这一站是可选的。它用训练集特征库修正内容特征，让音色更接近训练数据，并按 <code>protect</code> 保护无基频清辅音。没有 index 文件时不执行。</p>
 
 <h3>索引接口</h3>
 
 <ul class="io">
-<li><strong>输入参数：</strong><code>index_rate</code> 推理时可调，范围 0 到 1；候选表数 1 和近邻数 8 写死；index 文件按模型独立。</li>
+<li><strong>输入参数：</strong><code>index_rate</code> 推理时可调，范围 0 到 1；<code>protect</code> 推理时可调，范围 0 到 0.5（默认 0.33）；候选表数 1 和近邻数 8 写死；index 文件按模型独立。</li>
 <li><strong>输入信号：</strong>HuBERT 特征的尾部。当前 280/250 几何下是 [14, 768]，前面 125 帧属于过去上下文，不参与检索。</li>
-<li><strong>输出：</strong>同形状的混合特征 [14, 768]。没有 index 文件或 <code>index_rate=0</code> 时原样返回。</li>
+<li><strong>输出：</strong>同形状的混合特征 [14, 768]；若 <code>protect &lt; 0.5</code>，新块内无基频帧（<code>pitchf &lt;= 0</code>）再按 <code>protect</code> 混回检索前原始特征。没有 index 文件或 <code>index_rate=0</code> 时原样返回。</li>
 </ul>
 
 <aside class="why">
 <p class="why-label">补充解释</p>
 <ul>
-<li><strong>检索在做什么：</strong>在训练集特征库里找最相似的 8 个样本，按距离平方反比加权，再把它们的音色特征混进当前特征。</li>
+<li><strong>检索在做什么：</strong>在训练集特征库里找最相似的 8 个样本，按距离平方反比加权，再把它们的音色特征混进当前特征。实时端使用 AArch64 NEON 向量化、32 帧质心分块与多线程并行检索。</li>
 <li><strong>index_rate 改什么：</strong>0 表示完全不用检索，1 表示完全用检索特征。中间值在模型自己的音色和训练集音色之间过渡。</li>
+<li><strong>protect 改什么：</strong>对新块内无音高的清辅音帧保留 <code>1 - protect</code> 比例的原始特征（<code>protect = 0.5</code> 时跳过保护），避免清辅音被训练集特征覆盖发闷。</li>
 <li><strong>为什么只查尾部：</strong>过去上下文只用来提供历史，不需要检索训练集音色。只查新音频对应的特征，既省时间，也避免把历史音色反复混进来。</li>
 <li><strong>为什么不能跨模型共用：</strong>index 的向量和音色、训练集绑定。换模型通常要同时换 index。</li>
 </ul>
@@ -402,9 +403,9 @@ code {
 </ul>
 </aside>
 
-<h2>第 8 站 SOLA 与输出</h2>
+<h2>第 8 站 音量跟随、SOLA 与输出</h2>
 
-<p>这一站把 decoder 每块独立生成的波形对齐并拼成连续音频。</p>
+<p>这一站先对 decoder 输出的 300 ms 音频做块级音量跟随（<code>rms_mix_rate</code>）与 0.99 峰值限幅，再对齐并拼成连续音频。</p>
 
 <h3>SOLA 接口</h3>
 
@@ -434,10 +435,10 @@ code {
 <dd>改音色检索强度，0 到 1。0 完全不用训练集特征，1 完全用检索特征。没有 index 文件时不起作用。</dd>
 
 <dt>protect</dt>
-<dd>辅音保护比，0 到 0.5。实时链接受这个参数，但当前不执行保护混合，所以传了也不改变输出。</dd>
+<dd>辅音保护比，0 到 0.5（默认 0.33）。对新块内无基频帧（<code>pitchf &lt;= 0</code>），按比例保留检索前的原始特征（值越小保留原始特征越多，0.5 时跳过保护）。有 index 且 <code>index_rate &gt; 0</code> 时生效。</dd>
 
 <dt>rms_mix_rate</dt>
-<dd>音量包络混合比，0 到 1。实时链接受这个参数，但当前不做音量包络校正，所以传了也不改变输出。</dd>
+<dd>音量包络混合比，0 到 1（默认 1.0）。1.0 表示完全保持模型输出音量；小于 1.0 时用 120 ms 平滑窗、30 ms 步长向对应原声响度对齐（原声窗 RMS 小于 0.005 时不放大），输出前统一做 0.99 峰值限幅。</dd>
 
 <dt>f0_method</dt>
 <dd>音高提取方法。当前只接受 rmvpe，换别的值直接报错。</dd>
@@ -446,10 +447,10 @@ code {
 <dd>块长与过去上下文。它们决定延迟和连续性，值来自实时参数单一来源 JSON，C++ 镜像同一套。改它们等于改实时契约与资产形状，不能只改一个值。</dd>
 
 <dt>crossfade_ms / sola_search_ms / startup_delay_ms / skip_silence</dt>
-<dd>四个非形状旋钮，实时独有、不进模型预设。crossfade_ms 与 sola_search_ms 是定值 50 ms 与 10 ms，合计 60 ms，偏离在入口拒绝。startup_delay_ms 默认 400 ms，范围 0 到 15000 ms 且为 20 ms 的倍数，改动经停流再起流生效；skip_silence 默认 true，改动经 SetParams（0x0308）在下一推理块边界无中断生效。</dd>
+<dd>四个非形状旋钮，实时独有、不进模型预设。crossfade_ms 与 sola_search_ms 是定值 50 ms 与 10 ms，合计 60 ms，偏离在入口拒绝。startup_delay_ms 默认 340 ms，范围 0 到 15000 ms 且为 20 ms 的倍数，改动经停流再起流生效；skip_silence 默认 true，改动经 SetParams（0x0308）在下一推理块边界无中断生效。</dd>
 
 <dt>fp16</dt>
-<dd>编译时精度开关。开启后 engine 更小更快，可能有轻微数值差异。它不改变接口，只改变 engine 的数值和性能。</dd>
+<dd>编译时精度开关（当前默认构建配置开启）。开启后 engine 更小更快，它不改变接口，只改变 engine 的数值和性能。</dd>
 
 <dt>sample_rate</dt>
 <dd>模型原生采样率。实时链接受 32000 / 40000 / 48000 Hz，它决定输出帧有效样本数与输出侧几何。不在支持集内的模型被能力门控拒绝。播放侧固定 48000 Hz，由 pre 在边界重采样。</dd>
@@ -462,7 +463,7 @@ code {
 <p class="why-label">补充解释：为什么只有这几个真正可调</p>
 <ul>
 <li><strong>会话参数只有五个：</strong>pitch_shift、index_rate、rms_mix_rate、protect、f0_method。初始值随 StartStream 下发，实时流活动期间的调整与静音跳过 skip_silence 经 SetParams（0x0308）在下一推理块边界无中断生效，保留音高缓存与流缓冲；启动缓冲 startup_delay_ms 改动经停流再起流生效；淡化与 SOLA 搜索为定值。</li>
-<li><strong>为什么 protect 和 rms_mix_rate 不生效：</strong>实时路径优先低延迟，没有做辅音保护和音量包络校正。参数仍然接受并校验范围，是为了保持控制面统一，将来补实现时不用改接口。</li>
+<li><strong>为什么五个会话参数都生效：</strong>实时路径与文件路径共用同一组会话参数；五个参数及 <code>skip_silence</code> 均可通过 <code>SetParams</code> 在块边界无中断更新，仅无实现的 <code>filter_radius</code> 不暴露。</li>
 <li><strong>为什么块长这些不开放：</strong>改块长会牵动窗口、淡化、SOLA、启动缓冲和资产形状。单改一个值无法保持连续，所以形状类归单一来源 JSON，不开放运行时调参。非形状旋钮里只开放启动缓冲与静音跳过；淡化与 SOLA 虽属非形状类，但引擎形状按最大 overlap 固定，当前也锁为定值。</li>
 <li><strong>为什么 fp16 是编译时开关：</strong>TensorRT 在编译时决定数值精度。运行时改配置不会改变已经编好的 engine。</li>
 </ul>
@@ -478,7 +479,7 @@ code {
 
 <p>index 是可选的训练产物，按模型独立。没有它也能推理，只是不能用 <code>index_rate</code> 做检索混合。</p>
 
-<p>引擎在目标设备上编译，绑定设备和 TensorRT 版本。同名 <code>.engine</code> 优先于 <code>.onnx</code>；实时 HuBERT 和 RMVPE 必须使用健康的 TensorRT 引擎。</p>
+<p>实时引擎在目标设备上编译，绑定设备和 TensorRT 版本。同名 <code>.engine</code> 优先于 <code>.onnx</code>；实时 HuBERT 和 RMVPE 必须使用健康的 TensorRT 引擎；TensorRT 引擎对不超过 4 MiB 的张量复用 CUDA 锁页主机缓冲以消除跨流隐式同步。</p>
 
 <h2>和文件链的差异</h2>
 
@@ -486,21 +487,20 @@ code {
 
 <p>文件链的形状可以用档位调；实时链的形状由单一来源 JSON 与模型采样率推导，不能通过编译参数改。</p>
 
-<p>文件链有辅音保护、音量包络和后处理；实时链目前不应用 <code>protect</code> 和 <code>rms_mix_rate</code>。</p>
+<p>文件链有输入预处理（峰值归一 0.95、48 Hz 高通）、无声帧音高插值和整段级音量包络；实时链跳过输入预处理并关闭无声帧插值，辅音保护、块级音量跟随与 0.99 峰值限幅均在实时块内执行。</p>
 
 <p>文件链输出固定 48 kHz，离线收尾重采样；实时链按模型原生采样率输出，接受 32 / 40 / 48 kHz，重采样放在 pre 播放边界。</p>
 
 <h2>适用范围</h2>
 
-<p>本文依据当前代码和文档说明 RVC 实时推理的模块接口，不是实测报告。性能、延迟和音质数据见 <code>reports/</code> 下的对应报告。</p>
+<p>本文依据当前代码和文档说明 RVC 实时推理的模块接口，不是实测报告。性能、延迟和音质数据见 <code>reports/</code> 下的对应报告（含 48 kHz FP16 与 40 kHz 实测对比）。</p>
 
 <p>未验证项：</p>
 
 <ul>
-<li><code>--fp16</code> 对实时音质和延迟的影响，未在本文范围实测。启用前应按目标模型做对比。</li>
-<li>32 kHz 与 40 kHz 模型的实时链路已实现（几何按采样率推导、帧契约带 <code>sample_rate</code> 与 <code>valid_samples</code>），板端延迟、连续性、显存与音质未验证。阻塞原因与解除条件见 <code>docs/SPEC/SPEC-03-rvc.md</code> 板端条目。</li>
+<li>32 kHz 模型已完成实时冒烟与几何校验，板端音质主观听感未在实测报告范围评估。阻塞原因：缺少真实人声对拍样本。解除条件：在目标设备上录制 32 kHz 模型实时输出并按 <code>reports/</code> 流程评测。</li>
 <li>front 和 decoder 回退 ONNX 的实时延迟未测量。阻塞原因：实时链通常使用 TensorRT 引擎。解除条件：在目标设备上对比 ONNX 与 engine 的推理耗时。</li>
-<li>实时换模型已定为断流切换（<code>model use</code>）：过去上下文、SOLA 状态与音高缓存随流式调度器重建丢弃，不跨模型保留。板端切换接缝、延迟与帧守恒未验证，阻塞原因与解除条件同上。</li>
+<li>实时换模型已定为断流切换（<code>model use</code>）：过去上下文、SOLA 状态与音高缓存随流式调度器重建丢弃，不跨模型保留。板端真实人声下的接缝听感未评估，阻塞原因与解除条件同 32 kHz 项。</li>
 </ul>
 
 <p class="readme">相关文档：<a href="rvc-module.html">RVC 模块（文件链）</a> · <a href="rvc-realtime-module.html">RVC 实时模块（系统运行时）</a></p>
