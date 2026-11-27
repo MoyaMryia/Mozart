@@ -41,7 +41,7 @@ const captureClips = computed(() => props.status?.pre?.aec?.capture_clips ?? 0);
 const dsp = computed(() => props.status?.pre?.dsp ?? null);
 const dspSwitches = [
   { key: 'denoise', label: '降噪' },
-  { key: 'gate', label: '噪声门' },
+  { key: 'gate', label: '音量门' },
   { key: 'agc', label: '软件 AGC' },
   { key: 'limiter', label: '防爆限幅' },
 ] as const;

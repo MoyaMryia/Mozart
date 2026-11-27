@@ -134,7 +134,7 @@ retained 是提交结果未知而保留的数量；reasons 列出保留原因，
 `config set` 的支持键和生效成本归 daemon；不得因为配置表列了某键，就假定写回已经接通。
 设备键写入成功后，前端按 `restart_required`/`affected` 自动调用 `POST /services/{service}/restart` 使基线生效；其余重启类提示与 `status.pending_restart` 原样展示。
 设备面板提供「回声消除 (AEC)」开关，写 `pre.aec.enabled`（R 类，即时生效），并展示 `status.pre.aec` 的后端、延时估计、ERLE 与参考丢帧；后端为 `unavailable` 时开关置灰并显示「未链接」，`last_error` 以告警条展示。
-设备面板内嵌可折叠的「麦克风调校」抽屉（默认折叠，出现 `capture_clips > 0` 时在折叠头部与抽屉内提示削波告警）：（1）硬件增益与硬件 AGC 走 `PUT /api/v1/devices/capture-mixer`（映射 `DAEMON_MIC_MIXER_SET` → `PRE_SET_MIC_MIXER`），无硬件混音器控件的设备显式提示不支持；（2）软件前级增益写 `pre.capture_gain_db`（`-24..=24 dB`，R 类即时生效并带一键归零）；（3）前置处理四开关（`降噪` / `噪声门` / `软件 AGC` / `防爆限幅`）直接读写既有 `pre.dsp.*`（R 类）与 `status.pre.dsp` 快照。
+设备面板内嵌可折叠的「麦克风调校」抽屉（默认折叠，出现 `capture_clips > 0` 时在折叠头部与抽屉内提示削波告警）：（1）硬件增益与硬件 AGC 走 `PUT /api/v1/devices/capture-mixer`（映射 `DAEMON_MIC_MIXER_SET` → `PRE_SET_MIC_MIXER`），无硬件混音器控件的设备显式提示不支持；（2）软件前级增益写 `pre.capture_gain_db`（`-24..=24 dB`，R 类即时生效并带一键归零）；（3）前置处理四开关（`降噪` / `音量门` / `软件 AGC` / `防爆限幅`）直接读写既有 `pre.dsp.*`（R 类）与 `status.pre.dsp` 快照。
 设置路由走 `PUT /api/v1/mode`（`direct`/`rvc`/`broadcast`），前端按 `output_mode.requested`、`output_mode.applied`、`output_mode.phase` 与 `output_mode.last_error` 分开展示请求意图、实际模式、过渡阶段及故障原因，不把等待切换显示为已经切换。
 
 ### 业务子服务启停

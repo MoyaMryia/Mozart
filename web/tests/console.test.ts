@@ -854,7 +854,7 @@ describe('设备草稿', () => {
     swUp.click();
     expect(setCalls[0]).toEqual(['pre.capture_gain_db', '-2']);
 
-    const gateBtn = Array.from(root.querySelectorAll('button')).find(el => el.textContent?.includes('噪声门'))!;
+    const gateBtn = Array.from(root.querySelectorAll('button')).find(el => el.textContent?.includes('音量门'))!;
     gateBtn.click();
     expect(setCalls[1]).toEqual(['pre.dsp.gate', 'true']);
   });
