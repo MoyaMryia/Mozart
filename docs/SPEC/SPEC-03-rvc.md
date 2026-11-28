@@ -252,8 +252,9 @@ RMVPE 前端 mel 128 带、n_fft 1024、hop 160、30–8000 Hz、HTK Slaney（�
   - 逐秒分布：偏差集中在启动段（t=0–2 s，-100~200 cents）与少数重读段（+145~160），多数段 30–100 cents，无八度跳变；对拍指标地板（自对齐 +10 ms 错位）为 10 cents。
   - 遗留归因（结构性，非精度）：a) 实时 RMVPE 逐块 mel 补零口径 vs golden 整段 RMVPE 的帧级差；b) 启动态（意图 EMA 冷启动与历史窗零填充差异）；c) ContentVec 实时导出与 Applio 整段前端的帧对齐差异。列为 O3 前置观察，不影响 O3 提速项的等价性验证方法。
 - [ ] **O3（同精度提速）**：
+  - a0.（已完成）共享前端与 frieren front/decoder 的 FP16 补齐：11-25 重编只覆盖 bocchi 四引擎，qiqi 共享 hubert/rmvpe 与 frieren front/decoder 仍为 FP32。用 `build_realtime_engines.py --fp16` 重编并换装后，板端单块（frieren + sculptr，定频、canonical 停机）从 `70 ms` 降至 **`26.7 ms`**（f0+hubert 并行窗 `13.5`，sculptr+装配 `2.5`，front+decoder `10.6`），GPU 占空比 `11%`；golden 门 `logmel_mae EN 4.98（+0.2）/ ZH 5.09（-0.2）`，其余指标不变，通过。旧 FP32 引擎备份于设备 `/tmp/engine-backup-fp32/`。
   - a. sculptr 导出融合 `adapted_feats = feats + delta_feats`（engine 内 Add），`run_chained` 直连 front，省 `280×768 fp32` 两次往返拷贝；ONNX 对拍 golden 容差后替换资产与 C++ 接线。
-  - b. HuBERT 增量卷积缓存：`44800` 样本窗内仅新增 `240 ms`（`3840` 样本）卷积前段重算，历史段缓存复用；先做离线逐帧等价验证（感受野与重锚失效逻辑）再上实时。
+  - b. HuBERT 增量卷积缓存：f0 窗内 hubert 已降为并行支路瓶颈（`9.7 ms` GPU，仅新增 `3840` 样本需要重算），增量后预计总块 `26.7 → 约 21 ms`；先做离线逐帧等价验证（感受野与重锚失效逻辑）再上实时。
   - c. 意图缓存与中间缓冲复用等微优化。
   - 验收：单块推理耗时下降且 O1 指标不劣化。
 - [ ] **O4（板端实测收口）**：净延迟物理回录、60 s 长跑零欠载零缺帧、听感对照，报告入库；达标后将 sculptr 三件套扩展到正式模型目录。

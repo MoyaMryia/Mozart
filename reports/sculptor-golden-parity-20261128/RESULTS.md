@@ -1,42 +1,59 @@
-# O2 逐引擎精度盘点：fp32 回退路线证伪（O1 门内差分实测）
+# O3-a0 全引擎 FP16 补齐：单块 70 ms → 26.7 ms
 
-日期：2026-11-28。承接 [O1 基线](../sculptor-golden-parity-20261128/RESULTS.md)。
-golden：`eval_l2_en_frieren.wav`（本机离线 L2 链）。被测：板端隔离栈实时链（frieren + sculptor），
-snd-aloop 同源回灌 `eval_input_20s.wav`（`preprocess_16k` 16 kHz PCM16）。
+日期：2026-11-28。承接 O1/O2（同目录 [RESULTS.md](RESULTS.md)）。
 
-## 对拍工具
+## 发现
 
-新增 `tools/model/gate_compare.py`：RMS 包络粗对齐（±6 s，覆盖回录预卷与启动缓冲）→
-mel 相关细对齐（±40 帧，宽于 `compare_streaming_quality` 的 ±20 帧），输出整体指标与
-逐秒 cents/mel 分布。对拍指标地板（golden 自对齐 + 人为 10 ms 错位）为 **10 cents**。
+逐引擎 trtexec 盘点（定频、canonical 停机）发现 FP32 欠账：降延迟步骤 B（11-25）只重编了
+bocchi 的四引擎，共享前端（qiqi 目录 hubert-realtime / rmvpe-realtime）与 frieren 的
+front/decoder 仍是 11-15 的 FP32 资产：
 
-## 差分矩阵（仅改一个引擎，其余 fp16）
+| 引擎 | FP32 | FP16 | 加速 |
+| --- | --- | --- | --- |
+| hubert-realtime（共享） | 21.13 ms | 9.73 ms | 2.2× |
+| rmvpe-realtime（共享） | 11.87 ms | 4.92 ms | 2.4× |
+| frieren front | 9.22 ms | 4.72 ms | 2.0× |
+| frieren decoder | 28.48 ms | 5.18 ms | 5.5× |
 
-| 配置 | logmel_mae | rms_corr | cents \|abs\|中位 | signed 中位 | p90 \|abs\| |
-| --- | --- | --- | --- | --- | --- |
-| A0 全 fp16（TRT） | 4.75 dB | 0.946 | 90 | +30 | 190 |
-| A1 sculptor ORT fp32 | 4.87 dB | 0.946 | 90 | +30 | ~190 |
-| A2 rmvpe fp32 引擎 | 4.81 dB | 0.948 | 100 | +30 | 199 |
-| A3 hubert fp32 引擎 | 4.81 dB | 0.948 | 90 | +30 | 190 |
+（sculptor 引擎本就是 FP16，1.31 ms；f0 墙钟 28.7 ms 中 RMVPE GPU 只占 11.9 ms，
+其余为 HuBERT 并行支路在同一 GPU 上的争抢与 C++ mel 预处理——FP32 时代的错误归因已修正。）
 
-**结论：fp32 回退无可测收益，精度瓶颈不在引擎 fp16。保留全部 fp16 引擎（fp32 编译产物留在设备 `/tmp/*fp32.engine` 备查，未入资产）。**
+## 换装与实测
 
-## 偏差结构（A0 对齐后逐秒）
+- `build_realtime_engines.py --fp16` 正式管线重编四引擎，换装 qiqi（共享前端）与 frieren
+  （front/decoder + build-manifest.json）；旧 FP32 备份 `/tmp/engine-backup-fp32/`。
+- 板端单块（frieren + sculptor，240 ms 块，定频，canonical 停机，`MOZART_RVC_PROFILE=1`）：
 
-- 多数秒 30–100 cents；无八度跳变。
-- 启动段 t=0–2 s：-100~200 cents（意图 EMA 冷启动 + RMVPE 窗缘）。
-- 少数重读段（t=9–10 s、t=17–18 s）：+145–160 cents。
-- 初判与引擎精度无关（A1–A3 三方向均无变化），指向结构性口径差：
-  a) 实时 RMVPE 逐块 mel 补零 vs golden 整段 RMVPE 的帧级差；
-  b) 启动态历史窗零填充差异；
-  c) ContentVec 实时导出与 Applio 整段前端的帧对齐差异。
-  归因列为后续观察，不阻塞 O3 提速项（O3 各项的等价性验证以「改动前后同口径对拍」为门，不要求逼近 golden 的绝对值）。
+| 阶段 | FP32 时代 | FP16 换装后 |
+| --- | --- | --- |
+| f0 + HuBERT 并行窗 | 28.7 ms | 13.5 ms |
+| sculptor + 装配 | 2.5 ms | 2.5 ms |
+| front + decoder（chained） | 38.7 ms | 10.6 ms |
+| **单块总耗时** | **70 ms** | **26.7 ms**（p95 26.8，170 块） |
 
-## 运行状态
+GPU 占空比 70/240 = 29% → **11%**。EN/ZH 双语采集 `frames_dropped=0`、`last_error=None`。
 
-三轮采集均 `frames_dropped=0`、`last_error=None`；fp32 引擎编译于停机窗口（canonical 暂停/恢复正常）。
+## golden 门（换装后）
+
+| 指标 | EN | ZH | FP32 引擎基线 |
+| --- | --- | --- | --- |
+| logmel_mae_db | 4.98 | 5.09 | 4.75 / 5.31 |
+| rms_envelope_corr | 0.944 | 0.928 | 0.946 / 0.925 |
+| f0_median_cents | 90 | 90 | 90 / 80 |
+| voiced_iou | 0.924 | 0.944 | 0.924 / 0.948 |
+
+EN 退化 +0.2 dB（在 bocchi FP16 历史 +0.12 dB 同档），ZH 反而改善。**门通过。**
+
+## 顺手收益与风险
+
+- canonical（bocchi，共享前端指向 qiqi）随本次换装前端也变 FP16，预计单块再降约 10 ms；
+  重启后 `daemon/pre/rvc` 探活正常（rvc idle、无错误）。canonical 上的块耗时与听感未复测。
+- 未验证项：net 延迟（`startup_delay_ms` 可再下调的余量约 10–15 ms）物理回录；60 s 长跑。
+- 遗留：micro 基准 `tests/bench_f0_stage.cpp`（本地工作副本，未入库——如保留需补 CTest 注册与说明）。
 
 ## 适用范围
 
-- 配置：JetPack 6，隔离栈 `MozartMryia` `ce7e53d`，frieren-v2-40k 40k，EN 20 s 单样本单次采集。
-- 未验证项：ZH 侧逐秒分布（O1 已有整体指标）；实时 RMVPE 与整段 RMVPE 的帧级差量化。
+- 配置：JetPack 6 / TensorRT 10.16.2，jetson-clocks 定频，canonical 停机窗口内采集与换装，测后已恢复。
+- 引擎耗时为 trtexec `--loadEngine` 单引擎隔离口径；管道墙钟为 `[profile][realtime]` 逐块锚点（170 块）。
+- golden 门样本：EN 20 s / ZH 25 s 各单次采集；未做统计重复。
+- 未验证项：canonical（bocchi）换装前端后的块耗时与听感复测；net 延迟下调余量的物理回录；60 s 长跑零缺帧复验。
