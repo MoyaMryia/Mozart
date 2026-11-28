@@ -59,6 +59,14 @@ target_link_libraries(t_rvc_window_geometry PRIVATE mozart_rvc_runtime mozart_wa
 add_test(NAME rvc_window_geometry COMMAND t_rvc_window_geometry)
 set_tests_properties(rvc_window_geometry PROPERTIES LABELS "unit" TIMEOUT 30)
 
+# L2 意图塑形器意图信号移植对拍：features.py 黄金夹具 + 状态机语义（SPEC-03 步骤 6）。
+add_executable(t_sculptor_intent test_sculptor_intent.cpp)
+target_link_libraries(t_sculptor_intent PRIVATE mozart_rvc_runtime mozart_warnings)
+target_compile_definitions(t_sculptor_intent PRIVATE
+    MOZART_SCULPTOR_FIXTURE_DIR="${CMAKE_CURRENT_SOURCE_DIR}/fixtures/sculptor")
+add_test(NAME sculptor_intent COMMAND t_sculptor_intent)
+set_tests_properties(sculptor_intent PROPERTIES LABELS "unit" TIMEOUT 30)
+
 # 实时参数契约对拍：运行时读 tools/model/realtime_chain_params.json，逐项比对
 # realtime_geometry.hpp 常量并用 JSON 数值独立重算几何（拦两侧漂移）。
 add_executable(t_rvc_realtime_params test_rvc_realtime_params.cpp)

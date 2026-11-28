@@ -92,6 +92,7 @@ add_library(mozart_rvc_runtime STATIC
     src/rvc/feature_extractor.cpp
     src/rvc/model_loader.cpp
     src/rvc/onnx_engine.cpp
+    src/rvc/sculptor.cpp
     src/rvc/index_search.cpp
     transport/unix_dgram_stream.cpp
     control/ctl_link.cpp

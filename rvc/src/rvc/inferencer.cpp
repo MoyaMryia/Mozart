@@ -313,12 +313,18 @@ RVCInferencer::SessionParams RVCInferencer::snapshot_params() const {
 void RVCInferencer::reset_realtime() {
     realtime_pitch_cache_.assign(kRealtimePitchCacheFrames, 0);
     realtime_pitchf_cache_.assign(kRealtimePitchCacheFrames, 0.0f);
+    realtime_intent_cache_.assign(
+        kRealtimePitchCacheFrames, std::array<float, 4>{0.0f, 0.0f, 0.0f, 0.0f});
+    intent_state_.reset();
     realtime_random_.seed(114514);
 }
 
 void RVCInferencer::advance_realtime_silence(size_t shift_frames) {
     if (shift_frames == 0) return;
     push_realtime_pitch_cache({}, {}, shift_frames);
+    // 静音跳过路径无音频可算意图，仅同步推进缓存时间轴；EMA 状态冻结，
+    // 恢复语音后的首块相对 Python 训练口径存在短暂偏差（已知限制，SPEC-03 步骤 6）。
+    push_realtime_intent_cache(nullptr, 0, {}, shift_frames);
 }
 
 std::pair<std::vector<int64_t>, std::vector<float>> RVCInferencer::f0_to_pitch(
@@ -501,6 +507,125 @@ void RVCInferencer::push_realtime_pitch_cache(
         fresh_count,
         realtime_pitchf_cache_.begin() + static_cast<std::ptrdiff_t>(fresh_target)
     );
+}
+
+void RVCInferencer::push_realtime_intent_cache(
+    const float* audio_16k,
+    size_t audio_size,
+    const std::vector<float>& new_pitchf,
+    size_t shift
+) {
+    // 滑动与清零语义镜像 push_realtime_pitch_cache。
+    if (shift >= realtime_intent_cache_.size()) {
+        std::fill(
+            realtime_intent_cache_.begin(), realtime_intent_cache_.end(),
+            std::array<float, 4>{0.0f, 0.0f, 0.0f, 0.0f});
+        intent_state_.reset();
+    } else {
+        std::move(
+            realtime_intent_cache_.begin() + static_cast<std::ptrdiff_t>(shift),
+            realtime_intent_cache_.end(), realtime_intent_cache_.begin()
+        );
+        std::fill(
+            realtime_intent_cache_.end() - static_cast<std::ptrdiff_t>(shift),
+            realtime_intent_cache_.end(), std::array<float, 4>{0.0f, 0.0f, 0.0f, 0.0f});
+    }
+    if (new_pitchf.size() < 5) {
+        return;
+    }
+    // fresh 对齐与音高缓存一致：丢弃右缘 1 帧 RMVPE。
+    const size_t fresh_count = std::min(
+        new_pitchf.size() - 4, realtime_intent_cache_.size()
+    );
+    const size_t fresh_source = new_pitchf.size() - fresh_count - 1;
+    const size_t win_frames = audio_size / kRealtimeFeatureHop;
+    if (fresh_count > win_frames) {
+        throw std::invalid_argument("Realtime intent fresh frames exceed audio window");
+    }
+    for (size_t j = 0; j < fresh_count; ++j) {
+        const size_t win_frame = win_frames - fresh_count + j;
+        const size_t end_offset = win_frame * kRealtimeFeatureHop;
+        realtime_intent_cache_[realtime_intent_cache_.size() - fresh_count + j]
+            = intent_state_.compute_frame(
+                audio_16k, audio_size, end_offset, new_pitchf[fresh_source + j]);
+    }
+}
+
+void RVCInferencer::apply_realtime_sculptor(
+    std::vector<float>& resized_feats,
+    std::vector<float>& pitchf,
+    std::vector<int64_t>& pitch,
+    std::vector<float>& gain_db_frames
+) {
+    auto& engine = model_->realtime_sculptor_engine();
+    const auto cond = model_->sculptor_params().cond_vector();
+    const size_t frames = pitchf.size();
+    const size_t emb_dim = model_->config().emb_channels;
+    if (resized_feats.size() != frames * emb_dim
+        || realtime_intent_cache_.size() < frames) {
+        throw std::invalid_argument("Sculptor input geometry mismatch");
+    }
+
+    std::vector<float> intent;
+    intent.reserve(frames * 4);
+    for (size_t t = realtime_intent_cache_.size() - frames;
+         t < realtime_intent_cache_.size(); ++t) {
+        for (const float value : realtime_intent_cache_[t]) intent.push_back(value);
+    }
+    const std::vector<float> cond_float(cond.begin(), cond.end());
+    const std::vector<OnnxInput> inputs{
+        {"hubert_upsampled",
+         {1, static_cast<int64_t>(frames), static_cast<int64_t>(emb_dim)},
+         OnnxInput::Type::Float, resized_feats, {}},
+        {"intent_signals", {1, static_cast<int64_t>(frames), 4},
+         OnnxInput::Type::Float, std::move(intent), {}},
+        {"cond", {1, 4}, OnnxInput::Type::Float, cond_float, {}},
+    };
+    // 单输出 [1, frames, 771]：通道 0/1/2 为 log_f0/voiced_logit/gain_db，
+    // 3..771 为 delta_feats（tools/model/export_sculptor_onnx.py 拼接约定）。
+    constexpr size_t kSculptorChannels = 771;
+    auto out = engine.run(inputs, {"outputs"});
+    if (out.size() != frames * kSculptorChannels) {
+        throw std::runtime_error("Sculptor engine output shape is invalid");
+    }
+
+    std::vector<float> f0_l2(frames, 0.0f);
+    gain_db_frames.assign(frames, 0.0f);
+    for (size_t t = 0; t < frames; ++t) {
+        const float* row = out.data() + t * kSculptorChannels;
+        for (size_t c = 0; c < emb_dim; ++c) {
+            resized_feats[t * emb_dim + c] += row[3 + c];
+        }
+        f0_l2[t] = row[1] > 0.0f
+            ? std::clamp(std::exp(row[0]), 50.0f, 1100.0f) : 0.0f;
+        gain_db_frames[t] = std::clamp(row[2], -4.0f, 4.0f);
+    }
+    auto [new_pitch, new_pitchf] = f0_to_pitch(
+        f0_l2, /*pitch_shift=*/0, frames, /*interpolate_unvoiced=*/false);
+    pitchf = std::move(new_pitchf);
+    pitch = std::move(new_pitch);
+
+    // 增益包络：高斯 sigma=6（60 ms）平滑，nearest 边缘夹紧。
+    constexpr float kGainSigma = 6.0f;
+    std::vector<float> smoothed(frames, 0.0f);
+    const int radius = static_cast<int>(kGainSigma * 3.0f);
+    float norm = 0.0f;
+    std::vector<float> kernel(static_cast<size_t>(2 * radius + 1));
+    for (int k = -radius; k <= radius; ++k) {
+        const float w = std::exp(-0.5f * static_cast<float>(k * k) / (kGainSigma * kGainSigma));
+        kernel[static_cast<size_t>(k + radius)] = w;
+        norm += w;
+    }
+    for (size_t t = 0; t < frames; ++t) {
+        float acc = 0.0f;
+        for (int k = -radius; k <= radius; ++k) {
+            const int64_t idx = std::clamp<int64_t>(
+                static_cast<int64_t>(t) + k, 0, static_cast<int64_t>(frames) - 1);
+            acc += kernel[static_cast<size_t>(k + radius)] * gain_db_frames[static_cast<size_t>(idx)];
+        }
+        smoothed[t] = acc / norm;
+    }
+    gain_db_frames = std::move(smoothed);
 }
 
 uint32_t RVCInferencer::sample_realtime_random() {
@@ -846,6 +971,9 @@ std::vector<float> RVCInferencer::infer_realtime(
 
     const size_t shift = request.block_samples_16k / kHop16k;
     push_realtime_pitch_cache(new_pitch, new_pitchf, shift);
+    if (model_->has_sculptor()) {
+        push_realtime_intent_cache(audio.data(), audio.size(), new_pitchf, shift);
+    }
     if (frames > realtime_pitch_cache_.size()) {
         throw std::invalid_argument("Realtime pitch cache is smaller than analysis input");
     }
@@ -865,10 +993,12 @@ std::vector<float> RVCInferencer::infer_realtime(
     if (feats.empty() || feats.size() % emb_dim != 0) {
         throw std::runtime_error("Realtime HuBERT feature shape is invalid");
     }
+    const bool sculptor_active = model_->has_sculptor();
     const size_t feature_frames = feats.size() / emb_dim;
     const size_t index_start = std::min(request.skip_head_frames / 2, feature_frames);
     std::vector<float> unindexed_tail;
-    if (model_->index().loaded() && params.index_rate > 0.0f) {
+    // sculptor 激活时 delta_feats 替代索引检索与清辅音 protect。
+    if (!sculptor_active && model_->index().loaded() && params.index_rate > 0.0f) {
         std::vector<float> tail(
             feats.begin() + static_cast<std::ptrdiff_t>(index_start * emb_dim),
             feats.end()
@@ -894,11 +1024,18 @@ std::vector<float> RVCInferencer::infer_realtime(
             resized_feats.begin() + static_cast<std::ptrdiff_t>(target * emb_dim)
         );
     }
-    apply_realtime_protect(
-        resized_feats, unindexed_tail, pitchf,
-        request.skip_head_frames, index_start, feature_frames, emb_dim, params.protect
-    );
+    if (!sculptor_active) {
+        apply_realtime_protect(
+            resized_feats, unindexed_tail, pitchf,
+            request.skip_head_frames, index_start, feature_frames, emb_dim, params.protect
+        );
+    }
     const auto profile_hubert = profile::Clock::now();
+
+    std::vector<float> sculptor_gain_db;
+    if (sculptor_active) {
+        apply_realtime_sculptor(resized_feats, pitchf, pitch, sculptor_gain_db);
+    }
 
     const auto latent_shape = front.input_shape("latent_noise");
     if (latent_shape.size() != 3 || latent_shape[0] != 1
@@ -994,7 +1131,22 @@ std::vector<float> RVCInferencer::infer_realtime(
         throw std::runtime_error("Realtime decoder output shape is invalid");
     }
     const size_t block_input_16k = request.return_frames * kHop16k;
-    if (block_input_16k <= audio.size()) {
+    if (sculptor_active) {
+        // L2 增益替代 rms_mix_rate 音量跟随：return 区间逐帧插值后限幅。
+        const size_t gain_frames = sculptor_gain_db.size();
+        const size_t first = request.skip_head_frames;
+        const size_t samples_per_frame = model_->config().sample_rate / 100;
+        for (size_t s = 0; s < output.size(); ++s) {
+            const double pos = static_cast<double>(first)
+                + static_cast<double>(s) / static_cast<double>(samples_per_frame);
+            const size_t lo = std::min(static_cast<size_t>(pos), gain_frames - 1);
+            const size_t hi = std::min(lo + 1, gain_frames - 1);
+            const float frac = static_cast<float>(pos) - static_cast<float>(lo);
+            const float db = sculptor_gain_db[lo] * (1.0f - frac) + sculptor_gain_db[hi] * frac;
+            output[s] *= std::pow(10.0f, db / 20.0f);
+        }
+        limit_peak(output, 0.99f);
+    } else if (block_input_16k <= audio.size()) {
         apply_realtime_rms_mix_and_limit(
             audio.data() + (audio.size() - block_input_16k),
             block_input_16k,

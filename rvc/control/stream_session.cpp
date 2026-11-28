@@ -633,6 +633,12 @@ std::vector<std::string> InferenceBackend::capabilities() const {
     std::vector<std::string> result;
     if (supports_realtime()) result.push_back("realtime");
     if (supports_file()) result.push_back("file");
+    // L2 意图塑形器状态（SPEC-03 步骤 6）：激活后索引检索与 protect 被替代，
+    // 状态接口需可查询，供控制台与验收对比无塑形链路。
+    const auto model = models_->current_model();
+    if (model && model->loaded() && model->has_sculptor()) {
+        result.push_back("sculptor");
+    }
     return result;
 }
 

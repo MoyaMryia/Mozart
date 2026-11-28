@@ -15,6 +15,7 @@
 #include "config/rvc_config.h"
 #include "rvc/onnx_engine.hpp"
 #include "rvc/index_search.hpp"
+#include "rvc/sculptor.hpp"
 
 namespace rvc {
 
@@ -44,6 +45,12 @@ public:
     IEngine& generator_engine() { return *generator_engine_; }
     IEngine& realtime_front_engine() { return *realtime_front_engine_; }
     IEngine& realtime_decoder_engine() { return *realtime_decoder_engine_; }
+    // 可选 L2 意图塑形器；has_sculptor() 为 false 时不得解引用。
+    IEngine& realtime_sculptor_engine() { return *realtime_sculptor_engine_; }
+    const SculptorParams& sculptor_params() const { return sculptor_params_; }
+    bool has_sculptor() const {
+        return realtime_sculptor_engine_ && realtime_sculptor_engine_->loaded();
+    }
     bool has_generator() const {
         return generator_engine_ && generator_engine_->loaded();
     }
@@ -60,18 +67,23 @@ private:
     std::filesystem::path onnx_path_;
     std::filesystem::path realtime_front_path_;
     std::filesystem::path realtime_decoder_path_;
+    std::filesystem::path realtime_sculptor_path_;
+    std::filesystem::path sculptor_params_path_;
     std::filesystem::path index_path_;
     std::filesystem::path config_path_;
     RVCModelConfig config_;
+    SculptorParams sculptor_params_;
     std::atomic<bool> loaded_{false};
 
     std::unique_ptr<IEngine> generator_engine_;
     std::unique_ptr<IEngine> realtime_front_engine_;
     std::unique_ptr<IEngine> realtime_decoder_engine_;
+    std::unique_ptr<IEngine> realtime_sculptor_engine_;
     IndexSearch index_;
 
     bool load_generator(const std::string& device, bool half);
     bool load_realtime_generator();
+    bool load_sculptor();
     bool load_index();
 };
 
