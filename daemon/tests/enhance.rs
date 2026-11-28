@@ -144,6 +144,16 @@ fn absent_enhance_remains_stopped() {
     assert_eq!(reply.status, "error");
     assert!(reply.reason.contains("restarting daemon"));
     assert_eq!(status(&conn).pending_restart, ["enhance", "pre"]);
+    // live enhance 尚未生效前，禁止写 pre.dsp.denoise_mode=ulunas 并不得污染 TOML 基线。
+    let rejected = call(
+        &conn,
+        ctl::DAEMON_CONFIG_SET,
+        br#"{"key":"pre.dsp.denoise_mode","value":"ulunas"}"#,
+    );
+    assert_eq!(rejected.status, "error");
+    assert_eq!(rejected.code, ctl::CODE_INVALID_ARGUMENT);
+    let baseline = mozart_core::config::Config::load_from(Some(&daemon.dir.join("config.toml"))).unwrap();
+    assert!(baseline.pre.dsp.backend.is_none());
 }
 
 #[test]
@@ -241,4 +251,69 @@ fn enhance_stub_lifecycle_poll_restart_and_coupled_config() {
     assert_eq!(call(&conn, ctl::DAEMON_SHUTDOWN, b"").status, "ok");
     assert!(wait_exit(&mut daemon.child, Duration::from_secs(5)).success());
     assert!(!std::path::Path::new(&format!("/proc/{pid}")).exists());
+}
+
+#[test]
+fn runtime_denoise_mode_switches_between_off_wola_and_ulunas_without_restart() {
+    let config = format!(
+        "[daemon]\nrpc_timeout_ms = 300\n[process]\nenhance_bin = {:?}\n[enhance]\nmodel = 'test.onnx'\n",
+        example("enhance_stub").to_str().unwrap()
+    );
+    let mut daemon = DaemonProcess::start_with_config(
+        "denoise-mode-runtime",
+        &example("pre_stub"),
+        &example("rvc_stub"),
+        &config,
+    );
+    let conn = daemon.connect();
+    assert!(wait_until(Duration::from_secs(5), || status(&conn)
+        .pre
+        .is_some()));
+
+    let initial = status(&conn).pre.unwrap();
+    assert_eq!(initial.denoise_backend, "ulunas");
+    assert!(initial.dsp.unwrap().denoise);
+    assert!(initial.denoise_backends.iter().any(|b| b.id == "wola" && b.available));
+    assert!(initial.denoise_backends.iter().any(|b| b.id == "ulunas" && b.available));
+    let initial_pid = status(&conn).processes.pre.pid.unwrap();
+    assert_eq!(child_arg(initial_pid, "--effective-denoise-backend"), "ulunas");
+
+    // 切到 wola：免重启立即生效且不重建 pre。
+    let r = call(
+        &conn,
+        ctl::DAEMON_CONFIG_SET,
+        br#"{"key":"pre.dsp.denoise_mode","value":"wola"}"#,
+    );
+    assert_eq!(r.status, "ok", "{r:?}");
+    let after_wola = status(&conn);
+    assert_eq!(after_wola.processes.pre.pid.unwrap(), initial_pid);
+    assert!(after_wola.pending_restart.is_empty());
+    let pre = after_wola.pre.unwrap();
+    assert_eq!(pre.denoise_backend, "wola");
+    assert!(pre.dsp.unwrap().denoise);
+
+    // 切到 off：保留最近模型并关闭 denoise。
+    let r = call(
+        &conn,
+        ctl::DAEMON_CONFIG_SET,
+        br#"{"key":"pre.dsp.denoise_mode","value":"off"}"#,
+    );
+    assert_eq!(r.status, "ok", "{r:?}");
+    let pre = status(&conn).pre.unwrap();
+    assert!(!pre.dsp.unwrap().denoise);
+    assert_eq!(pre.denoise_backend, "wola");
+
+    // 从 off 原子一步切回 ulunas：同时开启 denoise 并切换后端。
+    let r = call(
+        &conn,
+        ctl::DAEMON_CONFIG_SET,
+        br#"{"key":"pre.dsp.denoise_mode","value":"ulunas"}"#,
+    );
+    assert_eq!(r.status, "ok", "{r:?}");
+    let pre = status(&conn).pre.unwrap();
+    assert!(pre.dsp.unwrap().denoise);
+    assert_eq!(pre.denoise_backend, "ulunas");
+
+    assert_eq!(call(&conn, ctl::DAEMON_SHUTDOWN, b"").status, "ok");
+    assert!(wait_exit(&mut daemon.child, Duration::from_secs(5)).success());
 }

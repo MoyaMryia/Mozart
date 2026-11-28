@@ -90,12 +90,35 @@ int main() {
         mozart_aec3_destroy(aec);
         return 6;
     }
-    std::printf("synthetic_65ms_erle=%.2f dB has_delay=%d delay_ms=%d\n",
-                erle_db, stats.has_delay, stats.delay_ms);
+    std::printf(
+        "synthetic_65ms_erle=%.2f dB has_delay=%d delay_ms=%d has_erl=%d erl=%.2f has_div=%d div=%.3f has_res=%d res=%.3f\n",
+        erle_db,
+        stats.has_delay,
+        stats.delay_ms,
+        stats.has_erl,
+        stats.erl_db,
+        stats.has_divergent,
+        stats.divergent_fraction,
+        stats.has_residual_echo,
+        stats.residual_echo_likelihood);
     if (erle_db <= 15.0) {
         std::fprintf(stderr, "ERLE %.2f dB did not exceed 15 dB\n", erle_db);
         mozart_aec3_destroy(aec);
         return 7;
+    }
+    if (!stats.has_delay || stats.delay_ms < 0) {
+        std::fprintf(stderr, "unexpected delay stats: has=%d ms=%d\n", stats.has_delay, stats.delay_ms);
+        mozart_aec3_destroy(aec);
+        return 7;
+    }
+
+    if (mozart_aec3_reset(nullptr) == 0 ||
+        mozart_aec3_get_stats(nullptr, &stats) == 0 ||
+        mozart_aec3_process_reverse(nullptr, far.data(), kFrameSamples) == 0 ||
+        mozart_aec3_process_capture(nullptr, out.data(), kFrameSamples, 0) == 0) {
+        std::fprintf(stderr, "null handle unexpectedly succeeded\n");
+        mozart_aec3_destroy(aec);
+        return 8;
     }
 
     if (mozart_aec3_reset(aec) != 0 ||
@@ -103,7 +126,7 @@ int main() {
         mozart_aec3_process_capture(aec, out.data(), kFrameSamples, 0) != 0) {
         std::fprintf(stderr, "reset or post-reset process failed\n");
         mozart_aec3_destroy(aec);
-        return 8;
+        return 9;
     }
 
     mozart_aec3_destroy(aec);

@@ -98,6 +98,7 @@ enum {
     MOZART_CTL_PRE_SET_AEC          = 0x020A,  // 体 {"enabled": bool}；运行中启停声学回声消除（SPEC-02）
     MOZART_CTL_PRE_SET_CAPTURE_GAIN = 0x020B,  // 体 {"capture_gain_db": f32}；运行中调节软件采集前级增益（SPEC-02）
     MOZART_CTL_PRE_SET_MIC_MIXER    = 0x020C,  // 体 {"volume_percent"?:u8,"agc_enabled"?:bool}；调节当前采集声卡 ALSA 硬件混音器（SPEC-02）
+    MOZART_CTL_PRE_SET_DENOISE      = 0x020D,  // 体 {"enabled"?:bool,"backend"?:string}；运行中启停或热切换已注册降噪后端（SPEC-02）
 
     MOZART_CTL_RVC_HELLO        = 0x0301,
     MOZART_CTL_RVC_LOAD_MODEL   = 0x0302,

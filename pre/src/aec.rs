@@ -13,11 +13,27 @@ use std::sync::atomic::{AtomicBool, AtomicI32, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
 const REF_RING_CAPACITY: usize = 16;
-const REF_MAX_BACKLOG: usize = 4;
-const REF_TARGET_BACKLOG: usize = 2;
+const REF_MAX_BACKLOG: usize = 2;
+const REF_TARGET_BACKLOG: usize = 1;
 const DEFAULT_DELAY_MS: u16 = 45;
 const TELEMETRY_SYNC_INTERVAL: u32 = 25;
-const CLIP_THRESHOLD: f32 = 0.99;
+pub const CLIP_THRESHOLD: f32 = 0.99;
+const UNSET_I32: i32 = i32::MIN;
+
+fn load_opt_f64(atom: &AtomicU64) -> Option<f64> {
+    let v = f64::from_bits(atom.load(Ordering::Relaxed));
+    v.is_finite().then_some(v)
+}
+
+fn store_opt_f64(atom: &AtomicU64, val: Option<f64>) {
+    let bits = val.filter(|v| v.is_finite()).unwrap_or(f64::NAN).to_bits();
+    atom.store(bits, Ordering::Relaxed);
+}
+
+fn load_opt_i32(atom: &AtomicI32) -> Option<i32> {
+    let v = atom.load(Ordering::Relaxed);
+    (v != UNSET_I32).then_some(v)
+}
 
 /// 播放侧送入参考环的单帧。
 #[derive(Clone, Copy)]
@@ -25,6 +41,8 @@ pub struct RefFrame {
     pub pcm: [f32; RAW_SAMPLES],
     pub epoch: u64,
     pub delay_ms: u16,
+    /// 该帧首样本预计抵达扬声器 DAC 的单调时钟时刻（ns）；未知或测试时为 0。
+    pub render_at_ns: u64,
 }
 
 /// 由播放线程独占的参考帧发送端：热路径零分配、非阻塞。
@@ -41,13 +59,20 @@ impl RefSender {
     }
 
     /// 非阻塞投递一帧最终混音后的单声道参考帧；环满丢弃并计数。
+    #[cfg(test)]
     pub fn push(&mut self, mono: &[f32; RAW_SAMPLES], delay_ms: u16) {
+        self.push_timed(mono, delay_ms, 0);
+    }
+
+    /// 非阻塞投递带 DAC 预计播出时间戳（ns）的单声道参考帧；环满丢弃并计数。
+    pub fn push_timed(&mut self, mono: &[f32; RAW_SAMPLES], delay_ms: u16, render_at_ns: u64) {
         if self
             .producer
             .push(RefFrame {
                 pcm: *mono,
                 epoch: self.epoch,
                 delay_ms,
+                render_at_ns,
             })
             .is_err()
         {
@@ -68,6 +93,12 @@ pub struct AecTelemetry {
     active: AtomicBool,
     delay_ms: AtomicI32,
     erle_bits: AtomicU64,
+    erl_bits: AtomicU64,
+    divergent_bits: AtomicU64,
+    residual_echo_bits: AtomicU64,
+    delay_median_ms: AtomicI32,
+    delay_std_ms: AtomicI32,
+    stream_delay_ms: AtomicI32,
     ref_dropped: Arc<AtomicU64>,
     ref_underruns: AtomicU64,
     resets: AtomicU64,
@@ -80,8 +111,14 @@ impl AecTelemetry {
         Self {
             backend_name,
             active: AtomicBool::new(false),
-            delay_ms: AtomicI32::new(-1),
+            delay_ms: AtomicI32::new(UNSET_I32),
             erle_bits: AtomicU64::new(f64::NAN.to_bits()),
+            erl_bits: AtomicU64::new(f64::NAN.to_bits()),
+            divergent_bits: AtomicU64::new(f64::NAN.to_bits()),
+            residual_echo_bits: AtomicU64::new(f64::NAN.to_bits()),
+            delay_median_ms: AtomicI32::new(UNSET_I32),
+            delay_std_ms: AtomicI32::new(UNSET_I32),
+            stream_delay_ms: AtomicI32::new(UNSET_I32),
             ref_dropped: Arc::new(AtomicU64::new(0)),
             ref_underruns: AtomicU64::new(0),
             resets: AtomicU64::new(0),
@@ -91,10 +128,6 @@ impl AecTelemetry {
     }
 
     pub fn status(&self, enabled: bool) -> PreAecStatus {
-        let raw_delay = self.delay_ms.load(Ordering::Relaxed);
-        let delay_ms = (raw_delay >= 0).then_some(raw_delay);
-        let erle = f64::from_bits(self.erle_bits.load(Ordering::Relaxed));
-        let erle_db = erle.is_finite().then_some(erle);
         let last_error = self
             .last_error
             .lock()
@@ -104,8 +137,14 @@ impl AecTelemetry {
             enabled,
             backend: self.backend_name.to_string(),
             active: enabled && self.active.load(Ordering::Relaxed),
-            delay_ms,
-            erle_db,
+            delay_ms: load_opt_i32(&self.delay_ms),
+            erle_db: load_opt_f64(&self.erle_bits),
+            erl_db: load_opt_f64(&self.erl_bits),
+            divergent_fraction: load_opt_f64(&self.divergent_bits),
+            residual_echo_likelihood: load_opt_f64(&self.residual_echo_bits),
+            delay_median_ms: load_opt_i32(&self.delay_median_ms),
+            delay_std_ms: load_opt_i32(&self.delay_std_ms),
+            stream_delay_ms: load_opt_i32(&self.stream_delay_ms),
             ref_dropped: self.ref_dropped.load(Ordering::Relaxed),
             ref_underruns: self.ref_underruns.load(Ordering::Relaxed),
             resets: self.resets.load(Ordering::Relaxed),
@@ -116,19 +155,27 @@ impl AecTelemetry {
 
     fn set_inactive(&self) {
         self.active.store(false, Ordering::Relaxed);
-        self.delay_ms.store(-1, Ordering::Relaxed);
-        self.erle_bits.store(f64::NAN.to_bits(), Ordering::Relaxed);
+        self.delay_ms.store(UNSET_I32, Ordering::Relaxed);
+        store_opt_f64(&self.erle_bits, None);
+        store_opt_f64(&self.erl_bits, None);
+        store_opt_f64(&self.divergent_bits, None);
+        store_opt_f64(&self.residual_echo_bits, None);
+        self.delay_median_ms.store(UNSET_I32, Ordering::Relaxed);
+        self.delay_std_ms.store(UNSET_I32, Ordering::Relaxed);
+        self.stream_delay_ms.store(UNSET_I32, Ordering::Relaxed);
     }
 
     fn set_stats(&self, stats: BackendStats) {
         self.delay_ms
-            .store(stats.delay_ms.unwrap_or(-1), Ordering::Relaxed);
-        let bits = stats
-            .erle_db
-            .filter(|v| v.is_finite())
-            .unwrap_or(f64::NAN)
-            .to_bits();
-        self.erle_bits.store(bits, Ordering::Relaxed);
+            .store(stats.delay_ms.unwrap_or(UNSET_I32), Ordering::Relaxed);
+        store_opt_f64(&self.erle_bits, stats.erle_db);
+        store_opt_f64(&self.erl_bits, stats.erl_db);
+        store_opt_f64(&self.divergent_bits, stats.divergent_fraction);
+        store_opt_f64(&self.residual_echo_bits, stats.residual_echo_likelihood);
+        self.delay_median_ms
+            .store(stats.delay_median_ms.unwrap_or(UNSET_I32), Ordering::Relaxed);
+        self.delay_std_ms
+            .store(stats.delay_std_ms.unwrap_or(UNSET_I32), Ordering::Relaxed);
     }
 
     fn set_last_error(&self, error: Option<&str>) {
@@ -161,6 +208,11 @@ pub fn channel(telemetry: &Arc<AecTelemetry>) -> (RefSender, RefReceiver) {
 pub struct BackendStats {
     pub delay_ms: Option<i32>,
     pub erle_db: Option<f64>,
+    pub erl_db: Option<f64>,
+    pub divergent_fraction: Option<f64>,
+    pub residual_echo_likelihood: Option<f64>,
+    pub delay_median_ms: Option<i32>,
+    pub delay_std_ms: Option<i32>,
 }
 
 pub trait AecBackend {
@@ -192,7 +244,26 @@ mod ffi {
         erle_db: f64,
         has_erl: libc::c_int,
         erl_db: f64,
+        has_divergent: libc::c_int,
+        divergent_fraction: f64,
+        has_residual_echo: libc::c_int,
+        residual_echo_likelihood: f64,
+        has_delay_median: libc::c_int,
+        delay_median_ms: libc::c_int,
+        has_delay_std: libc::c_int,
+        delay_std_ms: libc::c_int,
     }
+
+    const _: () = {
+        assert!(std::mem::size_of::<MozartAec3Stats>() == 88);
+        assert!(std::mem::offset_of!(MozartAec3Stats, has_delay) == 0);
+        assert!(std::mem::offset_of!(MozartAec3Stats, erle_db) == 16);
+        assert!(std::mem::offset_of!(MozartAec3Stats, erl_db) == 32);
+        assert!(std::mem::offset_of!(MozartAec3Stats, divergent_fraction) == 48);
+        assert!(std::mem::offset_of!(MozartAec3Stats, residual_echo_likelihood) == 64);
+        assert!(std::mem::offset_of!(MozartAec3Stats, delay_median_ms) == 76);
+        assert!(std::mem::offset_of!(MozartAec3Stats, delay_std_ms) == 84);
+    };
 
     extern "C" {
         fn mozart_aec3_create(sample_rate_hz: libc::c_int) -> *mut MozartAec3;
@@ -314,6 +385,13 @@ mod ffi {
             BackendStats {
                 delay_ms: (raw.has_delay != 0).then_some(raw.delay_ms as i32),
                 erle_db: (raw.has_erle != 0).then_some(raw.erle_db),
+                erl_db: (raw.has_erl != 0).then_some(raw.erl_db),
+                divergent_fraction: (raw.has_divergent != 0).then_some(raw.divergent_fraction),
+                residual_echo_likelihood: (raw.has_residual_echo != 0)
+                    .then_some(raw.residual_echo_likelihood),
+                delay_median_ms: (raw.has_delay_median != 0)
+                    .then_some(raw.delay_median_ms as i32),
+                delay_std_ms: (raw.has_delay_std != 0).then_some(raw.delay_std_ms as i32),
             }
         }
     }
@@ -376,15 +454,45 @@ pub fn default_backend_name() -> &'static str {
     }
 }
 
+/// 随每个采集帧传入 `AecProcessor::process_capture` 的同步与断流上下文。
+#[derive(Debug, Clone, Copy)]
+pub struct CaptureFrameMeta {
+    pub capture_epoch: u64,
+    pub gain_epoch: u64,
+    /// 本帧首样本估计被采集硬件录入的单调时钟时刻（ns）；未知或测试时为 0。
+    pub cap_start_ns: u64,
+    /// 软件前级增益与 80 Hz 高通前检测到的原始 ADC 削波标记。
+    pub raw_clipped: bool,
+    /// 当前播放端是否处于激活（非待机）状态。
+    pub playback_active: bool,
+}
+
+#[cfg(test)]
+impl CaptureFrameMeta {
+    pub fn with_epoch(capture_epoch: u64) -> Self {
+        Self {
+            capture_epoch,
+            gain_epoch: 0,
+            cap_start_ns: 0,
+            raw_clipped: false,
+            playback_active: true,
+        }
+    }
+}
+
 /// 处理线程持有的 AEC 状态机：管理参考环消费、因果重置与遥测同步。
 pub struct AecProcessor {
     backend: Box<dyn AecBackend + Send>,
     ref_rx: RefReceiver,
     telemetry: Arc<AecTelemetry>,
     was_enabled: bool,
+    was_playback_active: bool,
     last_capture_epoch: u64,
+    last_gain_epoch: u64,
     last_playback_epoch: Option<u64>,
-    last_delay_ms: u16,
+    last_stream_delay_ms: i32,
+    consecutive_underruns: u32,
+    need_reset_on_ref_resume: bool,
     frames_since_stats: u32,
     reported_error: bool,
 }
@@ -400,27 +508,73 @@ impl AecProcessor {
             ref_rx,
             telemetry,
             was_enabled: false,
+            was_playback_active: false,
             last_capture_epoch: 0,
+            last_gain_epoch: 0,
             last_playback_epoch: None,
-            last_delay_ms: DEFAULT_DELAY_MS,
+            last_stream_delay_ms: i32::from(DEFAULT_DELAY_MS),
+            consecutive_underruns: 0,
+            need_reset_on_ref_resume: false,
             frames_since_stats: 0,
             reported_error: false,
         }
     }
 
+    fn trim_ref_backlog(&mut self, reset_to_target: bool) -> (bool, u64) {
+        let backlog = self.ref_rx.consumer.slots();
+        let to_drop = if reset_to_target {
+            backlog.saturating_sub(REF_TARGET_BACKLOG)
+        } else if backlog > REF_MAX_BACKLOG + 1 {
+            // 稳态一次积压 >= 2 帧以上说明发生突发断跳：回退到目标水位并交调用方触发 AEC 重置。
+            backlog - REF_TARGET_BACKLOG
+        } else if backlog > REF_MAX_BACKLOG {
+            // 仅超出 1 帧属于 20 ms 时钟漂移微调：温和抽丢最旧 1 帧，不重置已收敛滤波器。
+            1
+        } else {
+            0
+        };
+        if to_drop == 0 {
+            return (false, 0);
+        }
+        let mut playback_epoch_changed = false;
+        let mut dropped_now = 0u64;
+        for _ in 0..to_drop {
+            let Ok(discarded) = self.ref_rx.consumer.pop() else {
+                break;
+            };
+            dropped_now += 1;
+            if self
+                .last_playback_epoch
+                .is_some_and(|prev| prev != discarded.epoch)
+            {
+                playback_epoch_changed = true;
+            }
+            self.last_playback_epoch = Some(discarded.epoch);
+        }
+        if dropped_now > 0 {
+            self.ref_rx
+                .ref_dropped
+                .fetch_add(dropped_now, Ordering::Relaxed);
+        }
+        (playback_epoch_changed, dropped_now)
+    }
+
     pub fn process_capture(
         &mut self,
         pcm: &mut [f32; RAW_SAMPLES],
-        capture_epoch: u64,
+        meta: CaptureFrameMeta,
         enabled: bool,
         mut on_error: impl FnMut(&str),
     ) {
-        if pcm.iter().any(|&s| s.abs() >= CLIP_THRESHOLD) {
+        if meta.raw_clipped || pcm.iter().any(|&s| s.abs() >= CLIP_THRESHOLD) {
             self.telemetry.capture_clips.fetch_add(1, Ordering::Relaxed);
         }
 
         if !enabled {
             while self.ref_rx.consumer.pop().is_ok() {}
+            self.was_playback_active = meta.playback_active;
+            self.consecutive_underruns = 0;
+            self.need_reset_on_ref_resume = false;
             if self.was_enabled || self.reported_error {
                 self.was_enabled = false;
                 self.reported_error = false;
@@ -434,6 +588,9 @@ impl AecProcessor {
         if !self.backend.is_available() {
             while self.ref_rx.consumer.pop().is_ok() {}
             self.was_enabled = true;
+            self.was_playback_active = meta.playback_active;
+            self.consecutive_underruns = 0;
+            self.need_reset_on_ref_resume = false;
             self.telemetry.set_inactive();
             if !self.reported_error {
                 let message = format!(
@@ -447,48 +604,68 @@ impl AecProcessor {
             return;
         }
 
-        let mut playback_epoch_changed = false;
-        let backlog = self.ref_rx.consumer.slots();
-        if backlog > REF_MAX_BACKLOG {
-            let to_drop = backlog - REF_TARGET_BACKLOG;
-            let mut dropped_now = 0u64;
-            for _ in 0..to_drop {
-                let Ok(discarded) = self.ref_rx.consumer.pop() else {
-                    break;
-                };
-                dropped_now += 1;
-                if self
-                    .last_playback_epoch
-                    .is_some_and(|prev| prev != discarded.epoch)
-                {
-                    playback_epoch_changed = true;
-                }
-                self.last_playback_epoch = Some(discarded.epoch);
-            }
-            if dropped_now > 0 {
-                self.ref_rx
-                    .ref_dropped
-                    .fetch_add(dropped_now, Ordering::Relaxed);
-            }
-        }
-
-        let ref_frame = self.ref_rx.consumer.pop().ok();
-        if let Some(rf) = ref_frame {
-            if self.last_playback_epoch.is_some_and(|prev| prev != rf.epoch) {
-                playback_epoch_changed = true;
-            }
-            self.last_playback_epoch = Some(rf.epoch);
-            self.last_delay_ms = rf.delay_ms;
-        } else {
-            self.telemetry.ref_underruns.fetch_add(1, Ordering::Relaxed);
-        }
-
         let turning_on = !self.was_enabled;
-        let capture_epoch_changed = capture_epoch != self.last_capture_epoch;
-        self.was_enabled = true;
-        self.last_capture_epoch = capture_epoch;
+        let capture_epoch_changed = meta.capture_epoch != self.last_capture_epoch;
+        let gain_epoch_changed = meta.gain_epoch != self.last_gain_epoch;
+        let playback_resumed = meta.playback_active && !self.was_playback_active;
 
-        if turning_on || capture_epoch_changed || playback_epoch_changed {
+        let (ref_frame, playback_epoch_changed, backlog_reset, underrun_resume_reset) =
+            if !meta.playback_active {
+                // 播放端缺设备待机期间不推参考帧，清空残留后喂静音且不累加 ref_underruns。
+                while let Ok(discarded) = self.ref_rx.consumer.pop() {
+                    self.last_playback_epoch = Some(discarded.epoch);
+                }
+                self.consecutive_underruns = 0;
+                self.need_reset_on_ref_resume = false;
+                (None, false, false, false)
+            } else {
+                let (trim_epoch_changed, dropped_now) =
+                    self.trim_ref_backlog(turning_on || playback_resumed);
+                let backlog_reset = !(turning_on || playback_resumed) && dropped_now >= 2;
+                let ref_frame = self.ref_rx.consumer.pop().ok();
+                let mut playback_epoch_changed = trim_epoch_changed;
+                let mut underrun_resume_reset = false;
+                if let Some(rf) = ref_frame {
+                    if self
+                        .last_playback_epoch
+                        .is_some_and(|prev| prev != rf.epoch)
+                    {
+                        playback_epoch_changed = true;
+                    }
+                    if self.need_reset_on_ref_resume {
+                        underrun_resume_reset = true;
+                        self.need_reset_on_ref_resume = false;
+                    }
+                    self.consecutive_underruns = 0;
+                    self.last_playback_epoch = Some(rf.epoch);
+                } else {
+                    self.telemetry.ref_underruns.fetch_add(1, Ordering::Relaxed);
+                    self.consecutive_underruns = self.consecutive_underruns.saturating_add(1);
+                    if self.consecutive_underruns >= 3 {
+                        self.need_reset_on_ref_resume = true;
+                    }
+                }
+                (
+                    ref_frame,
+                    playback_epoch_changed,
+                    backlog_reset,
+                    underrun_resume_reset,
+                )
+            };
+
+        self.was_enabled = true;
+        self.was_playback_active = meta.playback_active;
+        self.last_capture_epoch = meta.capture_epoch;
+        self.last_gain_epoch = meta.gain_epoch;
+
+        let should_reset = turning_on
+            || capture_epoch_changed
+            || gain_epoch_changed
+            || playback_epoch_changed
+            || playback_resumed
+            || backlog_reset
+            || underrun_resume_reset;
+        if should_reset {
             if let Err(err) = self.backend.reset() {
                 self.record_failure(&err, &mut on_error);
                 return;
@@ -497,9 +674,19 @@ impl AecProcessor {
         }
 
         let silence = [0.0f32; RAW_SAMPLES];
-        let (ref_pcm, delay_ms) = match &ref_frame {
-            Some(rf) => (&rf.pcm, rf.delay_ms as i32),
-            None => (&silence, self.last_delay_ms as i32),
+        let (ref_pcm, delay_ms) = if !meta.playback_active {
+            (&silence, 0)
+        } else if let Some(rf) = &ref_frame {
+            let delay_ms = if rf.render_at_ns > 0 && meta.cap_start_ns > 0 {
+                ((i128::from(rf.render_at_ns) - i128::from(meta.cap_start_ns)) / 1_000_000)
+                    .clamp(0, 500) as i32
+            } else {
+                i32::from(rf.delay_ms)
+            };
+            self.last_stream_delay_ms = delay_ms;
+            (&rf.pcm, delay_ms)
+        } else {
+            (&silence, self.last_stream_delay_ms)
         };
         if let Err(err) = self.backend.process_reverse(ref_pcm) {
             self.record_failure(&err, &mut on_error);
@@ -510,6 +697,9 @@ impl AecProcessor {
             return;
         }
 
+        self.telemetry
+            .stream_delay_ms
+            .store(delay_ms, Ordering::Relaxed);
         if self.reported_error {
             self.reported_error = false;
             self.telemetry.set_last_error(None);
@@ -598,6 +788,11 @@ mod tests {
             BackendStats {
                 delay_ms: Some(48),
                 erle_db: Some(22.5),
+                erl_db: Some(12.0),
+                divergent_fraction: Some(0.02),
+                residual_echo_likelihood: Some(0.05),
+                delay_median_ms: Some(47),
+                delay_std_ms: Some(2),
             }
         }
     }
@@ -616,16 +811,25 @@ mod tests {
         }
         assert_eq!(telemetry.status(true).ref_dropped, 2);
 
-        // 积压 16 帧（> 4）：单帧处理应裁剪到剩 2 帧再弹出 1 帧，共丢弃 14 帧。
+        // 积压 16 帧（> 2）：首帧启用裁剪到剩 1 帧再弹出 1 帧，共丢弃 15 帧。
         let mut cap = [0.2f32; RAW_SAMPLES];
-        proc.process_capture(&mut cap, 0, true, |_| {});
+        proc.process_capture(&mut cap, CaptureFrameMeta::with_epoch(0), true, |_| {});
         let st = telemetry.status(true);
-        assert_eq!(st.ref_dropped, 2 + (REF_RING_CAPACITY as u64 - REF_TARGET_BACKLOG as u64));
+        assert_eq!(
+            st.ref_dropped,
+            2 + (REF_RING_CAPACITY as u64 - REF_TARGET_BACKLOG as u64)
+        );
         assert_eq!(rev_calls.load(Ordering::Relaxed), 1);
         assert_eq!(st.resets, 1);
         assert!(st.active);
         assert_eq!(st.delay_ms, Some(48));
         assert_eq!(st.erle_db, Some(22.5));
+        assert_eq!(st.erl_db, Some(12.0));
+        assert_eq!(st.divergent_fraction, Some(0.02));
+        assert_eq!(st.residual_echo_likelihood, Some(0.05));
+        assert_eq!(st.delay_median_ms, Some(47));
+        assert_eq!(st.delay_std_ms, Some(2));
+        assert_eq!(st.stream_delay_ms, Some(45));
     }
 
     #[test]
@@ -638,16 +842,29 @@ mod tests {
         tx.push(&[0.3; RAW_SAMPLES], 45);
         let orig = [0.42f32; RAW_SAMPLES];
         let mut cap = orig;
-        proc.process_capture(&mut cap, 0, false, |_| {});
+        proc.process_capture(&mut cap, CaptureFrameMeta::with_epoch(0), false, |_| {});
         assert_eq!(cap, orig, "禁用时采集帧必须逐位保留");
         assert_eq!(rev_calls.load(Ordering::Relaxed), 0);
         assert_eq!(cap_calls.load(Ordering::Relaxed), 0);
         assert!(!telemetry.status(false).active);
 
         // 切回启用且环已被排空：应触发一次 ref_underruns 并喂静音参考。
-        proc.process_capture(&mut cap, 0, true, |_| {});
+        proc.process_capture(&mut cap, CaptureFrameMeta::with_epoch(0), true, |_| {});
         assert_eq!(telemetry.status(true).ref_underruns, 1);
         assert_eq!(rev_calls.load(Ordering::Relaxed), 1);
+
+        // 再次禁用应清空扩展遥测字段。
+        proc.process_capture(&mut cap, CaptureFrameMeta::with_epoch(0), false, |_| {});
+        let off = telemetry.status(false);
+        assert!(!off.active);
+        assert_eq!(off.delay_ms, None);
+        assert_eq!(off.erle_db, None);
+        assert_eq!(off.erl_db, None);
+        assert_eq!(off.divergent_fraction, None);
+        assert_eq!(off.residual_echo_likelihood, None);
+        assert_eq!(off.delay_median_ms, None);
+        assert_eq!(off.delay_std_ms, None);
+        assert_eq!(off.stream_delay_ms, None);
     }
 
     #[test]
@@ -659,30 +876,156 @@ mod tests {
 
         tx.push(&[0.1; RAW_SAMPLES], 42);
         let mut cap = [0.2f32; RAW_SAMPLES];
-        proc.process_capture(&mut cap, 0, true, |_| {});
+        proc.process_capture(&mut cap, CaptureFrameMeta::with_epoch(0), true, |_| {});
         assert_eq!(resets.load(Ordering::Relaxed), 1);
         assert_eq!(delay.load(Ordering::Relaxed), 42);
 
         // 同一 epoch：不重置。
         tx.push(&[0.1; RAW_SAMPLES], 44);
-        proc.process_capture(&mut cap, 0, true, |_| {});
+        proc.process_capture(&mut cap, CaptureFrameMeta::with_epoch(0), true, |_| {});
         assert_eq!(resets.load(Ordering::Relaxed), 1);
         assert_eq!(delay.load(Ordering::Relaxed), 44);
 
         // capture_epoch 跳变：触发重置。
         tx.push(&[0.1; RAW_SAMPLES], 44);
-        proc.process_capture(&mut cap, 1, true, |_| {});
+        proc.process_capture(&mut cap, CaptureFrameMeta::with_epoch(1), true, |_| {});
         assert_eq!(resets.load(Ordering::Relaxed), 2);
 
         // playback_epoch 跳变 + 削波：触发重置且记录削波。
         tx.discontinuity();
         tx.push(&[0.1; RAW_SAMPLES], 46);
         cap[10] = -0.995;
-        proc.process_capture(&mut cap, 1, true, |_| {});
+        proc.process_capture(&mut cap, CaptureFrameMeta::with_epoch(1), true, |_| {});
         assert_eq!(resets.load(Ordering::Relaxed), 3);
         let st = telemetry.status(true);
         assert_eq!(st.resets, 3);
         assert_eq!(st.capture_clips, 1);
+    }
+
+    #[test]
+    fn standby_playback_skips_underruns_and_resets_on_resume() {
+        let telemetry = Arc::new(AecTelemetry::new("fake-aec3"));
+        let (mut tx, rx) = channel(&telemetry);
+        let (backend, resets, _, _, delay) = FakeBackend::new(true);
+        let mut proc = AecProcessor::new(Box::new(backend), rx, telemetry.clone());
+
+        let standby = CaptureFrameMeta {
+            playback_active: false,
+            ..CaptureFrameMeta::with_epoch(0)
+        };
+        let mut cap = [0.1f32; RAW_SAMPLES];
+        for _ in 0..5 {
+            proc.process_capture(&mut cap, standby, true, |_| {});
+        }
+        let st = telemetry.status(true);
+        assert_eq!(st.ref_underruns, 0, "播放待机不应虚计 ref_underruns");
+        assert_eq!(resets.load(Ordering::Relaxed), 1);
+        assert_eq!(delay.load(Ordering::Relaxed), 0);
+        assert_eq!(st.stream_delay_ms, Some(0));
+
+        // 播放端接入恢复：触发一次干净重置。
+        tx.push(&[0.1; RAW_SAMPLES], 38);
+        proc.process_capture(&mut cap, CaptureFrameMeta::with_epoch(0), true, |_| {});
+        assert_eq!(resets.load(Ordering::Relaxed), 2);
+        assert_eq!(delay.load(Ordering::Relaxed), 38);
+        assert_eq!(telemetry.status(true).ref_underruns, 0);
+    }
+
+    #[test]
+    fn timestamps_gain_epoch_and_raw_clip_drive_aec() {
+        let telemetry = Arc::new(AecTelemetry::new("fake-aec3"));
+        let (mut tx, rx) = channel(&telemetry);
+        let (backend, resets, _, _, delay) = FakeBackend::new(true);
+        let mut proc = AecProcessor::new(Box::new(backend), rx, telemetry.clone());
+
+        tx.push_timed(&[0.1; RAW_SAMPLES], 20, 1_080_000_000);
+        let mut cap = [0.05f32; RAW_SAMPLES];
+        proc.process_capture(
+            &mut cap,
+            CaptureFrameMeta {
+                capture_epoch: 0,
+                gain_epoch: 0,
+                cap_start_ns: 1_015_000_000,
+                raw_clipped: false,
+                playback_active: true,
+            },
+            true,
+            |_| {},
+        );
+        assert_eq!(delay.load(Ordering::Relaxed), 65);
+        assert_eq!(telemetry.status(true).stream_delay_ms, Some(65));
+        assert_eq!(resets.load(Ordering::Relaxed), 1);
+
+        // 大幅增益突变（gain_epoch 跳变）触发重置；前级原始削波即使经衰减也必须计数。
+        tx.push_timed(&[0.1; RAW_SAMPLES], 20, 1_100_000_000);
+        cap = [0.05f32; RAW_SAMPLES];
+        proc.process_capture(
+            &mut cap,
+            CaptureFrameMeta {
+                capture_epoch: 0,
+                gain_epoch: 1,
+                cap_start_ns: 1_035_000_000,
+                raw_clipped: true,
+                playback_active: true,
+            },
+            true,
+            |_| {},
+        );
+        assert_eq!(resets.load(Ordering::Relaxed), 2);
+        assert_eq!(telemetry.status(true).capture_clips, 1);
+    }
+
+    #[test]
+    fn steady_state_backlog_and_prolonged_underrun_reset_policy() {
+        let telemetry = Arc::new(AecTelemetry::new("fake-aec3"));
+        let (mut tx, rx) = channel(&telemetry);
+        let (backend, resets, _, _, delay) = FakeBackend::new(true);
+        let mut proc = AecProcessor::new(Box::new(backend), rx, telemetry.clone());
+        let mut cap = [0.1f32; RAW_SAMPLES];
+        let meta = CaptureFrameMeta {
+            capture_epoch: 0,
+            gain_epoch: 0,
+            cap_start_ns: 1_000_000_000,
+            raw_clipped: false,
+            playback_active: true,
+        };
+
+        tx.push_timed(&[0.1; RAW_SAMPLES], 20, 1_065_000_000);
+        proc.process_capture(&mut cap, meta, true, |_| {});
+        assert_eq!(resets.load(Ordering::Relaxed), 1);
+        assert_eq!(delay.load(Ordering::Relaxed), 65);
+
+        // 稳态仅积压 3 帧（超限 REF_MAX_BACKLOG=2 1 帧）：温和抽丢 1 帧，不重置滤波器。
+        for _ in 0..3 {
+            tx.push_timed(&[0.1; RAW_SAMPLES], 20, 1_065_000_000);
+        }
+        proc.process_capture(&mut cap, meta, true, |_| {});
+        assert_eq!(telemetry.status(true).ref_dropped, 1);
+        assert_eq!(resets.load(Ordering::Relaxed), 1);
+        proc.process_capture(&mut cap, meta, true, |_| {});
+
+        // 稳态积压 4 帧（突发 >= 2 帧）：回退到目标水位 1 帧（丢 3 帧）并重置。
+        for _ in 0..4 {
+            tx.push_timed(&[0.1; RAW_SAMPLES], 20, 1_065_000_000);
+        }
+        proc.process_capture(&mut cap, meta, true, |_| {});
+        assert_eq!(telemetry.status(true).ref_dropped, 4);
+        assert_eq!(resets.load(Ordering::Relaxed), 2);
+
+        // 短暂欠载 2 帧（应沿用上次配对延时 65 ms，且恢复后不重置）；连续欠载 3 帧后再来帧：重置。
+        proc.process_capture(&mut cap, meta, true, |_| {});
+        assert_eq!(delay.load(Ordering::Relaxed), 65);
+        proc.process_capture(&mut cap, meta, true, |_| {});
+        tx.push_timed(&[0.1; RAW_SAMPLES], 20, 1_065_000_000);
+        proc.process_capture(&mut cap, meta, true, |_| {});
+        assert_eq!(resets.load(Ordering::Relaxed), 2);
+
+        for _ in 0..3 {
+            proc.process_capture(&mut cap, meta, true, |_| {});
+        }
+        tx.push_timed(&[0.1; RAW_SAMPLES], 20, 1_065_000_000);
+        proc.process_capture(&mut cap, meta, true, |_| {});
+        assert_eq!(resets.load(Ordering::Relaxed), 3);
     }
 
     #[test]
@@ -696,13 +1039,37 @@ mod tests {
         let orig = [0.25f32; RAW_SAMPLES];
         let mut cap = orig;
         let mut errors = Vec::new();
-        proc.process_capture(&mut cap, 0, true, |err| errors.push(err.to_string()));
-        proc.process_capture(&mut cap, 0, true, |err| errors.push(err.to_string()));
+        proc.process_capture(&mut cap, CaptureFrameMeta::with_epoch(0), true, |err| {
+            errors.push(err.to_string())
+        });
+        proc.process_capture(&mut cap, CaptureFrameMeta::with_epoch(0), true, |err| {
+            errors.push(err.to_string())
+        });
         assert_eq!(cap, orig);
         assert_eq!(errors.len(), 1, "同一失败状态只记录一次诊断原因");
         let st = telemetry.status(true);
         assert!(!st.active);
         assert!(st.last_error.is_some());
+    }
+
+    #[cfg(has_aec3)]
+    fn synth_far_signal(total_samples: usize, sample_rate: u32) -> Vec<f32> {
+        let mut far = vec![0.0f32; total_samples];
+        let mut rng = 0x2468ACE1u32;
+        let mut lp = 0.0f32;
+        for (i, slot) in far.iter_mut().enumerate().skip(sample_rate as usize) {
+            rng ^= rng << 13;
+            rng ^= rng >> 17;
+            rng ^= rng << 5;
+            let white = (rng >> 9) as f32 / 8388608.0 - 1.0;
+            lp = 0.85 * lp + 0.15 * white;
+            let env = 0.35
+                * (0.6
+                    + 0.4
+                        * (2.0 * std::f32::consts::PI * 2.5 * i as f32 / sample_rate as f32).sin());
+            *slot = env * lp;
+        }
+        far
     }
 
     #[cfg(has_aec3)]
@@ -718,22 +1085,7 @@ mod tests {
         // 12 s @ 48 kHz = 600 帧；65 ms 延迟（3120 样本）+ 100 ppm 时钟漂移。
         let total_frames = 600usize;
         let total_samples = total_frames * RAW_SAMPLES;
-        let mut far = vec![0.0f32; total_samples];
-        let mut rng = 0x2468ACE1u32;
-        let mut lp = 0.0f32;
-        for (i, slot) in far.iter_mut().enumerate().skip(RAW_SAMPLE_RATE as usize) {
-            rng ^= rng << 13;
-            rng ^= rng >> 17;
-            rng ^= rng << 5;
-            let white = (rng >> 9) as f32 / 8388608.0 - 1.0;
-            lp = 0.85 * lp + 0.15 * white;
-            let env = 0.35
-                * (0.6
-                    + 0.4
-                        * (2.0 * std::f32::consts::PI * 2.5 * i as f32 / RAW_SAMPLE_RATE as f32)
-                            .sin());
-            *slot = env * lp;
-        }
+        let far = synth_far_signal(total_samples, RAW_SAMPLE_RATE);
 
         let base_delay = 3120usize; // 65 ms
         let mut echo_in = vec![0.0f32; total_samples];
@@ -757,7 +1109,12 @@ mod tests {
             let mut cap_chunk: [f32; RAW_SAMPLES] =
                 echo_in[off..off + RAW_SAMPLES].try_into().unwrap();
             tx.push(&ref_chunk, 0);
-            proc.process_capture(&mut cap_chunk, 0, true, |e| errs.push(e.to_string()));
+            proc.process_capture(
+                &mut cap_chunk,
+                CaptureFrameMeta::with_epoch(0),
+                true,
+                |e| errs.push(e.to_string()),
+            );
             out_all.extend_from_slice(&cap_chunk);
         }
         assert!(errs.is_empty(), "真实 AEC3 不应报错：{errs:?}");
@@ -772,6 +1129,81 @@ mod tests {
         );
         let st = telemetry.status(true);
         assert!(st.active);
+        assert!(st.delay_ms.is_some());
+    }
+
+    #[cfg(has_aec3)]
+    #[test]
+    fn real_aec3_recovers_after_midstream_delay_jump() {
+        use mozart_core::RAW_SAMPLE_RATE;
+
+        let telemetry = Arc::new(AecTelemetry::new(default_backend_name()));
+        let (mut tx, rx) = channel(&telemetry);
+        let mut proc = AecProcessor::new(default_backend(), rx, telemetry.clone());
+
+        // 12 s @ 48 kHz = 600 帧：前 6 s 物理延迟 45 ms，第 6 s 起阶跃跳变为 95 ms（+50 ms）。
+        let total_frames = 600usize;
+        let jump_frame = 300usize;
+        let total_samples = total_frames * RAW_SAMPLES;
+        let far = synth_far_signal(total_samples, RAW_SAMPLE_RATE);
+
+        let delay_1 = (45 * RAW_SAMPLE_RATE as usize) / 1000;
+        let delay_2 = (95 * RAW_SAMPLE_RATE as usize) / 1000;
+        let jump_sample = jump_frame * RAW_SAMPLES;
+        let mut echo_in = vec![0.0f32; total_samples];
+        for i in 16..total_samples {
+            let d = if i < jump_sample { delay_1 } else { delay_2 };
+            if i > d {
+                echo_in[i] = 0.30 * far[i - d] + 0.12 * far[i - d - 1];
+            }
+        }
+
+        let mut out_all = Vec::with_capacity(total_samples);
+        let mut errs = Vec::new();
+        for f in 0..total_frames {
+            let off = f * RAW_SAMPLES;
+            let ref_chunk: [f32; RAW_SAMPLES] = far[off..off + RAW_SAMPLES].try_into().unwrap();
+            let mut cap_chunk: [f32; RAW_SAMPLES] =
+                echo_in[off..off + RAW_SAMPLES].try_into().unwrap();
+            let hint_ms: u64 = if f < jump_frame { 45 } else { 95 };
+            let cap_start_ns = 1_000_000_000 + (f as u64) * 20_000_000;
+            let render_at_ns = cap_start_ns + hint_ms * 1_000_000;
+            tx.push_timed(&ref_chunk, hint_ms as u16, render_at_ns);
+            proc.process_capture(
+                &mut cap_chunk,
+                CaptureFrameMeta {
+                    capture_epoch: 0,
+                    gain_epoch: 0,
+                    cap_start_ns,
+                    raw_clipped: false,
+                    playback_active: true,
+                },
+                true,
+                |e| errs.push(e.to_string()),
+            );
+            out_all.extend_from_slice(&cap_chunk);
+        }
+        assert!(errs.is_empty(), "真实 AEC3 跳变不应报错：{errs:?}");
+
+        let erle = |range: std::ops::Range<usize>| -> f64 {
+            let p_in: f64 = echo_in[range.clone()]
+                .iter()
+                .map(|&v| (v as f64) * (v as f64))
+                .sum();
+            let p_out: f64 = out_all[range]
+                .iter()
+                .map(|&v| (v as f64) * (v as f64))
+                .sum();
+            10.0 * ((p_in + 1e-24) / (p_out + 1e-24)).log10()
+        };
+        let pre_erle = erle((200 * RAW_SAMPLES)..(300 * RAW_SAMPLES));
+        let post_erle = erle((450 * RAW_SAMPLES)..total_samples);
+        assert!(
+            pre_erle > 12.0 && post_erle > 12.0,
+            "45ms→95ms 跳变前后 ERLE 均应 > 12 dB，实际跳变前 {pre_erle:.2} dB、恢复后 {post_erle:.2} dB"
+        );
+        let st = telemetry.status(true);
+        assert_eq!(st.stream_delay_ms, Some(95));
         assert!(st.delay_ms.is_some());
     }
 }

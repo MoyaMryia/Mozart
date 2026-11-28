@@ -28,7 +28,7 @@
 - 采集与播放设备名、数据面 socket 路径等部署配置经 `--config` 读取；daemon 拉起 pre 时传同一配置路径。
 - `[pre]` 配置段键：`capture_device`、`playback_device`（默认 `default`）、`capture_queue_frames`（采集→DSP 环容量，默认 8，1..=1024）、`capture_gain_db`（软件前级数字增益，默认 `0.0`，`-24.0..=24.0` dB，R 类运行时键）、`capture_file`（测试采集文件路径，默认不设置）、`consumers`（消费者列表，见下条分发；未设置回退 rvc+asr）。（`core/src/config.rs` PreConfig）
 - 文件采集源（测试注入）：`capture_file` 设置后，采集线程读 WAV 文件替代 ALSA 采集，播放仍走 ALSA；用于无麦克风环境的离线对拍，下游 DSP 与分发链路不变。文件契约：PCM16（format tag 1，不含 WAVE_FORMAT_EXTENSIBLE）、48000 Hz、至少 1 声道，取首声道（与设备采集取 FL 一致）；启动时入口校验一次，不合契约报错退出，由 daemon 退避重启。按实时节拍每 20 ms 发射一帧，文件播完循环；`frame_idx` 与 `pts_ns` 语义与设备采集一致。`GetStatus` 的采集设备名报告文件路径。换文件与换设备一样由重启生效，不做在线命令。（`pre/src/file_capture.rs`）
-- `[pre.dsp]` 配置段键：`denoise`（WOLA 谱降噪开关，默认 true，沿用旧 main.c 代码默认）、`gate`、`agc`、`limiter`（整形级开关，默认 false，沿用旧 main.c 代码默认）。禁用降噪时该级全部计算跳过：不走旧实现的旁路 WOLA 重建，无切换收敛期、无发射延迟，置信度恒 0；禁用整形级时逐位恒等跳过。（`core/src/config.rs:60-113`、`dsp/src/lib.rs:88-93`）
+- `[pre.dsp]` 配置段键：`denoise`（降噪总开关，默认 `true`，沿用旧 main.c 代码默认）、`backend`（可选降噪后端，缺省有 `[enhance]` 时取 `ulunas`、否则 `wola`；通过 `core/src/denoise.rs` 目录注册扩展）、`gate`、`agc`、`limiter`（整形级开关，默认 `false`）。禁用降噪时跳过降噪计算，48 kHz 主干无发射延迟、置信度恒 0 且 16 kHz 打包由统一 `resolve_vad` 按主干可闻度驱动能量型 VAD（修复此前 `conf = 0` 导致 `vad_flag` 恒 0 的问题）；禁用整形级时逐位恒等跳过。（`core/src/config.rs`、`core/src/denoise.rs`、`dsp/src/lib.rs`）
 - WOLA 谱降噪流式合同（旧实现实测口径）：960 样本定块首块发射 896、其后每块 960；发射流滞后输入流 64 样本，处理级对首块缺口补零保持 20 ms 帧节拍（旧 dsp.c wrapper 语义）。旧注释的“192 样本发射延迟”指 64 样本 hop 的完整重建跨度（frame 128 + hop 64）。（`dsp/src/lib.rs:84-107`、`dsp/src/noise_suppressor.rs:96-114`）
 - 整形级作用于 WOLA 发射样本（旧 dsp.c enhance 次序：NS 发射后、补零前）；参数固定为旧实现出厂默认，无配置键。
 - 16 kHz 打包：主干 960 对齐帧经 33 抽头 FIR 3:1 降采样为 320 样本契约帧，FIR 历史跨帧连续；InputFrame 的 meta 时间轴与主干帧同窗。`pts_ns` 取采集时间戳（frame.h 语义）；`frame_idx` 为打包序号（旧 `++frame_idx`，从 1 起；旧 main.c 打包时刻改写 pts 的做法不沿用）。（`dsp/src/decimator.rs:9-58`）
@@ -53,7 +53,7 @@
 ## UL-UNAS 可选后端
 
 - 新增 `enhance/` C++ 工作进程，以 ONNX Runtime CPU、单线程运行作者预训练权重；禁止随包复制模型，不依赖 PyTorch。
-- 可选 `[enhance]` 配置选定后端；默认不配置，沿用 WOLA。`pre.dsp.denoise` 控制选定后端，UL-UNAS 不与旧 WOLA 叠加。禁用时直接旁路且不调用网络，重新启用或帧不连续时重置会话。
+- `[enhance]` 配置选定服务端 16 kHz 增强后端；未设置 `pre.dsp.backend` 且存在 `[enhance]` 时默认启用 `ulunas`，否则默认 `wola`，也可在 `[pre.dsp].backend` 或运行时通过 `PRE_SET_DENOISE` 在同层模块间热切换，WOLA 与 UL-UNAS 不叠加。切换、禁用或帧不连续时重置对应后端会话。
 - 48 kHz 直通保留高通及 gate／AGC／limiter，UL-UNAS 仅处理 FIR 后的共享 16 kHz 输入。普通工作线程通过有界队列调用，采集／播放不等待推理。
 - 增强进程由 daemon 启停、退避重启并轮询状态；控制命令 Hello=0x0701、GetStatus=0x0702，使用既有 JSON 信封。pre 不生成子进程。
 - 音频通过独立 Unix SEQPACKET 会话传输：请求为输入 magic 加 InputFrame；应答为增强 magic、ready 和 InputFrame。首两次 ready=0，此后每请求输出对应两帧前的 320 样本；元数据保留源 frame_idx／pts_ns，不伪造新采集时刻。契约以 core C 头为准。
@@ -77,6 +77,7 @@
 
 改进待办：
 
+- [x] 同层降噪模块封装与运行时热切换：将 `WolaDenoiser` 与 `TrunkProcessor` 解耦出 `Dsp` 条件绑定（保留 `Dsp` 门面供文件离线与黄金对拍），在 `core/src/denoise.rs` 建立单点降噪模型目录与能力元数据生成，在 `pre/src/denoise/`（`mod.rs` / `wola.rs` / `ulunas.rs`）以 `TrunkDenoiser` + 异步 IPC 对等承载本地 48 kHz 与远程 16 kHz 模型并支撑后续模型平滑扩展；修复 `denoise = false` 时 `pack_frame` 因硬编码 `conf = 0.0` 走谱门限导致 `vad_flag = 0` 的静音漏洞（`Option<f32>` 置信度为 `None` 时走能量型 `Vad::update_activity` 且保留 `conf = 0`）；新增 `[pre.dsp].backend`（R 类）及运行时复合键 `pre.dsp.denoise_mode`（`off | <backend>`）、控制命令 `PRE_SET_DENOISE`（`0x020D`）、崩溃恢复参数 `--effective-denoise-backend`，状态上报 `denoise_backend` 与 `denoise_backends` 列表，并在切离 IPC 后端时清零 `enhancement.enabled`；Web 设备面板提供嵌套横向单选折叠框与动态扩展渲染。主机单测与桩集成测试已通过；未验证项：Jetson 板端真实麦克风/音频链路下 `关闭` / `WOLA` / `UL-UNAS` 运行时热切换实听与端到端延迟未验证（阻塞原因：本阶段在开发机完成代码重构与主机模拟验证，尚未部署至 Jetson 硬件与 USB 麦实测环境；解除条件：部署到目标设备后分别在 Direct 与 RVC 路由执行三档热切换实听，确认清辅音不吞字、无爆音且音频持续流畅）。（`core/src/denoise.rs`、`dsp/src/lib.rs`、`pre/src/denoise/`、`pre/src/state.rs`、`daemon/src/{server,services,supervisor}.rs`、`web/src/components/DevicesPanel.vue`）
 - [ ] 去伴奏效果不足（用户主观反馈，2026-11-26）：UL-UNAS 对背景伴奏的去除不达预期。先用固定伴奏加人声样本做增强开关对照，客观测量伴奏残留能量与近端语音失真，再决定调参或更换降噪器（候选见 [FUTURE](../FUTURE.md)「降噪器切换」）；不以主观听感直接换模型。
 
 ## 声学回声消除（AEC）
@@ -87,14 +88,14 @@
 
 已确认契约（步骤 2–3 已实现）：
 
-- 参考抓取：播放线程在 `fade_in` 与 `mute` 之后、ALSA 写成功后，把最终单声道参考帧经定长无锁 SPSC 环（`rtrb`，容量 16 帧）送入处理线程；零分配、非阻塞，环满丢弃并计数。处理线程积压超过 4 帧时修剪到目标 2 帧，修剪计入参考丢帧。（`pre/src/aec.rs` RefSender/RefReceiver/AecProcessor、`pre/src/playback.rs`）
-- 延时估计：设备打开时一次性估算 ALSA 播放缓冲时长（上限夹到 500 ms，失败回退 45 ms），随参考帧传入 `ProcessStream`；热切设备后重估。（`pre/src/playback.rs` buffer_delay_ms）
-- 因果重置：启用瞬间、采集 `capture_epoch` 跳变、播放 `playback_epoch` 跳变（热切设备、ALSA 欠载恢复）均重置 AEC3 滤波器并计数；参考缺帧计 `ref_underruns`，以静音参考加上一帧延时继续处理；采集削波（|样本| ≥ 0.99）计数。（`pre/src/aec.rs`、`pre/src/playback.rs`）
-- 处理位序：`Dsp::process_frame_with_hook` 在 80 Hz 高通之后、降噪与整形级之前调用 AEC；禁用时排空参考环、主干逐位直通。（`dsp/src/lib.rs`、`pre/src/main.rs` process_thread）
+- 参考抓取：播放线程仅在 AEC 启用时于 `fade_in` 与 `mute` 之后、ALSA 写成功后（遇欠载先推进 `discontinuity` 再推送新帧），把最终单声道参考帧经定长无锁 SPSC 环（`rtrb`，容量 16 帧）送入处理线程；零分配、非阻塞，环满丢弃并计数。首帧开启或播放待机恢复时将积压修剪到目标 1 帧；稳态超出 2 帧（仅 1 帧漂移）时温和抽丢最旧 1 帧而不重置，突发积压 >= 2 帧则回退到目标 1 帧并重置 AEC。（`pre/src/aec.rs` RefSender/RefReceiver/AecProcessor、`pre/src/playback.rs`）
+- 延时估计：AEC 启用时，播放线程以 `snd_pcm_delay`（`runtime_render_delay_ms`，静态开口估算 `buffer_delay_ms` 兜底 25 ms）推算参考首样本抵达 DAC 的单调时刻 `render_at_ns`，采集线程以采读耗时与 `snd_pcm_delay` 推算 `cap_start_ns`，处理线程配对 `(render_at_ns - cap_start_ns) / 1e6`（夹到 `0..=500 ms`）作为动态 `stream_delay_ms` 传入 `ProcessStream`。（`pre/src/playback.rs`、`pre/src/capture.rs`、`pre/src/aec.rs`）
+- 因果重置：启用瞬间、采集 `capture_epoch` 跳变（含 ALSA 溢出丢弃残余半帧并复位与处理前环丢帧）、播放 `playback_epoch` 跳变、播放待机恢复、连续 >= 3 帧参考欠载后恢复、突发积压丢帧 >= 2，以及软件前级增益累计偏离基线 `>= 6 dB` 或硬件混音器累计音量偏离 `>= 15%`/AGC 切换均触发 `aec_gain_epoch` / AEC3 重置并计数；播放缺设备待机期间不虚计 `ref_underruns`，短暂参考欠载沿用最近一次配对延时；`capture_clips` 综合统计软件增益及 80 Hz 高通前后的 `|样本| >= 0.99` 削波。（`pre/src/aec.rs`、`pre/src/capture.rs`、`pre/src/control.rs`、`pre/src/main.rs`、`pre/src/playback.rs`、`pre/src/state.rs`）
+- 处理位序：`Dsp::process_frame_with_hook` 在 `TrunkProcessor` 的 80 Hz 高通之后、降噪与整形级之前调用 AEC，同时关闭 WebRTC APM 内重复的 80 Hz 高通滤波；禁用时排空参考环、主干逐位直通。（`aec3/src/mozart_aec3.cpp`、`dsp/src/lib.rs`、`pre/src/main.rs` process_thread）
 - 配置与控制面：`[pre.aec].enabled`（bool，默认 false，R 类）；`PRE_SET_AEC`（`0x020A`，体 `{"enabled": bool}`）运行时启停，应答回显请求；`config set pre.aec.enabled` 由 daemon 下发，失败保留 TOML 基线与生效值不变。崩溃自愈经 `--effective-aec` 沿用生效开关。（`core/src/config.rs` PreAecConfig、`core/include/mozart/ctl.h`、`pre/src/control.rs`、`daemon/src/services.rs` set_aec、`daemon/src/server.rs` apply_runtime_key）
-- 可观测：`GetStatus` 的 `aec` 字段报告 enabled/backend/active/delay_ms/erle_db/ref_dropped/ref_underruns/resets/capture_clips/last_error；遥测每 25 帧同步一次，热路径只更新原子。后端不可用时显式记录原因，不修改采集。（`core/src/ctl/schema.rs` PreAecStatus、`pre/src/aec.rs` AecTelemetry）
-- 构建链接：`aec3/` 经 pkg-config 链接 `webrtc-audio-processing-1`（搜索 `MOZART_ASSETS_DIR` 与 `~/mozart-assets` 的 pkgconfig 路径），缺库时跳过该目标。`pre/build.rs` 在 `MOZART_AEC3_LIB_DIR` 设置时链接 `libmozart_aec3` 并置 `has_aec3`，否则用未链接桩，本机 cargo 检查不依赖外部 C++ 库；部署脚本在 `assets/lib/libmozart_aec3.so` 存在时导出该变量。CTest `aec3_wrapper` 覆盖封装层。（`aec3/CMakeLists.txt`、`pre/build.rs`、`tools/deploy-jetson.sh`、`tests/test_aec3_wrapper.cpp`）
-- 离线单测：环满发送侧丢最新、积压修剪丢最旧、禁用直通排空、采播双向 epoch 重置与削波计数、不可用后端显式报错；链接真实库时另跑 65 ms 延时加 100 ppm 漂移的合成回声消除测试。（`pre/src/aec.rs` tests）
+- 可观测：`GetStatus` 的 `aec` 字段报告 enabled/backend/active/delay_ms/erle_db/erl_db/divergent_fraction/residual_echo_likelihood/delay_median_ms/delay_std_ms/stream_delay_ms/ref_dropped/ref_underruns/resets/capture_clips/last_error；遥测每 25 帧同步一次，热路径只更新原子，AEC 故障只记 `aec.last_error`（禁停/恢复即清零，不污染全局 `pre.last_error`），启用状态下由 `daemon` 汇入 `degraded`，Web 设备面板展示 ERLE 与发散提示。后端不可用时显式记录原因，不修改采集。（`aec3/`、`core/src/ctl/schema.rs`、`daemon/src/services.rs`、`pre/src/aec.rs`、`web/src/contracts.ts`、`web/src/components/DevicesPanel.vue`）
+- 构建链接：`aec3/` 经 pkg-config 链接 `webrtc-audio-processing-1`（搜索 `MOZART_ASSETS_DIR` 与 `~/mozart-assets` 的 pkgconfig 路径），缺库时跳过该目标。`pre/build.rs` 在 `MOZART_AEC3_LIB_DIR` 设置时链接 `libmozart_aec3` 并置 `has_aec3`，否则用未链接桩，本机 cargo 检查不依赖外部 C++ 库；`tools/ci-local.sh`、`tools/deploy-jetson.sh` 与 `tools/jetson-unit-test.sh` 在 `libmozart_aec3.so` 存在时自动导出该变量。CTest `aec3_wrapper` 覆盖封装层。（`aec3/CMakeLists.txt`、`pre/build.rs`、`tools/ci-local.sh`、`tools/deploy-jetson.sh`、`tools/jetson-unit-test.sh`、`tests/test_aec3_wrapper.cpp`）
+- 离线单测：环满发送侧丢最新、首帧与突发积压修剪重置 vs 单帧漂移温和修剪、禁用直通与清空遥测、待机免虚计欠载及恢复重置、时间戳配对延时与增益跳变/前级削波联动、连续欠载恢复重置、不可用后端报错、`pre_aec_degraded` 汇总、控制面增益跳变阈值；链接真实库时跑 65 ms + 100 ppm 漂移及 45 ms→95 ms 延时跳变恢复测试。（`pre/src/aec.rs`、`pre/src/control.rs`、`daemon/src/services.rs`）
 
 顺序说明：步骤 1 原定先实测定参再实现，步骤 2–3 已先行落地（2026-11-26 提交）；步骤 1 的剩余职责是核验上述已定边界并调参，步骤 4 整机验收不变。
 
@@ -113,7 +114,8 @@
 改进待办：
 
 - [ ] AEC 效果不足（用户主观反馈，2026-11-26）：真实外放音量开大后残余回声仍存在，而且场景识别慢。先完成步骤 1 实测取得 ERLE、延时、漂移与场景切换收敛时间数据，定位根因（声学延时估计偏差、双声卡漂移、音乐类回声、收敛速度等）再调参；不以主观听感直接改滤波器。
-- [ ] 补延时跳变离线单测（步骤 2 遗留验收项）：现有单测覆盖逐帧延时透传与合成回声漂移，未覆盖延时跳变场景；补参考延时突变时的处理与重置断言。
+- [x] AEC 客观对齐、联动与诊断加固：移除 WebRTC APM 内重复的 80 Hz 高通滤波；`playback` 在 AEC 启用时经 ALSA 运行时延迟（`snd_pcm_delay`）与单调时间戳推算参考渲染时刻，与 `capture` 采帧起始时刻配对计算动态 `stream_delay_ms`，并标记播放待机态（缺设备待机不虚计 `ref_underruns`）；处理线程优化参考环溢出/断流重置与采集溢出/丢帧复位（`capture_epoch`），将削波检测前移到软件前级增益与高通之前，大幅增益突变（软件增益 `>= 6 dB` 或硬件混音大幅改动）触发 AEC 重置；补齐 `erl_db`、`divergent_fraction`、`residual_echo_likelihood`、`delay_median_ms`、`delay_std_ms` 与 `stream_delay_ms` 至 `PreAecStatus`（`daemon` 汇总 `aec.last_error` 至 `degraded`，Web 面板补 ERLE/发散显示）；`ci-local.sh` 与 `jetson-unit-test.sh` 自动探测并链接 `libmozart_aec3.so`。（`aec3/`、`tests/test_aec3_wrapper.cpp`、`core/src/ctl/schema.rs`、`daemon/src/services.rs`、`pre/src/{aec,capture,control,main,playback,state}.rs`、`tools/{ci-local,jetson-unit-test}.sh`、`web/src/`；本机完成全量 `ci-local.sh all`；Jetson 部署后通过 `13/13` CTest、`mozart-pre` 120 单元 + 8 集成（含 `has_aec3`）、`smoke` / `language` 套件，实机双 USB 声卡验证 `stream_delay_ms = 42..43 ms` 与 `-6.5 dB` 增益重置联动，ALSA Loopback TTS 回声实测 4–11 s 纯 AEC3 ERLE = `32.27 dB` 且 `--aec-probe` `align.py` 残差 `0.00 ms`，待机 `ref_underruns = 0`、热接入复位置 `2` 及 `-12 dB` 前级满幅削波 `51` 帧均已验证；真实物理扬声器对麦克风的桌面声学外放录制与 `xrun` 现场尚未验证——阻塞原因：当前未做物理扬声器声学录制与人为注错 `xrun`，解除条件：按步骤 1 实录真实桌面外放回声并用 `align.py` 核验）
+- [x] 补延时跳变离线单测（步骤 2 遗留验收项）：补齐稳态积压单帧漂移 vs 突发丢帧、连续参考欠载恢复、45 ms→95 ms 真实 AEC3 中途延时阶跃跳变恢复单测。（`pre/src/aec.rs` `steady_state_backlog_and_prolonged_underrun_reset_policy`、`real_aec3_recovers_after_midstream_delay_jump`；本机与 Jetson ARM64 已链接 `libmozart_aec3.so` 跑通）
 
 ## 改进点
 

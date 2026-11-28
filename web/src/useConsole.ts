@@ -1,6 +1,7 @@
 import { computed, onMounted, onUnmounted, ref, type Ref } from 'vue';
 import { ApiError, client, deviceNow, downloadResult } from './api';
 import { statusSchema, subtitleSchema, type ConnectionState, type DeviceEntry, type FileJob, type Health, type ModelEntry, type Service, type Status } from './contracts';
+import { denoiseModeLabel } from './denoise';
 import { SubtitleStore, subscribeStream } from './streams';
 import type { SubtitleRecord } from './contracts';
 
@@ -315,6 +316,8 @@ export function useConsole() {
         setNotice(`已写入基线并重启：${effect.affected.join('、')}`);
       } else if (key === 'pre.aec.enabled') {
         setNotice(value === 'true' ? '回声消除已开启。' : '回声消除已关闭。');
+      } else if (key === 'pre.dsp.denoise_mode') {
+        setNotice(value === 'off' ? '降噪已关闭。' : `降噪模型已切换为 ${denoiseModeLabel(status.value?.pre, value)}。`);
       } else if (key === 'pre.capture_gain_db' || key.startsWith('pre.dsp.')) {
         setNotice('麦克风参数已应用并保存。');
       } else if (area === 'devices') setNotice('基线已写入；文件任务使用各自的参数快照。');

@@ -1,5 +1,6 @@
 //! daemon 与 ctl 共用的运行配置：TOML 文件 + 环境变量覆盖 + 入口校验。
 
+use crate::denoise::{enhance_required_error, supported_backend_list, DenoiseBackend, DenoiseMode};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::fmt;
@@ -301,8 +302,11 @@ pub struct PreConsumerConfig {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct PreDspConfig {
-    /// WOLA 谱降噪开关，默认 true；false 时该级全部计算跳过。
+    /// 降噪总开关，默认 true；false 时跳过活跃降噪处理并使用能量 VAD。
     pub denoise: bool,
+    /// 可选降噪后端（缺省按是否配置 `[enhance]` 自动选择 ulunas / wola）。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub backend: Option<DenoiseBackend>,
     /// 48 kHz 噪声门，默认 false。
     pub gate: bool,
     /// 48 kHz 自动增益，默认 false。
@@ -315,6 +319,7 @@ impl Default for PreDspConfig {
     fn default() -> Self {
         Self {
             denoise: true,
+            backend: None,
             gate: false,
             agc: false,
             limiter: false,
@@ -1257,6 +1262,7 @@ impl Config {
             }
         }
         self.validate_enhance(self.enhance.as_ref())?;
+        self.validate_denoise_backend(self.pre.dsp.backend, self.enhance.as_ref())?;
         let mut seen = std::collections::HashSet::new();
         for entry in &self.models {
             if entry.id.is_empty() {
@@ -1282,6 +1288,31 @@ impl Config {
                 return Err(ConfigError::Invalid(format!(
                     "[[models]] duplicate id='{}' type='{}'",
                     entry.id, entry.model_type
+                )));
+            }
+        }
+        Ok(())
+    }
+
+    /// 解析生效的降噪后端：显式 `[pre.dsp].backend` 优先，否则有 `[enhance]` 时用 ulunas、无则 wola。
+    pub fn effective_denoise_backend(&self) -> DenoiseBackend {
+        self.pre.dsp.backend.unwrap_or(if self.enhance.is_some() {
+            DenoiseBackend::Ulunas
+        } else {
+            DenoiseBackend::Wola
+        })
+    }
+
+    pub fn validate_denoise_backend(
+        &self,
+        backend: Option<DenoiseBackend>,
+        enhance: Option<&EnhanceConfig>,
+    ) -> Result<(), ConfigError> {
+        if let Some(backend) = backend {
+            if backend.requires_enhance() && enhance.is_none() {
+                return Err(ConfigError::Invalid(format!(
+                    "pre.dsp.backend: {}",
+                    enhance_required_error(backend)
                 )));
             }
         }
@@ -1603,9 +1634,8 @@ pub fn device_key_kind(key: &str) -> Option<&'static str> {
 }
 
 /// 运行时键 → owning 服务（docs/config.md 的 R 类分类）。None 表示非运行时键。
-/// daemon/file 键由 daemon 自身即时应用；rvc 会话参数与实时旋钮由 daemon 按变更键
-/// 编排 `SetParams`、`StopStream`→`StartStream` 或只更新生效配置；pre/bridge 键
-/// 需对端运行时命令下发（未接入）。
+/// daemon/file 键由 daemon 自身即时应用；pre DSP/降噪/AEC/增益与 rvc 会话参数由
+/// daemon 即时下发；bridge 开关经状态文件与控制命令管理。
 pub fn runtime_key_owner(key: &str) -> Option<&'static str> {
     match key {
         "daemon.poll_interval_ms"
@@ -1622,6 +1652,8 @@ pub fn runtime_key_owner(key: &str) -> Option<&'static str> {
         | "file.ffmpeg_path"
         | "file.ffmpeg_timeout_ms" => Some("daemon"),
         "pre.dsp.denoise"
+        | "pre.dsp.backend"
+        | "pre.dsp.denoise_mode"
         | "pre.dsp.gate"
         | "pre.dsp.agc"
         | "pre.dsp.limiter"
@@ -1706,6 +1738,32 @@ pub fn set_key(path: Option<&Path>, key: &str, value: &str) -> Result<KeyEffect,
             affected: vec!["pre".to_string()],
         });
     }
+    if key == "pre.dsp.denoise_mode" {
+        let mode = DenoiseMode::parse(value).ok_or_else(|| {
+            ConfigError::Invalid(format!(
+                "键 {key} 仅支持 off/{}",
+                supported_backend_list()
+            ))
+        })?;
+        match mode {
+            DenoiseMode::Off => {
+                write_runtime_keys(path, &[("pre.dsp.denoise", toml_edit::value(false))])?;
+            }
+            DenoiseMode::Backend(backend) => {
+                write_runtime_keys(
+                    path,
+                    &[
+                        ("pre.dsp.denoise", toml_edit::value(true)),
+                        ("pre.dsp.backend", toml_edit::value(backend.as_str())),
+                    ],
+                )?;
+            }
+        }
+        return Ok(KeyEffect {
+            restart_required: false,
+            affected: Vec::new(),
+        });
+    }
     if let Some(owner) = runtime_key_owner(key) {
         if !matches!(owner, "daemon" | "rvc" | "pre") {
             return Err(ConfigError::Invalid(format!(
@@ -1743,6 +1801,12 @@ fn parse_runtime_value(key: &str, value: &str) -> Result<toml_edit::Item, Config
             _ => Err(ConfigError::Invalid(format!("键 {key} 需要 true/false"))),
         },
         "file.ffmpeg_path" | "rvc.f0_method" => Ok(toml_edit::value(value)),
+        "pre.dsp.backend" => {
+            let backend = DenoiseBackend::parse(value).ok_or_else(|| {
+                ConfigError::Invalid(format!("键 {key} 仅支持 {}", supported_backend_list()))
+            })?;
+            Ok(toml_edit::value(backend.as_str()))
+        }
         "pre.capture_gain_db" | "rvc.index_rate" | "rvc.rms_mix_rate" | "rvc.protect" => {
             let number: f64 = value
                 .parse()
@@ -1866,15 +1930,25 @@ fn write_toml_key(
     atomic_write(path, &doc.to_string())
 }
 
-/// 原子写运行时键：写前整体校验，非法值不落盘。
+/// 原子写单个运行时键：委托 `write_runtime_keys` 在同一事务中校验并落盘。
 fn write_runtime_key(
     path: Option<&Path>,
     key: &str,
     value: toml_edit::Item,
 ) -> Result<(), ConfigError> {
+    write_runtime_keys(path, &[(key, value)])
+}
+
+/// 原子写多个运行时键：写前整体校验，非法值或跨键约束冲突时不落盘。
+fn write_runtime_keys(
+    path: Option<&Path>,
+    updates: &[(&str, toml_edit::Item)],
+) -> Result<(), ConfigError> {
     let path = require_path(path)?;
     let mut doc = load_doc(path)?;
-    set_doc_key(&mut doc, key, value)?;
+    for (key, value) in updates {
+        set_doc_key(&mut doc, key, value.clone())?;
+    }
     validate_doc(path, &doc)?;
     atomic_write(path, &doc.to_string())
 }
@@ -2141,6 +2215,8 @@ mod tests {
         assert_eq!(runtime_key_owner("file.queue_capacity"), Some("daemon"));
         assert_eq!(runtime_key_owner("file.denoise"), Some("daemon"));
         assert_eq!(runtime_key_owner("pre.dsp.denoise"), Some("pre"));
+        assert_eq!(runtime_key_owner("pre.dsp.backend"), Some("pre"));
+        assert_eq!(runtime_key_owner("pre.dsp.denoise_mode"), Some("pre"));
         assert_eq!(runtime_key_owner("pre.aec.enabled"), Some("pre"));
         assert_eq!(runtime_key_owner("pre.capture_gain_db"), Some("pre"));
         assert_eq!(runtime_key_owner("rvc.pitch_shift"), Some("rvc"));
@@ -2201,6 +2277,15 @@ mod tests {
             assert!(set_key(Some(&path), key, "yes").is_err());
             assert!(!set_key(Some(&path), key, "false").unwrap().restart_required);
         }
+        assert!(set_key(Some(&path), "pre.dsp.backend", "unknown").is_err());
+        assert!(set_key(Some(&path), "pre.dsp.backend", "ulunas").is_err(), "无 [enhance] 时拒绝 ulunas");
+        assert!(set_key(Some(&path), "pre.dsp.denoise_mode", "ulunas").is_err(), "无 [enhance] 时拒绝 denoise_mode=ulunas");
+        assert!(!set_key(Some(&path), "pre.dsp.denoise_mode", "wola").unwrap().restart_required);
+        let with_mode = Config::load_from(Some(&path)).unwrap();
+        assert!(with_mode.pre.dsp.denoise);
+        assert_eq!(with_mode.pre.dsp.backend, Some(DenoiseBackend::Wola));
+        assert!(!set_key(Some(&path), "pre.dsp.denoise_mode", "off").unwrap().restart_required);
+        assert!(!Config::load_from(Some(&path)).unwrap().pre.dsp.denoise);
         assert!(set_key(Some(&path), "pre.aec.enabled", "yes").is_err());
         let aec_effect = set_key(Some(&path), "pre.aec.enabled", "true").unwrap();
         assert!(!aec_effect.restart_required);
@@ -2681,6 +2766,22 @@ mod tests {
 
         let bad_gate_type: Result<Config, _> = toml::from_str("[pre.dsp]\ngate = 1\n");
         assert!(bad_gate_type.is_err());
+
+        let default_no_enhance = Config::default();
+        assert_eq!(default_no_enhance.effective_denoise_backend(), DenoiseBackend::Wola);
+
+        let ulunas_without_enhance: Config =
+            toml::from_str("[pre.dsp]\nbackend = \"ulunas\"\n").unwrap();
+        assert!(ulunas_without_enhance.validate().is_err());
+
+        let with_enhance: Config =
+            toml::from_str("[enhance]\nmodel = \"/tmp/ulunas.onnx\"\n").unwrap();
+        assert_eq!(with_enhance.effective_denoise_backend(), DenoiseBackend::Ulunas);
+        let override_wola: Config =
+            toml::from_str("[pre.dsp]\nbackend = \"wola\"\n[enhance]\nmodel = \"/tmp/ulunas.onnx\"\n")
+                .unwrap();
+        assert!(override_wola.validate().is_ok());
+        assert_eq!(override_wola.effective_denoise_backend(), DenoiseBackend::Wola);
     }
 
     #[test]

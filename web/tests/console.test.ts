@@ -857,6 +857,77 @@ describe('设备草稿', () => {
     const gateBtn = Array.from(root.querySelectorAll('button')).find(el => el.textContent?.includes('音量门'))!;
     gateBtn.click();
     expect(setCalls[1]).toEqual(['pre.dsp.gate', 'true']);
+
+    // 默认回退三选一：未配置 [enhance] 时 UL-UNAS 禁用，可切换 关闭 / WOLA，点已选选项不重复发送。
+    const radios = Array.from(root.querySelectorAll<HTMLButtonElement>('[role="radiogroup"] button[role="radio"]'));
+    expect(radios.map(el => el.textContent?.trim())).toEqual(['关闭', 'WOLA', 'UL-UNAS']);
+    expect(radios[1].getAttribute('aria-checked')).toBe('true');
+    expect(radios[2].disabled).toBe(true);
+    expect(root.querySelector('.denoise-summary')?.textContent).toContain('WOLA · 运行中');
+    expect(root.textContent).toContain('UL-UNAS：需在配置中启用 [enhance] 模型');
+    radios[1].click();
+    expect(setCalls).toHaveLength(2);
+    radios[0].click();
+    expect(setCalls[2]).toEqual(['pre.dsp.denoise_mode', 'off']);
+
+    // 后端下发动态目录（含未来扩展模型）时横向单选框自适应展示并可热切，异常仅在 IPC 模型激活时展示。
+    const preExt = status.pre as NonNullable<typeof status.pre> & {
+      denoise_backend?: string;
+      denoise_backends?: Array<{ id: string; label: string; stage: string; available: boolean; unavailable_reason?: string | null }>;
+      enhancement?: unknown;
+    };
+    preExt.denoise_backend = 'ulunas';
+    preExt.denoise_backends = [
+      { id: 'wola', label: 'WOLA', stage: '48k_sync', available: true },
+      { id: 'ulunas', label: 'UL-UNAS', stage: '16k_enhance_ipc', available: true },
+      { id: 'deepfilter', label: 'DeepFilter', stage: '48k_sync', available: true },
+    ];
+    preExt.enhancement = { enabled: true, connected: true, frames_in: 10, frames_out: 8, dropped_frames: 0, queue_depth: 0, last_error: 'enhance timeout' };
+    await nextTick();
+
+    const updatedRadios = Array.from(root.querySelectorAll<HTMLButtonElement>('[role="radiogroup"] button[role="radio"]'));
+    expect(updatedRadios.map(el => el.textContent?.trim())).toEqual(['关闭', 'WOLA', 'UL-UNAS', 'DeepFilter']);
+    expect(updatedRadios[2].getAttribute('aria-checked')).toBe('true');
+    expect(updatedRadios[2].disabled).toBe(false);
+    expect(root.querySelector('.denoise-summary')?.textContent).toContain('UL-UNAS · 已连接');
+    expect(root.textContent).toContain('enhance timeout');
+    updatedRadios[3].click();
+    expect(setCalls[3]).toEqual(['pre.dsp.denoise_mode', 'deepfilter']);
+  });
+
+  it('控制台选择降噪模式发送 pre.dsp.denoise_mode 并提示模型名', async () => {
+    const backend = mockBackend();
+    const original = backend.fetcher.getMockImplementation()!;
+    backend.fetcher.mockImplementation(async (path, init) => {
+      if (path === '/api/v1/config' && init?.method === 'PUT') {
+        const body = JSON.parse(String(init.body));
+        if (body.key === 'pre.dsp.denoise_mode') {
+          return jsonResponse({ ...body, restart_required: false, affected: [] });
+        }
+      }
+      return original(path, init);
+    });
+    (backend.snapshot.pre as NonNullable<typeof backend.snapshot.pre> & Record<string, unknown>).dsp = {
+      denoise: true,
+      gate: false,
+      agc: false,
+      limiter: false,
+    };
+    (backend.snapshot.pre as NonNullable<typeof backend.snapshot.pre> & Record<string, unknown>).denoise_backend = 'wola';
+    (backend.snapshot.pre as NonNullable<typeof backend.snapshot.pre> & Record<string, unknown>).denoise_backends = [
+      { id: 'wola', label: 'WOLA', stage: '48k_sync', available: true },
+      { id: 'ulunas', label: 'UL-UNAS', stage: '16k_enhance_ipc', available: true },
+    ];
+    const root = mount(); await flush();
+    const radios = Array.from(root.querySelectorAll<HTMLButtonElement>('[role="radiogroup"] button[role="radio"]'));
+    radios[2].click(); await flush();
+    expect(backend.fetcher.mock.calls.some(([path, init]) =>
+      path === '/api/v1/config'
+      && typeof init?.body === 'string'
+      && init.body.includes('"pre.dsp.denoise_mode"')
+      && init.body.includes('"ulunas"'),
+    )).toBe(true);
+    expect(root.textContent).toContain('降噪模型已切换为 UL-UNAS。');
   });
 
   it('麦克风混音器写入按实际回读校正并在拒绝时回滚草稿，纯 AGC 设备也显示开关', async () => {

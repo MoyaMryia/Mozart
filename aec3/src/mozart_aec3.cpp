@@ -36,7 +36,9 @@ mozart_aec3_t* mozart_aec3_create(int sample_rate_hz) {
     webrtc::AudioProcessing::Config cfg;
     cfg.echo_canceller.enabled = true;
     cfg.echo_canceller.mobile_mode = false;
-    cfg.high_pass_filter.enabled = true;
+    // TrunkProcessor runs Highpass80 right before AEC; disable APM's duplicate HPF.
+    cfg.echo_canceller.enforce_high_pass_filtering = false;
+    cfg.high_pass_filter.enabled = false;
     apm->ApplyConfig(cfg);
 
     webrtc::StreamConfig sc(sample_rate_hz, 1);
@@ -129,6 +131,22 @@ int mozart_aec3_get_stats(const mozart_aec3_t* handle, mozart_aec3_stats_t* out)
     if (stats.echo_return_loss.has_value()) {
         out->has_erl = 1;
         out->erl_db = *stats.echo_return_loss;
+    }
+    if (stats.divergent_filter_fraction.has_value()) {
+        out->has_divergent = 1;
+        out->divergent_fraction = *stats.divergent_filter_fraction;
+    }
+    if (stats.residual_echo_likelihood.has_value()) {
+        out->has_residual_echo = 1;
+        out->residual_echo_likelihood = *stats.residual_echo_likelihood;
+    }
+    if (stats.delay_median_ms.has_value()) {
+        out->has_delay_median = 1;
+        out->delay_median_ms = *stats.delay_median_ms;
+    }
+    if (stats.delay_standard_deviation_ms.has_value()) {
+        out->has_delay_std = 1;
+        out->delay_std_ms = *stats.delay_standard_deviation_ms;
     }
     return 0;
 }

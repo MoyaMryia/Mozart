@@ -316,11 +316,19 @@ fn start_child(
         command.arg("--socket").arg(socket);
         if role == Role::Pre {
             let effective = shared.snapshot();
+            let effective_dsp = mozart_core::ctl::schema::DspSetRequest {
+                denoise: effective.pre.dsp.denoise,
+                gate: effective.pre.dsp.gate,
+                agc: effective.pre.dsp.agc,
+                limiter: effective.pre.dsp.limiter,
+            };
             command
                 .arg("--effective-enhance")
                 .arg(serde_json::to_string(&config.enhance).map_err(io::Error::other)?)
                 .arg("--effective-dsp")
-                .arg(serde_json::to_string(&effective.pre.dsp).map_err(io::Error::other)?)
+                .arg(serde_json::to_string(&effective_dsp).map_err(io::Error::other)?)
+                .arg("--effective-denoise-backend")
+                .arg(effective.effective_denoise_backend().as_str())
                 .arg("--effective-aec")
                 .arg(serde_json::to_string(&effective.pre.aec).map_err(io::Error::other)?)
                 .arg("--effective-capture-gain-db")

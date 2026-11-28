@@ -123,13 +123,35 @@ impl Services {
         &self,
         dsp: &mozart_core::config::PreDspConfig,
     ) -> Result<(), (String, String)> {
-        let body = serde_json::to_vec(dsp)
+        let req = ctl::schema::DspSetRequest {
+            denoise: dsp.denoise,
+            gate: dsp.gate,
+            agc: dsp.agc,
+            limiter: dsp.limiter,
+        };
+        let body = serde_json::to_vec(&req)
             .map_err(|err| (ctl::CODE_INTERNAL.to_string(), err.to_string()))?;
         let data = self
             .pre()
             .call_ok(ctl::PRE_SET_DSP, &body)
             .map_err(CallError::into_rejection)?;
         validate_dsp_echo(data.data, dsp)
+    }
+
+    /// 调用方持 transition 锁；运行时设置降噪开关与/或后端，只在 pre 确认成功后返回。
+    pub(crate) fn set_denoise(
+        &self,
+        enabled: Option<bool>,
+        backend: Option<mozart_core::denoise::DenoiseBackend>,
+    ) -> Result<(bool, mozart_core::denoise::DenoiseBackend), (String, String)> {
+        let req = ctl::schema::DenoiseSetRequest { enabled, backend };
+        let body = serde_json::to_vec(&req)
+            .map_err(|err| (ctl::CODE_INTERNAL.to_string(), err.to_string()))?;
+        let data = self
+            .pre()
+            .call_ok(ctl::PRE_SET_DENOISE, &body)
+            .map_err(CallError::into_rejection)?;
+        validate_denoise_echo(data.data, enabled, backend)
     }
 
     /// 调用方持 transition 锁；只在 pre 确认成功后提交共享配置。
@@ -926,12 +948,23 @@ fn pre_enhancement_degraded(status: &PreStatus, degraded: &mut Vec<String>) {
     }
 }
 
+fn pre_aec_degraded(status: &PreStatus, degraded: &mut Vec<String>) {
+    if let Some(aec) = &status.aec {
+        if aec.enabled {
+            if let Some(error) = &aec.last_error {
+                degraded.push(format!("pre aec: {error}"));
+            }
+        }
+    }
+}
+
 fn poll_pre(services: &Services, degraded: &mut Vec<String>) -> Option<PreStatus> {
     let mut pre = services.pre();
     match pre.call_ok(ctl::PRE_GET_STATUS, b"{}") {
         Ok(response) => match serde_json::from_value::<PreStatus>(response.data) {
             Ok(status) => {
                 pre_enhancement_degraded(&status, degraded);
+                pre_aec_degraded(&status, degraded);
                 Some(status)
             }
             Err(err) => {
@@ -1503,6 +1536,35 @@ fn validate_dsp_echo(
     Ok(())
 }
 
+#[derive(Debug, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct DenoiseEcho {
+    enabled: bool,
+    backend: mozart_core::denoise::DenoiseBackend,
+}
+
+fn validate_denoise_echo(
+    data: serde_json::Value,
+    expected_enabled: Option<bool>,
+    expected_backend: Option<mozart_core::denoise::DenoiseBackend>,
+) -> Result<(bool, mozart_core::denoise::DenoiseBackend), (String, String)> {
+    let echoed: DenoiseEcho = serde_json::from_value(data).map_err(|err| {
+        (
+            ctl::CODE_INTERNAL.to_string(),
+            format!("pre SetDenoise invalid echo: {err}"),
+        )
+    })?;
+    if expected_enabled.is_some_and(|expected| echoed.enabled != expected)
+        || expected_backend.is_some_and(|expected| echoed.backend != expected)
+    {
+        return Err((
+            ctl::CODE_INTERNAL.to_string(),
+            "pre SetDenoise echo differs from request".to_string(),
+        ));
+    }
+    Ok((echoed.enabled, echoed.backend))
+}
+
 fn validate_aec_echo(
     data: serde_json::Value,
     expected: &mozart_core::config::PreAecConfig,
@@ -1525,6 +1587,33 @@ fn validate_aec_echo(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn denoise_echo_requires_matching_enabled_and_backend() {
+        use mozart_core::denoise::DenoiseBackend;
+        assert_eq!(
+            validate_denoise_echo(
+                serde_json::json!({"enabled": true, "backend": "wola"}),
+                Some(true),
+                Some(DenoiseBackend::Wola),
+            )
+            .unwrap(),
+            (true, DenoiseBackend::Wola)
+        );
+        for invalid in [
+            serde_json::json!({}),
+            serde_json::json!({"enabled": false, "backend": "wola"}),
+            serde_json::json!({"enabled": true, "backend": "ulunas"}),
+            serde_json::json!({"enabled": true, "backend": "unknown"}),
+            serde_json::json!({"enabled": true, "backend": "wola", "extra": true}),
+        ] {
+            let (code, reason) =
+                validate_denoise_echo(invalid, Some(true), Some(DenoiseBackend::Wola))
+                    .unwrap_err();
+            assert_eq!(code, ctl::CODE_INTERNAL);
+            assert!(reason.contains("echo"));
+        }
+    }
 
     #[test]
     fn dsp_echo_requires_all_boolean_fields_and_exact_requested_values() {
@@ -1633,5 +1722,47 @@ mod tests {
         let (code, reason) = merge_session_key("rvc.future_key", &old, &fresh).unwrap_err();
         assert_eq!(code, ctl::CODE_INTERNAL);
         assert!(reason.contains("rvc.future_key"), "{reason}");
+    }
+
+    #[test]
+    fn pre_aec_degraded_reports_only_enabled_error() {
+        let base = json!({
+            "state": "running",
+            "route": "direct",
+            "mute": false,
+            "capture_device": "cap",
+            "playback_device": "play",
+            "frames_captured": 0,
+            "frames_played": 0,
+            "frames_dropped": 0,
+            "queue_depth": 0,
+            "consumer_drops": {},
+            "last_error": null,
+            "version": "test"
+        });
+        let make = |enabled: bool, last_error: Option<&str>| -> PreStatus {
+            let mut v = base.clone();
+            v["aec"] = json!({
+                "enabled": enabled,
+                "backend": "unavailable",
+                "active": false,
+                "delay_ms": null,
+                "erle_db": null,
+                "ref_dropped": 0,
+                "ref_underruns": 0,
+                "resets": 0,
+                "capture_clips": 0,
+                "last_error": last_error
+            });
+            serde_json::from_value(v).unwrap()
+        };
+
+        let mut degraded = Vec::new();
+        pre_aec_degraded(&make(false, Some("ignored when disabled")), &mut degraded);
+        pre_aec_degraded(&make(true, None), &mut degraded);
+        assert!(degraded.is_empty(), "{degraded:?}");
+
+        pre_aec_degraded(&make(true, Some("backend unavailable")), &mut degraded);
+        assert_eq!(degraded, vec!["pre aec: backend unavailable".to_string()]);
     }
 }

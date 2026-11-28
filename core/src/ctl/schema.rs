@@ -2,6 +2,7 @@
 //! 字段名是 CLI 与以后网页适配器的稳定机器契约。
 
 use crate::config::{PreDspConfig, RvcSessionValues};
+use crate::denoise::DenoiseBackend;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 
@@ -237,6 +238,8 @@ pub struct PreStatus {
     pub mic_mixer: Option<PreMicMixerStatus>,
     #[serde(default = "default_denoise_backend")]
     pub denoise_backend: String,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub denoise_backends: Vec<DenoiseBackendInfo>,
     pub state: String,
     pub route: Route,
     pub mute: bool,
@@ -276,6 +279,16 @@ pub struct PreStatus {
     pub version: String,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DenoiseBackendInfo {
+    pub id: String,
+    pub label: String,
+    pub stage: String,
+    pub available: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub unavailable_reason: Option<String>,
+}
+
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct PreEnhanceStatus {
     pub enabled: bool,
@@ -294,6 +307,18 @@ pub struct PreAecStatus {
     pub active: bool,
     pub delay_ms: Option<i32>,
     pub erle_db: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub erl_db: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub divergent_fraction: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub residual_echo_likelihood: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub delay_median_ms: Option<i32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub delay_std_ms: Option<i32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub stream_delay_ms: Option<i32>,
     pub ref_dropped: u64,
     pub ref_underruns: u64,
     pub resets: u64,
@@ -313,7 +338,7 @@ pub struct EnhanceStatus {
 }
 
 fn default_denoise_backend() -> String {
-    "wola".to_string()
+    DenoiseBackend::default().as_str().to_string()
 }
 
 fn default_speaker_state() -> String {
@@ -594,13 +619,23 @@ pub struct FileModeSetRequest {
 
 /// DSP 级开关请求体（PRE_SET_DSP）：四个开关全部必需，显式完整状态，
 /// 不做部分更新（SPEC-02 运行中切换 DSP 级）。
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct DspSetRequest {
     pub denoise: bool,
     pub gate: bool,
     pub agc: bool,
     pub limiter: bool,
+}
+
+/// 降噪启停与后端切换请求体（PRE_SET_DENOISE）：至少提供 enabled 或 backend 之一。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct DenoiseSetRequest {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub enabled: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub backend: Option<DenoiseBackend>,
 }
 
 /// 声学回声消除开关请求体（PRE_SET_AEC）：{"enabled": bool}。

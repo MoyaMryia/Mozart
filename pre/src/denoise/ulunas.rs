@@ -1,13 +1,13 @@
-//! 可选增强支路：普通线程串行请求，实时处理线程只写有界环。
-#[cfg(test)]
-mod tests;
+//! 16 kHz 神经网络降噪 IPC 后端（UL-UNAS 及后续同阶段模型）：
+//! 普通工作线程串行发起 SEQPACKET IPC 请求，实时处理线程只写入有界环。
+
+use super::{fanout, WorkItem};
 use crate::{ai, state::Shared};
 use mozart_core::config::EnhanceConfig;
 use mozart_core::ctl::schema::PreEnhanceStatus;
 use mozart_core::ring::Ring;
 use mozart_core::{
-    EnhanceReply, EnhanceRequest, InputFrame, ENHANCE_PACKET_MAGIC, ENHANCE_PRIMING_FRAMES,
-    INPUT_PACKET_MAGIC,
+    EnhanceReply, EnhanceRequest, ENHANCE_PACKET_MAGIC, ENHANCE_PRIMING_FRAMES, INPUT_PACKET_MAGIC,
 };
 use mozart_dsp::InputFrameAnalyzer;
 use std::collections::VecDeque;
@@ -17,28 +17,23 @@ use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
 use std::os::unix::ffi::OsStrExt;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::{Duration, Instant};
 
-#[derive(Clone, Copy)]
-pub struct WorkItem {
-    pub frame: InputFrame,
-    /// 采集序号用于识别上游环丢帧；打包序号在消费后仍连续。
-    pub source_idx: u32,
-    pub rvc_ai_active: bool,
-    pub file_generation: u64,
-    pub epoch: u64,
-    pub enabled: bool,
-}
-
-pub struct Enhancement {
+pub struct UlunasWorker {
     pub queue: Ring<WorkItem>,
     path: PathBuf,
     timeout: Duration,
     status: Mutex<PreEnhanceStatus>,
 }
 
-impl Enhancement {
+fn lock_status(status: &Mutex<PreEnhanceStatus>) -> MutexGuard<'_, PreEnhanceStatus> {
+    status
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
+impl UlunasWorker {
     pub fn new(config: &EnhanceConfig, run_dir: &Path) -> Self {
         Self {
             queue: Ring::new(config.queue_frames as usize),
@@ -49,7 +44,7 @@ impl Enhancement {
     }
 
     pub fn status(&self, enabled: bool) -> PreEnhanceStatus {
-        let mut status = self.status.lock().unwrap().clone();
+        let mut status = lock_status(&self.status).clone();
         status.enabled = enabled;
         status.queue_depth = self.queue.depth() as u64;
         status.dropped_frames += self.queue.dropped();
@@ -58,25 +53,8 @@ impl Enhancement {
     }
 }
 
-pub fn fanout(item: &WorkItem, shared: &Shared, senders: &mut [ai::Sender]) {
-    for (index, sender) in senders.iter_mut().enumerate() {
-        let _permit = if shared.consumers()[index].file_mode_affected {
-            if !item.rvc_ai_active {
-                continue;
-            }
-            let Some(permit) = shared.begin_ai_send(item.file_generation) else {
-                continue;
-            };
-            Some(permit)
-        } else {
-            None
-        };
-        sender.send(&item.frame, shared);
-    }
-}
-
 pub fn run(
-    enhance: Arc<Enhancement>,
+    enhance: Arc<UlunasWorker>,
     shared: Arc<Shared>,
     mut senders: Vec<ai::Sender>,
     stop: &AtomicBool,
@@ -84,49 +62,51 @@ pub fn run(
     let mut socket = None;
     let mut pending = VecDeque::<WorkItem>::with_capacity(ENHANCE_PRIMING_FRAMES + 1);
     let mut analyzer = InputFrameAnalyzer::default();
-    let mut epoch = shared.enhancement_epoch();
+    let mut epoch = shared.denoise_epoch();
     let mut last_idx: Option<u32> = None;
     let mut queue_drops = 0;
     while !stop.load(Ordering::Relaxed) {
         let item = enhance.queue.pop(Some(Duration::from_millis(10)));
-        let current_epoch = shared.enhancement_epoch();
+        let current_epoch = shared.denoise_epoch();
         let dropped = enhance.queue.dropped();
         let gap = item
             .is_some_and(|item| last_idx.is_some_and(|idx| item.source_idx != idx.wrapping_add(1)));
         if epoch != current_epoch || dropped != queue_drops || gap {
             socket = None;
             analyzer.reset();
-            let mut status = enhance.status.lock().unwrap();
+            let mut status = lock_status(&enhance.status);
             status.connected = false;
             status.dropped_frames += pending.len() as u64;
             if dropped != queue_drops || gap {
                 status.last_error = Some("enhancement input gap; session reset".into());
+            } else {
+                // 模式/开关切换清掉旧会话故障，避免切去本地降噪或切回时残留上次断开报警。
+                status.last_error = None;
             }
             pending.clear();
             last_idx = None;
             epoch = current_epoch;
             queue_drops = dropped;
         }
-        let Some(mut item) = item else {
+        let Some(item) = item else {
             continue;
         };
-        if item.epoch != current_epoch {
-            enhance.status.lock().unwrap().dropped_frames += 1;
-            continue;
-        }
         last_idx = Some(item.source_idx);
-        if !item.enabled {
-            analyzer.analyze(&mut item.frame);
+        if item.enhance_backend.is_none() {
             fanout(&item, &shared, &mut senders);
             continue;
         }
-        enhance.status.lock().unwrap().frames_in += 1;
+        if item.epoch != current_epoch {
+            lock_status(&enhance.status).dropped_frames += 1;
+            continue;
+        }
+        lock_status(&enhance.status).frames_in += 1;
         pending.push_back(item);
         let deadline = Instant::now() + enhance.timeout;
         let result = (|| {
             if socket.is_none() {
                 socket = Some(connect(&enhance.path, deadline, stop, &shared, epoch)?);
-                enhance.status.lock().unwrap().connected = true;
+                lock_status(&enhance.status).connected = true;
             }
             let reply = exchange(
                 socket.as_ref().unwrap(),
@@ -145,8 +125,8 @@ pub fn run(
         })();
         match result {
             Ok(reply) => {
-                // 关闭或重新启用发生在推理期间时，旧结果不得进入新支路。
-                if shared.enhancement_epoch() != epoch
+                // 切换后端、关闭或重新启用发生在推理期间时，旧结果不得进入新支路。
+                if shared.denoise_epoch() != epoch
                     || enhance.queue.dropped() != queue_drops
                     || stop.load(Ordering::Relaxed)
                 {
@@ -157,7 +137,7 @@ pub fn run(
                     source.frame.pcm = reply.frame.pcm;
                     analyzer.analyze(&mut source.frame);
                     fanout(&source, &shared, &mut senders);
-                    let mut status = enhance.status.lock().unwrap();
+                    let mut status = lock_status(&enhance.status);
                     status.frames_out += 1;
                     status.last_error = None;
                 }
@@ -166,17 +146,17 @@ pub fn run(
                 socket = None;
                 analyzer.reset();
                 last_idx = None;
-                let mut status = enhance.status.lock().unwrap();
+                let mut status = lock_status(&enhance.status);
                 status.connected = false;
                 status.dropped_frames += pending.len() as u64;
-                if shared.enhancement_epoch() == epoch && !stop.load(Ordering::Relaxed) {
+                if shared.denoise_epoch() == epoch && !stop.load(Ordering::Relaxed) {
                     status.last_error = Some(format!("enhancement: {err}"));
                 }
                 pending.clear();
             }
         }
     }
-    let mut status = enhance.status.lock().unwrap();
+    let mut status = lock_status(&enhance.status);
     status.connected = false;
     status.dropped_frames += pending.len() as u64;
     Ok(())
@@ -186,7 +166,11 @@ fn invalid(message: &'static str) -> io::Error {
     io::Error::new(io::ErrorKind::InvalidData, message)
 }
 
-fn validate(reply: &EnhanceReply, source: &WorkItem, ready: bool) -> io::Result<()> {
+pub(super) fn validate(
+    reply: &EnhanceReply,
+    source: &WorkItem,
+    ready: bool,
+) -> io::Result<()> {
     if reply.magic != ENHANCE_PACKET_MAGIC || reply.ready != u32::from(ready) {
         return Err(invalid("bad enhancement magic or priming state"));
     }
@@ -215,7 +199,7 @@ fn wait(
     epoch: u64,
 ) -> io::Result<()> {
     loop {
-        if stop.load(Ordering::Relaxed) || shared.enhancement_epoch() != epoch {
+        if stop.load(Ordering::Relaxed) || shared.denoise_epoch() != epoch {
             return Err(io::Error::new(
                 io::ErrorKind::Interrupted,
                 "enhancement epoch cancelled",
@@ -308,9 +292,9 @@ fn connect(
     Ok(fd)
 }
 
-fn exchange(
+pub(super) fn exchange(
     fd: &OwnedFd,
-    frame: &InputFrame,
+    frame: &mozart_core::InputFrame,
     deadline: Instant,
     stop: &AtomicBool,
     shared: &Shared,

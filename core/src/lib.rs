@@ -3,6 +3,7 @@
 
 pub mod config;
 pub mod ctl;
+pub mod denoise;
 pub mod dgram;
 pub mod preset;
 pub mod ring;

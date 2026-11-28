@@ -16,6 +16,14 @@ typedef struct {
     double erle_db;
     int    has_erl;
     double erl_db;
+    int    has_divergent;
+    double divergent_fraction;
+    int    has_residual_echo;
+    double residual_echo_likelihood;
+    int    has_delay_median;
+    int    delay_median_ms;
+    int    has_delay_std;
+    int    delay_std_ms;
 } mozart_aec3_stats_t;
 
 mozart_aec3_t* mozart_aec3_create(int sample_rate_hz);

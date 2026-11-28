@@ -7,8 +7,9 @@
 use crate::state::{DspSwitches, QueueReadout, Shared, VERSION};
 use mozart_core::config::{validate_capture_gain_db, validate_device_name};
 use mozart_core::ctl::schema::{
-    error_body, ok_body, AecSetRequest, CaptureGainSetRequest, DeviceUseRequest, DspSetRequest,
-    FileModeSetRequest, MicMixerSetRequest, MuteSetRequest, PlayoutSetRequest, RouteSetRequest,
+    error_body, ok_body, AecSetRequest, CaptureGainSetRequest, DenoiseSetRequest,
+    DeviceUseRequest, DspSetRequest, FileModeSetRequest, MicMixerSetRequest, MuteSetRequest,
+    PlayoutSetRequest, RouteSetRequest,
 };
 use mozart_core::ctl::{self, Message, Seqpacket, ACCEPT_POLL, IDLE_TIMEOUT, RECV_POLL};
 use mozart_core::dgram::FRAME_SIZE_MISMATCH_REASON;
@@ -358,6 +359,24 @@ fn dispatch_with_stop(
             }
             Err(err) => error_body(ctl::CODE_INVALID_ARGUMENT, &err.to_string()),
         },
+        ctl::PRE_SET_DENOISE => match serde_json::from_value::<DenoiseSetRequest>(body) {
+            Ok(request) => {
+                if request.enabled.is_none() && request.backend.is_none() {
+                    return error_body(
+                        ctl::CODE_INVALID_ARGUMENT,
+                        "enabled or backend must be provided",
+                    );
+                }
+                match shared.set_denoise_target(request.enabled, request.backend) {
+                    Ok((enabled, backend)) => ok_body(json!({
+                        "enabled": enabled,
+                        "backend": backend.as_str(),
+                    })),
+                    Err(reason) => error_body(ctl::CODE_INVALID_ARGUMENT, &reason),
+                }
+            }
+            Err(err) => error_body(ctl::CODE_INVALID_ARGUMENT, &err.to_string()),
+        },
         ctl::PRE_SET_AEC => match serde_json::from_value::<AecSetRequest>(body) {
             Ok(request) => {
                 shared.set_aec_enabled(request.enabled);
@@ -368,7 +387,7 @@ fn dispatch_with_stop(
         ctl::PRE_SET_CAPTURE_GAIN => match serde_json::from_value::<CaptureGainSetRequest>(body) {
             Ok(request) => match validate_capture_gain_db(request.capture_gain_db) {
                 Ok(db) => {
-                    shared.set_capture_gain_db(db);
+                    shared.apply_capture_gain_db(db);
                     ok_body(json!({ "capture_gain_db": db }))
                 }
                 Err(err) => error_body(ctl::CODE_INVALID_ARGUMENT, &err.to_string()),
@@ -769,6 +788,33 @@ mod tests {
                 limiter: true,
             }
         );
+
+        // PRE_SET_DENOISE 无 [enhance] 时允许 wola 与开关切换，拒绝 ulunas。
+        let reply = dispatch(
+            &message(
+                ctl::PRE_SET_DENOISE,
+                br#"{"enabled":false,"backend":"wola"}"#,
+            ),
+            &shared,
+            &cap,
+            &trunk,
+            &rvc,
+            &tts,
+            &mut log,
+        );
+        assert_eq!(data(&reply)["enabled"], false);
+        assert_eq!(data(&reply)["backend"], "wola");
+        assert!(!shared.dsp_target().denoise);
+        let rejected = dispatch(
+            &message(ctl::PRE_SET_DENOISE, br#"{"backend":"ulunas"}"#),
+            &shared,
+            &cap,
+            &trunk,
+            &rvc,
+            &tts,
+            &mut log,
+        );
+        assert_eq!(error_code(&rejected), ctl::CODE_INVALID_ARGUMENT);
     }
 
     #[test]
@@ -785,6 +831,35 @@ mod tests {
         );
         assert_eq!(data(&reply)["capture_gain_db"], -6.5);
         assert_eq!(shared.capture_gain_db(), -6.5);
+        assert_eq!(shared.aec_gain_epoch(), 1, "增益跳变 >= 6 dB 应触发 AEC 重置");
+
+        let step1 = dispatch(
+            &message(ctl::PRE_SET_CAPTURE_GAIN, br#"{"capture_gain_db":-4.0}"#),
+            &shared,
+            &cap,
+            &trunk,
+            &rvc,
+            &tts,
+            &mut log,
+        );
+        assert_eq!(data(&step1)["capture_gain_db"], -4.0);
+        assert_eq!(shared.aec_gain_epoch(), 1, "小幅微调 (-6.5 -> -4.0) 不触发 AEC 重置");
+
+        let step2 = dispatch(
+            &message(ctl::PRE_SET_CAPTURE_GAIN, br#"{"capture_gain_db":-0.5}"#),
+            &shared,
+            &cap,
+            &trunk,
+            &rvc,
+            &tts,
+            &mut log,
+        );
+        assert_eq!(data(&step2)["capture_gain_db"], -0.5);
+        assert_eq!(
+            shared.aec_gain_epoch(),
+            2,
+            "多步累计相对上次基线 -6.5 达 >= 6 dB 时仍应触发 AEC 重置"
+        );
 
         for bad in [
             &b"{}"[..],
@@ -808,7 +883,7 @@ mod tests {
                 std::str::from_utf8(bad)
             );
         }
-        assert_eq!(shared.capture_gain_db(), -6.5);
+        assert_eq!(shared.capture_gain_db(), -0.5);
     }
 
     #[test]

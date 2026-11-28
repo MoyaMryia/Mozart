@@ -16,7 +16,14 @@ cd "$REPO_DIR" || exit 1
 if [ -e "$ASSETS_DIR/lib/libsherpa-onnx-c-api.so" ]; then
   export SHERPA_ONNX_LIB_DIR="$ASSETS_DIR/lib"
 fi
-export LD_LIBRARY_PATH="$ASSETS_DIR/lib:$ASSETS_DIR/llama${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
+if [ -z "${MOZART_AEC3_LIB_DIR:-}" ]; then
+  if [ -e "$ASSETS_DIR/lib/libmozart_aec3.so" ]; then
+    export MOZART_AEC3_LIB_DIR="$ASSETS_DIR/lib"
+  elif [ -e "$REPO_DIR/build/jetson-release/aec3/libmozart_aec3.so" ]; then
+    export MOZART_AEC3_LIB_DIR="$REPO_DIR/build/jetson-release/aec3"
+  fi
+fi
+export LD_LIBRARY_PATH="$ASSETS_DIR/lib:$ASSETS_DIR/llama${MOZART_AEC3_LIB_DIR:+:$MOZART_AEC3_LIB_DIR}${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
 
 echo '== cargo test --workspace =='
 # 设备端进程桩测试对时序敏感，串行执行避免并行负载造成假失败。

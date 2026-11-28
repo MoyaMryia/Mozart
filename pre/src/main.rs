@@ -22,7 +22,7 @@ mod ai;
 mod alsa_stream;
 mod capture;
 mod control;
-mod enhancement;
+mod denoise;
 mod file_capture;
 mod mixer;
 mod playback;
@@ -90,6 +90,7 @@ struct Args {
     config: Option<PathBuf>,
     effective_enhance: Option<Option<mozart_core::config::EnhanceConfig>>,
     effective_dsp: Option<mozart_core::config::PreDspConfig>,
+    effective_denoise_backend: Option<mozart_core::denoise::DenoiseBackend>,
     effective_aec: Option<mozart_core::config::PreAecConfig>,
     effective_capture_gain_db: Option<f32>,
     effective_capture_device: Option<String>,
@@ -106,6 +107,7 @@ fn parse_args_from(mut args: impl Iterator<Item = String>) -> Result<Args, Strin
     let mut config = None;
     let mut effective_enhance = None;
     let mut effective_dsp = None;
+    let mut effective_denoise_backend = None;
     let mut effective_aec = None;
     let mut effective_capture_gain_db = None;
     let mut effective_capture_device = None;
@@ -151,10 +153,21 @@ fn parse_args_from(mut args: impl Iterator<Item = String>) -> Result<Args, Strin
                     serde_json::from_str(&json).map_err(|err| format!("--effective-dsp: {err}"))?;
                 effective_dsp = Some(mozart_core::config::PreDspConfig {
                     denoise: dsp.denoise,
+                    backend: None,
                     gate: dsp.gate,
                     agc: dsp.agc,
                     limiter: dsp.limiter,
                 });
+            }
+            "--effective-denoise-backend" => {
+                let raw = args
+                    .next()
+                    .ok_or("--effective-denoise-backend needs a backend id")?;
+                effective_denoise_backend = Some(
+                    mozart_core::denoise::DenoiseBackend::parse(&raw).ok_or_else(|| {
+                        format!("--effective-denoise-backend: unknown backend '{raw}'")
+                    })?,
+                );
             }
             "--effective-capture-device" => {
                 let dev = args
@@ -185,6 +198,7 @@ fn parse_args_from(mut args: impl Iterator<Item = String>) -> Result<Args, Strin
         config,
         effective_enhance,
         effective_dsp,
+        effective_denoise_backend,
         effective_aec,
         effective_capture_gain_db,
         effective_capture_device,
@@ -209,70 +223,94 @@ fn process_thread(
     mut senders: Vec<ai::Sender>,
     ref_rx: aec::RefReceiver,
 ) -> Result<(), String> {
-    // DSP 状态为定长数组，构造后热路径零分配。
-    let mut applied = shared.dsp_target();
-    let mut last_capture_epoch = 0u64;
-    let nn = shared.enhancement.is_some();
-    let mut dsp = mozart_dsp::Dsp::new(
-        applied.denoise && !nn,
-        applied.gate,
-        applied.agc,
-        applied.limiter,
+    // DSP 与同层降噪状态均为定长/预分配结构，构造后热路径零分配。
+    let (switches, backend, _) = shared.full_dsp_snapshot();
+    let mut applied_switches = switches;
+    let mut pipeline = mozart_dsp::TrunkProcessor::new(
+        switches.gate,
+        switches.agc,
+        switches.limiter,
+    );
+    let mut denoiser = denoise::DenoiseProcessor::new(
+        mozart_core::denoise::DenoiseMode::from_parts(switches.denoise, backend),
     );
     let mut aec = aec::AecProcessor::new(aec::default_backend(), ref_rx, shared.aec_telemetry());
+    let mut last_capture_epoch = 0u64;
+    let mut last_capture_idx: Option<u32> = None;
+    let mut local_capture_bump = 0u64;
     while !STOP.load(Ordering::Relaxed) {
         if let Some(captured) = capture_ring.pop(Some(PROCESS_POLL)) {
             let mut frame = captured.frame;
             let source_active = captured.rvc_ai_active;
-            let (target, epoch) = shared.dsp_snapshot();
-            if target != applied {
-                dsp.set_switches(
-                    target.denoise && !nn,
-                    target.gate,
-                    target.agc,
-                    target.limiter,
-                );
-                applied = target;
-            }
+            let frame_idx = frame.meta.frame_idx;
             if captured.capture_epoch != last_capture_epoch {
-                dsp.reset_denoise();
                 last_capture_epoch = captured.capture_epoch;
+                last_capture_idx = Some(frame_idx);
+            } else if let Some(prev_idx) = last_capture_idx {
+                if frame_idx != prev_idx.wrapping_add(1) {
+                    local_capture_bump = local_capture_bump.wrapping_add(1);
+                }
+                last_capture_idx = Some(frame_idx);
+            } else {
+                last_capture_idx = Some(frame_idx);
             }
+            let effective_cap_epoch = captured.capture_epoch.wrapping_add(local_capture_bump);
+            let (target_switches, target_backend, epoch) = shared.full_dsp_snapshot();
+            if target_switches != applied_switches {
+                pipeline.set_shaping(
+                    target_switches.gate,
+                    target_switches.agc,
+                    target_switches.limiter,
+                );
+                applied_switches = target_switches;
+            }
+            denoiser.sync(
+                mozart_core::denoise::DenoiseMode::from_parts(
+                    target_switches.denoise,
+                    target_backend,
+                ),
+                effective_cap_epoch,
+            );
+            let mut raw_pcm = frame.pcm;
+            let raw_clipped = raw_pcm.iter().any(|&s| s.abs() >= aec::CLIP_THRESHOLD);
             let aec_on = shared.aec_enabled();
-            let cap_epoch = captured.capture_epoch;
+            // 先读 gain_epoch 再读 capture_gain_db，与 apply_capture_gain_db 的写序对称。
+            let gain_epoch = shared.aec_gain_epoch();
             let gain_db = shared.capture_gain_db();
             if gain_db.abs() > 1e-4 {
                 let gain = mixer::linear_gain(gain_db);
-                let mut pcm = frame.pcm;
-                for sample in &mut pcm {
+                for sample in &mut raw_pcm {
                     *sample = (*sample * gain).clamp(-1.0, 1.0);
                 }
-                frame.pcm = pcm;
+                frame.pcm = raw_pcm;
             }
-            let conf = dsp.process_frame_with_hook(&mut frame, |pcm| {
-                aec.process_capture(pcm, cap_epoch, aec_on, |err| {
-                    shared.set_last_error(err);
+            let aec_meta = aec::CaptureFrameMeta {
+                capture_epoch: effective_cap_epoch,
+                gain_epoch,
+                cap_start_ns: captured.cap_start_ns,
+                raw_clipped,
+                playback_active: shared.is_playback_active(),
+            };
+            let conf = denoiser.process_trunk_frame(&mut pipeline, &mut frame, |pcm| {
+                aec.process_capture(pcm, aec_meta, aec_on, |err| {
                     eprintln!("mozart-pre: {err}");
                 });
             });
-            let input_frame = dsp.pack_frame(&frame, conf);
+            let input_frame = pipeline.pack_frame(&frame, conf);
             trunk.push(frame);
             // 受文件接管影响的消费者仅在 daemon 已断言实时态时发送
-            // （SPEC-04 单一权威）：未断言（启动/重启）或文件接管期间停发——
-            // 避免实时帧污染整段攒帧，也避免 pre 单边 reclaim。
-            // 只读原子，不分配不阻塞；其余消费者恒发不受影响。
-            let item = enhancement::WorkItem {
-                frame: input_frame,
-                source_idx: frame.meta.frame_idx,
-                rvc_ai_active: source_active,
-                file_generation: captured.file_generation,
-                epoch: if nn { captured.epoch } else { epoch },
-                enabled: target.denoise,
-            };
+            // （SPEC-04 单一权威）：未断言（启动/重启）或文件接管期间停发。
+            let item = denoiser.build_work_item(
+                input_frame,
+                frame.meta.frame_idx,
+                source_active,
+                captured.file_generation,
+                epoch.wrapping_add(captured.capture_epoch),
+            );
             if let Some(enhance) = &shared.enhancement {
                 enhance.queue.push(item);
             } else {
-                enhancement::fanout(&item, &shared, &mut senders);
+                denoise::fanout(&item, &shared, &mut senders);
             }
         }
     }
@@ -334,8 +372,16 @@ fn main() -> ExitCode {
             config.apply_effective_enhance(effective)?;
         }
         if let Some(effective) = args.effective_dsp {
+            let preserved_backend = config.pre.dsp.backend;
             config.pre.dsp = effective;
+            if config.pre.dsp.backend.is_none() {
+                config.pre.dsp.backend = preserved_backend;
+            }
         }
+        if let Some(backend) = args.effective_denoise_backend {
+            config.pre.dsp.backend = Some(backend);
+        }
+        config.validate_denoise_backend(config.pre.dsp.backend, config.enhance.as_ref())?;
         if let Some(effective) = args.effective_aec {
             config.pre.aec = effective;
         }
@@ -403,6 +449,7 @@ fn main() -> ExitCode {
     if let Some(enhance) = &config.enhance {
         shared.configure_enhancement(enhance, &config.daemon.run_dir);
     }
+    shared.init_denoise_backend(config.effective_denoise_backend());
     let shared = Arc::new(shared);
     // 容量已由配置校验保证 ≥ 1；Ring::new 对 0 会 panic。
     let capture_ring = Arc::new(Ring::<capture::CapturedFrame>::new(
@@ -471,6 +518,7 @@ fn main() -> ExitCode {
     if playback_pcm.is_none() {
         shared.playback_switch.mark_standby();
     }
+    shared.set_playback_active(playback_pcm.is_some());
     eprintln!(
         "mozart-pre: ai link out={}",
         config.rvc_output_socket().display()
@@ -544,7 +592,7 @@ fn main() -> ExitCode {
         let handle = match spawn_thread("mozart-enhance", move || {
             stop_on_fatal(
                 &STOP,
-                guard_panic(move || enhancement::run(enhance, worker_shared, senders, &STOP)),
+                guard_panic(move || denoise::ulunas::run(enhance, worker_shared, senders, &STOP)),
             )
         }) {
             Ok(handle) => handle,

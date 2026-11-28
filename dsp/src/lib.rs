@@ -43,6 +43,30 @@ fn energy_to_db(rms: f32) -> u8 {
     v.clamp(0.0, 255.0) as u8
 }
 
+fn rms(samples: &[f32]) -> f32 {
+    let power: f32 = samples.iter().map(|&sample| sample * sample).sum();
+    (power / samples.len() as f32).sqrt()
+}
+
+fn audible(rms: f32) -> bool {
+    20.0 * (rms + 1e-12).log10() > -60.0
+}
+
+/// 统一驱动状态滞回 VAD：有谱置信度时走门限候选，无光谱置信度时退回纯能量活动检测且 `conf` 写 0。
+fn resolve_vad(vad: &mut Vad, conf: Option<f32>, is_audible: bool) -> (u8, u8, u8) {
+    match conf {
+        Some(conf) => {
+            let (vad_flag, segment_id) = vad.update(conf, is_audible);
+            let conf_byte = (conf * 255.0 + 0.5) as u8;
+            (vad_flag, conf_byte, segment_id)
+        }
+        None => {
+            let (vad_flag, segment_id) = vad.update_activity(is_audible);
+            (vad_flag, 0, segment_id)
+        }
+    }
+}
+
 /// 契约帧分析器：增强与旁路共用能量型 VAD，时间轴原样保留。
 pub struct InputFrameAnalyzer {
     vad: Vad,
@@ -61,44 +85,61 @@ impl InputFrameAnalyzer {
 
     pub fn analyze(&mut self, frame: &mut InputFrame) {
         let pcm = frame.pcm;
-        let power: f32 = pcm.iter().map(|sample| sample * sample).sum();
-        let rms = (power / INPUT_SAMPLES as f32).sqrt();
-        let (vad_flag, segment_id) = self.vad.update_activity(audible(rms));
-        frame.meta.energy_db = energy_to_db(rms);
+        let frame_rms = rms(&pcm);
+        let (vad_flag, conf, segment_id) = resolve_vad(&mut self.vad, None, audible(frame_rms));
+        frame.meta.energy_db = energy_to_db(frame_rms);
         frame.meta.vad_flag = vad_flag;
         frame.meta.segment_id = segment_id;
-        frame.meta.conf = 0;
+        frame.meta.conf = conf;
     }
 }
 
-fn audible(rms: f32) -> bool {
-    20.0 * (rms + 1e-12).log10() > -60.0
+/// 48 kHz WOLA 谱降噪器包装：与主干其余级解耦，供上层按需热插拔调用。
+pub struct WolaDenoiser(NoiseSuppressor);
+
+impl Default for WolaDenoiser {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
-pub struct Dsp {
-    denoise: bool,
+impl WolaDenoiser {
+    pub fn new() -> Self {
+        Self(NoiseSuppressor::new())
+    }
+
+    pub fn reset(&mut self) {
+        self.0.reset();
+    }
+
+    pub fn process(
+        &mut self,
+        input: &[f32; RAW_SAMPLES],
+        out: &mut [f32; RAW_SAMPLES],
+    ) -> (usize, Option<f32>) {
+        let written = self.0.push(input, out);
+        (written, Some(self.0.speech_confidence() as f32))
+    }
+}
+
+/// 不绑定具体降噪实现的 48 kHz 主干与 16 kHz 打包管线：
+/// 80 Hz 高通 → `post_hp`（AEC）→ 可插拔 48 kHz 降噪回调 → gate/AGC/limiter → 3:1 降采样与 VAD。
+pub struct TrunkProcessor {
     hp: Highpass80,
-    ns: NoiseSuppressor,
     gate: Gate,
     agc: Agc,
     limiter: Limiter,
-    /// WOLA 发射暂存（发射数可能小于帧长，尾部由调用侧补零）。
     ns_out: [f32; RAW_SAMPLES],
     decimator: Decimator,
     vad: Vad,
-    /// 打包序号（旧 `++frame_idx`，从 1 起）。
     frame_idx: u32,
-    /// 降采样暂存。
     dec: [f32; INPUT_SAMPLES],
 }
 
-impl Dsp {
-    /// 级开关沿用旧 `mozart_dsp_config_t`；整形级默认关（旧 main.c L411）。
-    pub fn new(denoise: bool, gate: bool, agc: bool, limiter: bool) -> Self {
+impl TrunkProcessor {
+    pub fn new(gate: bool, agc: bool, limiter: bool) -> Self {
         Self {
-            denoise,
             hp: Highpass80::new(),
-            ns: NoiseSuppressor::new(),
             gate: Gate::new(gate),
             agc: Agc::new(agc),
             limiter: Limiter::new(limiter),
@@ -110,71 +151,43 @@ impl Dsp {
         }
     }
 
-    /// 运行时级开关（SPEC-02 SetDsp）。gate/agc/limiter 直接切换；
-    /// denoise 重新启用时重置 WOLA 流式状态（噪声估计与增益重新攒初始化帧），
-    /// 避免陈旧状态作用于新流产生伪影；禁用整级跳过（同启动配置语义）。
-    /// 定长状态写入，零分配，可在实时线程调用。
-    pub fn set_switches(&mut self, denoise: bool, gate: bool, agc: bool, limiter: bool) {
-        if denoise && !self.denoise {
-            self.ns.reset();
-        }
-        self.denoise = denoise;
+    pub fn set_shaping(&mut self, gate: bool, agc: bool, limiter: bool) {
         self.gate.set_enabled(gate);
         self.agc.set_enabled(agc);
         self.limiter.set_enabled(limiter);
     }
 
-    /// 采集源热切换时重置 WOLA 降噪状态（重新学习新设备底噪）；禁用时无操作。
-    pub fn reset_denoise(&mut self) {
-        if self.denoise {
-            self.ns.reset();
-        }
-    }
-
-    /// 就地处理一帧主干（960 样本），返回本帧语音置信度（0..1）。
-    /// 置信度语义同旧实现：自上次查询以来的功率加权平均，查询即清零；禁用
-    /// 降噪时恒 0。VAD 与 16 kHz 打包经 `pack_frame` 按帧消费该值。
-    pub fn process_frame(&mut self, frame: &mut RawFrame) -> f32 {
-        self.process_frame_with_hook(frame, |_| {})
-    }
-
-    /// 就地处理一帧主干（960 样本），并在 80 Hz 高通之后、降噪（WOLA）与
-    /// 整形级之前调用 `post_hp` 钩子（用于接入线性声学回声消除）。
-    pub fn process_frame_with_hook<F: FnMut(&mut [f32; RAW_SAMPLES])>(
+    /// 就地处理一帧主干（960 样本），由调用方注入可选的 48 kHz 降噪级。
+    pub fn process_frame<F, D>(
         &mut self,
         frame: &mut RawFrame,
         mut post_hp: F,
-    ) -> f32 {
+        mut denoise_stage: D,
+    ) -> Option<f32>
+    where
+        F: FnMut(&mut [f32; RAW_SAMPLES]),
+        D: FnMut(&[f32; RAW_SAMPLES], &mut [f32; RAW_SAMPLES]) -> (usize, Option<f32>),
+    {
         // packed 字段按值整块搬出，不取引用（同 playback.rs 的约定）。
         let mut pcm = frame.pcm;
         self.hp.process(&mut pcm);
         post_hp(&mut pcm);
-        let written = if self.denoise {
-            self.ns.push(&pcm, &mut self.ns_out)
-        } else {
-            self.ns_out = pcm;
-            RAW_SAMPLES
-        };
+        let (written, conf) = denoise_stage(&pcm, &mut self.ns_out);
         // 整形级作用于发射样本；禁用级逐位恒等跳过（stages.rs 约定）。
         self.gate.process(&mut self.ns_out[..written]);
         self.agc.process(&mut self.ns_out[..written]);
         self.limiter.process(&mut self.ns_out[..written]);
         // 发射滞后首块缺口补零，保持节拍与输出索引对齐（见模块说明）。
-        // written ≤ 960 由 960 定块发射计数保证；越界即 panic，不静默截断。
+        // written ≤ 960 由定块发射计数保证；越界即 panic，不静默截断。
         self.ns_out[written..].fill(0.0);
         frame.pcm = self.ns_out;
-        if self.denoise {
-            self.ns.speech_confidence() as f32
-        } else {
-            0.0
-        }
+        conf
     }
 
     /// 打包 16 kHz 契约帧（旧 `mozart_dsp_pack_frame` 等价）。
-    /// 输入为 `process_frame` 对齐后的 960 样本主干帧；`conf` 为该帧置信度。
-    /// `meta.pts_ns` 取主干帧的采集时间戳（frame.h 语义；旧 main.c L826 在
-    /// 打包时刻改写为 now−20 ms，不沿用）。`meta.frame_idx` 为打包序号。
-    pub fn pack_frame(&mut self, trunk: &RawFrame, conf: f32) -> InputFrame {
+    /// `conf` 为 `Some` 时驱动谱置信度 VAD，为 `None`（未跑 48 kHz 谱降噪或已关闭）时
+    /// 退回主干可闻度能量 VAD 并保持 `meta.conf = 0`。
+    pub fn pack_frame(&mut self, trunk: &RawFrame, conf: Option<f32>) -> InputFrame {
         // packed 字段按值整块搬出，不取引用。
         let meta = trunk.meta;
         let trunk_pcm = trunk.pcm;
@@ -187,21 +200,10 @@ impl Dsp {
         }
 
         // 能量取降采样并钳位后的契约帧（旧 dsp.c L162-165）。
-        let mut power = 0.0f32;
-        for &sample in &self.dec {
-            power += sample * sample;
-        }
-        let energy_db = energy_to_db((power / INPUT_SAMPLES as f32).sqrt());
-
+        let energy_db = energy_to_db(rms(&self.dec));
         // 电平门限：主干 RMS > -60 dB 才可闻（旧 dsp.c L170-174）。
-        let mut trunk_power = 0.0f32;
-        for &sample in &trunk_pcm {
-            trunk_power += sample * sample;
-        }
-        let trunk_rms = (trunk_power / RAW_SAMPLES as f32).sqrt();
-        let audible = audible(trunk_rms);
-
-        let (vad_flag, segment_id) = self.vad.update(conf, audible);
+        let is_audible = audible(rms(&trunk_pcm));
+        let (vad_flag, conf_byte, segment_id) = resolve_vad(&mut self.vad, conf, is_audible);
         self.frame_idx = self.frame_idx.wrapping_add(1);
         InputFrame {
             meta: FrameMeta {
@@ -209,11 +211,73 @@ impl Dsp {
                 frame_idx: self.frame_idx,
                 vad_flag,
                 energy_db,
-                conf: (conf * 255.0 + 0.5) as u8,
+                conf: conf_byte,
                 segment_id,
             },
             pcm: self.dec,
         }
+    }
+}
+
+/// WOLA + 主干管线便捷门面：供文件离线降噪与黄金对拍复用。
+pub struct Dsp {
+    denoise: bool,
+    wola: WolaDenoiser,
+    pipeline: TrunkProcessor,
+}
+
+impl Dsp {
+    /// 级开关沿用旧 `mozart_dsp_config_t`；整形级默认关（旧 main.c L411）。
+    pub fn new(denoise: bool, gate: bool, agc: bool, limiter: bool) -> Self {
+        Self {
+            denoise,
+            wola: WolaDenoiser::new(),
+            pipeline: TrunkProcessor::new(gate, agc, limiter),
+        }
+    }
+
+    /// 运行时级开关（SPEC-02 SetDsp）。gate/agc/limiter 直接切换；
+    /// denoise 重新启用时重置 WOLA 流式状态，禁用整级跳过。
+    pub fn set_switches(&mut self, denoise: bool, gate: bool, agc: bool, limiter: bool) {
+        if denoise && !self.denoise {
+            self.wola.reset();
+        }
+        self.denoise = denoise;
+        self.pipeline.set_shaping(gate, agc, limiter);
+    }
+
+    /// 采集源热切换时重置 WOLA 降噪状态；禁用时无操作。
+    pub fn reset_denoise(&mut self) {
+        if self.denoise {
+            self.wola.reset();
+        }
+    }
+
+    /// 就地处理一帧主干（960 样本），启用降噪时返回 `Some(conf)`，禁用时返回 `None`。
+    pub fn process_frame(&mut self, frame: &mut RawFrame) -> Option<f32> {
+        self.process_frame_with_hook(frame, |_| {})
+    }
+
+    /// 就地处理一帧主干（960 样本），并在 80 Hz 高通之后调用 `post_hp` 钩子。
+    pub fn process_frame_with_hook<F: FnMut(&mut [f32; RAW_SAMPLES])>(
+        &mut self,
+        frame: &mut RawFrame,
+        post_hp: F,
+    ) -> Option<f32> {
+        let denoise_enabled = self.denoise;
+        let wola = &mut self.wola;
+        self.pipeline.process_frame(frame, post_hp, |input, out| {
+            if denoise_enabled {
+                wola.process(input, out)
+            } else {
+                *out = *input;
+                (RAW_SAMPLES, None)
+            }
+        })
+    }
+
+    pub fn pack_frame(&mut self, trunk: &RawFrame, conf: Option<f32>) -> InputFrame {
+        self.pipeline.pack_frame(trunk, conf)
     }
 }
 
@@ -256,7 +320,10 @@ mod tests {
 
         let mut dsp = Dsp::new(false, false, false, false);
         let conf = dsp.process_frame(&mut input);
-        assert_eq!(conf, 0.0, "禁用降噪时置信度必须恒 0");
+        assert_eq!(conf, None, "禁用降噪时应返回 None（无谱置信度）");
+        let packed = dsp.pack_frame(&input, conf);
+        assert_eq!(packed.meta.conf, 0, "禁用降噪时 conf 字节必须恒 0");
+        assert_eq!(packed.meta.vad_flag, 1, "禁用降噪时主干可闻应由能量 VAD 点亮 vad_flag");
         let (actual, expected) = (input.pcm, expected.pcm);
         assert_eq!(actual, expected, "禁用降噪时必须整级跳过");
         // 对照：启用时首块尾部有 64 个补零样本（发射滞后），两者流不同
@@ -287,7 +354,7 @@ mod tests {
         let mut expected = frame.pcm;
         hp.process(&mut expected);
         let conf = dsp.process_frame(&mut frame);
-        assert_eq!(conf, 0.0, "禁用降噪后置信度必须恒 0");
+        assert_eq!(conf, None, "禁用降噪后置信度必须为 None");
         // packed 字段按值整块搬出比较，不取引用。
         let actual = frame.pcm;
         assert_eq!(actual, expected, "禁用后必须与高通输出逐位一致");
@@ -297,7 +364,7 @@ mod tests {
         let mut frame = test_frame(101);
         let mut reference = frame.pcm;
         hp.process(&mut reference);
-        let conf = dsp.process_frame(&mut frame);
+        let conf = dsp.process_frame(&mut frame).expect("重新启用后应返回谱置信度");
         assert!((0.0..=1.0).contains(&conf));
         let pcm = frame.pcm;
         assert_eq!(
@@ -360,10 +427,10 @@ mod tests {
         let mut dsp = Dsp::new(true, false, false, false);
         // 首块消耗掉发射滞后（尾部补零）；其后每块 960 进 960 出，无补零缺口
         let mut first = test_frame(0x4D5A5254);
-        assert!((0.0..=1.0).contains(&dsp.process_frame(&mut first)));
+        assert!(dsp.process_frame(&mut first).is_some());
         for block in 1..4 {
             let mut frame = test_frame(0x4D5A5254u32.wrapping_add(block));
-            let conf = dsp.process_frame(&mut frame);
+            let conf = dsp.process_frame(&mut frame).expect("启用后返回谱置信度");
             assert!((0.0..=1.0).contains(&conf), "置信度范围 0..1");
             let pcm = frame.pcm;
             assert!(
@@ -407,7 +474,7 @@ mod tests {
         trunk.pcm = [100.0; RAW_SAMPLES];
         trunk.meta.pts_ns = 0x1234_5678_9ABC_DEF0;
         // 第一帧：FIR 历史暖机，输出为部分和，未全部钳位。
-        let first = dsp.pack_frame(&trunk, 0.0);
+        let first = dsp.pack_frame(&trunk, Some(0.0));
         let (meta, pcm) = (first.meta, first.pcm);
         let FrameMeta {
             pts_ns,
@@ -428,7 +495,7 @@ mod tests {
         );
 
         // 第二帧：历史已暖，全部输出钳到 1.0 → RMS=1 → 能量字节 255。
-        let frame = dsp.pack_frame(&trunk, 0.5019608);
+        let frame = dsp.pack_frame(&trunk, Some(0.5019608));
         let (meta, pcm) = (frame.meta, frame.pcm);
         let FrameMeta {
             frame_idx,
@@ -455,7 +522,7 @@ mod tests {
         let mut dsp = Dsp::new(true, false, false, false);
         let mut trunk = test_frame(7);
         trunk.pcm = [0.0; RAW_SAMPLES];
-        let frame = dsp.pack_frame(&trunk, 0.0);
+        let frame = dsp.pack_frame(&trunk, Some(0.0));
         let (meta, pcm) = (frame.meta, frame.pcm);
         assert_eq!(meta.energy_db, 0, "静音帧能量字节为 0（-100 dB 以下截断）");
         assert!(pcm.iter().all(|&v| v == 0.0));

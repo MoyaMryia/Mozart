@@ -1,6 +1,6 @@
 # Mozart 配置规范（TOML schema）
 
-状态：定稿中。最后更新：2026-11-26。
+状态：定稿中。最后更新：2026-11-27。
 
 本文件是 TOML 配置的唯一 schema 依据：段、键、类型、默认、范围、运行时/重启分类。配置模型（TOML 基线 + 运行时状态文件、`config set`/`config save`、`restart_required` 契约）见 [SPEC-04](SPEC/SPEC-04-daemon.md)，本文件不复述。解析与校验实现于 `core/src/config.rs`，须与本文件一致。
 
@@ -75,9 +75,12 @@ LD_LIBRARY_PATH = "<资产根>/lib:<资产根>/llama"
 | 键 | 类型 | 默认 | 范围 | 类别 |
 | --- | --- | --- | --- | --- |
 | denoise | bool | true | — | R |
+| backend | string | 空（有 [enhance] 用 ulunas，否则 wola） | `core/src/denoise.rs` 已注册后端（如 `wola` / `ulunas`；`ulunas` 需配置 `[enhance]`） | R |
 | gate | bool | false | — | R |
 | agc | bool | false | — | R |
 | limiter | bool | false | — | R |
+
+另有运行时复合写入键 `pre.dsp.denoise_mode`（`off` 或已注册后端名如 `wola`/`ulunas`），在单次 `config set` 中原子写入 `pre.dsp.denoise` 与 `pre.dsp.backend` 并走 `PRE_SET_DENOISE`（`0x020D`）即时热切换。
 
 ### [pre.aec]
 
@@ -89,7 +92,7 @@ LD_LIBRARY_PATH = "<资产根>/lib:<资产根>/llama"
 
 ### [enhance]（可选）
 
-此段存在时，`pre.dsp.denoise` 选择 UL-UNAS，旧 WOLA 不叠加。省略此段保持旧默认。
+此段存在且未显式指定 `pre.dsp.backend` 时默认选用 `ulunas`，省略此段保持 `wola`；运行中可通过 `pre.dsp.backend` 或 `pre.dsp.denoise_mode` 在同层降噪模块间热切换，二者不叠加。
 增强仅作用于 RVC／ASR 共用的 16 kHz 支路；48 kHz 直通不经过模型。
 
 | 键 | 类型 | 默认 | 范围 | 类别 |
@@ -314,7 +317,7 @@ context_window = 2
 
 - **RVC 会话参数**（f0_method / pitch_shift / index_rate / rms_mix_rate / protect）：`config set rvc.<会话参数>` 与 `preset use` 写 TOML 持久基线。实时流在跑时，`pitch_shift` / `index_rate` / `f0_method` 与 `[rvc.realtime].skip_silence` 变化由 daemon 下发 `SetParams`（`0x0308`）在下一推理块边界无中断生效，失败时保留在跑旧参、生效配置保留旧值、TOML 保留新基线；`startup_delay_ms` 决定启动缓冲，变化仍走 `StopStream`→`StartStream`（失败用旧参恢复）。仅改 `protect` / `rms_mix_rate` 或参数值未变化只更新 TOML 基线与生效配置，不下发 `rvc` 命令。direct/空闲只更新生效配置。文件任务不中断：当前任务用旧参、下一任务用新参。`status.rvc_params` 表示当前生效配置；存在待生效基线或 rvc 不可达时，可能不等于正在跑的流参数。`protect` / `rms_mix_rate` 已在实时链路推理内应用（启动流时随会话参数生效；在线改值暂仅更新基线与生效配置、不触发重流）。编排细节见 [SPEC-04](SPEC/SPEC-04-daemon.md)。
 - **模型预设**（SPEC-11）：每个 RVC 模型目录 `presets/default.toml` 保存五个会话参数。模型切换时 daemon 载入该文件到 `[rvc]` 并应用；`preset save` 把当前 live 五参数写回当前模型，`preset use` 重新载入，`preset list` 显示预设值、live 值与 dirty。`presets/` 是资产树唯一可写目录；daemon 是唯一写者，原子写。命令细节见 [SPEC-11](SPEC/SPEC-11-preset.md)。
-- **pre DSP 开关**经 `SetDsp`（0x0207，体含 denoise/gate/agc/limiter 四键）运行时生效：denoise 重新启用时重置 WOLA 流式状态、重新攒初始化帧，gate/agc/limiter 直接切换。
+- **pre DSP 与降噪后端**：`pre.dsp.{denoise,gate,agc,limiter}` 经 `SetDsp`（`0x0207`）运行时生效；`pre.dsp.backend` 与复合键 `pre.dsp.denoise_mode` 经 `PRE_SET_DENOISE`（`0x020D`）运行时切换。启用/切换 48 kHz WOLA 时重置流式状态，切向 16 kHz IPC 后端时开启新 priming 会话，关闭降噪时退回能量型 VAD。（见 [SPEC-02](SPEC/SPEC-02-pre.md)）
 - **pre AEC 开关**经 `SetAec`（0x020A，体 `{"enabled": bool}`）运行时生效；重置条件与可观测指标见 [SPEC-02](SPEC/SPEC-02-pre.md)。
 - **逻辑上限 vs 预分配环**：`[file].queue_capacity` 是入队时查的逻辑上限（未预分配）→ R；`[pre].capture_queue_frames` 与 asr/tts/bridge 的 `*_capacity` 是预分配环/队列 → S。
 - **位置键**（storage_dir、subtitles_path）归 S：运行中改位置会使已有文件/队列分裂，需重启统一。

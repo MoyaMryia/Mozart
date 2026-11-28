@@ -124,6 +124,8 @@ pub const PRE_SET_AEC: u16 = 0x020A;
 pub const PRE_SET_CAPTURE_GAIN: u16 = 0x020B;
 /// 体：schema::MicMixerSetRequest {"volume_percent"?:u8,"agc_enabled"?:bool}；调节当前采集卡硬件混音器（SPEC-02）。
 pub const PRE_SET_MIC_MIXER: u16 = 0x020C;
+/// 体：schema::DenoiseSetRequest {"enabled"?:bool,"backend"?:DenoiseBackend}；运行中启停或热切换降噪后端（SPEC-02）。
+pub const PRE_SET_DENOISE: u16 = 0x020D;
 
 pub const RVC_HELLO: u16 = 0x0301;
 pub const RVC_LOAD_MODEL: u16 = 0x0302;
@@ -712,6 +714,7 @@ mod tests {
         assert_eq!(PRE_SET_AEC, 0x020A);
         assert_eq!(PRE_SET_CAPTURE_GAIN, 0x020B);
         assert_eq!(PRE_SET_MIC_MIXER, 0x020C);
+        assert_eq!(PRE_SET_DENOISE, 0x020D);
         assert_eq!(ENHANCE_HELLO, 0x0701);
         assert_eq!(ENHANCE_GET_STATUS, 0x0702);
     }
@@ -761,6 +764,7 @@ mod tests {
         ("PRE_SET_AEC", PRE_SET_AEC),
         ("PRE_SET_CAPTURE_GAIN", PRE_SET_CAPTURE_GAIN),
         ("PRE_SET_MIC_MIXER", PRE_SET_MIC_MIXER),
+        ("PRE_SET_DENOISE", PRE_SET_DENOISE),
         ("RVC_HELLO", RVC_HELLO),
         ("RVC_LOAD_MODEL", RVC_LOAD_MODEL),
         ("RVC_START_STREAM", RVC_START_STREAM),

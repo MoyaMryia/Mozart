@@ -59,11 +59,13 @@ fn write_capture_wav(path: &Path) {
 }
 
 /// 收一帧取置信度字节；帧流必须持续（20 ms 节拍）。
+fn recv_frame(rx: &FrameSocket<InputFrame>) -> InputFrame {
+    rx.recv(Some(Duration::from_secs(2)))
+        .expect("消费者支路必须持续送达")
+}
+
 fn recv_conf(rx: &FrameSocket<InputFrame>) -> u8 {
-    let frame = rx
-        .recv(Some(Duration::from_secs(2)))
-        .expect("消费者支路必须持续送达");
-    frame.meta.conf
+    recv_frame(rx).meta.conf
 }
 
 #[test]
@@ -104,9 +106,18 @@ fn set_dsp_toggles_denoise_at_runtime() {
     for _ in 0..3 {
         recv_conf(&rx);
     }
+    let mut saw_vad_active = false;
     for _ in 0..60 {
-        assert_eq!(recv_conf(&rx), 0, "禁用 denoise 后置信度必须恒 0");
+        let frame = recv_frame(&rx);
+        assert_eq!(frame.meta.conf, 0, "禁用 denoise 后置信度必须恒 0");
+        if frame.meta.vad_flag == 1 {
+            saw_vad_active = true;
+        }
     }
+    assert!(
+        saw_vad_active,
+        "禁用 denoise 后有声正弦段必须靠能量 VAD 点亮 vad_flag"
+    );
 
     // 运行中重新启用：WOLA 状态重置后重新攒初始化帧，置信度恢复非零。
     let data = call_ok(

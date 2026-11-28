@@ -2,6 +2,7 @@
 import { computed, reactive, ref, watch } from 'vue';
 import { requestCheckbox } from '../inputs';
 import type { DeviceEntry, Status } from '../contracts';
+import { buildDenoiseOptions, isEnhanceIpcStage } from '../denoise';
 import AlertBanner from './AlertBanner.vue';
 
 const props = defineProps<{ devices: DeviceEntry[]; status: Status | null; ready: boolean; busy: boolean; muted?: boolean; muteBlocked?: boolean; error?: string; baselines: Partial<Record<'capture' | 'playback', string>> }>();
@@ -32,15 +33,47 @@ const aecDetail = computed(() => {
   const parts = [aec.value.backend];
   if (aec.value.delay_ms != null) parts.push(`延迟 ${aec.value.delay_ms} ms`);
   if (aec.value.active && aec.value.erle_db != null) parts.push(`ERLE ${aec.value.erle_db.toFixed(1)} dB`);
-  if (aec.value.ref_dropped > 0) parts.push(`参考丢帧 ${aec.value.ref_dropped}`);
+  if (aec.value.active && aec.value.erl_db != null) parts.push(`ERL ${aec.value.erl_db.toFixed(1)} dB`);
+  if (aec.value.active && aec.value.divergent_fraction != null && aec.value.divergent_fraction > 0.1) {
+    parts.push(`发散 ${(aec.value.divergent_fraction * 100).toFixed(0)}%`);
+  }
+  if (aec.value.enabled && aec.value.ref_dropped > 0) parts.push(`参考丢帧 ${aec.value.ref_dropped}`);
   return parts.join(' · ');
 });
 
 const micMixer = computed(() => props.status?.pre?.mic_mixer ?? null);
 const captureClips = computed(() => props.status?.pre?.aec?.capture_clips ?? 0);
 const dsp = computed(() => props.status?.pre?.dsp ?? null);
+const enhancement = computed(() => props.status?.pre?.enhancement ?? null);
+const denoiseOptions = computed(() =>
+  buildDenoiseOptions(props.status?.pre, !!(props.status?.pre?.enhancement || props.status?.enhance)),
+);
+const activeDenoiseMode = computed(() => {
+  if (!props.ready || !dsp.value) return null;
+  if (!dsp.value.denoise) return 'off';
+  return props.status?.pre?.denoise_backend ?? 'wola';
+});
+const activeDenoiseOption = computed(() =>
+  activeDenoiseMode.value ? denoiseOptions.value.find(opt => opt.id === activeDenoiseMode.value) ?? null : null,
+);
+const denoiseSummary = computed(() => {
+  if (!activeDenoiseMode.value) return '未知';
+  if (activeDenoiseMode.value === 'off') return activeDenoiseOption.value?.label ?? '已关闭';
+  const label = activeDenoiseOption.value?.label ?? activeDenoiseMode.value.toUpperCase();
+  if (isEnhanceIpcStage(activeDenoiseOption.value?.stage) && enhancement.value) {
+    return `${label} · ${enhancement.value.connected ? '已连接' : '连接中'}`;
+  }
+  return `${label} · 运行中`;
+});
+const denoiseUnavailableNote = computed(() => {
+  const blocked = denoiseOptions.value.filter(opt => !opt.available && opt.unavailable_reason);
+  if (!blocked.length) return '';
+  return blocked.map(opt => `${opt.label}：${opt.unavailable_reason}`).join('；');
+});
+function selectDenoiseMode(mode: string) {
+  if (activeDenoiseMode.value !== mode) emit('set', 'pre.dsp.denoise_mode', mode);
+}
 const dspSwitches = [
-  { key: 'denoise', label: '降噪' },
   { key: 'gate', label: '音量门' },
   { key: 'agc', label: '软件 AGC' },
   { key: 'limiter', label: '防爆限幅' },
@@ -257,6 +290,35 @@ function nudgeSwGain(delta: number) {
         </div>
 
         <div>
+          <details class="denoise-details rounded-xl border border-edge px-3 py-2 mb-3">
+            <summary class="denoise-summary flex items-center gap-2 cursor-pointer select-none text-xs md:text-micro font-bold text-ink-2">
+              <svg class="console-chevron w-3.5 h-3.5 shrink-0 text-ink-3" aria-hidden="true" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round" viewBox="0 0 24 24"><path d="m9 18 6-6-6-6"/></svg>
+              <span class="shrink-0">降噪模型</span>
+              <span class="ml-auto text-micro font-mono font-normal text-ink-3 truncate">{{ denoiseSummary }}</span>
+            </summary>
+            <div class="pt-2.5 space-y-2">
+              <div role="radiogroup" aria-label="降噪模型选择" class="denoise-option-group">
+                <button
+                  v-for="opt in denoiseOptions"
+                  :key="opt.id"
+                  type="button"
+                  role="radio"
+                  class="denoise-option-btn"
+                  :class="{ 'is-active': activeDenoiseMode === opt.id }"
+                  :aria-checked="activeDenoiseMode === opt.id"
+                  :title="opt.unavailable_reason ?? opt.label"
+                  :disabled="busy || !ready || !dsp || (!opt.available && activeDenoiseMode !== opt.id)"
+                  @click="selectDenoiseMode(opt.id)"
+                >
+                  <span class="translate-toggle-dot" aria-hidden="true"></span>
+                  <span>{{ opt.label }}</span>
+                </button>
+              </div>
+              <p v-if="denoiseUnavailableNote" class="text-micro text-ink-3">{{ denoiseUnavailableNote }}</p>
+              <AlertBanner v-if="enhancement?.last_error && isEnhanceIpcStage(activeDenoiseOption?.stage)" :message="enhancement.last_error" tone="warn" />
+            </div>
+          </details>
+
           <span class="block text-xs md:text-micro font-bold text-ink-2 mb-1.5">前置处理</span>
           <div class="grid grid-cols-2 gap-2">
             <button

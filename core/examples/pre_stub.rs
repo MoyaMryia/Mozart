@@ -23,6 +23,7 @@ use stub_common::{body, expect_known, fail, ok, serve, StubArgs};
 struct PreOverrides {
     enhance: Option<Option<mozart_core::config::EnhanceConfig>>,
     dsp: Option<mozart_core::config::PreDspConfig>,
+    denoise_backend: Option<mozart_core::denoise::DenoiseBackend>,
     aec: Option<mozart_core::config::PreAecConfig>,
     capture_gain_db: Option<f32>,
     capture_device: Option<String>,
@@ -40,6 +41,7 @@ fn parse_pre_args() -> (StubArgs, PreOverrides) {
     let mut overrides = PreOverrides {
         enhance: None,
         dsp: None,
+        denoise_backend: None,
         aec: None,
         capture_gain_db: None,
         capture_device: None,
@@ -57,6 +59,12 @@ fn parse_pre_args() -> (StubArgs, PreOverrides) {
             "--delay-ms" => args.reply_delay = Duration::from_millis(value.parse().unwrap()),
             "--effective-enhance" => overrides.enhance = Some(serde_json::from_str(&value).unwrap()),
             "--effective-dsp" => overrides.dsp = Some(serde_json::from_str(&value).unwrap()),
+            "--effective-denoise-backend" => {
+                overrides.denoise_backend = Some(
+                    mozart_core::denoise::DenoiseBackend::parse(&value)
+                        .expect("valid denoise backend"),
+                );
+            }
             "--effective-aec" => overrides.aec = Some(serde_json::from_str(&value).unwrap()),
             "--effective-capture-gain-db" => overrides.capture_gain_db = Some(value.parse().unwrap()),
             "--effective-capture-device" => overrides.capture_device = Some(value),
@@ -79,6 +87,8 @@ struct State {
     startup_id: String,
     file_mode_delay: Duration,
     file_restore_fault: Option<std::path::PathBuf>,
+    enhance_configured: bool,
+    denoise_backend: mozart_core::denoise::DenoiseBackend,
     dsp: mozart_core::config::PreDspConfig,
     aec: mozart_core::config::PreAecConfig,
     capture_gain_db: f32,
@@ -98,6 +108,9 @@ fn main() {
     if let Some(dsp) = overrides.dsp {
         config.pre.dsp = dsp;
     }
+    let denoise_backend = overrides
+        .denoise_backend
+        .unwrap_or_else(|| config.effective_denoise_backend());
     if let Some(aec) = overrides.aec {
         config.pre.aec = aec;
     }
@@ -137,6 +150,8 @@ fn main() {
         startup_id,
         file_mode_delay,
         file_restore_fault: std::env::var_os("MOZART_PRE_STUB_FILE_RESTORE_FAULT").map(Into::into),
+        enhance_configured: config.enhance.is_some(),
+        denoise_backend,
         dsp: config.pre.dsp,
         aec: config.pre.aec,
         capture_gain_db: config.pre.capture_gain_db,
@@ -199,6 +214,7 @@ fn handle(msg: &Message, state: &mut State) -> Vec<u8> {
         ctl::PRE_SPEECH_STOP,
         ctl::PRE_SET_FILE_MODE,
         ctl::PRE_SET_DSP,
+        ctl::PRE_SET_DENOISE,
         ctl::PRE_SET_AEC,
         ctl::PRE_SET_CAPTURE_GAIN,
         ctl::PRE_SET_MIC_MIXER,
@@ -242,12 +258,54 @@ fn handle(msg: &Message, state: &mut State) -> Vec<u8> {
                 };
             state.dsp = mozart_core::config::PreDspConfig {
                 denoise: request.denoise,
+                backend: state.dsp.backend,
                 gate: request.gate,
                 agc: request.agc,
                 limiter: request.limiter,
             };
             record_dsp(&state.dsp);
-            ok(serde_json::to_value(&state.dsp).unwrap())
+            ok(json!({
+                "denoise": state.dsp.denoise,
+                "gate": state.dsp.gate,
+                "agc": state.dsp.agc,
+                "limiter": state.dsp.limiter,
+            }))
+        }
+        ctl::PRE_SET_DENOISE => {
+            if std::env::var("MOZART_PRE_STUB_DSP_REJECT_FILE")
+                .is_ok_and(|path| std::path::Path::new(&path).exists())
+            {
+                return fail(ctl::CODE_INVALID_ARGUMENT, "DSP rejected by stub");
+            }
+            let request: mozart_core::ctl::schema::DenoiseSetRequest =
+                match serde_json::from_value(body.clone()) {
+                    Ok(request) => request,
+                    Err(err) => return fail(ctl::CODE_INVALID_ARGUMENT, &err.to_string()),
+                };
+            if request.enabled.is_none() && request.backend.is_none() {
+                return fail(
+                    ctl::CODE_INVALID_ARGUMENT,
+                    "enabled or backend must be provided",
+                );
+            }
+            if let Some(backend) = request.backend {
+                if backend.requires_enhance() && !state.enhance_configured {
+                    return fail(
+                        ctl::CODE_INVALID_ARGUMENT,
+                        &mozart_core::denoise::enhance_required_error(backend),
+                    );
+                }
+                state.denoise_backend = backend;
+                state.dsp.backend = Some(backend);
+            }
+            if let Some(enabled) = request.enabled {
+                state.dsp.denoise = enabled;
+            }
+            record_dsp(&state.dsp);
+            ok(json!({
+                "enabled": state.dsp.denoise,
+                "backend": state.denoise_backend.as_str(),
+            }))
         }
         ctl::PRE_SET_AEC => {
             let request: mozart_core::ctl::schema::AecSetRequest =
@@ -355,6 +413,8 @@ fn handle(msg: &Message, state: &mut State) -> Vec<u8> {
         ctl::PRE_GET_STATUS => ok(json!({
             "state": "ok",
             "dsp": state.dsp,
+            "denoise_backend": state.denoise_backend.as_str(),
+            "denoise_backends": mozart_core::denoise::backend_infos(state.enhance_configured),
             "capture_gain_db": state.capture_gain_db,
             "mic_mixer": state.mic_mixer,
             "aec": {

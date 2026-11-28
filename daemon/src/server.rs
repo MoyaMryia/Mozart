@@ -622,7 +622,7 @@ fn restart_service(ctx: &Ctx, service: &str) -> Vec<u8> {
     {
         return schema::error_body(
             ctl::CODE_INVALID_ARGUMENT,
-            "changing the denoise backend requires restarting daemon",
+            "changing [enhance] requires restarting daemon",
         );
     }
     let coupled = matches!(role, Role::Pre | Role::Enhance) && config.enhance.is_some();
@@ -751,8 +751,15 @@ fn config_set_reply(ctx: &Ctx, request: &ConfigSetRequest) -> Vec<u8> {
         .toml_lock
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner());
-    // 写键前的生效配置：rvc 会话参数判断变化与失败回退都以它为旧值。
+    // 写键前的生效配置：rvc 会话参数判断变化、降噪依赖校验与失败回退都以它为旧值。
     let old = ctx.config.snapshot();
+    if matches!(request.key.as_str(), "pre.dsp.backend" | "pre.dsp.denoise_mode") {
+        if let Some(backend) = mozart_core::denoise::DenoiseBackend::parse(&request.value) {
+            if let Err(err) = old.validate_denoise_backend(Some(backend), old.enhance.as_ref()) {
+                return schema::error_body(ctl::CODE_INVALID_ARGUMENT, &err.to_string());
+            }
+        }
+    }
     match set_key(ctx.config_path.as_deref(), &request.key, &request.value) {
         Ok(effect) => {
             if effect.restart_required {
@@ -788,6 +795,25 @@ fn model_use_reply(ctx: &Ctx, model_id: &str) -> Vec<u8> {
             "previous_model_id": previous,
         })),
         Err((code, reason)) => schema::error_body(&code, &reason),
+    }
+}
+
+fn patch_pre_dsp_state(
+    pre: &mut schema::PreStatus,
+    dsp: &mozart_core::config::PreDspConfig,
+    backend: mozart_core::denoise::DenoiseBackend,
+) {
+    pre.denoise_backend = backend.as_str().to_string();
+    pre.dsp = Some(mozart_core::config::PreDspConfig {
+        denoise: dsp.denoise,
+        backend: None,
+        gate: dsp.gate,
+        agc: dsp.agc,
+        limiter: dsp.limiter,
+    });
+    if let Some(enhancement) = pre.enhancement.as_mut() {
+        enhancement.enabled = dsp.denoise && backend.requires_enhance();
+        enhancement.connected &= enhancement.enabled;
     }
 }
 
@@ -843,6 +869,41 @@ fn apply_runtime_key(ctx: &Ctx, key: &str, old: &Config) -> Result<(), (String, 
                     pre.capture_gain_db = fresh.pre.capture_gain_db;
                 });
             }
+        } else if key == "pre.dsp.backend" || key == "pre.dsp.denoise_mode" {
+            let (enabled_opt, backend_opt) = if key == "pre.dsp.backend" {
+                (None, requested_dsp.backend)
+            } else if requested_dsp.denoise {
+                (Some(true), requested_dsp.backend)
+            } else {
+                (Some(false), None)
+            };
+            if backend_opt.is_some() {
+                fresh
+                    .validate_denoise_backend(requested_dsp.backend, fresh.enhance.as_ref())
+                    .map_err(|err| (ctl::CODE_INVALID_ARGUMENT.to_string(), err.to_string()))?;
+                fresh.pre.dsp.backend = requested_dsp.backend;
+            }
+            if let Some(enabled) = enabled_opt {
+                fresh.pre.dsp.denoise = enabled;
+            }
+            if ctx.services_active.load(Ordering::Acquire) {
+                let (applied_enabled, applied_backend) = ctx
+                    .services
+                    .set_denoise(enabled_opt, backend_opt)
+                    .map_err(|(code, reason)| {
+                        (
+                            code,
+                            format!("pre SetDenoise: {reason}; effective DSP unchanged; TOML baseline kept; retry config set for the same key or restart daemon to apply"),
+                        )
+                    })?;
+                fresh.pre.dsp.denoise = applied_enabled;
+                if backend_opt.is_some() {
+                    fresh.pre.dsp.backend = Some(applied_backend);
+                }
+                lock_state(&ctx.state).patch_pre_status(|pre| {
+                    patch_pre_dsp_state(pre, &fresh.pre.dsp, applied_backend);
+                });
+            }
         } else {
             match key {
                 "pre.dsp.denoise" => fresh.pre.dsp.denoise = requested_dsp.denoise,
@@ -857,12 +918,13 @@ fn apply_runtime_key(ctx: &Ctx, key: &str, old: &Config) -> Result<(), (String, 
                 }
             }
             if ctx.services_active.load(Ordering::Acquire) {
+                let active_backend = fresh.effective_denoise_backend();
                 ctx.services.set_dsp(&fresh.pre.dsp).map_err(|(code, reason)| (
                     code,
                     format!("pre SetDsp: {reason}; effective DSP unchanged; TOML baseline kept; retry config set for the same key or restart daemon to apply"),
                 ))?;
                 lock_state(&ctx.state).patch_pre_status(|pre| {
-                    pre.dsp = Some(fresh.pre.dsp.clone());
+                    patch_pre_dsp_state(pre, &fresh.pre.dsp, active_backend);
                 });
             }
         }

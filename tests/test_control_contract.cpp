@@ -31,6 +31,7 @@ static_assert(MOZART_CTL_PRE_GET_STATUS == 0x0204);
 static_assert(MOZART_CTL_PRE_SPEECH_STOP == 0x0205);
 static_assert(MOZART_CTL_PRE_SET_CAPTURE_GAIN == 0x020B);
 static_assert(MOZART_CTL_PRE_SET_MIC_MIXER == 0x020C);
+static_assert(MOZART_CTL_PRE_SET_DENOISE == 0x020D);
 static_assert(MOZART_CTL_RVC_GET_STATUS == 0x0306);
 static_assert(MOZART_CTL_RVC_LIST_MODELS == 0x0307);
 static_assert(MOZART_CTL_ASR_HELLO == 0x0401);

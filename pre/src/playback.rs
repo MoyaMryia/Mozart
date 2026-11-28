@@ -338,12 +338,30 @@ fn configure_at_boundary(
     request.policy != PlayoutPolicy::RealtimeOnly || router.route() == request.route
 }
 
-/// 打开时估算一次 ALSA 播放缓冲时长（ms），不进入热循环。
+/// 打开时估算一次 ALSA 播放缓冲中当前写入帧首样本的滞后时长（ms），作为静态兜底。
 fn buffer_delay_ms(pcm: &alsa::pcm::PCM) -> u16 {
     pcm.get_params()
         .ok()
-        .map(|(buffer, _)| ((buffer as usize * 1000) / RAW_SAMPLE_RATE as usize).min(500) as u16)
-        .unwrap_or(45)
+        .map(|(buffer, _)| {
+            let ahead = (buffer as usize).saturating_sub(RAW_SAMPLES);
+            ((ahead * 1000) / RAW_SAMPLE_RATE as usize).min(500) as u16
+        })
+        .unwrap_or(25)
+}
+
+/// 运行时查询 ALSA 播放队列延迟（当前刚写入的 960 样本块首样本距 DAC 播出的剩余时长）。
+fn runtime_render_delay_ms(pcm: &alsa::pcm::PCM, fallback_ms: u16) -> u16 {
+    pcm.status()
+        .ok()
+        .and_then(|st| {
+            let queued = st.get_delay();
+            if queued < 0 {
+                return None;
+            }
+            let ahead = (queued as u64).saturating_sub(RAW_SAMPLES as u64);
+            Some(((ahead * 1000) / RAW_SAMPLE_RATE as u64).min(500) as u16)
+        })
+        .unwrap_or(fallback_ms)
 }
 
 /// 播放线程主体。启动阶段若指定播放设备未就绪（`pcm == None`），按 20 ms 节拍继续排空
@@ -370,6 +388,7 @@ pub fn run(
     let mut playback_delay_ms = pcm.as_ref().map(buffer_delay_ms).unwrap_or(0);
     let mut underruns = 0u64;
     let mut reported = 0u64;
+    shared.set_playback_active(pcm.is_some());
     loop {
         let frame_start = Instant::now();
         // This boundary follows the previous ALSA write. Acknowledgement here
@@ -391,6 +410,7 @@ pub fn run(
                     }
                     playback_delay_ms = buffer_delay_ms(&new_pcm);
                     pcm = Some(new_pcm);
+                    shared.set_playback_active(true);
                     ref_tx.discontinuity();
                     fade_in.trigger();
                     shared.clear_startup_open_error_if_ready();
@@ -427,6 +447,7 @@ pub fn run(
         }
 
         let Some(active_pcm) = pcm.as_ref() else {
+            shared.set_playback_active(false);
             // 无有效播放设备时仅按 20 ms 节拍排空环而不累加 tts_frames_played / rvc_playout_gap 等实播计数。
             let _ = trunk.pop(Some(Duration::ZERO));
             drain_rvc_skipped(&rvc, &shared);
@@ -466,7 +487,7 @@ pub fn run(
             shared.set_last_error(&message);
             message
         })?;
-        match alsa_stream::transfer(
+        let transfer_res = alsa_stream::transfer(
             active_pcm,
             &io,
             Op::Write,
@@ -476,10 +497,24 @@ pub fn run(
             shared.playback_switch.pending_flag(),
             &mut underruns,
             probe.as_mut(),
-        ) {
+        );
+        if underruns > reported {
+            reported = underruns;
+            ref_tx.discontinuity();
+            shared.set_playback_underruns(underruns);
+            let message = format!("playback underrun recovered (total {underruns})");
+            shared.set_last_error(&message);
+            eprintln!("mozart-pre: {message}");
+        }
+        match transfer_res {
             Ok(()) => {
                 shared.add_played(1);
-                ref_tx.push(&mono, playback_delay_ms);
+                if shared.aec_enabled() {
+                    let delay_ms = runtime_render_delay_ms(active_pcm, playback_delay_ms);
+                    let render_at_ns =
+                        crate::capture::now_ns() + u64::from(delay_ms) * 1_000_000;
+                    ref_tx.push_timed(&mono, delay_ms, render_at_ns);
+                }
             }
             Err(StreamError::Cancelled) => return Ok(()),
             Err(StreamError::Reopen) => continue,
@@ -492,14 +527,6 @@ pub fn run(
                 shared.set_last_error(&message);
                 return Err(format!("playback: {message}"));
             }
-        }
-        if underruns > reported {
-            reported = underruns;
-            ref_tx.discontinuity();
-            shared.set_playback_underruns(underruns);
-            let message = format!("playback underrun recovered (total {underruns})");
-            shared.set_last_error(&message);
-            eprintln!("mozart-pre: {message}");
         }
     }
 }

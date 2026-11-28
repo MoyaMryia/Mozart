@@ -9,8 +9,8 @@ cd "$(git rev-parse --show-toplevel)"
 MAX_TRACKED_BYTES=$((5 * 1024 * 1024))
 
 # 阶段名与触发路径（扩展正则，匹配暂存文件路径）。
-NATIVE_PATHS='^(core|pre|enhance|rvc|daemon|api|tests)/|^CMakeLists\.txt$|^CMakePresets\.json$|^cmake/'
-RUST_PATHS='^(core|dsp|pre|daemon|ctl|asr|tts|bridge|web-adapter)/|^Cargo\.toml$|^Cargo\.lock$|^tools/(ci-local|deploy-jetson|install-jetson-systemd|jetson-e2e)\.sh$'
+NATIVE_PATHS='^(core|pre|enhance|rvc|daemon|api|tests|aec3)/|^CMakeLists\.txt$|^CMakePresets\.json$|^cmake/'
+RUST_PATHS='^(core|dsp|pre|daemon|ctl|asr|tts|bridge|web-adapter|aec3)/|^Cargo\.toml$|^Cargo\.lock$|^tools/(ci-local|deploy-jetson|install-jetson-systemd|jetson-e2e|jetson-unit-test|jetson-aec-acoustic)\.sh$'
 WEB_PATHS='^web/'
 
 skip() { echo "跳过 $1：$2" >&2; }
@@ -58,7 +58,7 @@ stage_native() {
     fi
     cmake --preset host-debug
     cmake --build --preset host-debug --parallel 2
-    if ctest --preset host-debug -N 2>/dev/null | grep -q 'Test #'; then
+    if ctest_list=$(ctest --preset host-debug -N 2>/dev/null) && grep -q 'Test #' <<<"$ctest_list"; then
         ctest --preset host-debug
     else
         skip native "没有注册的 ctest 用例"
@@ -69,6 +69,8 @@ check_runtime_scripts() {
     bash -n tools/deploy-jetson.sh
     bash -n tools/install-jetson-systemd.sh
     bash -n tools/jetson-e2e.sh
+    bash -n tools/jetson-unit-test.sh
+    bash -n tools/jetson-aec-acoustic.sh
 }
 
 build_adapter_fixtures() {
@@ -81,6 +83,10 @@ stage_rust() {
     if [ ! -f Cargo.toml ]; then
         skip rust "没有 Cargo.toml"
         return 0
+    fi
+    if [ -z "${MOZART_AEC3_LIB_DIR:-}" ] && [ -e build/host-debug/aec3/libmozart_aec3.so ]; then
+        export MOZART_AEC3_LIB_DIR="$PWD/build/host-debug/aec3"
+        export LD_LIBRARY_PATH="$MOZART_AEC3_LIB_DIR${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
     fi
     cargo check --workspace
     build_adapter_fixtures

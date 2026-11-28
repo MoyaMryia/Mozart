@@ -4,12 +4,24 @@
 use mozart_core::config::{PreConsumerConfig, PreDspConfig};
 use mozart_core::ctl;
 use mozart_core::ctl::schema::{PlayoutPolicy, PreMicMixerStatus, PreStatus, Route};
+use mozart_core::denoise::{backend_infos, enhance_required_error, DenoiseBackend};
+#[cfg(test)]
+use mozart_core::denoise::DenoiseMode;
 use std::collections::BTreeMap;
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicU8, AtomicUsize, Ordering};
 use std::sync::{mpsc, Mutex};
 use std::time::{Duration, Instant};
 
 const SWITCH_POLL: Duration = Duration::from_millis(20);
+const DSP_SWITCH_MASK: u64 = 0xF;
+const DENOISE_BACKEND_SHIFT: u32 = 4;
+const DENOISE_BACKEND_MASK: u64 = 0xFF << DENOISE_BACKEND_SHIFT;
+const DENOISE_EPOCH_SHIFT: u32 = 12;
+
+fn decode_backend(value: u64) -> DenoiseBackend {
+    DenoiseBackend::from_u8(((value & DENOISE_BACKEND_MASK) >> DENOISE_BACKEND_SHIFT) as u8)
+        .unwrap_or_default()
+}
 
 struct SwitchRequest {
     target: String,
@@ -253,6 +265,7 @@ fn speaker_name(speaker: Speaker) -> &'static str {
 }
 
 /// 状态快照需要的队列读数；控制线程组装 status 时传入。
+#[derive(Default)]
 pub struct QueueReadout {
     /// 采集 → DSP 环深度（帧）。
     pub depth: u64,
@@ -357,16 +370,22 @@ pub struct Shared {
     /// 消费者列表（启动时按配置固定）：每个消费者一个输入发送丢弃计数槽，
     /// 处理线程发布绝对值，控制线程组装 status 时读取。
     consumers: Vec<Consumer>,
-    /// DSP 级开关目标：控制线程（SetDsp）写，处理线程逐帧读、变化时应用。
+    /// DSP 级开关与降噪后端目标（位 0..3 为四级开关，位 4..11 为降噪后端，位 12..63 为 epoch）。
     dsp_target: AtomicU64,
-    /// 采集设备切换代次：采集热切换成功后递增，触发处理线程重置 WOLA 与增强会话。
+    /// 采集设备切换或溢出代次：触发处理线程重置降噪与 AEC 会话。
     capture_epoch: AtomicU64,
-    pub enhancement: Option<std::sync::Arc<crate::enhancement::Enhancement>>,
+    /// 大幅采集增益跳变代次：仅触发 AEC 重新适应，不重置降噪底噪。
+    aec_gain_epoch: AtomicU64,
+    /// 播放设备当前是否处于活跃打开状态（非缺设备待机）。
+    playback_active: AtomicBool,
+    pub enhancement: Option<std::sync::Arc<crate::denoise::ulunas::UlunasWorker>>,
     /// 在线 AEC 开关与遥测（控制线程读写开关，处理线程维护遥测）。
     aec_enabled: AtomicBool,
     aec: std::sync::Arc<crate::aec::AecTelemetry>,
     /// 软件采集前级数字增益（dB，f32::to_bits；控制线程写，处理线程只读）。
     capture_gain_bits: AtomicU32,
+    /// 上次触发 AEC 重置（或初始基线）时的软件增益（dB，仅控制路径读写）。
+    aec_gain_anchor_bits: AtomicU32,
     /// 当前采集卡 ALSA Mixer 控制入口与快照（单锁附带代次防并发撕裂；绝不进实时音频循环）。
     capture_mixer: Mutex<CaptureMixerState>,
     /// AI 输出帧坏包丢弃，接收线程发布绝对值。
@@ -405,6 +424,7 @@ struct CaptureMixerState {
     generation: u64,
     ctl: Option<(String, String)>,
     status: PreMicMixerStatus,
+    aec_anchor: Option<(Option<u8>, Option<bool>)>,
 }
 
 impl Shared {
@@ -428,14 +448,20 @@ impl Shared {
             frames_captured: AtomicU64::new(0),
             frames_played: AtomicU64::new(0),
             consumers: consumers.into_iter().map(Consumer::from_config).collect(),
-            dsp_target: AtomicU64::new(dsp.code().into()),
+            dsp_target: AtomicU64::new(
+                u64::from(dsp.code())
+                    | (u64::from(DenoiseBackend::default().to_u8()) << DENOISE_BACKEND_SHIFT),
+            ),
             capture_epoch: AtomicU64::new(0),
+            aec_gain_epoch: AtomicU64::new(0),
+            playback_active: AtomicBool::new(true),
             enhancement: None,
             aec_enabled: AtomicBool::new(false),
             aec: std::sync::Arc::new(crate::aec::AecTelemetry::new(
                 crate::aec::default_backend_name(),
             )),
             capture_gain_bits: AtomicU32::new(0.0f32.to_bits()),
+            aec_gain_anchor_bits: AtomicU32::new(0.0f32.to_bits()),
             capture_mixer: Mutex::new(CaptureMixerState::default()),
             ai_recv_dropped: AtomicU64::new(0),
             tts_recv_dropped: AtomicU64::new(0),
@@ -577,24 +603,90 @@ impl Shared {
     }
 
     /// DSP 级开关目标；处理线程逐帧读，与已应用值比较，变化时应用。
+    #[cfg(test)]
     pub fn dsp_target(&self) -> DspSwitches {
         self.dsp_snapshot().0
     }
 
-    /// SetDsp 命令目标：控制线程写，处理线程在一帧内应用。
+    /// SetDsp 命令目标：控制线程写，处理线程在一帧内应用，保留当前选中的降噪后端。
     pub fn set_dsp_target(&self, dsp: DspSwitches) {
         self.dsp_target
-            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |old| {
-                let epoch = (old >> 4) + u64::from((old as u8 & 1) != (dsp.code() & 1));
-                Some((epoch << 4) | u64::from(dsp.code()))
+            .try_update(Ordering::AcqRel, Ordering::Acquire, |old| {
+                let denoise_changed = (old & 1) != u64::from(dsp.denoise);
+                let epoch = (old >> DENOISE_EPOCH_SHIFT) + u64::from(denoise_changed);
+                let backend_bits = old & DENOISE_BACKEND_MASK;
+                Some(
+                    (epoch << DENOISE_EPOCH_SHIFT)
+                        | backend_bits
+                        | u64::from(dsp.code()),
+                )
             })
             .unwrap();
     }
 
+    /// 运行时设置降噪开关与/或后端（`PRE_SET_DENOISE` 控制面外部入口校验）。
+    pub fn set_denoise_target(
+        &self,
+        enabled: Option<bool>,
+        backend: Option<DenoiseBackend>,
+    ) -> Result<(bool, DenoiseBackend), String> {
+        if let Some(target_backend) = backend {
+            if target_backend.requires_enhance() && self.enhancement.is_none() {
+                return Err(enhance_required_error(target_backend));
+            }
+        }
+        let mut result = (false, DenoiseBackend::default());
+        self.dsp_target
+            .try_update(Ordering::AcqRel, Ordering::Acquire, |old| {
+                let old_switches = DspSwitches::from_code((old & DSP_SWITCH_MASK) as u8);
+                let old_backend = decode_backend(old);
+                let mut new_switches = old_switches;
+                if let Some(on) = enabled {
+                    new_switches.denoise = on;
+                }
+                let new_backend = backend.unwrap_or(old_backend);
+                result = (new_switches.denoise, new_backend);
+                let changed =
+                    new_switches.denoise != old_switches.denoise || new_backend != old_backend;
+                let epoch = (old >> DENOISE_EPOCH_SHIFT) + u64::from(changed);
+                Some(
+                    (epoch << DENOISE_EPOCH_SHIFT)
+                        | (u64::from(new_backend.to_u8()) << DENOISE_BACKEND_SHIFT)
+                        | u64::from(new_switches.code()),
+                )
+            })
+            .unwrap();
+        Ok(result)
+    }
+
+    /// 启动期设置已校验的初始降噪后端，不递増 epoch、不重复校验。
+    pub fn init_denoise_backend(&self, backend: DenoiseBackend) {
+        self.dsp_target
+            .try_update(Ordering::AcqRel, Ordering::Acquire, |old| {
+                Some(
+                    (old & !DENOISE_BACKEND_MASK)
+                        | (u64::from(backend.to_u8()) << DENOISE_BACKEND_SHIFT),
+                )
+            })
+            .unwrap();
+    }
+
+    pub fn full_dsp_snapshot(&self) -> (DspSwitches, DenoiseBackend, u64) {
+        let value = self.dsp_target.load(Ordering::Acquire);
+        let switches = DspSwitches::from_code((value & DSP_SWITCH_MASK) as u8);
+        (switches, decode_backend(value), value >> DENOISE_EPOCH_SHIFT)
+    }
+
     /// 开关与 epoch 同一原子快照，避免快速关开漏掉会话重置。
     pub fn dsp_snapshot(&self) -> (DspSwitches, u64) {
-        let value = self.dsp_target.load(Ordering::Acquire);
-        (DspSwitches::from_code(value as u8), value >> 4)
+        let (switches, _, epoch) = self.full_dsp_snapshot();
+        (switches, epoch)
+    }
+
+    #[cfg(test)]
+    pub fn denoise_snapshot(&self) -> (DenoiseMode, u64) {
+        let (switches, backend, epoch) = self.full_dsp_snapshot();
+        (DenoiseMode::from_parts(switches.denoise, backend), epoch)
     }
 
     pub fn aec_enabled(&self) -> bool {
@@ -610,8 +702,19 @@ impl Shared {
     }
 
     pub fn set_capture_gain_db(&self, db: f32) {
-        self.capture_gain_bits
-            .store(db.to_bits(), Ordering::Release);
+        let bits = db.to_bits();
+        self.capture_gain_bits.store(bits, Ordering::Release);
+        self.aec_gain_anchor_bits.store(bits, Ordering::Release);
+    }
+
+    pub fn apply_capture_gain_db(&self, db: f32) {
+        let bits = db.to_bits();
+        let anchor = f32::from_bits(self.aec_gain_anchor_bits.load(Ordering::Acquire));
+        self.capture_gain_bits.store(bits, Ordering::Release);
+        if (db - anchor).abs() >= 6.0 {
+            self.aec_gain_anchor_bits.store(bits, Ordering::Release);
+            self.bump_aec_gain_epoch();
+        }
     }
 
     pub fn refresh_capture_mixer(&self, pcm: Option<&alsa::pcm::PCM>, device: &str) {
@@ -620,6 +723,7 @@ impl Shared {
             ctl.as_ref().map(|(c, _)| c.as_str()),
             ctl.as_ref().map(|(_, l)| l.as_str()),
         );
+        let anchor = (status.volume_percent, status.agc_enabled);
         let mut guard = self
             .capture_mixer
             .lock()
@@ -627,6 +731,7 @@ impl Shared {
         guard.generation = guard.generation.wrapping_add(1);
         guard.ctl = ctl;
         guard.status = status;
+        guard.aec_anchor = Some(anchor);
     }
 
     pub fn begin_capture_mixer_apply(&self) -> Option<(u64, String, String)> {
@@ -645,14 +750,34 @@ impl Shared {
         generation: u64,
         status: PreMicMixerStatus,
     ) -> PreMicMixerStatus {
-        let mut guard = self
-            .capture_mixer
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-        if guard.generation == generation {
-            guard.status = status;
+        let (out, should_bump) = {
+            let mut guard = self
+                .capture_mixer
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            let mut should_bump = false;
+            if guard.generation == generation {
+                guard.status = status;
+                let anchor = guard
+                    .aec_anchor
+                    .unwrap_or((guard.status.volume_percent, guard.status.agc_enabled));
+                let vol_jumped = match (anchor.0, guard.status.volume_percent) {
+                    (Some(a), Some(b)) => a.abs_diff(b) >= 15,
+                    _ => false,
+                };
+                let agc_toggled = anchor.1 != guard.status.agc_enabled;
+                if vol_jumped || agc_toggled {
+                    guard.aec_anchor =
+                        Some((guard.status.volume_percent, guard.status.agc_enabled));
+                    should_bump = true;
+                }
+            }
+            (guard.status.clone(), should_bump)
+        };
+        if should_bump {
+            self.bump_aec_gain_epoch();
         }
-        guard.status.clone()
+        out
     }
 
     pub fn mic_mixer_status(&self) -> PreMicMixerStatus {
@@ -667,7 +792,7 @@ impl Shared {
         self.aec.clone()
     }
 
-    pub fn enhancement_epoch(&self) -> u64 {
+    pub fn denoise_epoch(&self) -> u64 {
         self.dsp_snapshot().1.wrapping_add(self.capture_epoch())
     }
 
@@ -679,14 +804,31 @@ impl Shared {
         self.capture_epoch.fetch_add(1, Ordering::AcqRel) + 1
     }
 
+    pub fn aec_gain_epoch(&self) -> u64 {
+        self.aec_gain_epoch.load(Ordering::Acquire)
+    }
+
+    pub fn bump_aec_gain_epoch(&self) -> u64 {
+        self.aec_gain_epoch.fetch_add(1, Ordering::AcqRel) + 1
+    }
+
+    pub fn is_playback_active(&self) -> bool {
+        self.playback_active.load(Ordering::Acquire)
+    }
+
+    pub fn set_playback_active(&self, active: bool) {
+        self.playback_active.store(active, Ordering::Release);
+    }
+
     pub fn configure_enhancement(
         &mut self,
         config: &mozart_core::config::EnhanceConfig,
         run_dir: &std::path::Path,
     ) {
-        self.enhancement = Some(std::sync::Arc::new(crate::enhancement::Enhancement::new(
-            config, run_dir,
-        )));
+        self.enhancement = Some(std::sync::Arc::new(
+            crate::denoise::ulunas::UlunasWorker::new(config, run_dir),
+        ));
+        self.init_denoise_backend(DenoiseBackend::Ulunas);
     }
 
     /// 发布 AI 输出帧坏包丢弃的累计绝对值（接收线程调用）。
@@ -796,23 +938,20 @@ impl Shared {
             "tts".to_string(),
             self.tts_recv_dropped.load(Ordering::Relaxed) + queue.tts_dropped,
         );
-        let dsp = self.dsp_target();
+        let (dsp, backend, _) = self.full_dsp_snapshot();
         PreStatus {
             playout_policy: self.playout_policy(),
             state: "running".to_string(),
-            denoise_backend: if self.enhancement.is_some() {
-                "ulunas"
-            } else {
-                "wola"
-            }
-            .to_string(),
+            denoise_backend: backend.as_str().to_string(),
+            denoise_backends: backend_infos(self.enhancement.is_some()),
             enhancement: self
                 .enhancement
                 .as_ref()
-                .map(|enhance| enhance.status(dsp.denoise)),
+                .map(|enhance| enhance.status(dsp.denoise && backend.requires_enhance())),
             aec: Some(self.aec.status(self.aec_enabled())),
             dsp: Some(PreDspConfig {
                 denoise: dsp.denoise,
+                backend: None,
                 gate: dsp.gate,
                 agc: dsp.agc,
                 limiter: dsp.limiter,
@@ -1174,5 +1313,40 @@ mod tests {
         assert_eq!(recovered, "dev-a");
         assert!(standby_slot.is_active());
         handle.join().unwrap();
+    }
+
+    #[test]
+    fn mixer_aec_anchor_bumps_epoch_on_cumulative_volume_or_agc_change() {
+        let shared = test_shared("cap", "play", "id");
+        let make = |vol: u8, agc: bool| mozart_core::ctl::schema::PreMicMixerStatus {
+            supported: true,
+            card_name: Some("USB Mic".to_string()),
+            volume_percent: Some(vol),
+            agc_supported: true,
+            agc_enabled: Some(agc),
+            ..Default::default()
+        };
+        {
+            let mut guard = shared.capture_mixer.lock().unwrap();
+            guard.generation = 1;
+            guard.ctl = Some(("hw:0".to_string(), "Mic".to_string()));
+            guard.status = make(80, false);
+            guard.aec_anchor = Some((Some(80), Some(false)));
+        }
+        assert_eq!(shared.aec_gain_epoch(), 0);
+
+        // 单步仅降 10%（未满 15%）：不重置。
+        shared.finish_capture_mixer_apply(1, make(70, false));
+        assert_eq!(shared.aec_gain_epoch(), 0);
+
+        // 再降 6%（累计较基线 80% 已差 16% >= 15%）：触发重置并刷新基线到 64%。
+        shared.finish_capture_mixer_apply(1, make(64, false));
+        assert_eq!(shared.aec_gain_epoch(), 1);
+
+        // 围绕新基线 64% 小步变动不重置；切 AGC 立即触发重置。
+        shared.finish_capture_mixer_apply(1, make(60, false));
+        assert_eq!(shared.aec_gain_epoch(), 1);
+        shared.finish_capture_mixer_apply(1, make(60, true));
+        assert_eq!(shared.aec_gain_epoch(), 2);
     }
 }

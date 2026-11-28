@@ -114,7 +114,7 @@ fn run_dsp_chain(
             },
             pcm,
         };
-        confs.push(dsp.process_frame(&mut frame));
+        confs.push(dsp.process_frame(&mut frame).expect("WOLA 启用时必有置信度"));
         // counts.txt 的每块发射数与 wola 流同源；越界即 panic，不静默截断。
         let count = *count;
         // packed 字段按值搬出再切片，不取引用。
@@ -196,7 +196,7 @@ fn dsp_frame_stream_matches_c_wrapper_reference() {
             },
             pcm,
         };
-        confs.push(dsp.process_frame(&mut frame));
+        confs.push(dsp.process_frame(&mut frame).expect("WOLA 启用时必有置信度"));
         let actual = frame.pcm;
 
         let mut expected = [0f32; RAW_SAMPLES];
