@@ -30,6 +30,8 @@ def main() -> None:
                    help="Directory containing the prosody_sculptor_l2 python modules")
     p.add_argument("--output", type=Path, required=True)
     p.add_argument("--target-frames", type=int, default=280)
+    p.add_argument("--fused", action="store_true",
+                   help="通道 3.. 直接输出适配后特征 hubert+delta（缺省为 delta 残差）")
     args = p.parse_args()
 
     sys.path.insert(0, str(args.l2_dir.resolve()))
@@ -46,19 +48,21 @@ def main() -> None:
     total = 3 + model.hubert_dim
 
     class Combined(torch.nn.Module):
-        def __init__(self, inner):
+        def __init__(self, inner, fused):
             super().__init__()
             self.inner = inner
+            self.fused = fused
 
         def forward(self, hubert_upsampled, intent_signals, cond):
             f0, voiced, gain, delta = self.inner(hubert_upsampled, intent_signals, cond)
-            # [B,T],[B,T],[B,T],[B,T,768] -> [B,T,771]
+            # [B,T],[B,T],[B,T],[B,T,768] -> [B,T,771]；fused 时尾段直接输出适配后特征
             f0 = f0.unsqueeze(-1)
             voiced = voiced.unsqueeze(-1)
             gain = gain.unsqueeze(-1)
-            return torch.cat((f0, voiced, gain, delta), dim=-1)
+            tail = hubert_upsampled + delta if self.fused else delta
+            return torch.cat((f0, voiced, gain, tail), dim=-1)
 
-    wrapper = Combined(model).eval()
+    wrapper = Combined(model, args.fused).eval()
 
     hub = torch.randn(1, frames, model.hubert_dim)
     intent = torch.randn(1, frames, 4)

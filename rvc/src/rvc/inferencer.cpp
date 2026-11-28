@@ -582,7 +582,7 @@ void RVCInferencer::apply_realtime_sculptor(
         {"cond", {1, 4}, OnnxInput::Type::Float, cond_float, {}},
     };
     // 单输出 [1, frames, 771]：通道 0/1/2 为 log_f0/voiced_logit/gain_db，
-    // 3..771 为 delta_feats（tools/model/export_sculptor_onnx.py 拼接约定）。
+    // 3..771 为适配后特征（hubert+delta 引擎内融合，tools/model/export_sculptor_onnx.py --fused）。
     constexpr size_t kSculptorChannels = 771;
     auto out = engine.run(inputs, {"outputs"});
     if (out.size() != frames * kSculptorChannels) {
@@ -593,9 +593,8 @@ void RVCInferencer::apply_realtime_sculptor(
     gain_db_frames.assign(frames, 0.0f);
     for (size_t t = 0; t < frames; ++t) {
         const float* row = out.data() + t * kSculptorChannels;
-        for (size_t c = 0; c < emb_dim; ++c) {
-            resized_feats[t * emb_dim + c] += row[3 + c];
-        }
+        // 融合契约：通道 3.. 直接是适配后特征（hubert+delta 已在引擎内相加）。
+        std::copy_n(row + 3, emb_dim, resized_feats.begin() + static_cast<std::ptrdiff_t>(t * emb_dim));
         f0_l2[t] = row[1] > 0.0f
             ? std::clamp(std::exp(row[0]), 50.0f, 1100.0f) : 0.0f;
         gain_db_frames[t] = std::clamp(row[2], -4.0f, 4.0f);

@@ -214,7 +214,7 @@ RMVPE 前端 mel 128 带、n_fft 1024、hop 160、30–8000 Hz、HTK Slaney（�
 - [ ] **步骤 6：接入 L2 因果意图塑形器（prosody sculptor，替代索引检索清洗源声道泄漏）**
   - **背景与依据**：离线归因矩阵（`rvc-reference` 归因实验）已确认仅换 F0/能量不够，源说话人声门/声道色彩经 ContentVec 泄漏把目标声码器拖回源音色。L2 双语因果 Intent-to-Prosody + Feature Adapter（约 4.36 M 参数，静态 `[1,280]` 契约，与实时几何 `front_frames = 280` 一致）在 100 Hz 帧钟输出 `pred_log_f0`、`pred_voiced_logit`、`pred_log_gain_db`、`delta_feats`，其中 `delta_feats` 残差清洗替代 FAISS 索引检索。权重与评估见 `rvc-reference/prosody_sculptor_l2/`（双语 LibriTTS-R + AISHELL-3 训练，EN/ZH 对拍通过）。
   - **改动方案**：
-    1. 资产约定：模型目录放 `sculptor.onnx`（板端编译为 `sculptor.engine`，`make_engine` 自动优先）+ `sculptor.json`（`gender`/`target_f0`/`target_f0_std`/`softness`）；ONNX 单输出 `[1,280,771]` 帧主序（f0/voiced/gain/delta 按通道拼接），规避 `IEngine` 单输出接口限制；导出脚本 `tools/model/export_sculptor_onnx.py`。
+    1. 资产约定：模型目录放 `sculptor.onnx`（板端编译为 `sculptor.engine`，`make_engine` 自动优先）+ `sculptor.json`（`gender`/`target_f0`/`target_f0_std`/`softness`）；ONNX 单输出 `[1,280,771]` 帧主序（f0/voiced/gain/适配后特征按通道拼接，适配后特征 = hubert+delta 引擎内融合，`tools/model/export_sculptor_onnx.py --fused`），规避 `IEngine` 单输出接口限制；导出脚本 `tools/model/export_sculptor_onnx.py`。
     2. 模型加载：`model_loader` 检测到 `sculptor.onnx/.engine` 才加载（可选资产），校验输入形状 `[1,T,768]/[1,T,4]/[1,4]` 并 warmup，T 必须等于 front 帧数；无 sculptor 时行为完全不变。加载成功后 `capabilities` 增加 `sculptor` 位，`GetStatus` / `LoadModel` 响应可查询；目录有资产但加载失败则拒载并在日志记录原因，不静默回退。
     3. 推理接入：`infer_realtime` 在特征检索/protect 之后、front 之前调用——`delta_feats` 逐帧加到 `resized_feats`；L2 F0（voiced>0 取 `exp(pred_log_f0)`，否则 0）经 `f0_to_pitch(..., interpolate_unvoiced=false)` 替换 `pitch`/`pitchf`；`pred_log_gain_db` 限幅 ±4 dB、高斯 σ=6 平滑后施加于 decoder 输出 return 区间样本。sculptor 激活时跳过索引检索与 protect（由 delta 替代），`pitch_shift` 不生效（L2 自带目标 F0）。
     4. 意图信号：`features.py` 的 `causal_rms`/EMA 均值方差/粗意图轮廓（80 ms 平滑）/停顿概率单点移植到 `rvc/src/rvc/sculptor.cpp`，跨块 EMA 状态与音高缓存同节奏（fresh_count 帧对齐）推进，断流重置时同步清零。
@@ -251,10 +251,14 @@ RMVPE 前端 mel 128 带、n_fft 1024、hop 160、30–8000 Hz、HTK Slaney（�
   - 盘点结果（`tools/model/gate_compare.py` 对拍门，EN golden）：sculptr ORT fp32 与 TRT fp16 指标逐项相同（cents \|abs\|中位均 90）；rmvpe fp32 引擎 `100`（反而略差）；hubert fp32 引擎 `90`（无变化）。**结论：精度瓶颈不在引擎 fp16，保留全部 fp16 引擎**（同速下无精度可拉）。
   - 逐秒分布：偏差集中在启动段（t=0–2 s，-100~200 cents）与少数重读段（+145~160），多数段 30–100 cents，无八度跳变；对拍指标地板（自对齐 +10 ms 错位）为 10 cents。
   - 遗留归因（结构性，非精度）：a) 实时 RMVPE 逐块 mel 补零口径 vs golden 整段 RMVPE 的帧级差；b) 启动态（意图 EMA 冷启动与历史窗零填充差异）；c) ContentVec 实时导出与 Applio 整段前端的帧对齐差异。列为 O3 前置观察，不影响 O3 提速项的等价性验证方法。
-- [ ] **O3（同精度提速）**：
-  - a0.（已完成）共享前端与 frieren front/decoder 的 FP16 补齐：11-25 重编只覆盖 bocchi 四引擎，qiqi 共享 hubert/rmvpe 与 frieren front/decoder 仍为 FP32。用 `build_realtime_engines.py --fp16` 重编并换装后，板端单块（frieren + sculptr，定频、canonical 停机）从 `70 ms` 降至 **`26.7 ms`**（f0+hubert 并行窗 `13.5`，sculptr+装配 `2.5`，front+decoder `10.6`），GPU 占空比 `11%`；golden 门 `logmel_mae EN 4.98（+0.2）/ ZH 5.09（-0.2）`，其余指标不变，通过。旧 FP32 引擎备份于设备 `/tmp/engine-backup-fp32/`。
-  - a. sculptr 导出融合 `adapted_feats = feats + delta_feats`（engine 内 Add），`run_chained` 直连 front，省 `280×768 fp32` 两次往返拷贝；ONNX 对拍 golden 容差后替换资产与 C++ 接线。
-  - b. HuBERT 增量卷积缓存：f0 窗内 hubert 已降为并行支路瓶颈（`9.7 ms` GPU，仅新增 `3840` 样本需要重算），增量后预计总块 `26.7 → 约 21 ms`；先做离线逐帧等价验证（感受野与重锚失效逻辑）再上实时。
-  - c. 意图缓存与中间缓冲复用等微优化。
-  - 验收：单块推理耗时下降且 O1 指标不劣化。
+- [x] **O3-a0（同精度提速）：共享前端与 frieren front/decoder 的 FP16 补齐**
+  - 11-25 重编只覆盖 bocchi 四引擎，qiqi 共享 hubert/rmvpe 与 frieren front/decoder 仍为 FP32。用 `build_realtime_engines.py --fp16` 重编并换装后，板端单块（frieren + sculptr，定频、canonical 停机）从 `70 ms` 降至 **`26.7 ms`**（f0+hubert 并行窗 `13.5`，sculptr+装配 `2.5`，front+decoder `10.6`），GPU 占空比 `11%`；golden 门 `logmel_mae EN 4.98（+0.2）/ ZH 5.09（-0.2）`，其余指标不变，通过。旧 FP32 引擎备份于设备 `/tmp/engine-backup-fp32/`。
+- [x] **O3-a（同精度提速）：sculptr 融合适配特征 + `startup_delay` 回调红利**
+  - 导出工具新增 `--fused`：通道 3.. 直接输出适配后特征（hubert+delta 引擎内相加），ORT 对拍 `3.34e-06`；C++ 契约同步更新（`tools/model/export_sculptor_onnx.py`、`apply_realtime_sculptor`）。融合引擎 TRT 实测 `1.35 ms`，单块总耗时保持 `26.7 ms`（加法本就亚毫秒，收益在契约简化与后续直连可能）。
+  - golden 门：EN `logmel_mae 4.81`（优于非融合）、ZH `5.13`，其余指标不变，通过。
+  - `startup_delay_ms` 扫描（静音流零缺帧）：300/280/260 均通过；脉冲回录实测净滞后 **`280 → 350 ms`**（对照 320 → `400 ms`），较旧口径净减约 `50 ms`。
+- [x] **O3-b：HuBERT 增量缓存——判定不可行，移入 FUTURE**
+  - 导出图盘点：hubert-realtime 含全序列位置卷积（k=128 s=1 group=16）与全局注意力（MatMul/Softmax），感受野 `41039/44800` 样本盖满整窗，每帧输出依赖全部输入；逐块增量缓存不可行。流式注意力变体（分块 KV 或限看历史）需重导出并重过 golden 门，移入 [FUTURE](../FUTURE.md)。f0 窗内 HuBERT 的并行墙钟收益维持现状（并行窗 `13.5 ms`，GPU 占空比 `11%`）。
+- [x] **O3-c：意图缓存与中间缓冲复用等微优化**
+  - 已随 O3-a 契约简化落地（适配后特征直接拷贝替代逐帧加法）；意图信号计算与缓存推进经黄金夹具与板端单测验证无新增开销项，其余候选微优化在 `26.7 ms` 占空比 `11%` 下无收益，不再单列。
 - [ ] **O4（板端实测收口）**：净延迟物理回录、60 s 长跑零欠载零缺帧、听感对照，报告入库；达标后将 sculptr 三件套扩展到正式模型目录。

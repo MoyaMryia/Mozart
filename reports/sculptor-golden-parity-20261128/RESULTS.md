@@ -57,3 +57,29 @@ EN 退化 +0.2 dB（在 bocchi FP16 历史 +0.12 dB 同档），ZH 反而改善�
 - 引擎耗时为 trtexec `--loadEngine` 单引擎隔离口径；管道墙钟为 `[profile][realtime]` 逐块锚点（170 块）。
 - golden 门样本：EN 20 s / ZH 25 s 各单次采集；未做统计重复。
 - 未验证项：canonical（bocchi）换装前端后的块耗时与听感复测；net 延迟下调余量的物理回录；60 s 长跑零缺帧复验。
+
+# O3-a/b/c 收口（同日续）
+
+## O3-a：sculptor 融合适配特征 + startup_delay 回调
+
+- 导出 `--fused`：通道 3.. 直接输出适配后特征（hubert+delta 引擎内相加），ORT 对拍 `3.34e-06`；
+  C++ 契约同步（`apply_realtime_sculptor` 直接拷贝适配后特征）。融合引擎 TRT `1.35 ms`。
+- 板端单块保持 `26.7 ms`（p95 27.1，160 块，f0+hubert 窗 `13.5` / sculptor+装配 `2.6` / front+decoder `10.6`）。
+- golden 门：EN `logmel_mae 4.81`（优于非融合的 4.98）、ZH `5.13`，其余指标不变。**通过。**
+- startup_delay 扫描（静音流）：300/280/260 零缺帧零错误。脉冲回录（220 Hz 满幅脉冲、
+  arecord 提前 0.5 s）：**净滞后 `startup 280 → 350 ms`**（对照 320 → 400 ms），较换装前净减约 50 ms。
+
+## O3-b：HuBERT 增量缓存——不可行，移入 FUTURE
+
+hubert-realtime 导出图盘点（onnx 节点级）：7 层特征卷积（hop 320 样本）之后还有全序列位置卷积
+（k=128 s=1 group=16）与全局注意力（MatMul/Softmax/LayerNorm），感受野 `41039/44800` 样本
+盖满整窗——每帧输出依赖全部输入，逐块增量缓存不可行。流式注意力变体移入 `docs/FUTURE.md`。
+
+## O3-c：微优化
+
+随 O3-a 契约简化落地（适配后特征直接拷贝）；其余候选在 11% 占空比下无收益，不再单列。
+
+## 48 kHz 长跑与听感
+
+未验证项（O4 剩余）：60 s 连续长跑零欠载复验、真实语音听感 ABX。sculptor 三件套扩展到
+正式模型目录待 O4。
