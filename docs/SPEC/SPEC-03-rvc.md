@@ -211,6 +211,15 @@ RMVPE 前端 mel 128 带、n_fft 1024、hop 160、30–8000 Hz、HTK Slaney（�
   - **改动方案**：`RVCInferencer::f0_to_pitch` 增加 `interpolate_unvoiced` 开关；实时链路 `infer_realtime` 传入 `false`，保留无基频帧为 `pitch = 1` 且 `pitchf = 0.0f`；离线文件链路 `infer` 保持 `true` 以维持离线对拍口径不变。
   - **独立验收**：C++ 单测验证 `f0_to_pitch(..., false)` 在混合清浊音序列中保持无声帧 `pitch=1 / pitchf=0`、有声帧正常移调；板端四起点三档对照（`interp` / `pitchf0` / `native`）显示 `native` 静音底噪降 22.5%（`0.0071 → 0.0055`）、人声/背景信噪比升 `+0.95 dB`、停顿跳变降 21%、SOLA 标准差从 `3.62` 降至 `3.39 ms`，实听电音明显减轻。
 
+- [ ] **步骤 6：接入 L2 因果意图塑形器（prosody sculptor，替代索引检索清洗源声道泄漏）**
+  - **背景与依据**：离线归因矩阵（`rvc-reference` 归因实验）已确认仅换 F0/能量不够，源说话人声门/声道色彩经 ContentVec 泄漏把目标声码器拖回源音色。L2 双语因果 Intent-to-Prosody + Feature Adapter（约 4.36 M 参数，静态 `[1,280]` 契约，与实时几何 `front_frames = 280` 一致）在 100 Hz 帧钟输出 `pred_log_f0`、`pred_voiced_logit`、`pred_log_gain_db`、`delta_feats`，其中 `delta_feats` 残差清洗替代 FAISS 索引检索。权重与评估见 `rvc-reference/prosody_sculptor_l2/`（双语 LibriTTS-R + AISHELL-3 训练，EN/ZH 对拍通过）。
+  - **改动方案**：
+    1. 资产约定：模型目录放 `sculptor.onnx`（板端编译为 `sculptor.engine`，`make_engine` 自动优先）+ `sculptor.json`（`gender`/`target_f0`/`target_f0_std`/`softness`）；ONNX 单输出 `[1,280,771]` 帧主序（f0/voiced/gain/delta 按通道拼接），规避 `IEngine` 单输出接口限制；导出脚本 `tools/model/export_sculptor_onnx.py`。
+    2. 模型加载：`model_loader` 检测到 `sculptor.onnx/.engine` 才加载（可选资产），校验输入形状 `[1,T,768]/[1,T,4]/[1,4]` 并 warmup，T 必须等于 front 帧数；无 sculptor 时行为完全不变。加载成功后 `capabilities` 增加 `sculptor` 位，`GetStatus` / `LoadModel` 响应可查询；目录有资产但加载失败则拒载并在日志记录原因，不静默回退。
+    3. 推理接入：`infer_realtime` 在特征检索/protect 之后、front 之前调用——`delta_feats` 逐帧加到 `resized_feats`；L2 F0（voiced>0 取 `exp(pred_log_f0)`，否则 0）经 `f0_to_pitch(..., interpolate_unvoiced=false)` 替换 `pitch`/`pitchf`；`pred_log_gain_db` 限幅 ±4 dB、高斯 σ=6 平滑后施加于 decoder 输出 return 区间样本。sculptor 激活时跳过索引检索与 protect（由 delta 替代），`pitch_shift` 不生效（L2 自带目标 F0）。
+    4. 意图信号：`features.py` 的 `causal_rms`/EMA 均值方差/粗意图轮廓（80 ms 平滑）/停顿概率单点移植到 `rvc/src/rvc/sculptor.cpp`，跨块 EMA 状态与音高缓存同节奏（fresh_count 帧对齐）推进，断流重置时同步清零。
+  - **独立验收**：C++ 单测（意图信号黄金对拍 fixtures、EMA 状态跨块推进一致性、形状校验拒绝分支、无 sculptor 回归不变）；本机 `host-debug` 构建 + CTest；板端 MozartMryia 隔离部署实测单块耗时增量、流式 E2E 零缺帧与听感对照（frieren/bocchi）。
+
 ---
 
 ### 实时延迟拆解与分阶段降延迟调查
