@@ -154,13 +154,19 @@ fn newer_mode_cancels_waiting_realtime_restart_during_unknown_stop() {
     let fault = root.join("stop-fault");
     let log = root.join("stub.log");
     let daemon = DaemonProcess::start_file("supersede-realtime", &root.join("files"), "", true, &[
-        ("MOZART_STARTUP_MODE", "rvc".into()),
+        ("MOZART_STARTUP_MODE", "direct".into()),
         ("MOZART_RVC_STUB_STOP_FAULT_FILE", fault.display().to_string()),
         ("MOZART_STUB_LOG", log.display().to_string()),
     ]);
     let conn = daemon.connect();
     let window = Duration::from_secs(5);
     let applied = |mode| status(&conn).output_mode.is_some_and(|m| m.applied == Some(mode));
+    // Isolate stop-fault counts from cold-start retries while pre is still starting.
+    assert!(wait_until(window, || {
+        let view = status(&conn);
+        view.rvc.is_some() && view.output_mode.is_some_and(|m| m.applied == Some(OutputMode::Direct))
+    }));
+    output_mode(&conn, "rvc");
     assert!(wait_until(window, || applied(OutputMode::Rvc)));
     let start_prefix = format!("mozart-rvc-stub {} ", ctl::RVC_START_STREAM);
     let starts = || std::fs::read_to_string(&log).unwrap().lines().filter(|line| line.starts_with(&start_prefix)).count();

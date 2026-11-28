@@ -22,7 +22,7 @@
 
 ~/.mozart-prev/               # 最近部署前源码快照（人工回滚锚点）
 ~/.mozart-source-backup.*/    # 各部署事务独立源码快照
-~/.mozart-deploy.lock/        # 同一账户的源码部署全局锁
+~/.mozart-deploy.lock         # 同一账户的 flock 会话锁文件
 
 ~/mozart-runtime/             # 运行时根；同一时间只跑这一份
 ├── mozart.toml               # 运行配置（唯一手改入口）
@@ -122,15 +122,16 @@ MOZART_JETSON=<SSH目标> uv run tools/jetson-audio.py
 
 AEC3 为可选构建依赖：部署脚本只编 `mozart-rvc` 与 `mozart-enhance` 两个 C++ 目标，不编 `mozart_aec3`。封装库需预先构建并放入资产 lib 目录（`libmozart_aec3.so`）；部署脚本检测到后导出 `MOZART_AEC3_LIB_DIR` 供 pre 链接真实后端，否则 pre 用未链接桩，`pre.aec.enabled` 开启会报告不可用原因。构建依赖与链接契约见 [SPEC-02](SPEC/SPEC-02-pre.md)。
 
-1. 快照 `~/Mozart` 源码到 `~/.mozart-prev`。
-2. rsync 本机仓库到 `~/Mozart`，排除 `target/`、`build/`、`.git/`。默认按内容同步（`--checksum --no-times`）：变更文件落传输时刻的 mtime，未变更文件保持原 mtime，构建缓存保留。`--full` 时前拨全部源码 mtime 并删除 workspace 成员的 cargo 指纹，强制全量重编。
-3. 构建 Rust 全部二进制与示例；构建 `jetson-release` C++ 产物；rvc 对齐到 `target/debug`。增量时 cargo/ninja 只重编受影响部分。
-4. 构建前停止整栈，释放共享内存；保持停机至安装完成。
-5. 备份 `~/mozart-runtime/bin` 到 `bin.prev` 与 `web.prev`；安装 9 个程序、静态资源与 `examples/rvc_stub`，并清理旧 `bin/mozart-web-service`。安装用临时文件加原子替换，不打断运行中的进程；若配置低端口（`< 1024`）则对 `mozart-web-adapter` 授予 `cap_net_bind_service`。
+1. 通过独立 SSH 会话持有 `flock` 文件锁。创建事务源码快照，并同步到 `~/.mozart-prev`。遇到含 `owner` 的历史锁目录时停止，请先核实旧事务。
+2. rsync 本机仓库到 `~/Mozart`，排除 `target/`、`build/`、`.git/`。默认按内容同步（`--checksum --no-times`）：变更文件落传输时刻的 mtime，未变更文件保持原 mtime，构建缓存保留。`--full` 在设备构建阶段运行 `cargo clean` 和 CMake `--clean-first`。
+3. 源码同步后暂停整栈，释放共享内存；保持停机至安装完成。
+4. 构建 Rust debug 二进制与 `rvc_stub` 示例；构建 `jetson-release` C++ 产物；rvc 对齐到 `target/debug`。增量时 cargo/ninja 只重编受影响部分。
+5. 安装前用新 ctl 的 `config validate --json` 离线校验 `mozart.toml`。备份 `~/mozart-runtime/bin` 到 `bin.prev`，备份 `~/mozart-runtime/web` 到 `web.prev`；安装 9 个程序、静态资源与 `examples/rvc_stub`，并清理旧 `bin/mozart-web-service`。安装用临时文件加原子替换，不打断运行中的进程；若配置低端口（`< 1024`）则对 `mozart-web-adapter` 授予 `cap_net_bind_service`。
 6. 用 `mozart.toml` 启动整栈（若设备已启用 `mozart.service`，自动经 `systemctl start mozart.service` 启动，否则经 `mozart-ctl up`），等待 `web`、pre、RVC、配置中的增强链路及原本正常的服务恢复。
-7. 写 `~/mozart-runtime/deploy.json`（含 `systemd` 托管标记）。
+7. 按预检结果检查 RVC 状态。显式选择 `rvc` 且配置了模型时要求 `loaded` 或 `streaming`；默认直出也接受 `idle`。除手动模式下输出模式为空外，等待输出模式应用。探测 `/api/v1/health`。HTTP 返回 `200` 且 `status` 为 `ok` 后写 `deploy.json`。访问源不在非空 `allowed_origins` 中时只告警，不修改配置。
+8. 成功后按修改时间保留最近 3 份源码快照。当前用户的 `/tmp/mozart-deploy.*` 事务目录也保留 3 份，其中必须包含当前事务。
 
-失败时执行事务内的 `rollback.sh`。它恢复独立源码快照，清理失效构建缓存，并恢复原先运行的服务（按部署前托管方式走 `systemctl` 或 `mozart-ctl`；从旧版迁移失败回滚至 `bin.prev` 时保留旧独立服务恢复兼容）。安装开始后还恢复 `bin.prev` 与 `web.prev`；回滚失败时保留锁和事务记录，不假报成功。
+发布前失败时由持锁会话执行事务内的 `rollback.sh`。发布后清理失败会返回非零，保留已发布的新栈。对原有源码目录，仅在开始同步后按内容回退；回退文件使用新的修改时间，不清空构建缓存。安装开始后还恢复 `bin.prev` 与 `web.prev`。按原托管方式恢复服务。会话结束时自动释放锁；失败事务保留记录供排查，不删除锁文件。
 
 ### 开机定频与自启（systemd）
 
@@ -161,7 +162,7 @@ MOZART_JETSON=<SSH目标> tools/install-jetson-systemd.sh --uninstall
 
 默认配置监听 `8080` 高端口，无需 `cap_net_bind_service` 或免密 `sudo` 即可启动。若手动配置低端口（`< 1024`），脚本才通过 `sudo -n setcap` 授予 `cap_net_bind_service`；没有该权限时请保持高端口配置。服务以运行目录所有者启动，不以 root 运行；绑定后、创建工作线程前清除进程 capability。设备需提供 `jq` 和 libcap 工具。
 
-`deploy.json` 记录提交号、dirty 标记、时间、构建预设、构建模式和 `systemd` 托管标记；部署期间整栈重启。当前实测范围及标准整链部署阻塞见[适配器报告](../reports/web-adapter-20261117/RESULTS.md#适用范围)。
+`deploy.json` 记录提交号、dirty 标记、时间、构建预设、部署模式（默认 `incremental`，指定 `--full` 时为 `full`）和 `systemd` 托管标记；部署期间整栈重启。适配器实测范围见[适配器报告](../reports/web-adapter-20261117/RESULTS.md#适用范围)。`30d0eaf` 基线的板端实测覆盖配置拦截与停栈后异常退出回滚。`cf8c800` 已支持此前被拒绝的 `bridge.llama_model_id`；新栈部署验收见[部署加固报告](../reports/deploy-hardening-20261126/RESULTS.md#适用范围)。
 
 ### 仅前端部署
 

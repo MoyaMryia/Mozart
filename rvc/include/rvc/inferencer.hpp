@@ -14,6 +14,7 @@
 #include "rvc/cancellation.hpp"
 
 #include "rvc/model_loader.hpp"
+#include "rvc/sculptor.hpp"
 #include "rvc/feature_extractor.hpp"
 
 namespace rvc {
@@ -125,6 +126,23 @@ public:
         const std::vector<float>& new_pitchf,
         size_t shift
     );
+    // 意图信号缓存推进：fresh 对齐与音高缓存一致（各丢弃右缘 1 帧）。
+    // 音高缓存推进后调用；静音跳过路径无音频，意图状态冻结（已知限制）。
+    void push_realtime_intent_cache(
+        const float* audio_16k,
+        size_t audio_size,
+        const std::vector<float>& new_pitchf,
+        size_t shift
+    );
+    // L2 塑形：delta_feats 并入 resized_feats，替换 pitch/pitchf，
+    // 返回整窗 280 帧增益（已平滑，调用方切片 return 区间）。
+    // 调用前置条件：model_->has_sculptor() 且 pitchf.size() == 塑形器帧数。
+    void apply_realtime_sculptor(
+        std::vector<float>& resized_feats,
+        std::vector<float>& pitchf,
+        std::vector<int64_t>& pitch,
+        std::vector<float>& gain_db_frames
+    );
     uint32_t sample_realtime_random();
     RealtimeStateSnapshot realtime_state_snapshot() const;
 
@@ -146,6 +164,8 @@ private:
     SessionParams params_;
     std::vector<int64_t> realtime_pitch_cache_;
     std::vector<float> realtime_pitchf_cache_;
+    std::vector<std::array<float, 4>> realtime_intent_cache_;
+    IntentSignalState intent_state_;
     std::mt19937 realtime_random_{114514};
     std::atomic<uint64_t> generator_windows_{0};
 

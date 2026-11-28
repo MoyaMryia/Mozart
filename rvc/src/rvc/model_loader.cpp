@@ -3,6 +3,7 @@
 //   - RVCModelConfig 增加 model_version 报告口径（config.json 的 version
 //     字段，缺省派生 sr{采样率}.emb{emb_channels}）。
 #include "rvc/model_loader.hpp"
+#include "rvc/realtime_geometry.hpp"
 #include <spdlog/spdlog.h>
 #include <fstream>
 #include <nlohmann/json.hpp>
@@ -107,6 +108,8 @@ RVCModel::RVCModel(const std::string& model_id, const std::filesystem::path& mod
     , onnx_path_(model_dir / (model_id + ".onnx"))
     , realtime_front_path_(model_dir / (model_id + "-front.onnx"))
     , realtime_decoder_path_(model_dir / (model_id + "-decoder.onnx"))
+    , realtime_sculptor_path_(model_dir / "sculptor.onnx")
+    , sculptor_params_path_(model_dir / "sculptor.json")
     , index_path_(model_dir / (model_id + ".index"))
     , config_path_(model_dir / "config.json")
 {}
@@ -148,6 +151,12 @@ bool RVCModel::load(const std::string& device, bool half) {
         // index_rate=0 的调用方在 inferencer 侧跳过检索，但内存仍会占用。
         if (std::filesystem::exists(index_path_)) {
             load_index();
+        }
+
+        // L2 塑形器为可选资产：目录无 sculptor.onnx 时保持既有行为；
+        // 有资产但加载失败则拒载，避免静默回退到无塑形链路。
+        if (std::filesystem::exists(realtime_sculptor_path_) && !load_sculptor()) {
+            return false;
         }
 
         loaded_ = true;
@@ -196,6 +205,44 @@ bool RVCModel::load_realtime_generator() {
 
     realtime_front_engine_ = std::move(front);
     realtime_decoder_engine_ = std::move(decoder);
+    return true;
+}
+
+bool RVCModel::load_sculptor() {
+    auto params = SculptorParams::from_json(sculptor_params_path_);
+    if (!params) return false;
+    sculptor_params_ = *params;
+
+    spdlog::info("Loading realtime sculptor: {}", realtime_sculptor_path_.string());
+    auto sculptor = make_engine(realtime_sculptor_path_);
+    if (!sculptor || !sculptor->loaded()) return false;
+
+    const auto hubert_shape = sculptor->input_shape("hubert_upsampled");
+    const auto intent_shape = sculptor->input_shape("intent_signals");
+    const auto cond_shape = sculptor->input_shape("cond");
+    const auto front_frames = derive_realtime_geometry().front_frames;
+    const bool shape_ok = hubert_shape.size() == 3 && hubert_shape[0] == 1
+        && hubert_shape[1] == static_cast<int64_t>(front_frames)
+        && hubert_shape[2] == static_cast<int64_t>(config_.emb_channels)
+        && intent_shape.size() == 3 && intent_shape[0] == 1
+        && intent_shape[1] == static_cast<int64_t>(front_frames)
+        && intent_shape[2] == 4
+        && cond_shape.size() == 2 && cond_shape[0] == 1 && cond_shape[1] == 4;
+    if (!shape_ok) {
+        spdlog::error(
+            "Sculptor engine shape mismatch for {}: hubert[{}] intent[{}] cond[{}] vs front_frames={}",
+            model_id_, hubert_shape.size(), intent_shape.size(), cond_shape.size(),
+            front_frames);
+        return false;
+    }
+    if (!warmup_fixed_engine(*sculptor, {"hubert_upsampled", "intent_signals", "cond"}, "outputs")) {
+        return false;
+    }
+    realtime_sculptor_engine_ = std::move(sculptor);
+    spdlog::info(
+        "Sculptor enabled for {} (gender={}, target_f0={}, std={}, softness={})",
+        model_id_, sculptor_params_.gender, sculptor_params_.target_f0,
+        sculptor_params_.target_f0_std, sculptor_params_.softness);
     return true;
 }
 

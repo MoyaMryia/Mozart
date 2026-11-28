@@ -106,6 +106,28 @@ fn status_json(env: &CtlEnv) -> Status {
 }
 
 #[test]
+fn config_validate_reports_startup_rvc_expectation_offline() {
+    for (tag, body, configured, expected, managed) in [
+        ("default", "[rvc]\nmodel_id = 'demo'", true, false, true),
+        ("rvc", "[daemon]\nstartup_mode = 'rvc'\n[rvc]\nmodel_id = 'demo'", true, true, true),
+        ("fallback", "[daemon]\nstartup_mode = 'rvc'", false, false, true),
+        ("broadcast", "[daemon]\nstartup_mode = 'broadcast'\n[rvc]\nmodel_id = 'demo'", true, false, true),
+        ("manual", "[daemon]\nstartup_mode = 'manual'\n[rvc]\nmodel_id = 'demo'", true, false, false),
+    ] {
+        let env = CtlEnv::with_config(tag, body);
+        let output = env.command()
+            .env_remove("MOZART_STARTUP_MODE")
+            .args(["config", "validate", "--json"])
+            .output()
+            .unwrap();
+        let data = stdout_json(&output);
+        assert_eq!(data["rvc_model_configured"], configured, "{tag}");
+        assert_eq!(data["startup_rvc_expected"], expected, "{tag}");
+        assert_eq!(data["output_mode_managed"], managed, "{tag}");
+    }
+}
+
+#[test]
 fn up_status_route_mute_down() {
     let env = CtlEnv::new("flow");
 

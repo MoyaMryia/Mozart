@@ -211,6 +211,15 @@ RMVPE 前端 mel 128 带、n_fft 1024、hop 160、30–8000 Hz、HTK Slaney（�
   - **改动方案**：`RVCInferencer::f0_to_pitch` 增加 `interpolate_unvoiced` 开关；实时链路 `infer_realtime` 传入 `false`，保留无基频帧为 `pitch = 1` 且 `pitchf = 0.0f`；离线文件链路 `infer` 保持 `true` 以维持离线对拍口径不变。
   - **独立验收**：C++ 单测验证 `f0_to_pitch(..., false)` 在混合清浊音序列中保持无声帧 `pitch=1 / pitchf=0`、有声帧正常移调；板端四起点三档对照（`interp` / `pitchf0` / `native`）显示 `native` 静音底噪降 22.5%（`0.0071 → 0.0055`）、人声/背景信噪比升 `+0.95 dB`、停顿跳变降 21%、SOLA 标准差从 `3.62` 降至 `3.39 ms`，实听电音明显减轻。
 
+- [ ] **步骤 6：接入 L2 因果意图塑形器（prosody sculptor，替代索引检索清洗源声道泄漏）**
+  - **背景与依据**：离线归因矩阵（`rvc-reference` 归因实验）已确认仅换 F0/能量不够，源说话人声门/声道色彩经 ContentVec 泄漏把目标声码器拖回源音色。L2 双语因果 Intent-to-Prosody + Feature Adapter（约 4.36 M 参数，静态 `[1,280]` 契约，与实时几何 `front_frames = 280` 一致）在 100 Hz 帧钟输出 `pred_log_f0`、`pred_voiced_logit`、`pred_log_gain_db`、`delta_feats`，其中 `delta_feats` 残差清洗替代 FAISS 索引检索。权重与评估见 `rvc-reference/prosody_sculptor_l2/`（双语 LibriTTS-R + AISHELL-3 训练，EN/ZH 对拍通过）。
+  - **改动方案**：
+    1. 资产约定：模型目录放 `sculptor.onnx`（板端编译为 `sculptor.engine`，`make_engine` 自动优先）+ `sculptor.json`（`gender`/`target_f0`/`target_f0_std`/`softness`）；ONNX 单输出 `[1,280,771]` 帧主序（f0/voiced/gain/适配后特征按通道拼接，适配后特征 = hubert+delta 引擎内融合，`tools/model/export_sculptor_onnx.py --fused`），规避 `IEngine` 单输出接口限制；导出脚本 `tools/model/export_sculptor_onnx.py`。
+    2. 模型加载：`model_loader` 检测到 `sculptor.onnx/.engine` 才加载（可选资产），校验输入形状 `[1,T,768]/[1,T,4]/[1,4]` 并 warmup，T 必须等于 front 帧数；无 sculptor 时行为完全不变。加载成功后 `capabilities` 增加 `sculptor` 位，`GetStatus` / `LoadModel` 响应可查询；目录有资产但加载失败则拒载并在日志记录原因，不静默回退。
+    3. 推理接入：`infer_realtime` 在特征检索/protect 之后、front 之前调用——`delta_feats` 逐帧加到 `resized_feats`；L2 F0（voiced>0 取 `exp(pred_log_f0)`，否则 0）经 `f0_to_pitch(..., interpolate_unvoiced=false)` 替换 `pitch`/`pitchf`；`pred_log_gain_db` 限幅 ±4 dB、高斯 σ=6 平滑后施加于 decoder 输出 return 区间样本。sculptor 激活时跳过索引检索与 protect（由 delta 替代），`pitch_shift` 不生效（L2 自带目标 F0）。
+    4. 意图信号：`features.py` 的 `causal_rms`/EMA 均值方差/粗意图轮廓（80 ms 平滑）/停顿概率单点移植到 `rvc/src/rvc/sculptor.cpp`，跨块 EMA 状态与音高缓存同节奏（fresh_count 帧对齐）推进，断流重置时同步清零。
+  - **独立验收**：C++ 单测（意图信号黄金对拍 fixtures、EMA 状态跨块推进一致性、形状校验拒绝分支、无 sculptor 回归不变）；本机 `host-debug` 构建 + CTest；板端 MozartMryia 隔离部署实测单块耗时增量、流式 E2E 零缺帧与听感对照（frieren/bocchi）。
+
 ---
 
 ### 实时延迟拆解与分阶段降延迟调查
@@ -230,3 +239,26 @@ RMVPE 前端 mel 128 带、n_fft 1024、hop 160、30–8000 Hz、HTK Slaney（�
 - [x] **降延迟步骤 B（同机 `--fp16` 重编实时引擎与索引加速）**：在 Jetson 本机使用 `build_realtime_engines.py --fp16` 重建四引擎并消除跨设备 plan 警告；配合 `IndexSearch` 加速（88.6 ms → 6.0 ms），`bocchi-v2-48k`（`index_rate=0.8`，3561 质心 / 138915 向量）单块推理从 `176.7 ms` 降至 `58.6 ms`（P95 `63.8 ms`，3.0× 提速），声学近无损（vs 文件参考 Log-Mel L1 `4.864` vs FP32 `4.742 dB`，RMS L1 `2.691` vs `2.529 dB`）；`startup_delay_ms = 320 ms` 实测物理回录净延迟 `460.2 ms`（`-122.2 ms`），60 s 连续长跑 253 块零欠载、零缺帧、零重置。已将 `realtime_chain_params.json` 的 `compile.fp16` 默认设为 `true`。
 - [x] **降延迟步骤 C（短块 profile 实验：240 ms → 160 ms）**：在隔离目录完成 `window_samples = 2560`（160 ms 块，`front=272`、`decoder=22`、`hubert=43520`、`rmvpe=32`）全套 FP16 资产导出与板端实测：单块推理 `51.3~52.4 ms`（P95 `56.9~62.7 ms`，GPU 占空比 32.8%），`startup_delay_ms = 240 / 220 ms` 均通过 60 s 长跑（378 块零欠载、零缺帧、零重置），物理回录净延迟压至 **`385.6 / 365.6 ms`**（相对 `direct` 纯 RVC 滞后 `292 / 266 ms`，较基线降 **`216.8 ms` / `-37.2%`**）。但 160 ms 块相对 240 ms 存在轻微声学代价（Log-Mel L1 `+0.11~0.23 dB`、RMS L1 `+0.21~0.35 dB`、接缝频率 6.25 vs 4.17 缝/s）且破坏既有 240 ms 资产形状兼容，故**暂不切换主干默认块长**，完整数据归档于 [realtime-quality-latency-20261125/RESULTS.md](../../reports/realtime-quality-latency-20261125/RESULTS.md)。
 - [x] **降延迟步骤 D（板端定频 + `TrtEngine` CUDA 锁页缓冲并行）**：板端启用 `jetson_clocks` 锁定 CPU/GPU/EMC 最高频，消除 240 ms 块间隙空闲降频（`1020 → 306 MHz`），单块 FP16 推理从 `56.8 ms` 降至 `32.2 ms`（P95 `32.4 ms`）；随后在 `TrtEngine`（`rvc/include/rvc/trt_engine.hpp`、`rvc/src/rvc/trt_engine.cpp`）为每个张量引入复用 CUDA 锁页缓冲（`cudaMallocHost` / `cudaFreeHost`）消除非锁页 `cudaMemcpyAsync` 的隐式同步，单块推理进一步降至 **`29.89 ms`**（P95 `30.05 ms`，逐位误差 `0.0000000`），240 ms 切块在 `startup_delay_ms = 260 ms` 下零缺帧达成 **`398~405 ms`** 净延迟（较基线降 `~184 ms`）。后续补充锁页缓冲长跑与动态尺寸切换压测，并将开机定频与 `mozart` 启动纳入受控 `systemd` 单元及部署适配。
+
+### L2 实时链路 golden 对齐与推理栈优化（O1–O4，按步推进）
+
+背景：L2 意图塑形器（SPEC-03 步骤 6）已接入实时链并在板端隔离部署（`reports/sculptor-jetson-deploy-20261128`）。本机已产出 L2 离线链 golden：`prosody_sculptor_l2` 塑形 → `frieren-v2-40k` RVC（`eval_l2_en_frieren.wav` / `eval_l2_zh_frieren.wav`，含声学指标）。目标：板端实时输出对齐本机 golden（同精度），在预算内拉高精度或降低耗时（同精度下提速）。逐引擎预算：定频 + FP16 下单块 RVC 实测 `29.89 ms`，sculptr TRT `1.31 ms`（trtexec），块周期 `240 ms`。
+
+- [x] **O1（验收锚点）：建立「板端实时 L2 链 ↔ 本机 golden」对拍口径**
+  - 方法：板端 snd-aloop 回灌与本机 golden 同源的 `16 kHz` 输入（`eval_input_20s.wav` / `eval_input_zh_25s.wav` 经 `preprocess_16k`），隔离栈（frieren + sculptr）实时流，回录输出；与本机 golden 波形按相关对齐后用 `tools/model/compare_streaming_quality.py` 指标（Log-Mel L1 / RMS L1 / 接缝）对拍，并记录净延迟（脉冲串法）。
+  - 验收：对拍指标阈值与净延迟基线入库 `reports/`，作为 O2/O3 每步的回归门。已完成，基线见 [sculptor-golden-parity-20261128](../../reports/sculptor-golden-parity-20261128/RESULTS.md)：EN/ZH `logmel_corr 0.915/0.913`、`logmel_mae 4.92/5.31 dB`、`voiced_iou 0.924/0.948`、`f0_median_cents +90/+80`；O2 优先归因 f0 偏移。
+- [x] **O2（同速拉精度）：逐引擎精度盘点与预算内回退**
+  - 盘点结果（`tools/model/gate_compare.py` 对拍门，EN golden）：sculptr ORT fp32 与 TRT fp16 指标逐项相同（cents \|abs\|中位均 90）；rmvpe fp32 引擎 `100`（反而略差）；hubert fp32 引擎 `90`（无变化）。**结论：精度瓶颈不在引擎 fp16，保留全部 fp16 引擎**（同速下无精度可拉）。
+  - 逐秒分布：偏差集中在启动段（t=0–2 s，-100~200 cents）与少数重读段（+145~160），多数段 30–100 cents，无八度跳变；对拍指标地板（自对齐 +10 ms 错位）为 10 cents。
+  - 遗留归因（结构性，非精度）：a) 实时 RMVPE 逐块 mel 补零口径 vs golden 整段 RMVPE 的帧级差；b) 启动态（意图 EMA 冷启动与历史窗零填充差异）；c) ContentVec 实时导出与 Applio 整段前端的帧对齐差异。列为 O3 前置观察，不影响 O3 提速项的等价性验证方法。
+- [x] **O3-a0（同精度提速）：共享前端与 frieren front/decoder 的 FP16 补齐**
+  - 11-25 重编只覆盖 bocchi 四引擎，qiqi 共享 hubert/rmvpe 与 frieren front/decoder 仍为 FP32。用 `build_realtime_engines.py --fp16` 重编并换装后，板端单块（frieren + sculptr，定频、canonical 停机）从 `70 ms` 降至 **`26.7 ms`**（f0+hubert 并行窗 `13.5`，sculptr+装配 `2.5`，front+decoder `10.6`），GPU 占空比 `11%`；golden 门 `logmel_mae EN 4.98（+0.2）/ ZH 5.09（-0.2）`，其余指标不变，通过。旧 FP32 引擎备份于设备 `/tmp/engine-backup-fp32/`。
+- [x] **O3-a（同精度提速）：sculptr 融合适配特征 + `startup_delay` 回调红利**
+  - 导出工具新增 `--fused`：通道 3.. 直接输出适配后特征（hubert+delta 引擎内相加），ORT 对拍 `3.34e-06`；C++ 契约同步更新（`tools/model/export_sculptor_onnx.py`、`apply_realtime_sculptor`）。融合引擎 TRT 实测 `1.35 ms`，单块总耗时保持 `26.7 ms`（加法本就亚毫秒，收益在契约简化与后续直连可能）。
+  - golden 门：EN `logmel_mae 4.81`（优于非融合）、ZH `5.13`，其余指标不变，通过。
+  - `startup_delay_ms` 扫描（静音流零缺帧）：300/280/260 均通过；脉冲回录实测净滞后 **`280 → 350 ms`**（对照 320 → `400 ms`），较旧口径净减约 `50 ms`。
+- [x] **O3-b：HuBERT 增量缓存——判定不可行，移入 FUTURE**
+  - 导出图盘点：hubert-realtime 含全序列位置卷积（k=128 s=1 group=16）与全局注意力（MatMul/Softmax），感受野 `41039/44800` 样本盖满整窗，每帧输出依赖全部输入；逐块增量缓存不可行。流式注意力变体（分块 KV 或限看历史）需重导出并重过 golden 门，移入 [FUTURE](../FUTURE.md)。f0 窗内 HuBERT 的并行墙钟收益维持现状（并行窗 `13.5 ms`，GPU 占空比 `11%`）。
+- [x] **O3-c：意图缓存与中间缓冲复用等微优化**
+  - 已随 O3-a 契约简化落地（适配后特征直接拷贝替代逐帧加法）；意图信号计算与缓存推进经黄金夹具与板端单测验证无新增开销项，其余候选微优化在 `26.7 ms` 占空比 `11%` 下无收益，不再单列。
+- [ ] **O4（板端实测收口）**：净延迟物理回录、60 s 长跑零欠载零缺帧、听感对照，报告入库；达标后将 sculptr 三件套扩展到正式模型目录。

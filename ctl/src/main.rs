@@ -1,5 +1,5 @@
 use clap::{Parser, Subcommand, ValueEnum};
-use mozart_core::config::{ensure_log_dir, ensure_run_dir, Config, RvcSessionValues};
+use mozart_core::config::{ensure_log_dir, ensure_run_dir, Config, RvcSessionValues, StartupMode};
 use mozart_core::ctl::schema::{
     Activity, ConfigGetRequest, ConfigSetRequest, DeviceEntry, DeviceKind, DeviceListRequest,
     DeviceUseRequest, FileCancelRequest, FileFetchRequest, FileJob, FileJobState, FileProgress,
@@ -245,6 +245,8 @@ enum DeviceAction {
 
 #[derive(Subcommand)]
 enum ConfigAction {
+    /// 用 daemon 配置加载器离线检查配置；--json 输出模式托管、模型配置与启动期 RVC 预期
+    Validate,
     /// 改单个键的持久基线；重启键返回需重启提示
     Set {
         /// 配置键，如 pre.capture_device
@@ -337,6 +339,17 @@ fn run(cli: Cli) -> Result<(), CliError> {
             DeviceAction::Use { kind, device } => device_use(&config, cli.json, kind, &device),
         },
         Action::Config { action } => match action {
+            ConfigAction::Validate => {
+                if cli.json {
+                    let configured = !config.rvc.model_id.is_empty();
+                    println!("{}", json!({
+                        "output_mode_managed": config.daemon.startup_mode != StartupMode::Manual,
+                        "rvc_model_configured": configured,
+                        "startup_rvc_expected": config.daemon.startup_mode == StartupMode::Rvc && configured,
+                    }));
+                }
+                Ok(())
+            },
             ConfigAction::Set { key, value } => config_set(&config, &key, &value, cli.json),
             ConfigAction::Get { key } => config_get(&config, key.as_deref(), cli.json),
             ConfigAction::Save => config_save(&config, cli.json),

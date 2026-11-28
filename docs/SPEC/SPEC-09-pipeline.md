@@ -32,7 +32,7 @@
 
 ### 验收
 
-- 新环境按文档构建检查、一条命令部署启动并过健康检查、部署提交/时间/结果可查、全过程无需手工 rsync/ssh/重启均已通过；一条命令回滚与跨平台音频桥接验收仍在待办。
+- 历史基线已通过构建检查、单命令部署启动、健康检查与部署记录查询。`30d0eaf` 基线的前三次增量部署均因不识别 `bridge.llama_model_id` 失败：一次安装后回滚，两次安装前拦截。`cf8c800` 已支持该字段。
 
 ## 入口
 
@@ -68,17 +68,22 @@
 
 ## DevOps 约定
 
+- [x] 修正部署探活与回滚：手动模式允许空输出模式；停服前记录意图，中断后按原托管方式恢复。对齐部署说明中的构建顺序与备份路径。
+- [x] 核对事务收尾：只允许持原锁回滚；区分发布后的清理失败与安装失败；访问源不匹配才告警。
+- [x] 对齐 `cf8c800`：按启动模式和模型配置检查 RVC 状态；保留 AEC3 构建环境导出。
+- [x] 补验部署事务（[预检与停栈后强杀实测](../../reports/deploy-hardening-20261126/RESULTS.md#事务修复补验)）：断连后持阶段锁回滚，区分锁争用与执行错误，收紧停栈基线、访问源与安装探活，记录 systemd 限流恢复方法。
 - [ ] 文档检查补全：句长与限制句检查（旧实现依赖 Python 脚本）；现只查行尾空白与报告“## 适用范围”。
 - [ ] 原子发布：版本目录加 `current` 链接，失败不破坏上一版。
 - [ ] 可回滚：保留最近若干版本，回滚一条命令。
 - [ ] 可追溯：每次部署记录提交、时间、预设和结果。`deploy.json` 已记录提交、dirty、时间与预设。
-- [ ] 方案 1 部署流板端实测：新部署流未在 Jetson 上跑过，`ci-local.sh` 只做语法检查，健康检查读 `processes.web` 也不代表 TCP 已监听（见下条）。解除条件：板端跑一次完整 `deploy-jetson.sh` 与一次回滚，核对 `processes.web`、页面可达与 `bin.prev` 恢复结果，证据落 `reports/`。
-- [ ] 部署锁自动释放与回滚缓存保护：将 `tools/deploy-jetson.sh` 的目录锁 `~/.mozart-deploy.lock` 改为绑定会话生命周期的文件锁（`flock`），确保 SSH 断连或进程异常退出时自动释放不留死锁；回滚仅在源码确实发生回退且构建产物失效时清理缓存，取消无条件 `cargo clean` 与 `ninja -t clean`。
-- [ ] 部署构建与健康检查加固：收紧部署健康检查（等配置模型时的 `rvc` 或 `output_mode` 离开过渡态，并核验 `web` 运行且 `/api/v1/health` 返回 `200`）；部署末尾按当前 SSH 目标 IP 与端口核对 `[web].allowed_origins`，缺失时明文告警提示而不擅改配置。板端 Rust 构建保持 debug（用户决定：release 全量与增量编译在 8 GB 设备上过慢），不改 `--release`。
-- [ ] 部署工程卫生加固：部署成功后按上限（保留最近 `3` 份）自动清理历史 `~/.mozart-source-backup.*` 与 `/tmp/mozart-deploy.*` 快照；`deploy.json` 按实际构型写入 `mode`（`full` / `incremental`）。（注：停栈后最多 `3 s` 进程收割缓冲已随 `systemd` 适配在 `tools/deploy-jetson.sh` 中补齐。）
+- [ ] 方案 1 成功发布：板端已执行失败部署与回滚；安装后首次回滚遇 systemd 限流，人工启动后恢复。设备在线后补测新栈完整发布，见[部署加固报告](../../reports/deploy-hardening-20261126/RESULTS.md#适用范围)。
+- [x] 部署锁自动释放与回滚缓存保护（[互斥与回滚实测](../../reports/deploy-hardening-20261126/RESULTS.md)）：将 `tools/deploy-jetson.sh` 的目录锁 `~/.mozart-deploy.lock` 改为绑定会话生命周期的文件锁（`flock`），确保 SSH 断连或进程异常退出时自动释放不留死锁；回滚恢复源码，不清理构建缓存。
+- [x] 安装前使用新 `mozart-ctl config validate` 离线校验 daemon 配置（[实测](../../reports/deploy-hardening-20261126/RESULTS.md)）；配置不兼容时直接回滚，不启动新 daemon，以免触发 systemd 启动限流。
+- [ ] 部署构建与健康检查加固（已实现，[部署成功路径待验收](../../reports/deploy-hardening-20261126/RESULTS.md#适用范围)）：收紧部署健康检查（手动模式允许空输出模式，否则要求输出模式已应用；须有 RVC 状态。启动时预期加载 RVC 则只接受 `loaded` 或 `streaming`，否则也接受 `idle`。核验 `web` 运行且 `/api/v1/health` 返回 HTTP `200`、`status=ok`）；部署末尾按当前 SSH 目标 IP 与端口核对 `[web].allowed_origins`，缺失时明文告警提示而不擅改配置。板端 Rust 构建保持 debug（用户决定：release 全量与增量编译在 8 GB 设备上过慢），不改 `--release`。
+- [ ] 部署工程卫生加固（已实现，[部署成功路径待验收](../../reports/deploy-hardening-20261126/RESULTS.md#适用范围)）：部署成功后按上限（保留最近 `3` 份）自动清理历史 `~/.mozart-source-backup.*` 与 `/tmp/mozart-deploy.*` 快照；`deploy.json` 按实际构型写入 `mode`（`full` / `incremental`）。（注：停栈后最多 `3 s` 进程收割缓冲已随 `systemd` 适配在 `tools/deploy-jetson.sh` 中补齐。）
 - [x] 轻量前端部署 `tools/deploy-web.sh`：纯前端改动不必走全栈部署。主机构建 web（按需 `npm ci`，复用 lock stamp）→ 备份设备 `web/dist` 到 `web.prev` → `rsync --checksum --delete` 替换运行位 `web/dist`；不编后端、不停栈、不重启（适配器按请求读盘，立即生效）。SSH 目标由参数或 `MOZART_JETSON` 提供，`MOZART_RUNTIME_DIR` 覆盖运行目录。接口（适配器路由或 daemon schema）变更仍须走 `deploy-jetson.sh`。板端实测：构建 628 ms，替换后适配器立即提供新哈希资源，web/daemon 进程号不变。
 - [x] Jetson 开机定频与 `systemd` 自启模板及部署/E2E 适配：在仓库独立维护两个单元模板 `deploy/systemd/mozart-clocks.service.in`（开机在 `nvpmodel.service` 之后备份原调频状态并执行 `jetson_clocks`，默认保留自动调速风扇、可选 `--fan` 满载，停服恢复）与 `deploy/systemd/mozart.service.in`（在定频完成后以运行用户前台托管 `~/mozart-runtime/bin/mozart-daemon`，`KillMode=mixed` + `SIGTERM` 平滑退场，经 `--restart <on-failure|no>` 可选故障自动重启）；由 `tools/install-jetson-systemd.sh`（支持远程 SSH 落临时脚本 + 按需 PTY 执行，或 `--local`）按当前用户、动态探测二进制路径与运行目录渲染安装，并写入经 `visudo -cf` 校验的最小权限 `/etc/sudoers.d/mozart-deploy`。`tools/deploy-jetson.sh`（含回滚脚本）与 `tools/jetson-e2e.sh` 核对 `WorkingDirectory` 匹配后，对 `active|activating|reloading|deactivating` 状态的 `mozart.service` 自动改走 `systemctl stop / start` 并补最多 `3 s` 进程收割等待；未装 `systemd` 或指向隔离目录时回退 `mozart-ctl down / up`。
-- [ ] `systemd` 服务板端实机验收：已在 Jetson 实机完成 `tools/install-jetson-systemd.sh` 安装接管（默认自动静音风扇）、无密码 `systemctl stop / start`、`tools/deploy-jetson.sh` 完整部署停复（`63 s`）、`kill -9` 约 `5 s` 自动恢复及冷重启后 `mozart-clocks.service` → `mozart.service` 按序拉起全栈 7 项服务（证据见 `reports/realtime-quality-latency-20261125/RESULTS.md`）；剩余未测项为 `systemd` 托管下的 `tools/jetson-e2e.sh` 停复往返。阻塞原因：尚未单独跑 `jetson-e2e.sh`；解除条件：在板端执行一次 `tools/jetson-e2e.sh smoke` 确认自动停复无误。
+- [x] `systemd` 服务板端实机验收：安装、重启与冷启动见[原报告](../../reports/realtime-quality-latency-20261125/RESULTS.md)。原运行栈的 `jetson-e2e.sh --smoke` 停复往返见[部署加固报告](../../reports/deploy-hardening-20261126/RESULTS.md)。
 
 ## 待讨论
 
