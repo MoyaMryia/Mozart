@@ -1,47 +1,42 @@
-# L2 实时链路板端 golden 对拍基线（O1）
+# O2 逐引擎精度盘点：fp32 回退路线证伪（O1 门内差分实测）
 
-日期：2026-11-28。承接 [sculptor-jetson-deploy-20261128](../sculptor-jetson-deploy-20261128/RESULTS.md)。
-golden：本机离线 L2 链输出 `prosody_sculptor_l2/local_eval_20261128/eval_l2_{en,zh}_frieren.wav`
-（L2 塑形 → frieren-v2-40k RVC，`infer_stream_eval.py --rvc-eval`）。
-被测：板端隔离栈实时链（frieren + sculptor TRT 引擎，`~/MozartMryia`，`ce7e53d`）。
+日期：2026-11-28。承接 [O1 基线](../sculptor-golden-parity-20261128/RESULTS.md)。
+golden：`eval_l2_en_frieren.wav`（本机离线 L2 链）。被测：板端隔离栈实时链（frieren + sculptor），
+snd-aloop 同源回灌 `eval_input_20s.wav`（`preprocess_16k` 16 kHz PCM16）。
 
-## 方法
+## 对拍工具
 
-1. 输入同源：`eval_input_*.wav` 经 `features.read_audio`（`preprocess_16k`）得 16 kHz PCM16，
-   与 golden 链消费的信号完全一致。
-2. 板端 snd-aloop：`aplay → Loopback DEV0,SUB2 → pre 采集 DEV1,SUB2`；
-   `pre 播放 DEV0,SUB3 → arecord DEV1,SUB3` 48 kHz 立体声回录，arecord 提前 0.5 s。
-3. 路径对齐 golden：`pre.dsp.denoise=false`，rvc 参数 `pitch_shift=0`、`index_rate=0`、
-   `rms_mix_rate=1.0`、`protect=0.33`（sculptor 激活时该两项由 L2 替代，与 golden 一致）。
-4. 对齐：16 kHz 域 RMS 包络有界互相关粗对齐（EN/ZH 均 `1.00 s`，即回录预卷 + 启动缓冲），
-   裁剪后 `tools/model/compare_streaming_quality.py`（`stream_hop=3840`，块周期 240 ms）细对齐。
+新增 `tools/model/gate_compare.py`：RMS 包络粗对齐（±6 s，覆盖回录预卷与启动缓冲）→
+mel 相关细对齐（±40 帧，宽于 `compare_streaming_quality` 的 ±20 帧），输出整体指标与
+逐秒 cents/mel 分布。对拍指标地板（golden 自对齐 + 人为 10 ms 错位）为 **10 cents**。
 
-## 指标（O1 基线，回归门）
+## 差分矩阵（仅改一个引擎，其余 fp16）
 
-| 指标 | EN | ZH |
-| --- | --- | --- |
-| logmel_corr | 0.915 | 0.913 |
-| logmel_mae_db | 4.92 | 5.31 |
-| rms_envelope_corr | 0.946 | 0.925 |
-| rms_ratio_db | +0.49 | +1.26 |
-| centroid_median_delta_hz | +40 | +51 |
-| f0_median_cents | +90 | +80 |
-| voiced_iou | 0.924 | 0.948 |
-| 细对齐残差 | 0 ms | 10 ms |
+| 配置 | logmel_mae | rms_corr | cents \|abs\|中位 | signed 中位 | p90 \|abs\| |
+| --- | --- | --- | --- | --- | --- |
+| A0 全 fp16（TRT） | 4.75 dB | 0.946 | 90 | +30 | 190 |
+| A1 sculptor ORT fp32 | 4.87 dB | 0.946 | 90 | +30 | ~190 |
+| A2 rmvpe fp32 引擎 | 4.81 dB | 0.948 | 100 | +30 | 199 |
+| A3 hubert fp32 引擎 | 4.81 dB | 0.948 | 90 | +30 | 190 |
 
-运行状态：`blocks=242`、`frames_dropped=0`、`last_error=None`，frieren 40k 实时 `inference_ms_p95 = 70.0 ms`
-（不定频窗口，canonical 同机在跑；定频口径见降延迟步骤 D 的 `29.89 ms` 基线为无 L2 路径）。
+**结论：fp32 回退无可测收益，精度瓶颈不在引擎 fp16。保留全部 fp16 引擎（fp32 编译产物留在设备 `/tmp/*fp32.engine` 备查，未入资产）。**
 
-## 初判
+## 偏差结构（A0 对齐后逐秒）
 
-- 包络/音色结构高度一致（corr 0.91–0.95），量级与文件链 FP16 对 FP32 的历史容差（Log-Mel L1
-  `4.86 vs 4.74 dB`）同档，作为 O2/O3 回归门可用。
-- `f0_median_cents` +80~90（≈0.7–0.9 半音）超出 fp16 噪声预期，O2 优先定位：候选因素为
-  RMVPE fp16 引擎对 intent 轮廓的扰动、sculptr fp16 引擎、以及 aloop 回录增益链。
-- 回录链路含 ALSA plughw 转换与 16-bit 量化，为固定系统偏置，改动前后同口径可比。
+- 多数秒 30–100 cents；无八度跳变。
+- 启动段 t=0–2 s：-100~200 cents（意图 EMA 冷启动 + RMVPE 窗缘）。
+- 少数重读段（t=9–10 s、t=17–18 s）：+145–160 cents。
+- 初判与引擎精度无关（A1–A3 三方向均无变化），指向结构性口径差：
+  a) 实时 RMVPE 逐块 mel 补零 vs golden 整段 RMVPE 的帧级差；
+  b) 启动态历史窗零填充差异；
+  c) ContentVec 实时导出与 Applio 整段前端的帧对齐差异。
+  归因列为后续观察，不阻塞 O3 提速项（O3 各项的等价性验证以「改动前后同口径对拍」为门，不要求逼近 golden 的绝对值）。
+
+## 运行状态
+
+三轮采集均 `frames_dropped=0`、`last_error=None`；fp32 引擎编译于停机窗口（canonical 暂停/恢复正常）。
 
 ## 适用范围
 
-- 配置：JetPack 6，隔离栈 `MozartMryia` `ce7e53d`，frieren-v2-40k 40k；canonical 停机窗口内采集，测后已恢复。
-- 样本数：EN 20 s / ZH 25 s 各一条，单次采集，未做统计重复。
-- 未验证项：sculptor 在真实语音（非静音流）上的板端单块耗时增量；f0 偏移的根因归因（O2 执行）。
+- 配置：JetPack 6，隔离栈 `MozartMryia` `ce7e53d`，frieren-v2-40k 40k，EN 20 s 单样本单次采集。
+- 未验证项：ZH 侧逐秒分布（O1 已有整体指标）；实时 RMVPE 与整段 RMVPE 的帧级差量化。
