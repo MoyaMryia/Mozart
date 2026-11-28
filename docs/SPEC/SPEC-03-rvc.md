@@ -247,9 +247,10 @@ RMVPE 前端 mel 128 带、n_fft 1024、hop 160、30–8000 Hz、HTK Slaney（�
 - [x] **O1（验收锚点）：建立「板端实时 L2 链 ↔ 本机 golden」对拍口径**
   - 方法：板端 snd-aloop 回灌与本机 golden 同源的 `16 kHz` 输入（`eval_input_20s.wav` / `eval_input_zh_25s.wav` 经 `preprocess_16k`），隔离栈（frieren + sculptr）实时流，回录输出；与本机 golden 波形按相关对齐后用 `tools/model/compare_streaming_quality.py` 指标（Log-Mel L1 / RMS L1 / 接缝）对拍，并记录净延迟（脉冲串法）。
   - 验收：对拍指标阈值与净延迟基线入库 `reports/`，作为 O2/O3 每步的回归门。已完成，基线见 [sculptor-golden-parity-20261128](../../reports/sculptor-golden-parity-20261128/RESULTS.md)：EN/ZH `logmel_corr 0.915/0.913`、`logmel_mae 4.92/5.31 dB`、`voiced_iou 0.924/0.948`、`f0_median_cents +90/+80`；O2 优先归因 f0 偏移。
-- [ ] **O2（同速拉精度）：逐引擎精度盘点与预算内回退**
-  - 盘点板端 hubert-realtime / rmvpe-realtime / front / decoder / sculptr 的 fp16 与定频状态（frieren 与 qiqi、后续 bocchi）；sculptr 引擎 fp16 `1.31 ms` → fp32 约 `2.6 ms` 仍在预算，逐项在 O1 门内试测回退收益（delta 通道加法回 fp32 的精度增量优先）。
-  - 验收：O1 指标可测改善或确认无改善；无改善项记录后回退。
+- [x] **O2（同速拉精度）：逐引擎精度盘点与预算内回退**
+  - 盘点结果（`tools/model/gate_compare.py` 对拍门，EN golden）：sculptr ORT fp32 与 TRT fp16 指标逐项相同（cents \|abs\|中位均 90）；rmvpe fp32 引擎 `100`（反而略差）；hubert fp32 引擎 `90`（无变化）。**结论：精度瓶颈不在引擎 fp16，保留全部 fp16 引擎**（同速下无精度可拉）。
+  - 逐秒分布：偏差集中在启动段（t=0–2 s，-100~200 cents）与少数重读段（+145~160），多数段 30–100 cents，无八度跳变；对拍指标地板（自对齐 +10 ms 错位）为 10 cents。
+  - 遗留归因（结构性，非精度）：a) 实时 RMVPE 逐块 mel 补零口径 vs golden 整段 RMVPE 的帧级差；b) 启动态（意图 EMA 冷启动与历史窗零填充差异）；c) ContentVec 实时导出与 Applio 整段前端的帧对齐差异。列为 O3 前置观察，不影响 O3 提速项的等价性验证方法。
 - [ ] **O3（同精度提速）**：
   - a. sculptr 导出融合 `adapted_feats = feats + delta_feats`（engine 内 Add），`run_chained` 直连 front，省 `280×768 fp32` 两次往返拷贝；ONNX 对拍 golden 容差后替换资产与 C++ 接线。
   - b. HuBERT 增量卷积缓存：`44800` 样本窗内仅新增 `240 ms`（`3840` 样本）卷积前段重算，历史段缓存复用；先做离线逐帧等价验证（感受野与重锚失效逻辑）再上实时。
